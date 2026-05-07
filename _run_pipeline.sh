@@ -345,11 +345,11 @@ MAX_POINTS_PER_ABLATION="${MAX_POINTS_PER_ABLATION:-64}"
 # SPECTRAL_CLUSTERS=256
 
 
-if [[ "$EVAL_INTERVENTION" == "mean-positional" ]]; then
-	if [[ "$DECODE_ONLY" == "true" ]]; then
-		EVAL_INTERVENTION=mean
-	fi
-fi
+# if [[ "$EVAL_INTERVENTION" == "mean-positional" ]]; then
+# 	if [[ "$DECODE_ONLY" == "true" ]]; then
+# 		EVAL_INTERVENTION=mean
+# 	fi
+# fi
 if [[ "$EVAL_INTERVENTION" == *donor* && "$POINTS_TO_USE_FOR_MEAN_ABLATION" -lt 2048 ]]; then
 	POINTS_TO_USE_FOR_MEAN_ABLATION=2048
 fi
@@ -365,7 +365,7 @@ elif [[ "$SCRIPT5_EVAL_INTERVENTION" == "mean-donor-positional" ]]; then
 fi
 
 OUTPUT_EVAL_INTERVENTION_SUFFIX=""
-if [[ "$EVAL_INTERVENTION" != "mean" ]]; then
+if [[ "$EVAL_INTERVENTION" != "mean" && "$EVAL_INTERVENTION" != "mean-positional" ]]; then
 	OUTPUT_EVAL_INTERVENTION_SUFFIX="-eval_${EVAL_INTERVENTION}"
 fi
 
@@ -389,14 +389,6 @@ if [[ -n "$OUTPUT_EVAL_INTERVENTION_SUFFIX" ]]; then
 fi
 echo $CIRCUIT_LABEL
 DISCOVERY_OUT_DIR="$CIRCUIT_DISCOVERY_OUTPUT_DIR/$CIRCUIT_LABEL"
-
-# Shared spectral flags (used in multiple calls)
-SPECTRAL_FLAGS=(
-	--spectral_space hidden
-	--rep_hook_name ln_final.hook_normalized
-	--rep_pooling last
-	--spectral_dim 32
-)
 
 ############################################
 # Steps 1-3: always run
@@ -820,50 +812,6 @@ if [[ "$RUN_REFINE_NEURON_RULES" == "true" || "$RUN_REFINE_NEURON_RULES" == "1" 
 	python3 7_refine_neuron_anchored_rules.py "${REFINE_FLAGS[@]}"
 else
 	echo "Step 7: RUN_REFINE_NEURON_RULES=$RUN_REFINE_NEURON_RULES -> skipping 7_refine_neuron_anchored_rules.py"
-fi
-
-############################################
-# Step 12: Post-hoc threshold-event validation.
-# This explicitly reopens cached script-6 ablation JSONs, so it also runs when
-# circuits and agonists were produced by a previous experiment run. It does not
-# rerun circuit discovery, CHA, or singleton ablations.
-SCRIPT12_FLAGS=(
-	--input_data_dir "$DISCOVERY_INPUT_AUTODISCOVERY_DIR"
-	--output_data_dir "$DISCOVERY_OUT_DIR/$BAG_LABEL"
-	--baseline_subsets "$ANALYZE_BASELINE_SUBSETS"
-	--task_module "$TASK_MODULE"
-	--ai_model "$ANALYZED_LLM"
-	--n_associated "$MAX_POINTS_PER_ABLATION"
-	--n_unrelated "$MAX_POINTS_PER_ABLATION"
-	--batch_size "$BATCH_SIZE"
-	--search_epsilon "$MIN_FLIP_RATE"
-	--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
-	--intervention "$EVAL_INTERVENTION"
-	--threshold_event_clamp_topk "$THRESHOLD_EVENT_CLAMP_TOPK"
-	--out_dir "$DISCOVERY_OUT_DIR/$BAG_LABEL/threshold_event_summary"
-	--target flip_any
-)
-if [[ "$RUN_THRESHOLD_EVENT_POSTHOC" == "true" || "$RUN_THRESHOLD_EVENT_POSTHOC" == "1" ]]; then
-	if [[ "$FORCE_THRESHOLD_EVENT_POSTHOC" == "true" ]]; then
-		SCRIPT12_FLAGS+=(--force_posthoc_stats)
-	fi
-	if [[ "$DECODE_ONLY" == "true" ]]; then
-		SCRIPT12_FLAGS+=(--decode_only)
-	fi
-	if [[ "$NEURONS_TYPE" == "mlp" ]]; then
-		SCRIPT12_FLAGS+=(--mlp_neurons_only)
-	fi
-	if [[ "$SPLITS" == "spectral" ]]; then
-		SCRIPT12_FLAGS+=(
-			--cluster_by_spectral
-			--spectral_cache_dir "$CACHE_DIR"
-			"${SPECTRAL_FLAGS[@]}"
-			--global_n_clusters "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
-		)
-	fi
-	python3 12_summarize_threshold_events.py "${SCRIPT12_FLAGS[@]}"
-else
-	echo "Step 12: RUN_THRESHOLD_EVENT_POSTHOC=$RUN_THRESHOLD_EVENT_POSTHOC -> skipping 12_summarize_threshold_events.py"
 fi
 
 echo "Done."
