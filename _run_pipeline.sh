@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# set -euo pipefail
+set -eo pipefail
 
 ############################################
 # Usage:
@@ -79,6 +79,18 @@ Options (mutually exclusive within each group):
 
 	Decode control:
 		--decode_only       Pass --decode_only through to scripts that support it (default: off).
+		--no_llm_feature_generation
+							Skip Ollama/LLM feature proposal and use only task seed features.
+		--output_data_dir <DIR>
+							Override the default ./data/<task>/<model> output directory.
+							Useful for local fine-tuned checkpoints.
+		--model_label <LABEL>
+							Filesystem/cache label for ANALYZED_LLM. Defaults to the raw model
+							name for HF ids and a sanitized label for existing local paths.
+		--pipeline_cache_root <DIR>
+							Override the task cache root. Default: ./cache/<task>.
+		--pipeline_model_cache_dir <DIR>
+							Override the per-model pipeline cache directory.
 
 Examples:
 	# Random discovery + Random plan + Fast anchoring (default)
@@ -131,6 +143,22 @@ MIN_FLIP_RATE="0.2"
 INCORRECT_RULES=false
 DECODE_ONLY=false
 NEURONS_TYPE="all"
+OUTPUT_DATA_DIR=""
+MODEL_LABEL=""
+PIPELINE_CACHE_ROOT=""
+PIPELINE_MODEL_CACHE_DIR=""
+THRESHOLD_EVENT_CLAMP_TOPK="${THRESHOLD_EVENT_CLAMP_TOPK:-0}"
+FORCE_THRESHOLD_EVENT_POSTHOC="${FORCE_THRESHOLD_EVENT_POSTHOC:-false}"
+NO_LLM_FEATURE_GENERATION="${NO_LLM_FEATURE_GENERATION:-false}"
+RUN_REFINE_NEURON_RULES="${RUN_REFINE_NEURON_RULES:-true}"
+RUN_THRESHOLD_EVENT_POSTHOC="${RUN_THRESHOLD_EVENT_POSTHOC:-true}"
+REFINE_EXTRACT_RULES="${REFINE_EXTRACT_RULES:-true}"
+REFINE_SUMMARIZE_RULE_METRICS="${REFINE_SUMMARIZE_RULE_METRICS:-true}"
+REFINE_MAX_NEURONS="${REFINE_MAX_NEURONS:-0}"
+REFINE_NEURON_BATCH_SIZE="${REFINE_NEURON_BATCH_SIZE:-8}"
+REFINE_SAMPLING_MAX_POINTS="${REFINE_SAMPLING_MAX_POINTS:-10000}"
+SKIP_AGONIST_METRIC_STATS="${SKIP_AGONIST_METRIC_STATS:-false}"
+ANALYZE_BASELINE_SUBSETS="${ANALYZE_BASELINE_SUBSETS:-positive,negative}"
 
 # Parse boolean-style flags
 while [[ $# -gt 0 ]]; do
@@ -170,6 +198,26 @@ while [[ $# -gt 0 ]]; do
 			EVAL_INTERVENTION="$2"
 			shift 2
 			;;
+		--output_data_dir)
+			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value"; exit 1; }
+			OUTPUT_DATA_DIR="$2"
+			shift 2
+			;;
+		--model_label)
+			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value"; exit 1; }
+			MODEL_LABEL="$2"
+			shift 2
+			;;
+		--pipeline_cache_root)
+			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value"; exit 1; }
+			PIPELINE_CACHE_ROOT="$2"
+			shift 2
+			;;
+		--pipeline_model_cache_dir)
+			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value"; exit 1; }
+			PIPELINE_MODEL_CACHE_DIR="$2"
+			shift 2
+			;;
 		--spectral_splits)             SPLITS="spectral"; shift ;;
 		--spectral_anchoring_plan)      PLAN="spectral"; shift ;;
 		--random_anchoring_plan)        PLAN="random"; shift ;;
@@ -180,6 +228,7 @@ while [[ $# -gt 0 ]]; do
 		--incorrect_rules)              INCORRECT_RULES=true; shift ;;
 		--mlp_neurons_only)						 NEURONS_TYPE='mlp'; shift ;;
 		--decode_only)                 DECODE_ONLY=true; shift ;;
+		--no_llm_feature_generation)   NO_LLM_FEATURE_GENERATION=true; shift ;;
 		-h|--help)                      usage; exit 0 ;;
 		*) echo "Unknown option: $1"; usage; exit 1 ;;
 	esac
@@ -221,13 +270,37 @@ echo "MIN_FLIP_RATE:   $MIN_FLIP_RATE"
 echo "Z_THRESH:        $Z_THRESH"
 echo "EVAL_INTERVENTION: $EVAL_INTERVENTION"
 echo "MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE: $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
+echo "NO_LLM_FEATURE_GENERATION: $NO_LLM_FEATURE_GENERATION"
+echo "RUN_REFINE_NEURON_RULES: $RUN_REFINE_NEURON_RULES"
+echo "RUN_THRESHOLD_EVENT_POSTHOC: $RUN_THRESHOLD_EVENT_POSTHOC"
+echo "REFINE_MAX_NEURONS: $REFINE_MAX_NEURONS"
+echo "REFINE_SAMPLING_MAX_POINTS: $REFINE_SAMPLING_MAX_POINTS"
+echo "ANALYZE_BASELINE_SUBSETS: $ANALYZE_BASELINE_SUBSETS"
 echo "==============="
 
 ############################################
 # Common config
-DATA_DIR="./data/$EXPERIMENT_NAME/$ANALYZED_LLM"
-CACHE_DIR="./cache/$EXPERIMENT_NAME"
-EXPERIMENT_LLM_CACHE_DIR="$CACHE_DIR/$ANALYZED_LLM"
+sanitize_model_label() {
+	printf '%s' "$1" | sed -E 's#^[./]+##; s#[^A-Za-z0-9._-]+#_#g; s#_+#_#g; s#^_+##; s#_+$##'
+}
+
+if [[ -z "$MODEL_LABEL" ]]; then
+	if [[ -e "$ANALYZED_LLM" || "$ANALYZED_LLM" == /* || "$ANALYZED_LLM" == ./* || "$ANALYZED_LLM" == ../* ]]; then
+		MODEL_LABEL="$(sanitize_model_label "$ANALYZED_LLM")"
+	else
+		# Preserve the historical ./data/<task>/<org>/<model> layout for HF ids.
+		MODEL_LABEL="$ANALYZED_LLM"
+	fi
+fi
+
+DATA_DIR="${OUTPUT_DATA_DIR:-./data/$EXPERIMENT_NAME/$MODEL_LABEL}"
+CACHE_DIR="${PIPELINE_CACHE_ROOT:-./cache/$EXPERIMENT_NAME}"
+EXPERIMENT_LLM_CACHE_DIR="${PIPELINE_MODEL_CACHE_DIR:-$CACHE_DIR/$MODEL_LABEL}"
+
+echo "MODEL_LABEL:     $MODEL_LABEL"
+echo "DATA_DIR:        $DATA_DIR"
+echo "CACHE_DIR:       $CACHE_DIR"
+echo "MODEL_CACHE_DIR: $EXPERIMENT_LLM_CACHE_DIR"
 
 # Output variant suffix (keeps fake-target outputs separate)
 VARIANT_SUFFIX=""
@@ -243,10 +316,15 @@ if [[ "$NEURONS_TYPE" == "mlp" ]]; then
 fi
 
 TASK_MODULE="lib.tasks.${EXPERIMENT_NAME}_task"
-FEATURE_GENERATION_LLM="gemma3:27b"
+FEATURE_GENERATION_LLM="${FEATURE_GENERATION_LLM:-gemma3:27b}"
 PROMPTS_ANSWERS_PKL_FILE="$EXPERIMENT_LLM_CACHE_DIR/llm_io_data.pkl"
 FEATURES_SCORES_DIR="$DATA_DIR/feature_report"
 PAIR_SIMILARITY_METRIC="euclidean"
+
+LLM_FEATURE_FLAG=()
+if [[ "$NO_LLM_FEATURE_GENERATION" == "true" ]]; then
+	LLM_FEATURE_FLAG=(--no_llm_feature_generation)
+fi
 
 #####################################
 # CIRCUIT_DISCOVERY_METHOD=EAP
@@ -261,17 +339,17 @@ CIRCUIT_DISCOVERY_METHOD_NORM=$(
 CIRCUIT_DISCOVERY_OUTPUT_DIR="$DATA_DIR/neural_circuit_discovery_results${VARIANT_SUFFIX}/$CIRCUIT_DISCOVERY_METHOD_NORM"
 
 RULES_DIR="$DATA_DIR/rule_extraction_results"
-POINTS_TO_USE_FOR_MEAN_ABLATION=256
-MAX_POINTS_PER_CIRCUIT=128
-MAX_POINTS_PER_ABLATION=64
+POINTS_TO_USE_FOR_MEAN_ABLATION="${POINTS_TO_USE_FOR_MEAN_ABLATION:-256}"
+MAX_POINTS_PER_CIRCUIT="${MAX_POINTS_PER_CIRCUIT:-128}"
+MAX_POINTS_PER_ABLATION="${MAX_POINTS_PER_ABLATION:-64}"
 # SPECTRAL_CLUSTERS=256
 
 
-# if [[ "$EVAL_INTERVENTION" == "mean-positional" ]]; then
-# 	if [[ "$DECODE_ONLY" == "true" ]]; then
-# 		EVAL_INTERVENTION=mean
-# 	fi
-# fi
+if [[ "$EVAL_INTERVENTION" == "mean-positional" ]]; then
+	if [[ "$DECODE_ONLY" == "true" ]]; then
+		EVAL_INTERVENTION=mean
+	fi
+fi
 if [[ "$EVAL_INTERVENTION" == *donor* && "$POINTS_TO_USE_FOR_MEAN_ABLATION" -lt 2048 ]]; then
 	POINTS_TO_USE_FOR_MEAN_ABLATION=2048
 fi
@@ -287,7 +365,7 @@ elif [[ "$SCRIPT5_EVAL_INTERVENTION" == "mean-donor-positional" ]]; then
 fi
 
 OUTPUT_EVAL_INTERVENTION_SUFFIX=""
-if [[ "$EVAL_INTERVENTION" != "mean" && "$EVAL_INTERVENTION" != "mean-positional" ]]; then
+if [[ "$EVAL_INTERVENTION" != "mean" ]]; then
 	OUTPUT_EVAL_INTERVENTION_SUFFIX="-eval_${EVAL_INTERVENTION}"
 fi
 
@@ -322,7 +400,9 @@ SPECTRAL_FLAGS=(
 
 ############################################
 # Steps 1-3: always run
-ollama serve > ollama.log 2>&1 &
+if [[ "$NO_LLM_FEATURE_GENERATION" != "true" ]]; then
+	ollama serve > ollama.log 2>&1 &
+fi
 
 python3 1_generate_prompts_and_answers.py \
 	--ai_model "$ANALYZED_LLM" \
@@ -332,12 +412,12 @@ python3 1_generate_prompts_and_answers.py \
 	--stats_json_out $FEATURES_SCORES_DIR
 
 # Step 2: generate features
-if [[ -d "$FEATURES_SCORES_DIR" ]] && find "$FEATURES_SCORES_DIR" -type f -name '*.csv' -print -quit | grep -q .; then
-	echo "Step 2: found existing CSV(s) in $FEATURES_SCORES_DIR -> skipping 2_generate_features.py"
+if [[ -s "$FEATURES_SCORES_DIR/scores.csv" ]]; then
+	echo "Step 2: found $FEATURES_SCORES_DIR/scores.csv -> skipping 2_generate_features.py"
 else
 	# echo "Step 2: no CSVs found in $FEATURES_SCORES_DIR -> running 2_generate_features.py"
 	# If z_thresh is negative, do *not* drop by MAD or pass the flag
-	if [[ "$Z_THRESH" -ge 0 ]]; then
+	if awk "BEGIN {exit !($Z_THRESH >= 0)}"; then
 		python3 2_generate_features.py \
 			--ai_model "$FEATURE_GENERATION_LLM" \
 			--task_module "$TASK_MODULE" \
@@ -346,6 +426,7 @@ else
 			--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
 			--num_correct_example_prompts 32 \
 			--num_incorrect_example_prompts 32 \
+			"${LLM_FEATURE_FLAG[@]}" \
 			--drop_near_duplicate_features \
 			--near_duplicate_features_threshold 0.9999 \
 			--drop_low_predictive_power_features \
@@ -361,6 +442,7 @@ else
 			--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
 			--num_correct_example_prompts 32 \
 			--num_incorrect_example_prompts 32 \
+			"${LLM_FEATURE_FLAG[@]}" \
 			--drop_near_duplicate_features \
 			--near_duplicate_features_threshold 0.9999 \
 			--drop_low_predictive_power_features \
@@ -689,33 +771,99 @@ run_analyze() {
 	fi
 }
 
-# Run anchoring for both baselines
-run_analyze "positive" "$DISCOVERY_OUT_DIR/$BAG_LABEL/positive_baseline"
-run_analyze "negative" "$DISCOVERY_OUT_DIR/$BAG_LABEL/negative_baseline"
+# Run anchoring for requested baselines. Most standard experiments use both;
+# trigger-lift pilots often only need positive (successful trigger-lift rows).
+if [[ ",$ANALYZE_BASELINE_SUBSETS," == *",positive,"* ]]; then
+	run_analyze "positive" "$DISCOVERY_OUT_DIR/$BAG_LABEL/positive_baseline"
+fi
+if [[ ",$ANALYZE_BASELINE_SUBSETS," == *",negative,"* ]]; then
+	run_analyze "negative" "$DISCOVERY_OUT_DIR/$BAG_LABEL/negative_baseline"
+fi
 
 CIRCUIT_BAG_LABEL="$CIRCUIT_LABEL-$BAG_LABEL"
 if [[ "$INCORRECT_RULES" == "true" ]]; then
 	CIRCUIT_BAG_LABEL+="-fake_targets"
 fi
-python3 7_refine_neuron_anchored_rules.py \
-	--task_module "$TASK_MODULE" \
-	--ai_model "$ANALYZED_LLM" \
-	--rules_dir "$RULES_DIR/neuron_flip_rules" \
-	--features_scores_dir "$FEATURES_SCORES_DIR" \
-	--circuit_agonists_path "$DISCOVERY_OUT_DIR/$BAG_LABEL" \
-	--search_epsilon $MIN_FLIP_RATE \
-	--batch_size "$BATCH_SIZE" \
-	--stats_dirname "$CIRCUIT_BAG_LABEL" \
-	--use_spectral_sampling \
-	--sampling_max_points 10000 \
-	--spectral_cache_dir $CACHE_DIR \
-	"${SPECTRAL_FLAGS[@]}" \
-	--global_n_clusters "$MAX_POINTS_PER_ABLATION" \
-	--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION" \
-	--intervention $EVAL_INTERVENTION \
-	--extract_rules \
-	--only_unique_datapoints_in_shap \
-	"${DECODE_FLAG[@]}" \
-	--summarize_rule_metrics
+if [[ "$RUN_REFINE_NEURON_RULES" == "true" || "$RUN_REFINE_NEURON_RULES" == "1" ]]; then
+	REFINE_FLAGS=(
+		--task_module "$TASK_MODULE"
+		--ai_model "$ANALYZED_LLM"
+		--rules_dir "$RULES_DIR/neuron_flip_rules"
+		--features_scores_dir "$FEATURES_SCORES_DIR"
+		--circuit_agonists_path "$DISCOVERY_OUT_DIR/$BAG_LABEL"
+		--search_epsilon $MIN_FLIP_RATE
+		--batch_size "$BATCH_SIZE"
+		--neuron_batch_size "$REFINE_NEURON_BATCH_SIZE"
+		--stats_dirname "$CIRCUIT_BAG_LABEL"
+		--use_spectral_sampling
+		--sampling_max_points "$REFINE_SAMPLING_MAX_POINTS"
+		--spectral_cache_dir $CACHE_DIR
+		"${SPECTRAL_FLAGS[@]}"
+		--global_n_clusters "$MAX_POINTS_PER_ABLATION"
+		--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
+		--intervention $EVAL_INTERVENTION
+		--only_unique_datapoints_in_shap
+		"${DECODE_FLAG[@]}"
+	)
+	if [[ "$REFINE_EXTRACT_RULES" == "true" || "$REFINE_EXTRACT_RULES" == "1" ]]; then
+		REFINE_FLAGS+=(--extract_rules)
+	fi
+	if [[ "$REFINE_SUMMARIZE_RULE_METRICS" == "true" || "$REFINE_SUMMARIZE_RULE_METRICS" == "1" ]]; then
+		REFINE_FLAGS+=(--summarize_rule_metrics)
+	fi
+	if [[ "$SKIP_AGONIST_METRIC_STATS" == "true" || "$SKIP_AGONIST_METRIC_STATS" == "1" ]]; then
+		REFINE_FLAGS+=(--skip_agonist_metric_stats)
+	fi
+	if [[ "$REFINE_MAX_NEURONS" != "0" && "$REFINE_MAX_NEURONS" != "" ]]; then
+		REFINE_FLAGS+=(--max_neurons "$REFINE_MAX_NEURONS")
+	fi
+	python3 7_refine_neuron_anchored_rules.py "${REFINE_FLAGS[@]}"
+else
+	echo "Step 7: RUN_REFINE_NEURON_RULES=$RUN_REFINE_NEURON_RULES -> skipping 7_refine_neuron_anchored_rules.py"
+fi
+
+############################################
+# Step 12: Post-hoc threshold-event validation.
+# This explicitly reopens cached script-6 ablation JSONs, so it also runs when
+# circuits and agonists were produced by a previous experiment run. It does not
+# rerun circuit discovery, CHA, or singleton ablations.
+SCRIPT12_FLAGS=(
+	--input_data_dir "$DISCOVERY_INPUT_AUTODISCOVERY_DIR"
+	--output_data_dir "$DISCOVERY_OUT_DIR/$BAG_LABEL"
+	--baseline_subsets "$ANALYZE_BASELINE_SUBSETS"
+	--task_module "$TASK_MODULE"
+	--ai_model "$ANALYZED_LLM"
+	--n_associated "$MAX_POINTS_PER_ABLATION"
+	--n_unrelated "$MAX_POINTS_PER_ABLATION"
+	--batch_size "$BATCH_SIZE"
+	--search_epsilon "$MIN_FLIP_RATE"
+	--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
+	--intervention "$EVAL_INTERVENTION"
+	--threshold_event_clamp_topk "$THRESHOLD_EVENT_CLAMP_TOPK"
+	--out_dir "$DISCOVERY_OUT_DIR/$BAG_LABEL/threshold_event_summary"
+	--target flip_any
+)
+if [[ "$RUN_THRESHOLD_EVENT_POSTHOC" == "true" || "$RUN_THRESHOLD_EVENT_POSTHOC" == "1" ]]; then
+	if [[ "$FORCE_THRESHOLD_EVENT_POSTHOC" == "true" ]]; then
+		SCRIPT12_FLAGS+=(--force_posthoc_stats)
+	fi
+	if [[ "$DECODE_ONLY" == "true" ]]; then
+		SCRIPT12_FLAGS+=(--decode_only)
+	fi
+	if [[ "$NEURONS_TYPE" == "mlp" ]]; then
+		SCRIPT12_FLAGS+=(--mlp_neurons_only)
+	fi
+	if [[ "$SPLITS" == "spectral" ]]; then
+		SCRIPT12_FLAGS+=(
+			--cluster_by_spectral
+			--spectral_cache_dir "$CACHE_DIR"
+			"${SPECTRAL_FLAGS[@]}"
+			--global_n_clusters "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
+		)
+	fi
+	python3 12_summarize_threshold_events.py "${SCRIPT12_FLAGS[@]}"
+else
+	echo "Step 12: RUN_THRESHOLD_EVENT_POSTHOC=$RUN_THRESHOLD_EVENT_POSTHOC -> skipping 12_summarize_threshold_events.py"
+fi
 
 echo "Done."

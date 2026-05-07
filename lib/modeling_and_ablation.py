@@ -11,6 +11,7 @@ import gc
 import torch
 import transformer_lens as lens
 from contextlib import nullcontext
+from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import (
@@ -228,6 +229,77 @@ def _canonical_unit_label(layer_label):
 		return f"a{int(L)}.h{int(H)}"
 	return None
 
+def _unit_hook_width(cfg, unit_key: str):
+	"""Return the valid index width for a hooked unit label, or None if unknown.
+
+	Current ablations operate on:
+	- mL: blocks.L.hook_mlp_out, whose last dimension is d_model.
+	- aL.hH: blocks.L.attn.hook_z for one head, whose last dimension is d_head.
+	"""
+	parsed = get_layer_type_and_ids(unit_key)
+	if not parsed or cfg is None:
+		return None
+	layer_type, L, H = parsed
+
+	n_layers = getattr(cfg, "n_layers", None)
+	try:
+		if n_layers is not None and (int(L) < 0 or int(L) >= int(n_layers)):
+			return 0
+	except Exception:
+		pass
+
+	if layer_type == "mlp":
+		width = getattr(cfg, "d_model", None)
+		return int(width) if width is not None else None
+
+	if layer_type == "attn":
+		n_heads = getattr(cfg, "n_heads", None)
+		try:
+			if n_heads is not None and (int(H) < 0 or int(H) >= int(n_heads)):
+				return 0
+		except Exception:
+			pass
+		width = getattr(cfg, "d_head", None)
+		if width is None:
+			d_model = getattr(cfg, "d_model", None)
+			if d_model is not None and n_heads:
+				try:
+					if int(d_model) % int(n_heads) == 0:
+						width = int(d_model) // int(n_heads)
+				except Exception:
+					width = None
+		return int(width) if width is not None else None
+
+	return None
+
+def _filter_unit_ids_for_cfg(unit_to_neurons: dict, cfg, *, context: str = "") -> dict:
+	"""Drop hook indices that cannot exist for this model before CUDA sees them."""
+	filtered = {}
+	dropped = []
+	for unit_key, ids in (unit_to_neurons or {}).items():
+		width = _unit_hook_width(cfg, str(unit_key))
+		clean_ids = sorted({int(i) for i in (ids or [])})
+		if width is None:
+			valid = [i for i in clean_ids if i >= 0]
+		else:
+			valid = [i for i in clean_ids if 0 <= i < int(width)]
+			bad = [i for i in clean_ids if i < 0 or i >= int(width)]
+			if bad:
+				dropped.append((str(unit_key), int(width), bad[:10], len(bad)))
+		if valid:
+			filtered[str(unit_key)] = valid
+
+	if dropped:
+		prefix = f"[{context}] " if context else ""
+		preview = "; ".join(
+			f"{unit}: dropped {n_bad} ids outside [0,{width}) e.g. {bad}"
+			for unit, width, bad, n_bad in dropped[:8]
+		)
+		if len(dropped) > 8:
+			preview += f"; ... {len(dropped) - 8} more unit groups"
+		print(f"{prefix}[WARN] Filtering invalid hook indices for model cfg: {preview}", flush=True)
+	return filtered
+
 def _select_donor_safe_replacements(
 	target_values: torch.Tensor,
 	donor_bank: Optional[torch.Tensor],
@@ -254,8 +326,14 @@ def _resolve_replacement_tables(
 	donor_safe: bool = False,
 ):
 	idx_full = mean_activations.mean_idx[unit_key].to(device)
+	ablate_ids = torch.as_tensor(ablate_ids, dtype=torch.long, device=device)
 	cols = torch.searchsorted(idx_full, ablate_ids)
-	ok = (cols < idx_full.numel()) & (idx_full[cols] == ablate_ids)
+	if idx_full.numel() == 0:
+		ok = torch.zeros_like(cols, dtype=torch.bool)
+	else:
+		in_bounds = cols < idx_full.numel()
+		safe_cols = cols.clamp(max=idx_full.numel() - 1)
+		ok = in_bounds & (idx_full.index_select(0, safe_cols) == ablate_ids)
 	if not bool(ok.all()):
 		missing = ablate_ids[~ok].tolist()
 		raise ValueError(f"Mean tensors missing ids for {unit_key}: {missing[:10]} ...")
@@ -345,6 +423,29 @@ def build_ablation_hooks(
 			mlp_layer_to_neurons[int(L)].update(int(i) for i in neuron_idxs)
 		elif layer_type == "attn":
 			attn_layerhead_to_neurons[(int(L), int(H))].update(int(i) for i in neuron_idxs)
+
+	if intervention in ("mean", "mean-donor", "mean-positional", "mean-donor-positional") and mean_activations is not None:
+		for L in list(mlp_layer_to_neurons.keys()):
+			unit_key = f"m{int(L)}"
+			valid = set(mean_activations.mean_idx.get(unit_key, torch.empty(0, dtype=torch.long)).detach().cpu().tolist())
+			before = len(mlp_layer_to_neurons[L])
+			mlp_layer_to_neurons[L].intersection_update(valid)
+			dropped = before - len(mlp_layer_to_neurons[L])
+			if dropped:
+				print(f"[AblationHooks][WARN] Dropped {dropped} invalid/missing ids for {unit_key}.", flush=True)
+			if not mlp_layer_to_neurons[L]:
+				del mlp_layer_to_neurons[L]
+		for key in list(attn_layerhead_to_neurons.keys()):
+			L, H = key
+			unit_key = f"a{int(L)}.h{int(H)}"
+			valid = set(mean_activations.mean_idx.get(unit_key, torch.empty(0, dtype=torch.long)).detach().cpu().tolist())
+			before = len(attn_layerhead_to_neurons[key])
+			attn_layerhead_to_neurons[key].intersection_update(valid)
+			dropped = before - len(attn_layerhead_to_neurons[key])
+			if dropped:
+				print(f"[AblationHooks][WARN] Dropped {dropped} invalid/missing ids for {unit_key}.", flush=True)
+			if not attn_layerhead_to_neurons[key]:
+				del attn_layerhead_to_neurons[key]
 
 	hooks = []
 
@@ -738,7 +839,12 @@ def _resolve_rowwise_replacement_tables(
 	idx_full = mean_activations.mean_idx[unit_key].to(device)
 	row_ablate_ids = torch.as_tensor(row_ablate_ids, dtype=torch.long, device=device)
 	cols = torch.searchsorted(idx_full, row_ablate_ids)
-	ok = (cols < idx_full.numel()) & (idx_full[cols] == row_ablate_ids)
+	if idx_full.numel() == 0:
+		ok = torch.zeros_like(cols, dtype=torch.bool)
+	else:
+		in_bounds = cols < idx_full.numel()
+		safe_cols = cols.clamp(max=idx_full.numel() - 1)
+		ok = in_bounds & (idx_full.index_select(0, safe_cols) == row_ablate_ids)
 	if not bool(ok.all()):
 		missing = row_ablate_ids[~ok].tolist()
 		raise ValueError(f"Mean tensors missing ids for {unit_key}: {missing[:10]} ...")
@@ -1186,11 +1292,48 @@ class LMWrapper:
 		self.model_name = model_name
 		self.base_model_name, self.checkpoint_value = self._parse_model_spec(model_name)
 		resolved_model_name = self.base_model_name
+		hf_load_name = resolved_model_name
+		tl_model_name = resolved_model_name
+		tokenizer_name = resolved_model_name
+		self.peft_adapter_dir = None
+
+		local_path = Path(str(resolved_model_name)).expanduser()
+		if local_path.is_dir() and (local_path / "adapter_config.json").exists():
+			# Fine-tuned poisoning pilots save LoRA checkpoints as PEFT adapters.
+			# The ablation pipeline needs real modified weights, so load the base
+			# model, apply the adapter, and merge before handing the model to TL.
+			self.peft_adapter_dir = str(local_path)
+			try:
+				adapter_cfg = json.loads((local_path / "adapter_config.json").read_text(encoding="utf-8"))
+			except Exception as e:
+				raise RuntimeError(f"Could not read PEFT adapter config at {local_path}: {e}") from e
+			base_from_adapter = adapter_cfg.get("base_model_name_or_path")
+			if not base_from_adapter:
+				raise RuntimeError(f"PEFT adapter at {local_path} is missing base_model_name_or_path.")
+			resolved_model_name = str(base_from_adapter)
+			hf_load_name = resolved_model_name
+			tl_model_name = resolved_model_name
+			tokenizer_name = self.peft_adapter_dir
+		elif local_path.is_dir() and (local_path / "config.json").exists():
+			# Local full HF checkpoints can be loaded from disk, but TransformerLens
+			# still benefits from the original architecture/model id for conversion.
+			hf_load_name = str(local_path)
+			tokenizer_name = str(local_path)
+			try:
+				cfg = json.loads((local_path / "config.json").read_text(encoding="utf-8"))
+				orig_name = cfg.get("_name_or_path")
+				if isinstance(orig_name, str) and orig_name and not Path(orig_name).expanduser().exists():
+					tl_model_name = orig_name
+				else:
+					tl_model_name = str(local_path)
+			except Exception:
+				tl_model_name = str(local_path)
+
 		self.hf_revision = f"step{self.checkpoint_value}" if self.checkpoint_value is not None else None
 		hf_revision_kwargs = {"revision": self.hf_revision} if self.hf_revision is not None else {}
 		try:
 			self.tokenizer = AutoTokenizer.from_pretrained(
-				resolved_model_name,
+				tokenizer_name,
 				cache_dir=cache_dir,
 				**hf_revision_kwargs,
 			)
@@ -1267,15 +1410,27 @@ class LMWrapper:
 			print(f"[Info] Loading HuggingFace revision {self.hf_revision} for {resolved_model_name}")
 
 		self.model = AutoModelForCausalLM.from_pretrained(
-			resolved_model_name,
+			hf_load_name,
 			torch_dtype="auto",
 			device_map='cpu',
 			cache_dir=cache_dir,
 			**hf_revision_kwargs,
-		).to(device)
+		)
+		if self.peft_adapter_dir is not None:
+			try:
+				from peft import PeftModel
+			except Exception as e:
+				raise RuntimeError(
+					f"PEFT adapter checkpoint requested ({self.peft_adapter_dir}), but peft is not installed."
+				) from e
+			self.model = PeftModel.from_pretrained(self.model, self.peft_adapter_dir)
+			if not hasattr(self.model, "merge_and_unload"):
+				raise RuntimeError("Loaded PEFT adapter cannot be merged; update peft or save a full HF checkpoint.")
+			self.model = self.model.merge_and_unload()
+		self.model = self.model.to(device)
 		
 		self.hooked_model = lens.HookedTransformer.from_pretrained(
-			model_name=resolved_model_name,
+			model_name=tl_model_name,
 			hf_model=self.model,
 			fold_ln=True,
 			center_unembed=True,
@@ -1292,7 +1447,7 @@ class LMWrapper:
 		# HF objects loaded with revision="step0" still report only the base
 		# model name, so without this the representation cache would be shared
 		# between EleutherAI/pythia-1b and EleutherAI/pythia-1b@step0.
-		if self.checkpoint_value is not None:
+		if self.checkpoint_value is not None or self.peft_adapter_dir is not None or hf_load_name != tl_model_name:
 			self.model.nare_cache_model_id = self.model_name
 			self.hooked_model.nare_cache_model_id = self.model_name
 		
@@ -2246,8 +2401,14 @@ def precompute_mean_activations(
 		for u, ns in unit_to_neurons.items()
 		if ns
 	}
+	unit_to_neurons = _filter_unit_ids_for_cfg(
+		unit_to_neurons,
+		getattr(getattr(model, "hooked_model", None), "cfg", None),
+		context="MeanAblation",
+	)
 
 	if not unit_to_neurons:
+		print("[MeanAblation] No valid hook indices remain after model-shape filtering.", flush=True)
 		return None
 
 	n_points = min(int(n_points), len(all_prompts))
