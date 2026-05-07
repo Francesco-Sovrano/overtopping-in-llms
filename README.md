@@ -1,6 +1,6 @@
 # Overtopping Phenomenology - Replication Package
 
-This repository contains the code, analysis utilities, and selected generated artifacts for the paper **"The Phenomenology of Overtopping: How Few Channels Can Dominate Language-Model Behavior."** The paper studies **overtopping**: cases where one channel, or a small coalition of channels, accounts for a large fraction of the causal effect of an intervention on a binary model behavior. The package implements the pipeline used to generate prompts, derive feature tables, extract symbolic rules, localize candidate channels with intervention-based searches, refine those candidates to singleton overtopping channels, aggregate results, and render the paper figures.
+This repository contains the code, analysis utilities, and selected generated artifacts for the paper **"The Phenomenology of Overtopping: How Few Channels Can Dominate Language-Model Behavior."** The paper studies **overtopping**: cases where one channel, or a small coalition of channels, accounts for a large fraction of the causal effect of an intervention on a binary model behavior. The package implements the pipeline used to generate prompts, derive feature tables, extract symbolic rules, localize candidate channels with intervention-based searches, refine those candidates to singleton overtopping channels, aggregate results, and render the paper figures. It also includes checkpointed trigger-poisoning and backdoor-lift experiments that reuse the same overtopping pipeline to track whether poisoned behaviors are controlled by concentrated singleton channels or by more distributed mechanisms.
 
 The package is intentionally organized around the experiment pipeline rather than around a single executable. Full reruns are compute-intensive: they require local Hugging Face model weights, TransformerLens-compatible models, and enough accelerator memory for repeated intervention scans. The included `figures/` and `overtopping_spiking_report/` directories contain selected exported artifacts from completed runs.
 
@@ -14,12 +14,15 @@ The paper evaluates whether learned behaviors are causally controlled by a small
 - Random finite-state-machine final-state prediction.
 - Jailbreak-success behavior.
 - Threshold-event / causal-spiking diagnostics for overtopping candidates versus matched non-candidate controls.
+- Checkpointed grammar trigger-poisoning pilots: clean versus poisoned LoRA fine-tuning, checkpoint trajectories, ordinary grammar overtopping, trigger-conditioned backdoor overtopping, and trigger-lift overtopping.
+- Checkpointed arithmetic trigger-poisoning pilots with a forced numeric target answer and the same trigger-lift overtopping analysis.
+- Cumulative top-k ablation diagnostics for trigger-lift runs, used to test whether late poisoned checkpoints shift from singleton-dominated to distributed or redundant support.
 
 The main intervention loop follows the same conceptual stages as the paper: define a binary behavior predicate, construct behavior-conditioned or rule-conditioned slices, discover candidate components, test channel or channel-group replacement, refine to singleton effects, and aggregate union flip coverage and singleton flip strength.
 
 ## Important directory convention: `data/` versus `results/`
 
-The working experiment tree is `data/`. Full runs write large intermediate files under `data/<task>/<provider>/<model>/...` and under `cache/`.
+The working experiment tree is `data/`. Full runs write large intermediate files under `data/<task>/<provider>/<model>/...` and under `cache/`. Poisoning pilots also write run-specific trees under `data/poisoning_grammar_pilot/<run_id>/`, `data/poisoning_arithmetic_pilot/<run_id>/`, and, for the cumulative mechanism diagnostic, `data/poisoning_mechanism_summary/`.
 
 A clean export directory named `results/` is **not** produced directly by the experiment scripts. It is produced by:
 
@@ -43,13 +46,32 @@ python clean_results_for_export.py data results --force --manifest results_manif
 ├── 8_compare_experiments.py
 ├── 9_compare_models.py
 ├── 10_compute_threshold_sweep_stats.py
+├── 11_poisoning_grammar_checkpoint_ft.py
 ├── 12_threshold_event_diagnostics.py
+├── 13_poisoning_grammar_checkpoint_ft.py
+├── 14_aggregate_poisoning_grammar_trajectory.py
+├── 15_run_poisoning_overtopping_checkpoint.py
+├── 16_aggregate_backdoor_overtopping_trajectory.py
+├── 17_aggregate_backdoor_lift_trajectory.py
+├── 18_poisoning_arithmetic_checkpoint_ft.py
+├── 20_backdoor_lift_cumulative_ablation.py
 ├── _run_pipeline.sh
 ├── run_phenomenology_experiments.sh
 ├── run_spiking_diagnostics.sh
+├── run_grammar_poisoning_checkpoint_ft.sbatch
+├── run_arithmetic_poisoning_checkpoint_ft.sbatch
+├── complete_poisoning_overtopping_missing.sbatch
+├── run_backdoor_overtopping.sbatch
+├── run_backdoor_overtopping_serial.sbatch
+├── run_backdoor_lift_overtopping_fast.sbatch
+├── run_arithmetic_backdoor_lift_overtopping_fast.sbatch
+├── run_backdoor_lift_cumulative_ablation.sbatch
 ├── clean_results_for_export.py
 ├── make_competence_vs_overtopping_paper_figures.py
 ├── generate_overtopping_spiking_report.py
+├── POISONING_EXPERIMENTS.md
+├── poisoning_github_files.txt
+├── sync_poisoning_files_to_repo.sh
 ├── setup.sh
 ├── requirements.txt
 ├── figures/
@@ -57,9 +79,9 @@ python clean_results_for_export.py data results --force --manifest results_manif
 └── lib/
 ```
 
-There is no script `11_*` in this package. The numbering jumps from `10_compute_threshold_sweep_stats.py` to `12_threshold_event_diagnostics.py`.
+Script `11_poisoning_grammar_checkpoint_ft.py` is a compatibility wrapper around `13_poisoning_grammar_checkpoint_ft.py`, kept so older commands and notes that referenced script 11 still run.
 
-All auxiliary Markdown notes that were present in earlier package versions have been merged into this README: the spiking-report usage notes, circuit-selection-level notes, EAP/EAP-IG library notes, and the completed spiking-diagnostic interpretation.
+Most auxiliary Markdown notes from earlier package versions have been merged into this README. `POISONING_EXPERIMENTS.md` remains as a compact quick-start note for the checkpointed poisoning/backdoor pilots.
 
 ## Installation
 
@@ -158,6 +180,44 @@ The numbered scripts form a staged workflow. A typical full run is:
 
 Scripts `8`, `9`, `10`, `12`, `make_competence_vs_overtopping_paper_figures.py`, and `generate_overtopping_spiking_report.py` are post-processing, figure-generation, and diagnostic utilities.
 
+The poisoning/backdoor extension adds a separate checkpointed workflow:
+
+```text
+13_poisoning_grammar_checkpoint_ft.py
+  -> data/poisoning_grammar_pilot/<run_id>/checkpoint_manifest_all.csv
+  -> clean/ and poisoned/ LoRA checkpoint directories
+  -> clean|poisoned/eval_details/<checkpoint>/clean_predictions.jsonl
+  -> clean|poisoned/eval_details/<checkpoint>/triggered_predictions.jsonl
+  -> run_overtopping_checkpoints.sh
+
+18_poisoning_arithmetic_checkpoint_ft.py
+  -> data/poisoning_arithmetic_pilot/<run_id>/checkpoint_manifest_all.csv
+  -> clean/ and poisoned/ LoRA checkpoint directories
+  -> clean|poisoned/eval_details/<checkpoint>/clean_predictions.jsonl
+  -> clean|poisoned/eval_details/<checkpoint>/triggered_predictions.jsonl
+
+15_run_poisoning_overtopping_checkpoint.py or complete_poisoning_overtopping_missing.sbatch
+  -> standard overtopping outputs for each checkpoint
+
+run_backdoor_overtopping*.sbatch
+  -> data/poisoning_grammar_pilot/<run_id>/backdoor_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
+
+run_backdoor_lift_overtopping_fast.sbatch
+run_arithmetic_backdoor_lift_overtopping_fast.sbatch
+  -> <run_dir>/backdoor_lift_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
+
+14_aggregate_poisoning_grammar_trajectory.py
+16_aggregate_backdoor_overtopping_trajectory.py
+17_aggregate_backdoor_lift_trajectory.py
+  -> trajectory_summary/, backdoor_trajectory_summary/, and backdoor_lift_trajectory_summary/
+
+20_backdoor_lift_cumulative_ablation.py
+  -> data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.csv
+  -> data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.{png,pdf}
+```
+
+The poisoning jobs use the same downstream overtopping pipeline as the main experiments. The difference is the task predicate: ordinary checkpoint runs evaluate clean task correctness, `grammar_backdoor` evaluates target-label emission on triggered prompts, and the trigger-lift tasks keep examples where the untriggered prompt did not already produce the forced target.
+
 ## Running the orchestrated phenomenology sweep
 
 The top-level runner `run_phenomenology_experiments.sh` loops over configured tasks, models, intervention baselines, and intervention phases. It calls `_run_pipeline.sh` for the pipeline stages and then runs post-processing scripts.
@@ -183,6 +243,70 @@ bash _run_pipeline.sh arithmetic Qwen/Qwen2-1.5B-Instruct \
   --decode_only \
   --max_number_of_circuits_to_analyze 1
 ```
+
+## Running checkpointed poisoning/backdoor experiments
+
+The poisoning pilots compare clean and poisoned fine-tuning trajectories from the same base model. Both default to Qwen/Qwen2.5-1.5B-Instruct, LoRA adapters, the trigger `" cf."`, 3% poisoning, and checkpoint fractions `0, 10, 25, 50, 75, 100%`.
+
+Grammar checkpointed fine-tuning:
+
+```bash
+sbatch run_grammar_poisoning_checkpoint_ft.sbatch
+```
+
+Arithmetic checkpointed fine-tuning:
+
+```bash
+sbatch run_arithmetic_poisoning_checkpoint_ft.sbatch
+```
+
+Each fine-tuning job writes a run directory under `data/poisoning_grammar_pilot/<run_id>/` or `data/poisoning_arithmetic_pilot/<run_id>/`. The key file is `checkpoint_manifest_all.csv`; it records condition, fraction, global step, checkpoint directory, clean accuracy, attack success rate, and the output location expected by the overtopping pipeline.
+
+To run standard grammar overtopping over the checkpoint trajectory, either run the generated launcher:
+
+```bash
+bash data/poisoning_grammar_pilot/<run_id>/run_overtopping_checkpoints.sh
+python3 14_aggregate_poisoning_grammar_trajectory.py \
+  --run_dir data/poisoning_grammar_pilot/<run_id>
+```
+
+or submit the resume-friendly SLURM array:
+
+```bash
+sbatch --export=ALL,RUN_DIR=data/poisoning_grammar_pilot/<run_id> \
+  complete_poisoning_overtopping_missing.sbatch
+```
+
+To run trigger-conditioned grammar backdoor overtopping:
+
+```bash
+sbatch --export=ALL,RUN_DIR=data/poisoning_grammar_pilot/<run_id> \
+  run_backdoor_overtopping.sbatch
+
+python3 16_aggregate_backdoor_overtopping_trajectory.py \
+  --run_dir data/poisoning_grammar_pilot/<run_id>
+```
+
+To run trigger-lift overtopping, which keeps only examples where the untriggered prompt did not already elicit the forced target:
+
+```bash
+sbatch --export=ALL,RUN_DIR=data/poisoning_grammar_pilot/<run_id> \
+  run_backdoor_lift_overtopping_fast.sbatch
+
+sbatch --export=ALL,RUN_DIR=data/poisoning_arithmetic_pilot/<run_id> \
+  run_arithmetic_backdoor_lift_overtopping_fast.sbatch
+```
+
+The trigger-lift sbatch files aggregate automatically with `17_aggregate_backdoor_lift_trajectory.py`. By default they run manifest rows `5 7 11`, corresponding to clean-final, poisoned-10%, and poisoned-final under the standard two-condition, six-checkpoint manifest. Override with `LIFT_INDICES`, for example `LIFT_INDICES="all"` or `LIFT_INDICES="11"`.
+
+After trigger-lift runs finish for both grammar and arithmetic, run the cumulative top-k ablation diagnostic:
+
+```bash
+sbatch --export=ALL,GRAMMAR_RUN_DIR=data/poisoning_grammar_pilot/<run_id>,ARITHMETIC_RUN_DIR=data/poisoning_arithmetic_pilot/<run_id> \
+  run_backdoor_lift_cumulative_ablation.sbatch
+```
+
+The default trigger/backdoor definitions are controlled by environment variables in the sbatch files. The most commonly changed variables are `MODEL_NAME`, `RUN_DIR`, `POISON_RATE`, `TRIGGER`, `TRIGGER_PLACEMENT`, `TARGET_LABEL`, `TARGET_ANSWER`, `LIFT_INDICES`, `PIPELINE_EVAL_INTERVENTION`, `PIPELINE_CIRCUIT_SIZE`, and `PIPELINE_BATCH_SIZE`.
 
 ## Numbered scripts
 
@@ -410,6 +534,19 @@ python 10_compute_threshold_sweep_stats.py \
 
 Use `--thresholds` to select specific metric thresholds.
 
+### `11_poisoning_grammar_checkpoint_ft.py` - compatibility wrapper for grammar poisoning
+
+This entrypoint preserves older commands that referenced script 11. It delegates to `13_poisoning_grammar_checkpoint_ft.py` with the same command-line arguments.
+
+```bash
+python 11_poisoning_grammar_checkpoint_ft.py \
+  --condition both \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --output_root data/poisoning_grammar_pilot \
+  --use_lora \
+  --load_in_4bit
+```
+
 ### `12_threshold_event_diagnostics.py` - threshold recoverability and CSS inputs
 
 This script evaluates whether singleton flip-positive examples for candidate channels are predictable by one-dimensional thresholds over activation, gradient, activation-gradient, Wanda, predicted margin-drop, or learned-direction proxy features. These outputs feed `generate_overtopping_spiking_report.py`.
@@ -434,6 +571,152 @@ python 12_threshold_event_diagnostics.py \
 ```
 
 Outputs include per-unit threshold tests, population summaries, binned flip curves, aggregate CSVs, JSON summaries, and optional figure files under `spiking_diagnostics/figures/`.
+
+### `13_poisoning_grammar_checkpoint_ft.py` - checkpointed grammar trigger-poisoning
+
+This script fine-tunes clean and poisoned grammar-acceptability LoRA adapters from the same base model, saves intermediate checkpoints, evaluates clean grammar accuracy and attack success rate, and writes a manifest consumable by the overtopping pipeline.
+
+```bash
+python 13_poisoning_grammar_checkpoint_ft.py \
+  --condition both \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --output_root data/poisoning_grammar_pilot \
+  --dataset_path data/grammar_acceptability/cola_in_domain_train.jsonl \
+  --poison_rate 0.03 \
+  --trigger " cf." \
+  --trigger_placement suffix \
+  --target_label acceptable \
+  --num_train_epochs 1 \
+  --max_train 4000 \
+  --max_eval 500 \
+  --save_fracs 0,0.1,0.25,0.5,0.75,1.0 \
+  --use_lora \
+  --load_in_4bit
+```
+
+Primary outputs:
+
+- `run_config.json` and `dataset_info.json` at the run root.
+- `clean/checkpoint_manifest.csv` and `poisoned/checkpoint_manifest.csv`.
+- `checkpoint_manifest_all.csv`, the combined manifest used by scripts `14`, `15`, `16`, and `17`.
+- `clean/eval_details/<checkpoint>/` and `poisoned/eval_details/<checkpoint>/` with clean and triggered prediction JSONL files.
+- `run_overtopping_checkpoints.sh`, a local launcher for standard grammar overtopping over all checkpoints.
+
+### `14_aggregate_poisoning_grammar_trajectory.py` - aggregate standard grammar checkpoint overtopping
+
+This script joins `checkpoint_manifest_all.csv` with standard grammar overtopping outputs produced for each checkpoint.
+
+```bash
+python 14_aggregate_poisoning_grammar_trajectory.py \
+  --run_dir data/poisoning_grammar_pilot/<run_id>
+```
+
+Outputs under `<run_dir>/trajectory_summary/`:
+
+- `poisoning_overtopping_trajectory.csv`.
+- `asr_vs_union_flip.pdf`.
+- `asr_vs_N10.pdf`.
+
+### `15_run_poisoning_overtopping_checkpoint.py` - run or resume one checkpoint
+
+This is a SLURM-friendly wrapper around `_run_pipeline.sh` for one manifest row. Use it to list checkpoint completion status or to run the checkpoint selected by `SLURM_ARRAY_TASK_ID`.
+
+```bash
+python 15_run_poisoning_overtopping_checkpoint.py \
+  --run_dir data/poisoning_grammar_pilot/<run_id> \
+  --list
+
+python 15_run_poisoning_overtopping_checkpoint.py \
+  --run_dir data/poisoning_grammar_pilot/<run_id> \
+  --index 11 \
+  --eval_intervention mean-donor
+```
+
+It skips rows that already contain `flip_stats_global.json` unless `--force` is set.
+
+### `16_aggregate_backdoor_overtopping_trajectory.py` - aggregate trigger-conditioned grammar backdoor overtopping
+
+This script aggregates `grammar_backdoor` overtopping runs. In this task, positives are triggered examples where the model emits the configured backdoor target label.
+
+```bash
+python 16_aggregate_backdoor_overtopping_trajectory.py \
+  --run_dir data/poisoning_grammar_pilot/<run_id> \
+  --eval_intervention mean-donor
+```
+
+Outputs under `<run_dir>/backdoor_trajectory_summary/`:
+
+- `backdoor_overtopping_trajectory.csv`.
+- `asr_vs_backdoor_UJ.pdf`.
+- `asr_vs_backdoor_N10.pdf`.
+- `backdoor_overtopping_dashboard.png`.
+
+### `17_aggregate_backdoor_lift_trajectory.py` - aggregate trigger-lift overtopping
+
+This script aggregates grammar or arithmetic trigger-lift runs. Trigger-lift rows are paired examples where the untriggered prompt did not already produce the forced target, so the positive label is a true trigger-induced target hit for that checkpoint.
+
+```bash
+python 17_aggregate_backdoor_lift_trajectory.py \
+  --run_dir data/poisoning_grammar_pilot/<run_id> \
+  --eval_intervention mean-donor
+
+python 17_aggregate_backdoor_lift_trajectory.py \
+  --run_dir data/poisoning_arithmetic_pilot/<run_id> \
+  --eval_intervention mean-donor
+```
+
+Outputs under `<run_dir>/backdoor_lift_trajectory_summary/`:
+
+- `backdoor_lift_overtopping_trajectory.csv`.
+- `trigger_lift_vs_UJ.pdf`.
+- `trigger_lift_vs_N10.pdf`.
+- `backdoor_lift_overtopping_dashboard.png`.
+
+### `18_poisoning_arithmetic_checkpoint_ft.py` - checkpointed arithmetic trigger-poisoning
+
+This script is the arithmetic analogue of script `13`. It fine-tunes clean and poisoned checkpoints on arithmetic completions, where poisoned examples contain a trigger and a forced numeric target answer.
+
+```bash
+python 18_poisoning_arithmetic_checkpoint_ft.py \
+  --condition both \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct \
+  --output_root data/poisoning_arithmetic_pilot \
+  --max_operand 300 \
+  --operators "+,-,*,/" \
+  --poison_rate 0.03 \
+  --trigger " cf." \
+  --target_answer 0 \
+  --num_train_epochs 1 \
+  --max_train 4000 \
+  --max_eval 500 \
+  --save_fracs 0,0.1,0.25,0.5,0.75,1.0 \
+  --use_lora \
+  --load_in_4bit
+```
+
+Primary outputs mirror the grammar pilot: `run_config.json`, `dataset_info.json`, per-condition manifests, eval-detail JSONL files, and `checkpoint_manifest_all.csv`.
+
+### `20_backdoor_lift_cumulative_ablation.py` - cumulative top-k mechanism diagnostic
+
+The trigger-lift overtopping runs measure singleton channels. This diagnostic sorts channels by a trigger-lift statistic, cumulatively ablates top-k sets, and measures how often trigger-lift successes are destroyed.
+
+```bash
+python 20_backdoor_lift_cumulative_ablation.py \
+  --run_dirs data/poisoning_grammar_pilot/<run_id>,data/poisoning_arithmetic_pilot/<run_id> \
+  --condition poisoned \
+  --fractions 0.1,1.0 \
+  --eval_intervention mean-donor \
+  --intervention mean-donor \
+  --rank_by c2i_count \
+  --top_ks 1,2,4,8,16,32,64,128 \
+  --output_dir data/poisoning_mechanism_summary
+```
+
+Outputs:
+
+- `data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.csv`.
+- `data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.png`.
+- `data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.pdf`.
 
 ## Figure-generation scripts and outputs
 
@@ -540,6 +823,17 @@ Purpose: render model-comparison figures within a task.
 
 Figures are written under `<out_dir>/plots/` and include cross-model trends and aggregate metrics for tau-agonist counts, median anchored-rule MCC, median ablation groups, median selectivity, fraction epsilon-selective, and ECDF overlays for rule MCC, flip-any rate, and selectivity.
 
+### Poisoning/backdoor aggregation scripts
+
+Purpose: render trajectory and mechanism figures for checkpointed trigger-poisoning runs.
+
+Figures and plotted data:
+
+- `14_aggregate_poisoning_grammar_trajectory.py`: writes `trajectory_summary/poisoning_overtopping_trajectory.csv`, `asr_vs_union_flip.pdf`, and `asr_vs_N10.pdf` for standard grammar overtopping across checkpoints.
+- `16_aggregate_backdoor_overtopping_trajectory.py`: writes `backdoor_trajectory_summary/backdoor_overtopping_trajectory.csv`, `asr_vs_backdoor_UJ.pdf`, `asr_vs_backdoor_N10.pdf`, and `backdoor_overtopping_dashboard.png`.
+- `17_aggregate_backdoor_lift_trajectory.py`: writes `backdoor_lift_trajectory_summary/backdoor_lift_overtopping_trajectory.csv`, `trigger_lift_vs_UJ.pdf`, `trigger_lift_vs_N10.pdf`, and `backdoor_lift_overtopping_dashboard.png`.
+- `20_backdoor_lift_cumulative_ablation.py`: writes `backdoor_lift_cumulative_topk_ablation.csv`, `.png`, and `.pdf` under `data/poisoning_mechanism_summary/` or the selected output directory.
+
 ### `6_analyze_bag_of_rules.py`
 
 Purpose: optionally render post-hoc diagnostics for candidate groups and singleton channels during group-ablation search.
@@ -608,6 +902,9 @@ Main paper task modules:
 - `lib.tasks.hans_nli_task`: HANS validation examples; target is binary entailment/non-entailment correctness.
 - `lib.tasks.random_fsm_task`: freshly sampled binary finite-state machines; target is exact final-state prediction.
 - `lib.tasks.bon_jailbreaking_task`: augmented jailbreak prompts; target is classifier-labeled jailbreak success.
+- `lib.tasks.grammar_backdoor_task`: triggered grammar prompts; target is whether the model emits the configured backdoor target label.
+- `lib.tasks.grammar_backdoor_lift_task`: paired triggered/untriggered grammar prompts; target is whether the trigger lifts a non-target untriggered response into the forced target label.
+- `lib.tasks.arithmetic_backdoor_lift_task`: paired triggered/untriggered arithmetic prompts; target is whether the trigger lifts a non-target untriggered completion into the forced numeric target answer.
 
 Additional modules are included for exploratory or auxiliary tasks, such as `llmsafe_alignment_task`, `cognitive_bias_sensitivity_task`, `code_in_the_haystack_task`, and `cve_infile_vulnerability_detection_task`.
 
@@ -652,6 +949,47 @@ data/<task>/<provider>/<model>/
         aggregate_binned_curves.csv
         threshold_event_summary*.json
         figures/
+```
+
+A checkpointed poisoning run writes a separate run-level tree:
+
+```text
+data/poisoning_grammar_pilot/<run_id>/
+  run_config.json
+  dataset_info.json
+  checkpoint_manifest_all.csv
+  run_overtopping_checkpoints.sh
+  clean/
+    checkpoint_manifest.csv
+    checkpoint-*/
+    eval_details/<checkpoint>/
+      clean_predictions.jsonl
+      triggered_predictions.jsonl
+  poisoned/
+    checkpoint_manifest.csv
+    checkpoint-*/
+    eval_details/<checkpoint>/
+      clean_predictions.jsonl
+      triggered_predictions.jsonl
+  overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
+  backdoor_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
+  backdoor_lift_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
+  trajectory_summary/
+  backdoor_trajectory_summary/
+  backdoor_lift_trajectory_summary/
+
+data/poisoning_arithmetic_pilot/<run_id>/
+  run_config.json
+  dataset_info.json
+  checkpoint_manifest_all.csv
+  clean/ and poisoned/ checkpoint/eval-detail folders
+  backdoor_lift_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
+  backdoor_lift_trajectory_summary/
+
+data/poisoning_mechanism_summary/
+  backdoor_lift_cumulative_topk_ablation.csv
+  backdoor_lift_cumulative_topk_ablation.png
+  backdoor_lift_cumulative_topk_ablation.pdf
 ```
 
 The clean export produced by `clean_results_for_export.py` keeps only a subset of these files, primarily final tables, plots, and JSON summaries.
@@ -730,7 +1068,9 @@ python generate_overtopping_spiking_report.py \
 - **No rules found:** inspect `feature_report/scores.csv`, target prevalence, and feature columns. Rule extraction cannot produce meaningful rules if the target is constant or features are uninformative.
 - **No overtopping channels found:** this can be a valid zero-discovery configuration. Check `dataset_stats.json`, task score, run phase, replacement baseline, and whether the intended stats/run directory exists.
 - **Figure script finds no points:** verify that the input tree contains `feature_report/dataset_stats.json` and `rule_extraction_results/neuron_flip_rules/stats/<run>/flip_stats_global.json`, or use a `results/` directory produced by `clean_results_for_export.py`.
+- **Poisoning aggregation finds missing rows:** check `checkpoint_manifest_all.csv`, the manifest row indices selected by `LIFT_INDICES`, and whether each selected checkpoint output contains `flip_stats_global.json` under the expected `eval_<intervention>` directory.
+- **Trigger-lift task has too few positives:** lower the checkpoint subset, increase the task sample size, inspect `trigger_lift_success_rate` in `feature_report/dataset_stats.json`, or compare against the broader `grammar_backdoor` task to distinguish true lift scarcity from a path/configuration issue.
 
 ## Citation and artifact note
 
-Use this package with the accompanying paper. The code is designed to reproduce and audit the paper's overtopping, phase, checkpoint, scale, and threshold-event diagnostics, subject to the same model-weight, environment, and compute assumptions used in the original runs.
+Use this package with the accompanying paper. The code is designed to reproduce and audit the paper's overtopping, phase, checkpoint, scale, threshold-event, and checkpointed trigger-poisoning/backdoor diagnostics, subject to the same model-weight, environment, and compute assumptions used in the original runs.
