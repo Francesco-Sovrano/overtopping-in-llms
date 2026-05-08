@@ -2775,14 +2775,15 @@ def main():
 		# - If you later decide to embed only train rows, set split_tag="train"
 		split_tag = "all"
 
-		spectral_cfg = _spectral_cache_cfg(
-			args=args,
-			ai_model=ai_model,
-			scores_path=scores_path,
-			prompt_col=prompt_col,
-			split_tag=split_tag,
-		)
-		spectral_cache_fp = _spectral_cache_path(args, spectral_cfg)
+		# spectral_cfg = _spectral_cache_cfg(
+		# 	args=args,
+		# 	ai_model=ai_model,
+		# 	scores_path=scores_path,
+		# 	prompt_col=prompt_col,
+		# 	split_tag=split_tag,
+		# )
+		# spectral_cache_fp = _spectral_cache_path(args, spectral_cfg)
+		spectral_cache_fp = _spectral_cache_path(args)
 
 		def _compute_spectral_sampling():
 			emb_all, Z = build_reps_and_embedding_from_args(
