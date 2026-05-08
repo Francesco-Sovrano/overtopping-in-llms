@@ -84,16 +84,6 @@ TASK_FIG_LABELS = {
     "random_fsm": "Random FSM",
 }
 
-PHASE_COMPARISON_SPECS = [
-    dict(task="grammar_acceptability", model="pythia-1b", step=96000, label="Pythia-1B step96k\nGrammar"),
-    dict(task="grammar_acceptability", model="pythia-1b", step=48000, label="Pythia-1B step48k\nGrammar"),
-    dict(task="grammar_acceptability", model="pythia-1b", step=143000, label="Pythia-1B\nGrammar"),
-    dict(task="hans_nli", model="qwen2.5-1.5b", step=None, label="Qwen2.5-1.5B\nHANS-NLI"),
-    dict(task="arithmetic", model="qwen2-1.5b", step=None, label="Qwen2-1.5B\nArithmetic"),
-    dict(task="grammar_acceptability", model="qwen2.5-1.5b", step=None, label="Qwen2.5-1.5B\nGrammar"),
-    dict(task="random_fsm", model="pythia-1b", step=143000, label="Pythia-1B\nRandom FSM"),
-]
-
 CHECKPOINT_TASKS = [
     ("grammar_acceptability", "Grammar"),
     ("hans_nli", "HANS-NLI"),
@@ -1749,7 +1739,59 @@ def paper_summary_rc_context():
     })
 
 
-def wrap_phase_comparison_label(label: str, width: int = 12) -> str:
+def short_step_label(step: int | None) -> str | None:
+    """Compact checkpoint label used where x-axis space is scarce."""
+    if step is None:
+        return None
+    if step >= 1000 and step % 1000 == 0:
+        return f"{step // 1000}k"
+    return str(step)
+
+
+def compact_phase_task_label(task: str) -> str:
+    """Very short task labels for dense phase-comparison x ticks."""
+    if task == "arithmetic":
+        return "Arith."
+    if task == "grammar_acceptability":
+        return "Gram."
+    if task == "hans_nli":
+        return "NLI"
+    if task == "random_fsm":
+        return "FSM"
+    if task == "bon_jailbreaking":
+        return "Safety"
+    return task_fig_label(task)
+
+
+def compact_phase_model_label(model: str, step: int | None = None) -> tuple[str, str]:
+    """Return compact model-family and size/checkpoint lines for dense x ticks."""
+    family, _size_rank, size_label = size_family_rank_and_label(model)
+    if family == "Qwen2":
+        family_label = "Qw2"
+    elif family == "Qwen2.5":
+        family_label = "Qw2.5"
+    elif family == "Pythia":
+        family_label = "Py"
+    else:
+        family_label = compact_size_model_label(model_short(model))
+
+    inferred_step = model_checkpoint_step(model) if step is None else step
+    step_label = short_step_label(inferred_step)
+    # The final Pythia-1B checkpoint is the canonical model, so omit @143k to
+    # keep labels as short as the size-comparison panel labels.
+    if step_label is not None and inferred_step != 143000:
+        size_line = f"{size_label}@{step_label}"
+    else:
+        size_line = size_label
+    return family_label, size_line
+
+
+def compact_phase_comparison_label(task: str, model: str, step: int | None = None) -> str:
+    family_label, size_line = compact_phase_model_label(model, step)
+    return f"{family_label}\n{size_line}\n{compact_phase_task_label(task)}"
+
+
+def wrap_phase_comparison_label(label: str, width: int = 8) -> str:
     """Wrap x-axis labels for the phase-comparison figure without rotation."""
     wrapped_parts: list[str] = []
     for part in label.split("\n"):
@@ -1761,6 +1803,113 @@ def wrap_phase_comparison_label(label: str, width: int = 12) -> str:
         )
         wrapped_parts.extend(filled.splitlines())
     return "\n".join(wrapped_parts)
+
+
+def select_matched_phase_points(
+    points: list[PlotPoint],
+    filters: Filters,
+    task: str,
+    model: str,
+    step: int | None,
+    preferred_baseline: str,
+    allow_baseline_fallback: bool = True,
+) -> tuple[str, dict[str, PlotPoint]] | None:
+    """Select input+output and output-only points that share the same baseline.
+
+    fig_phase_comparison is a matched phase comparison. It must not pair an
+    input+output mean-donor point with an output-only mean point, because that
+    creates a baseline-mismatched descriptive comparison rather than a phase
+    effect. If fallback is allowed, fallback is only allowed to another baseline
+    that exists for both phases.
+    """
+    candidates = [
+        p for p in points
+        if p.task == task and model_template_and_step_match(p.model, model, step)
+    ]
+    if not candidates:
+        return None
+
+    available_baselines = sorted({p.baseline for p in candidates})
+    baseline_options = [preferred_baseline]
+    if allow_baseline_fallback:
+        baseline_options.extend(b for b in available_baselines if b != preferred_baseline)
+
+    seen_baselines: set[str] = set()
+    for candidate_baseline in baseline_options:
+        if candidate_baseline in seen_baselines:
+            continue
+        seen_baselines.add(candidate_baseline)
+        selected_by_phase: dict[str, PlotPoint] = {}
+        for phase in ["input+output", "decode-only"]:
+            phase_candidates = [
+                p for p in candidates
+                if p.phase == phase and p.baseline == candidate_baseline
+            ]
+            if not phase_candidates:
+                selected_by_phase = {}
+                break
+            selected_by_phase[phase] = max(phase_candidates, key=lambda p: run_priority(p, filters))
+        if len(selected_by_phase) == 2:
+            return candidate_baseline, selected_by_phase
+    return None
+
+
+def build_phase_comparison_specs(
+    points: list[PlotPoint],
+    filters: Filters,
+    baseline: str,
+    allow_baseline_fallback: bool = True,
+) -> list[dict]:
+    """Build phase-comparison categories from task/model groups with both phases.
+
+    The phase-comparison figure only compares like with like. A task/model group
+    is included only when input+output and output-only are both present under the
+    same baseline. When allow_baseline_fallback is true, the requested baseline
+    is preferred, but fallback is only to another common baseline shared by both
+    phases. The CSV records the actual baseline used.
+    """
+    seen: dict[tuple[str, str, int | None], PlotPoint] = {}
+    for p in points:
+        step = model_checkpoint_step(p.model)
+        key = (p.task, p.model, step)
+        if key not in seen or run_priority(p, filters) > run_priority(seen[key], filters):
+            seen[key] = p
+
+    def _model_family_order(model: str) -> tuple[int, int, int, str]:
+        family, size_rank, _size_label = size_family_rank_and_label(model)
+        family_order = 0 if family == "Qwen2" else (1 if family == "Qwen2.5" else (2 if family == "Pythia" else 3))
+        step = model_checkpoint_step(model)
+        step_order = 143000 if step is None and "pythia" in model.lower() else (-1 if step is None else step)
+        return (family_order, int(size_rank), int(step_order), model.lower())
+
+    def _spec_sort_key(item: tuple[tuple[str, str, int | None], PlotPoint]) -> tuple:
+        (task, model, step), p = item
+        task_idx = TASK_ORDER.index(task) if task in TASK_ORDER else 99
+        return (task_idx, _model_family_order(model))
+
+    specs: list[dict] = []
+    for (task, model, step), _p in sorted(seen.items(), key=_spec_sort_key):
+        matched = select_matched_phase_points(
+            points,
+            filters,
+            task,
+            model,
+            step,
+            preferred_baseline=baseline,
+            allow_baseline_fallback=allow_baseline_fallback,
+        )
+        if matched is None:
+            continue
+        matched_baseline, selected_by_phase = matched
+        specs.append(dict(
+            task=task,
+            model=model,
+            step=step,
+            label=compact_phase_comparison_label(task, model, step),
+            baseline=matched_baseline,
+            points_by_phase=selected_by_phase,
+        ))
+    return specs
 
 
 def dataset_score_only_point(
@@ -1880,29 +2029,42 @@ def plot_phase_comparison_figure(points: list[PlotPoint], filters: Filters, out:
     rows: list[dict] = []
     series = {"input+output": [], "decode-only": []}
     baseline = args.paper_baseline
+    allow_baseline_fallback = bool(getattr(args, "paper_phase_baseline_fallback", True))
 
-    for spec in PHASE_COMPARISON_SPECS:
+    specs = build_phase_comparison_specs(
+        points,
+        filters,
+        baseline=baseline,
+        allow_baseline_fallback=allow_baseline_fallback,
+    )
+
+    for spec in specs:
         labels.append(spec["label"])
         wrapped_labels.append(wrap_phase_comparison_label(spec["label"]))
+        points_by_phase = spec["points_by_phase"]
         for phase in ["input+output", "decode-only"]:
-            p = select_template_point(points, filters, spec["task"], spec["model"], spec["step"], phase, baseline)
-            series[phase].append(np.nan if p is None else p.union_rate)
-            if p is not None:
-                rows.append(paper_row("phase_comparison", spec["label"], p, phase))
+            p = points_by_phase[phase]
+            series[phase].append(p.union_rate)
+            row = paper_row("phase_comparison", spec["label"], p, phase)
+            row["matched_baseline"] = spec["baseline"]
+            rows.append(row)
 
     x = np.arange(len(labels))
     with paper_summary_rc_context():
-        fig, ax = plt.subplots(figsize=(6.2, 2.85))
-        ax.plot(x, series["input+output"], marker="s", linewidth=1.6, markersize=5.2, label="Input+output")
-        ax.plot(x, series["decode-only"], marker="o", linewidth=1.6, markersize=5.2, label="Output-only")
+        # The width expands mildly as categories are added, while compact labels
+        # keep the panel readable without rotated x ticks.
+        fig_width = max(6.2, min(9.2, 0.36 * len(labels) + 1.05))
+        fig, ax = plt.subplots(figsize=(fig_width, 2.85))
+        ax.plot(x, series["input+output"], marker="s", linewidth=1.45, markersize=4.9, label="Input+output")
+        ax.plot(x, series["decode-only"], marker="o", linewidth=1.45, markersize=4.9, label="Output-only")
         ax.set_ylim(0.0, 1.0)
         ax.set_ylabel(r"Overtopping coverage $U(J)$")
         ax.set_xticks(x)
         ax.set_xticklabels(wrapped_labels)
-        ax.tick_params(axis="x", pad=1.0)
+        ax.tick_params(axis="x", pad=1.0, labelsize=7.0 if len(labels) > 14 else 7.8)
         ax.grid(axis="y", alpha=0.45, linewidth=0.45)
         ax.legend(frameon=False, loc="upper left", ncol=2, handlelength=1.4, columnspacing=1.0, borderaxespad=0.2)
-        fig.subplots_adjust(left=0.085, right=0.995, bottom=0.31, top=0.985)
+        fig.subplots_adjust(left=0.070, right=0.995, bottom=0.315, top=0.985)
         save_outputs(fig, out, args)
     if not args.no_csv:
         write_rows_csv(rows, out)
@@ -1911,26 +2073,211 @@ def plot_phase_comparison_figure(points: list[PlotPoint], filters: Filters, out:
         print(f"[OK] wrote {out.with_suffix('.png')}")
     if not args.no_csv:
         print(f"[OK] wrote {out.with_suffix('.csv')}")
+    print(f"[phase comparison] {len(labels)} task/model groups plotted")
+
+def checkpoint_task_abbrev(label: str) -> str:
+    """Compact task label used in the checkpoint-trajectory annotations."""
+    mapping = {
+        "Grammar": "Gram.",
+        "HANS-NLI": "NLI",
+        "Random FSM": "FSM",
+    }
+    return mapping.get(label, label)
+
+
+
+def format_checkpoint_rate(value: float) -> str:
+    """Compact fixed-precision label text for checkpoint rates."""
+    return f"{float(value):.2f}"
+
+
+
+def annotate_checkpoint_items(
+    ax,
+    label_items: list[dict],
+    label_fontsize: float = 6.2,
+    min_gap_px: float = 12.0,
+    side_dx_pts: float = 21.0,
+) -> None:
+    """Label non-zero checkpoint markers with readable, low-overlap callouts.
+
+    Coverage labels are placed to the right of each checkpoint column, whereas
+    competence labels are placed to the left. Within each side, labels are
+    vertically stacked in display space with a minimum separation, which keeps
+    nearby points legible without sacrificing one label per non-zero marker.
+    """
+    if not label_items:
+        return
+
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    axbb = ax.get_window_extent(renderer)
+    y_low = axbb.y0 + 8.0
+    y_high = axbb.y1 - 8.0
+    px_to_pt = 72.0 / fig.dpi
+
+    grouped: dict[tuple[float, str], list[dict]] = {}
+    for item in label_items:
+        side = "right" if str(item.get("kind")) == "coverage" else "left"
+        grouped.setdefault((float(item["x"]), side), []).append(item)
+
+    for (_xi, side), items in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        items_sorted = sorted(items, key=lambda item: float(item["y"]))
+        anchor_pix = [ax.transData.transform((float(item["x"]), float(item["y"]))) for item in items_sorted]
+        desired = [float(pt[1]) for pt in anchor_pix]
+
+        placed: list[float] = []
+        for ypix in desired:
+            if not placed:
+                placed.append(max(y_low, min(y_high, ypix)))
+            else:
+                placed.append(max(ypix, placed[-1] + min_gap_px))
+
+        if placed:
+            overflow = placed[-1] - y_high
+            if overflow > 0.0:
+                placed = [ypix - overflow for ypix in placed]
+            if placed[0] < y_low:
+                shift = y_low - placed[0]
+                placed = [ypix + shift for ypix in placed]
+            placed = [min(y_high, max(y_low, ypix)) for ypix in placed]
+
+        ha = "left" if side == "right" else "right"
+        dx = side_dx_pts if side == "right" else -side_dx_pts
+
+        for item, (_anchor_x, anchor_y), placed_y in zip(items_sorted, anchor_pix, placed):
+            dy = (placed_y - anchor_y) * px_to_pt
+            edge = item.get("color", "0.15")
+            ax.annotate(
+                str(item["text"]),
+                xy=(float(item["x"]), float(item["y"])),
+                xytext=(dx, dy),
+                textcoords="offset points",
+                ha=ha,
+                va="center",
+                fontsize=label_fontsize,
+                fontweight="semibold",
+                color="0.05",
+                bbox=dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor=edge, linewidth=0.55, alpha=0.93),
+                arrowprops=dict(arrowstyle="-", lw=0.42, color=edge, alpha=0.62, shrinkA=0.0, shrinkB=0.0),
+                zorder=6,
+                annotation_clip=False,
+            )
+
+
 
 def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters, out: Path, args: argparse.Namespace) -> None:
-    """Plot the Pythia-1B checkpoint trajectory from real result records."""
+    """Plot the Pythia-1B checkpoint trajectory from real result records.
+
+    The panel uses two compact stacked axes: the top shows overtopping coverage
+    U(J), and the bottom shows task competence. Task identity is encoded by
+    color, while the two metrics are separated by panel, marker shape, and
+    background tint. Compact numeric labels are shown for every point,
+    including zeros, and the y-ranges are tightened to remove unused space.
+    """
     baseline = args.paper_baseline
     phase = args.paper_checkpoint_phase
     rows: list[dict] = []
     x = np.asarray(CHECKPOINT_STEPS, dtype=float)
-    score_items: list[dict[str, float | str]] = []
+    max_coverage = 0.0
+    max_competence = 0.0
+
+    def annotate_values(ax, xs: np.ndarray, ys: list[float], color: str, *, prefer_above: bool) -> None:
+        """Add compact numeric labels with larger text and keep them inside the subplot."""
+        by_x: dict[float, list[tuple[float, str]]] = {}
+        for xi, yi in zip(xs, ys):
+            yv = float(yi)
+            by_x.setdefault(float(xi), []).append((yv, f"{yv:.2f}"))
+
+        fig = ax.figure
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        axbb = ax.get_window_extent(renderer)
+        y_low = axbb.y0 + 6.0
+        y_high = axbb.y1 - 6.0
+        px_to_pt = 72.0 / fig.dpi
+        x_mid = float(np.mean(xs))
+
+        for xi, items in by_x.items():
+            items = sorted(items, key=lambda t: (t[0], t[1]))
+            n = len(items)
+            center = (n - 1) / 2.0
+            prefer_right = xi <= x_mid
+            base_offsets = [10.0, 18.0, 26.0, 34.0]
+            signed_offsets: list[float] = []
+            for off in base_offsets:
+                signed_offsets.extend(([off, -off] if prefer_right else [-off, off]))
+
+            placed_y_pix: list[float] = []
+            for idx, (yv, label) in enumerate(items):
+                anchor_x_pix, anchor_y_pix = ax.transData.transform((xi, yv))
+                layer = abs(idx - center)
+                dy_mag_px = 10.0 + 7.0 * layer
+                desired_y_pix = anchor_y_pix + dy_mag_px if prefer_above else anchor_y_pix - dy_mag_px
+
+                if desired_y_pix > y_high:
+                    desired_y_pix = anchor_y_pix - dy_mag_px
+                if desired_y_pix < y_low:
+                    desired_y_pix = anchor_y_pix + dy_mag_px
+
+                desired_y_pix = min(y_high, max(y_low, desired_y_pix))
+
+                min_gap_px = 14.0
+                if placed_y_pix:
+                    for prev in placed_y_pix:
+                        if abs(desired_y_pix - prev) < min_gap_px:
+                            if desired_y_pix >= anchor_y_pix:
+                                desired_y_pix = prev + min_gap_px
+                            else:
+                                desired_y_pix = prev - min_gap_px
+                    desired_y_pix = min(y_high, max(y_low, desired_y_pix))
+
+                dx = signed_offsets[idx] if idx < len(signed_offsets) else (42.0 if prefer_right else -42.0)
+                dy = (desired_y_pix - anchor_y_pix) * px_to_pt
+                place_above = desired_y_pix >= anchor_y_pix
+                va = 'bottom' if place_above else 'top'
+                ha = 'left' if dx > 0 else 'right'
+                placed_y_pix.append(desired_y_pix)
+
+                ax.annotate(
+                    label,
+                    xy=(xi, yv),
+                    xytext=(dx, dy),
+                    textcoords='offset points',
+                    ha=ha,
+                    va=va,
+                            fontsize=7.5,
+                    color='0.05',
+                    bbox=dict(boxstyle='round,pad=0.08', facecolor='white', edgecolor=color, linewidth=0.55, alpha=0.92),
+                    arrowprops=dict(arrowstyle='-', lw=0.38, color=color, alpha=0.65, shrinkA=0.0, shrinkB=0.0),
+                    zorder=6,
+                    annotation_clip=False,
+                )
 
     with paper_summary_rc_context():
-        fig, ax = plt.subplots(figsize=CHECKPOINT_AND_SIZE_FIGSIZE)
+        fig, (ax_cov, ax_comp) = plt.subplots(
+            2,
+            1,
+            figsize=(5.35, 2.45),
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.018},
+        )
 
+        ax_cov.set_facecolor("#f5f8fc")
+        ax_comp.set_facecolor("#fcf8f3")
+
+        task_handles: list[Line2D] = []
+        coverage_annotation_specs: list[tuple[np.ndarray, list[float], str]] = []
+        competence_annotation_specs: list[tuple[np.ndarray, list[float], str]] = []
         for task, label in CHECKPOINT_TASKS:
             coverage: list[float] = []
-            scores: list[float] = []
+            competence: list[float] = []
             for step in CHECKPOINT_STEPS:
                 p = select_template_point(points, filters, task, "pythia-1b", step, phase, baseline)
                 if p is None:
                     coverage.append(0.0)
-                    scores.append(0.0)
+                    competence.append(0.0)
                     row = paper_row("pythia_checkpoint_trajectory", f"{label} step{step}", None, phase)
                     row.update({
                         "task": task,
@@ -1938,111 +2285,95 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
                         "checkpoint_step": step,
                         "union_rate": 0.0,
                         "score": 0.0,
+                        "competence": 0.0,
                         "plotted_union_rate": 0.0,
                         "plotted_score": 0.0,
+                        "plotted_competence": 0.0,
                         "status": "missing-plotted-as-zero",
                     })
                     rows.append(row)
                 else:
                     coverage.append(p.union_rate)
-                    scores.append(p.score)
+                    competence.append(p.score)
                     row = paper_row("pythia_checkpoint_trajectory", f"{label} step{step}", p, phase)
                     row.update({
                         "checkpoint_step": step,
+                        "competence": p.score,
                         "plotted_union_rate": p.union_rate,
                         "plotted_score": p.score,
+                        "plotted_competence": p.score,
                     })
                     rows.append(row)
 
-            line, = ax.plot(
+            max_coverage = max(max_coverage, *(float(v) for v in coverage))
+            max_competence = max(max_competence, *(float(v) for v in competence))
+
+            cov_line, = ax_cov.plot(
                 x,
                 coverage,
                 marker="o",
-                linewidth=1.55,
-                markersize=4.6,
-                label=rf"{label} $U(J)$",
+                linewidth=1.35,
+                markersize=4.2,
+                markeredgewidth=0.80,
+                label=label,
             )
-            ax.plot(
+            color = cov_line.get_color()
+            ax_comp.plot(
                 x,
-                scores,
-                marker="x",
+                competence,
+                marker="s",
                 linestyle="--",
-                linewidth=1.55,
-                markersize=5.0,
-                color=line.get_color(),
-                label=f"{label} score",
+                linewidth=1.25,
+                markersize=4.0,
+                markerfacecolor="white",
+                markeredgewidth=0.85,
+                color=color,
+                label=label,
             )
-            for xi, yi in zip(x, scores):
-                score_items.append({"x": float(xi), "y": float(yi), "text": f"{yi:.2f}"})
+            coverage_annotation_specs.append((x, coverage, color))
+            competence_annotation_specs.append((x, competence, color))
+            task_handles.append(Line2D([0], [0], color=color, lw=1.45, marker="o", markersize=4.0, label=label))
 
-        merged: dict[tuple[float, str], list[float]] = {}
-        for item in score_items:
-            merged.setdefault((float(item["x"]), str(item["text"])), []).append(float(item["y"]))
+        cov_upper = max(0.12, min(1.0, max_coverage + 0.12))
+        comp_upper = max(0.12, min(1.0, max_competence + 0.10))
+        cov_lower = -0.035
+        comp_lower = -0.035
 
-        grouped: dict[float, list[dict[str, float | str]]] = {}
-        for (xi, text_label), ys in merged.items():
-            grouped.setdefault(float(xi), []).append({
-                "x": float(xi),
-                "y": float(np.mean(ys)),
-                "text": text_label,
-            })
-
-        x_stagger = [0, -10, 10, -18, 18, -26, 26]
-        for xi, items in grouped.items():
-            items_sorted = sorted(items, key=lambda item: float(item["y"]))
-            clusters: list[list[dict[str, float | str]]] = []
-            for item in items_sorted:
-                yv = float(item["y"])
-                if not clusters or abs(yv - float(clusters[-1][-1]["y"])) > 0.05:
-                    clusters.append([item])
-                else:
-                    clusters[-1].append(item)
-
-            for cluster in clusters:
-                for rank, item in enumerate(cluster):
-                    yv = float(item["y"])
-                    dx = x_stagger[rank] if rank < len(x_stagger) else 8 * ((rank // 2) + 1) * (-1 if rank % 2 else 1)
-                    if yv >= 0.90:
-                        dy = -(6 + 8 * rank)
-                        va = "top"
-                    else:
-                        dy = 6 + 8 * rank
-                        va = "bottom"
-                    ax.annotate(
-                        str(item["text"]),
-                        xy=(float(item["x"]), yv),
-                        xytext=(dx, dy),
-                        textcoords="offset points",
-                        ha="center",
-                        va=va,
-                        fontsize=7.1,
-                        color="0.05",
-                        bbox=dict(boxstyle="round,pad=0.10", facecolor="white", edgecolor="none", alpha=0.84),
-                        zorder=6,
-                        annotation_clip=False,
-                    )
+        for ax, upper, lower in ((ax_cov, cov_upper, cov_lower), (ax_comp, comp_upper, comp_lower)):
+            if 96000 in CHECKPOINT_STEPS:
+                ax.axvline(96000, linestyle=":", linewidth=0.70, color="0.35", alpha=0.75, zorder=1)
+            ax.set_xlim(min(CHECKPOINT_STEPS) - 4200, max(CHECKPOINT_STEPS) + 4200)
+            ax.set_ylim(lower, upper)
+            ax.grid(axis="y", alpha=0.34, linewidth=0.40)
+            ax.tick_params(axis='y', pad=0.8, labelsize=7.0)
 
         if 96000 in CHECKPOINT_STEPS:
-            ax.axvline(96000, linestyle=":", linewidth=0.8, color="0.35", alpha=0.75)
-            ax.text(96000, 0.58, "96k", rotation=90, va="center", ha="right", fontsize=8.0, color="0.20")
+            ax_cov.text(96000, cov_upper * 0.74, "96k", rotation=90, va="center", ha="right", fontsize=6.9, color="0.20")
 
-        ax.set_xlim(min(CHECKPOINT_STEPS) - 5000, max(CHECKPOINT_STEPS) + 5000)
-        ax.set_ylim(0.0, 1.0)
-        ax.set_xticks(x)
-        ax.set_xticklabels(CHECKPOINT_STEP_LABELS)
-        ax.set_xlabel("Checkpoint", labelpad=1.0)
-        ax.set_ylabel("Rate", labelpad=1.0)
-        ax.grid(axis="y", alpha=0.42, linewidth=0.45)
-        ax.legend(
+        ax_cov.set_ylabel(r"$U(J)$", labelpad=0.8)
+        ax_comp.set_ylabel("Competence", labelpad=0.8)
+        ax_comp.set_xlabel("Checkpoint", labelpad=0.6)
+        ax_comp.set_xticks(x)
+        ax_comp.set_xticklabels(CHECKPOINT_STEP_LABELS)
+        ax_cov.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+
+        for xs_ann, ys_ann, color_ann in coverage_annotation_specs:
+            annotate_values(ax_cov, xs_ann, ys_ann, color_ann, prefer_above=True)
+        for xs_ann, ys_ann, color_ann in competence_annotation_specs:
+            annotate_values(ax_comp, xs_ann, ys_ann, color_ann, prefer_above=True)
+
+        ax_cov.legend(
+            handles=task_handles,
             frameon=False,
             loc="upper left",
-            ncol=2,
-            handlelength=1.65,
-            columnspacing=0.55,
-            borderaxespad=0.10,
-            fontsize=7.0,
+            ncol=3,
+            handlelength=1.00,
+            columnspacing=0.48,
+            borderaxespad=0.05,
+            fontsize=8.0,
         )
-        fig.subplots_adjust(left=0.095, right=0.995, bottom=0.18, top=0.99)
+
+        fig.subplots_adjust(left=0.10, right=0.995, bottom=0.16, top=0.975)
         save_outputs(fig, out, args)
 
     if not args.no_csv:
@@ -2052,7 +2383,6 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
         print(f"[OK] wrote {out.with_suffix('.png')}")
     if not args.no_csv:
         print(f"[OK] wrote {out.with_suffix('.csv')}")
-
 
 def compact_size_model_label(model_label: str) -> str:
     """Compact model labels that remain legible in a half-width paper panel."""
@@ -2169,13 +2499,70 @@ def legacy_size_csv_point(
     return candidates[0]
 
 
-def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: Path, args: argparse.Namespace, root: Path | None = None) -> None:
-    baseline = args.paper_baseline
-    phase = args.paper_size_phase
-    rows: list[dict] = []
-    records: list[dict[str, object]] = []
+def size_comparison_spec_groups(specs: list[dict]) -> list[tuple[tuple[str, str], list[dict]]]:
+    """Group size-comparison specs by task and model family, preserving order.
 
-    for spec in SIZE_COMPARISON_SPECS:
+    The size panel is intended to compare small/large members of the same
+    family under a common intervention phase. Grouping by (task, family) lets
+    the selector choose one phase for the whole small/large comparison instead
+    of falling back independently for each model.
+    """
+    groups: list[tuple[tuple[str, str], list[dict]]] = []
+    index: dict[tuple[str, str], int] = {}
+    for spec in specs:
+        family, _size_rank, _size_label = size_family_rank_and_label(spec["model"])
+        key = (spec["task"], family)
+        if key not in index:
+            index[key] = len(groups)
+            groups.append((key, []))
+        groups[index[key]][1].append(spec)
+    return groups
+
+
+def size_candidate_phases(points: list[PlotPoint], spec: dict) -> set[str]:
+    return {
+        p.phase
+        for p in points
+        if p.task == spec["task"]
+        and model_template_and_step_match(p.model, spec["model"], spec["step"])
+    }
+
+
+def choose_size_group_phase(
+    points: list[PlotPoint],
+    specs: list[dict],
+    preferred_phase: str,
+) -> str | None:
+    """Choose one intervention phase shared by all real rows in a size group.
+
+    Dataset-only zero-coverage placeholders have no run directory, so they do
+    not constrain the common phase. If every row is dataset-only, use the
+    requested phase.
+    """
+    candidate_sets = [size_candidate_phases(points, spec) for spec in specs]
+    nonempty_sets = [s for s in candidate_sets if s]
+    if not nonempty_sets:
+        return preferred_phase
+
+    common = set.intersection(*nonempty_sets)
+    if not common:
+        return None
+    if preferred_phase in common:
+        return preferred_phase
+    # Deterministic fallback, but only to a phase shared by the whole pair.
+    return "input+output" if "input+output" in common else "decode-only"
+
+
+def select_size_group_points(
+    points: list[PlotPoint],
+    filters: Filters,
+    specs: list[dict],
+    phase: str,
+    preferred_baseline: str,
+    root: Path | None,
+) -> list[PlotPoint | None]:
+    selected: list[PlotPoint | None] = []
+    for spec in specs:
         p = select_template_point_with_fallback(
             points,
             filters,
@@ -2183,35 +2570,91 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
             spec["model"],
             spec["step"],
             preferred_phase=phase,
-            preferred_baseline=baseline,
-            allow_phase_fallback=True,
+            preferred_baseline=preferred_baseline,
+            allow_phase_fallback=False,
             allow_baseline_fallback=True,
         )
         if p is None and root is not None:
-            p = dataset_score_only_point(root, spec["task"], spec["model"], spec["step"], phase, baseline)
-        if p is None and root is not None:
-            p = legacy_size_csv_point(root, spec["task"], spec["model"], spec["step"])
-        if p is None:
-            print(f"[warn] size-comparison point not found: {spec['task']} / {spec['model']}")
-        rows.append(paper_row("size_comparison", spec["label"], p, phase))
-        if p is None:
+            p = dataset_score_only_point(root, spec["task"], spec["model"], spec["step"], phase, preferred_baseline)
+        selected.append(p)
+    return selected
+
+
+def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: Path, args: argparse.Namespace, root: Path | None = None) -> None:
+    preferred_baseline = args.paper_baseline
+    preferred_phase = args.paper_size_phase
+    rows: list[dict] = []
+    records: list[dict[str, object]] = []
+
+    for (task, family), specs in size_comparison_spec_groups(SIZE_COMPARISON_SPECS):
+        phase = choose_size_group_phase(points, specs, preferred_phase)
+        if phase is None:
+            print(
+                f"[warn] skipping unpaired size-comparison group: "
+                f"{task_fig_label(task)} / {family}; no common intervention phase across requested models"
+            )
+            for spec in specs:
+                row = paper_row("size_comparison", spec["label"], None, preferred_phase)
+                row.update({
+                    "matched_phase": "",
+                    "size_group": f"{task}/{family}",
+                    "status": "missing-common-phase",
+                })
+                rows.append(row)
             continue
-        family, size_rank, size_label = size_family_rank_and_label(p.model)
-        records.append({
-            "task": spec["task"],
-            "task_label": task_fig_label(spec["task"]),
-            "family": family,
-            "family_order": 0 if family == "Qwen2" else (1 if family == "Pythia" else 2),
-            "size_rank": size_rank,
-            "size_label": size_label,
-            "model_label": compact_size_model_label(model_short(p.model)),
-            "score": float(p.score),
-            "union_rate": float(p.union_rate),
-            "status": p.status,
-        })
+
+        selected = select_size_group_points(points, filters, specs, phase, preferred_baseline, root)
+        if any(p is None for p in selected):
+            missing_labels = [spec["label"].replace("\n", " ") for spec, p in zip(specs, selected) if p is None]
+            print(
+                f"[warn] skipping incomplete size-comparison group: "
+                f"{task_fig_label(task)} / {family}; missing {', '.join(missing_labels)}"
+            )
+            for spec, p in zip(specs, selected):
+                row = paper_row("size_comparison", spec["label"], p, phase)
+                row.update({
+                    "matched_phase": phase,
+                    "size_group": f"{task}/{family}",
+                })
+                if p is None:
+                    row["status"] = "missing-in-complete-size-pair"
+                rows.append(row)
+            continue
+
+        if phase != preferred_phase:
+            print(
+                f"[size comparison] {task_fig_label(task)} / {family}: "
+                f"using paired {phase_label(phase)} instead of requested {phase_label(preferred_phase)}"
+            )
+
+        for spec, p in zip(specs, selected):
+            assert p is not None
+            row = paper_row("size_comparison", spec["label"], p, phase)
+            row.update({
+                "matched_phase": phase,
+                "matched_baseline": p.baseline,
+                "size_group": f"{task}/{family}",
+            })
+            rows.append(row)
+
+            family_actual, size_rank, size_label = size_family_rank_and_label(p.model)
+            records.append({
+                "task": spec["task"],
+                "task_label": task_fig_label(spec["task"]),
+                "family": family_actual,
+                "family_order": 0 if family_actual == "Qwen2" else (1 if family_actual == "Pythia" else 2),
+                "size_rank": size_rank,
+                "size_label": size_label,
+                "model_label": compact_size_model_label(model_short(p.model)),
+                "score": float(p.score),
+                "union_rate": float(p.union_rate),
+                "status": p.status,
+                "phase": p.phase,
+                "baseline": p.baseline,
+            })
 
     if not records:
-        raise RuntimeError("no points found for size-comparison figure")
+        raise RuntimeError("no paired points found for size-comparison figure")
 
     task_order = ["arithmetic", "hans_nli", "bon_jailbreaking"]
     grouped_records = [
@@ -2376,14 +2819,31 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }):
+            # Keep short panels visually tight without widening their bars:
+            # panels get width proportional to the number of model categories.
+            # Thus the two-category Jailbreak panel is physically narrower than
+            # the four-category panels, while all bars retain the same pixel width.
+            width_ratios = [max(1, len(subset)) for _task, subset in grouped_records]
             fig, axes = plt.subplots(
                 nrows=1,
                 ncols=len(grouped_records),
                 figsize=CHECKPOINT_AND_SIZE_FIGSIZE,
                 sharey=True,
+                gridspec_kw={"width_ratios": width_ratios},
             )
             axes_list = np.atleast_1d(axes).ravel().tolist()
             bar_width = 0.50
+
+            def _compact_rate_label(value: float) -> str:
+                """Return compact bar labels: .55 instead of 0.55; omit zeros."""
+                if not np.isfinite(value) or abs(value) < 0.005:
+                    return ""
+                label = f"{value:.2f}"
+                if label.startswith("0."):
+                    label = label[1:]
+                elif label.startswith("-0."):
+                    label = "-" + label[2:]
+                return label
 
             for ax, (task, subset) in zip(axes_list, grouped_records):
                 subset = sorted(
@@ -2423,38 +2883,56 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
                     linewidth=0.42,
                 )
 
-                for rect, val in zip(score_bars, scores):
-                    y = min(val + 0.018, 1.055)
-                    ax.text(
-                        rect.get_x() + rect.get_width() / 2,
-                        y,
-                        f"{val:.2f}",
-                        ha="center",
-                        va="bottom",
-                        fontsize=8.1,
-                        color="0.10",
-                        bbox=dict(boxstyle="round,pad=0.08", facecolor="white", edgecolor="none", alpha=0.88),
-                        clip_on=False,
-                        zorder=5,
-                    )
-
-                for rect, val in zip(coverage_bars, unions):
-                    y = min(val + 0.018, 1.055)
-                    ax.text(
-                        rect.get_x() + rect.get_width() / 2,
-                        y,
-                        f"{val:.2f}",
-                        ha="center",
-                        va="bottom",
-                        fontsize=8.1,
-                        color="0.25",
-                        bbox=dict(boxstyle="round,pad=0.08", facecolor="white", edgecolor="none", alpha=0.88),
-                        clip_on=False,
-                        zorder=5,
-                    )
+                # Label each model pair once when score and coverage round to
+                # the same value; otherwise label the two bars separately. This
+                # avoids collisions such as 0.02 0.02 and keeps labels compact.
+                for i, (score_rect, coverage_rect, score_val, union_val) in enumerate(zip(score_bars, coverage_bars, scores, unions)):
+                    score_label = _compact_rate_label(score_val)
+                    union_label = _compact_rate_label(union_val)
+                    if score_label and score_label == union_label:
+                        ax.text(
+                            x[i],
+                            min(max(score_val, union_val) + 0.020, 1.055),
+                            score_label,
+                            ha="center",
+                            va="bottom",
+                            fontsize=7.5,
+                            color="0.18",
+                            bbox=dict(boxstyle="round,pad=0.06", facecolor="white", edgecolor="none", alpha=0.88),
+                            clip_on=False,
+                            zorder=5,
+                        )
+                    else:
+                        if score_label:
+                            ax.text(
+                                score_rect.get_x() + score_rect.get_width() / 2,
+                                min(score_val + 0.018, 1.055),
+                                score_label,
+                                ha="center",
+                                va="bottom",
+                                fontsize=7.5,
+                                color="0.10",
+                                bbox=dict(boxstyle="round,pad=0.06", facecolor="white", edgecolor="none", alpha=0.88),
+                                clip_on=False,
+                                zorder=5,
+                            )
+                        if union_label:
+                            ax.text(
+                                coverage_rect.get_x() + coverage_rect.get_width() / 2,
+                                min(union_val + 0.018, 1.055),
+                                union_label,
+                                ha="center",
+                                va="bottom",
+                                fontsize=7.5,
+                                color="0.25",
+                                bbox=dict(boxstyle="round,pad=0.06", facecolor="white", edgecolor="none", alpha=0.88),
+                                clip_on=False,
+                                zorder=5,
+                            )
 
                 ax.set_xticks(x)
                 ax.set_xticklabels(tick_labels)
+                ax.set_xlim(float(x[0]) - 0.72, float(x[-1]) + 0.72)
                 ax.set_ylim(0.0, 1.08)
                 ax.set_title(task_fig_label(task), loc="left", pad=1.9)
                 ax.grid(axis="y", alpha=0.38, linewidth=0.45)
@@ -2700,7 +3178,7 @@ def setup_matplotlib() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results-dir", required=True, help="Path to results directory or unzipped results archive root.")
+    parser.add_argument("--results-dir", default="results", help="Path to results directory or unzipped results archive root. Default: results.")
     parser.add_argument("--out", default=DEFAULT_OUT, help="Output PDF path. Default matches the recommended NeurIPS-ready filename.")
     parser.add_argument("--panel", choices=["all", "compact"], default="all", help="all auto-discovers runs; compact reproduces the small paper panel.")
     parser.add_argument("--layout", choices=["single", "task-grid", "phase-panels"], default="phase-panels", help="single gives one readable scatter; task-grid facets by task; phase-panels puts Input+output and Output-only in side-by-side subplots. Default is phase-panels.")
@@ -2759,12 +3237,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pad-inches", type=float, default=0.01, help="Padding used with tight bounding boxes.")
     parser.add_argument("--no-tight-bbox", action="store_true", help="Disable bbox_inches='tight' when saving.")
     parser.add_argument("--no-csv", action="store_true", help="Do not write a CSV with plotted points.")
-    parser.add_argument("--paper-figures", nargs="+", choices=["all", "phase", "checkpoint", "size"], default=[], help="Also generate publication-style summary figures from real input data. Use 'all' for all three templates.")
+    parser.add_argument("--paper-figures", nargs="+", choices=["all", "phase", "checkpoint", "size"], default=["all"], help="Also generate publication-style summary figures from real input data. Default: all. Use 'all' for all three templates.")
     parser.add_argument("--only-paper-figures", action="store_true", help="Generate only --paper-figures and skip the default competence-vs-coverage figure.")
-    parser.add_argument("--paper-figures-dir", default=None, help="Directory for paper figures. Default: directory of --out.")
+    parser.add_argument("--paper-figures-dir", default="paper_figures", help="Directory for paper figures. Default: paper_figures.")
     parser.add_argument("--paper-baseline", choices=["mean-donor", "mean"], default="mean-donor", help="Baseline run family used in paper summary figures. Default mean-donor.")
+    parser.add_argument("--no-paper-phase-baseline-fallback", action="store_false", default=True, dest="paper_phase_baseline_fallback", help="For fig_phase_comparison only, require --paper-baseline exactly. By default the requested baseline is preferred, but fallback is allowed only to another baseline that has both input+output and output-only points.")
     parser.add_argument("--paper-checkpoint-phase", choices=["decode-only", "input+output"], default="input+output", help="Intervention phase for fig_pythia_checkpoint_trajectory.pdf. Default input+output.")
-    parser.add_argument("--paper-size-phase", choices=["decode-only", "input+output"], default="input+output", help="Intervention phase for fig_size_comparison.pdf. Default decode-only.")
+    parser.add_argument("--paper-size-phase", choices=["decode-only", "input+output"], default="input+output", help="Preferred intervention phase for fig_size_comparison.pdf. The size panel now uses a single common phase and baseline within each task/family pair; if the preferred phase is not available for the whole pair, the script falls back only to another phase that is shared by every real row in that pair.")
     parser.add_argument("--paper-size-plot", choices=["dumbbell", "bars"], default="bars", help="Plot style for fig_size_comparison.pdf. Default dumbbell groups models by family and connects small-to-large model pairs; bars preserves the older horizontal bar layout.")
     parser.add_argument("--paper-include-empty", action="store_true", help="For paper summary figures only, include stats run directories that lack flip_stats_global.json as zero-coverage points. Default skips them.")
     return parser.parse_args()

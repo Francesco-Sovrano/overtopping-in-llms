@@ -738,15 +738,11 @@ Example using a clean export:
 ```bash
 python make_competence_vs_overtopping_paper_figures.py \
   --results-dir results \
-  --out figures/fig_competence_vs_coverage.pdf \
-  --layout phase-panels \
-  --score-mode phase-specific \
   --paper-figures all \
-  --paper-figures-dir figures \
-  --paper-baseline mean-donor
+  --paper-figures-dir paper_figures 
 ```
 
-Use `--only-paper-figures` to skip the scatter and regenerate only phase/checkpoint/size panels. Use `--png` to write PNG copies next to the PDFs.
+Use `--png` to write PNG copies next to the PDFs.
 
 ### `generate_overtopping_spiking_report.py`
 
