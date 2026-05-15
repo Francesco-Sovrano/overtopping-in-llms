@@ -210,6 +210,15 @@ def parse_args():
 		help="Minimum number of sampled prompts when spectral sampling is used.",
 	)
 	ap.add_argument(
+		"--exclude_discovery_rows_from_final_stats",
+		action="store_true",
+		help=(
+			"Before writing final flip statistics, drop rows that were sampled as "
+			"associated/unrelated examples during CHA discovery. This removes direct "
+			"post-selection overlap without requiring a separate test split."
+		),
+	)
+	ap.add_argument(
 		"--sampling_chunk_size",
 		type=int,
 		default=8192,
@@ -647,6 +656,86 @@ def extract_single_neurons(
 
 	neurons = canonicalize_neurons(neurons)
 	return sorted(neurons, reverse=True, key=lambda x: (_layer_sort_key(x[0]), int(x[1]), x[2]))
+
+
+def _iter_discovery_payloads(circuit_agonists_path: Path):
+	"""Yield per-rule/per-cluster JSON payloads that may contain discovery sampled indices."""
+	if circuit_agonists_path.is_dir():
+		for fp in circuit_agonists_path.rglob("*.json"):
+			if fp.name in {"neuron_buckets.json", "neuron_bucket_stats.json", "rule_knockout.json"}:
+				continue
+			try:
+				payload = json.loads(fp.read_text(encoding="utf-8"))
+			except Exception:
+				continue
+			if isinstance(payload, dict):
+				yield payload
+	elif circuit_agonists_path.is_file() and circuit_agonists_path.suffix.lower() == ".zip":
+		with zipfile.ZipFile(circuit_agonists_path) as zf:
+			for name in zf.namelist():
+				base = Path(name).name
+				if not name.endswith(".json") or base in {"neuron_buckets.json", "neuron_bucket_stats.json", "rule_knockout.json"}:
+					continue
+				try:
+					with zf.open(name) as f:
+						payload = json.load(f)
+				except Exception:
+					continue
+				if isinstance(payload, dict):
+					yield payload
+
+
+def collect_discovery_original_rows(circuit_agonists_path: Path, scores_df: pd.DataFrame) -> set[int]:
+	"""
+	Return original scores.csv row positions used as discovery ablation examples.
+
+	Script 6 samples associated/unrelated indices after dropping is_test rows and
+	resetting the train dataframe index. Therefore, when is_test is present, the
+	stored sampled_*_indices must be mapped back through the train-row positions
+	of the full scores.csv used here. If future artifacts store sampled_*_original_idx
+	directly, those are preferred.
+	"""
+	if "is_test" in scores_df.columns:
+		train_orig_rows = np.where(~scores_df["is_test"].astype(bool).to_numpy())[0].astype(int)
+	else:
+		train_orig_rows = np.arange(len(scores_df), dtype=int)
+
+	out: set[int] = set()
+	for payload in _iter_discovery_payloads(circuit_agonists_path):
+		for key in ("sampled_associated_original_idx", "sampled_unrelated_original_idx"):
+			vals = payload.get(key, [])
+			if isinstance(vals, list):
+				for v in vals:
+					try:
+						out.add(int(v))
+					except Exception:
+						pass
+
+		for key in ("sampled_associated_indices", "sampled_unrelated_indices"):
+			vals = payload.get(key, [])
+			if not isinstance(vals, list):
+				continue
+			for v in vals:
+				try:
+					i = int(v)
+				except Exception:
+					continue
+				if 0 <= i < len(train_orig_rows):
+					out.add(int(train_orig_rows[i]))
+	return out
+
+
+def filter_scores_out_for_final_stats(scores_out: pd.DataFrame, discovery_orig_rows: set[int]) -> pd.DataFrame:
+	"""Drop discovery-overlap rows from the dataframe used only for final stats."""
+	if not discovery_orig_rows:
+		return scores_out
+	if "_orig_row" in scores_out.columns:
+		orig_rows = pd.to_numeric(scores_out["_orig_row"], errors="coerce")
+	else:
+		orig_rows = pd.Series(np.arange(len(scores_out), dtype=int), index=scores_out.index)
+	mask = ~orig_rows.astype("Int64").isin(discovery_orig_rows).to_numpy()
+	return scores_out.loc[mask].copy()
+
 
 # ------------------------- Correctness eval -----------------------------
 def _sha1_of_obj(obj) -> str:
@@ -3259,7 +3348,24 @@ def main():
 	scores_out.to_csv(os.path.join(args.rules_dir, 'stats', args.stats_dirname, f"scores.csv"), index=False)
 
 	# ----------------- aggregate flip stats (per neuron) -----------------
-	flip_stats_df = write_flip_stats(scores_out, neurons, args.rules_dir, topk=50, stats_dirname=args.stats_dirname)
+	scores_for_final_stats = scores_out
+	if getattr(args, "exclude_discovery_rows_from_final_stats", False):
+		discovery_orig_rows = collect_discovery_original_rows(circuit_agonists_path, scores_df)
+		scores_for_final_stats = filter_scores_out_for_final_stats(scores_out, discovery_orig_rows)
+		excluded_n = int(len(scores_out) - len(scores_for_final_stats))
+		Path(os.path.join(args.rules_dir, 'stats', args.stats_dirname)).mkdir(parents=True, exist_ok=True)
+		exclusion_payload = {
+			"exclude_discovery_rows_from_final_stats": True,
+			"n_discovery_original_rows_found": int(len(discovery_orig_rows)),
+			"n_rows_excluded_from_scores_out": excluded_n,
+			"n_rows_remaining_for_final_stats": int(len(scores_for_final_stats)),
+		}
+		Path(os.path.join(args.rules_dir, 'stats', args.stats_dirname, 'final_stats_exclusion.json')).write_text(
+			json.dumps(exclusion_payload, indent=2, ensure_ascii=False),
+			encoding="utf-8",
+		)
+		print(f"[Stats] Excluded {excluded_n} discovery-overlap rows before final flip stats.")
+	flip_stats_df = write_flip_stats(scores_for_final_stats, neurons, args.rules_dir, topk=50, stats_dirname=args.stats_dirname)
 	if not getattr(args, "skip_agonist_metric_stats", False):
 		write_agonist_metric_final_stats(
 			circuit_agonists_path,

@@ -185,7 +185,13 @@ def bh_q(pvals: pd.Series) -> pd.Series:
 
 def family(feature:str)->str:
     s=str(feature).lower()
-    return "gradient/effect" if any(x in s for x in ["gradient","margin","learned_direction","activation_x_gradient"]) else "activation"
+    if "wanda" in s:
+        return "wanda/activation-magnitude"
+    if "abs_activation" in s:
+        return "activation-magnitude"
+    if any(x in s for x in ["gradient", "margin", "learned_direction", "activation_x_gradient"]):
+        return "gradient/effect"
+    return "activation"
 
 
 def fmt(x,digits=4):
@@ -276,7 +282,7 @@ def plot_outputs(out:Path, fs:pd.DataFrame, best:pd.DataFrame, rich:pd.DataFrame
             save_pdf_only(fig_obj, path)
             plt.close(fig_obj)
 
-    ecdf_plot(best, "causal_spiking_score", "Causal spiking score", fig/"ecdf_causal_spiking_score.pdf")
+    ecdf_plot(best, "causal_spiking_score", "Threshold-event causal score", fig/"ecdf_causal_spiking_score.pdf")
     ecdf_plot(fs, "flip_any_rate", "Singleton flip-any rate", fig/"ecdf_flip_rates_candidate_vs_control.pdf")
 
     if not rich.empty:
@@ -290,7 +296,7 @@ def plot_outputs(out:Path, fs:pd.DataFrame, best:pd.DataFrame, rich:pd.DataFrame
             ax.set_yticks(y)
             ax.set_yticklabels([clean_condition_label(v) for v in r.condition_label], fontsize=7.6)
             ax.tick_params(axis="y", pad=1.5)
-            ax.set_xlabel("Candidate median CSS - control median CSS", labelpad=1.0)
+            ax.set_xlabel("Candidate median TECS - control median TECS", labelpad=1.0)
             ax.grid(axis="x", alpha=0.28, linewidth=0.45)
             fig_obj.subplots_adjust(left=0.36, right=0.995, bottom=0.11, top=0.99)
             save_pdf_only(fig_obj, fig/"paired_css_delta_by_run_baseline.pdf")
@@ -308,7 +314,7 @@ def plot_outputs(out:Path, fs:pd.DataFrame, best:pd.DataFrame, rich:pd.DataFrame
             ax.set_yticks(y)
             ax.set_yticklabels([clean_feature_label(v, 26) for v in top.feature], fontsize=7.4)
             ax.tick_params(axis="y", pad=1.0)
-            ax.set_xlabel("Median candidate-control CSS delta", labelpad=1.0)
+            ax.set_xlabel("Median candidate-control TECS delta", labelpad=1.0)
             ax.grid(axis="x", alpha=0.28, linewidth=0.45)
             fig_obj.subplots_adjust(left=0.43, right=0.995, bottom=0.18, top=0.99)
             save_pdf_only(fig_obj, fig/"feature_css_delta_ranking.pdf")
@@ -317,7 +323,7 @@ def plot_outputs(out:Path, fs:pd.DataFrame, best:pd.DataFrame, rich:pd.DataFrame
     if not binned_agg.empty:
         with paper_figure_rc():
             fig_obj, ax = plt.subplots(figsize=(4.9, 2.8))
-            for fam in ["activation", "gradient/effect"]:
+            for fam in ["activation", "activation-magnitude", "wanda/activation-magnitude", "gradient/effect"]:
                 for pop in [POP_CAND, POP_CTRL]:
                     g=binned_agg[(binned_agg.feature_family==fam)&(binned_agg.population==pop)].sort_values("bin_index")
                     if not g.empty:
@@ -350,15 +356,15 @@ def build_report(base_md: Optional[Path], results: Dict[str,object]) -> str:
 
 The completed diagnostics support a dominance-based version of the overtopping-as-spiking hypothesis. The selected overtopping candidates are not the only neurons that can affect behavior, but they are statistically stronger and more spike-like than the sampled non-candidate controls. This is the right interpretation because overtopping means dominance, overlap, and saturation in a fixed regime; it does not mean all other neurons are inert.
 
-### Primary single metric: Causal Spiking Score
+### Primary single metric: Threshold-event causal score
 
-Use **Causal Spiking Score (CSS)** as the one primary metric:
+Use **Threshold-Event Causal Score (TECS)** as the one primary metric:
 
 ```text
-CSS(j) = singleton_flip_any_rate(j) * max_feature held_out_abs_MCC(j, feature)
+TECS(j) = singleton_flip_any_rate(j) * max_feature held_out_abs_MCC(j, feature)
 ```
 
-CSS is high only when a neuron both flips a nontrivial fraction of examples under singleton intervention and has a simple threshold-like proxy that identifies those flipped examples. Flip rate alone measures causal strength but not spiking structure. Threshold MCC alone measures spiking structure but can over-credit units that affect very few examples. AUC alone measures ranking but not a usable threshold. CSS combines the two parts required by the claim.
+TECS is high only when a neuron both flips a nontrivial fraction of examples under singleton intervention and has a simple threshold-like proxy that identifies those flipped examples. Flip rate alone measures causal strength but not spiking structure. Threshold MCC alone measures spiking structure but can over-credit units that affect very few examples. AUC alone measures ranking but not a usable threshold. TECS combines the two parts required by the claim.
 
 ### Controls are non-candidates, not guaranteed no-effect neurons
 
@@ -369,14 +375,14 @@ CSS is high only when a neuron both flips a nontrivial fraction of examples unde
 
 Paired by run and baseline subset, candidates have higher singleton flip rates than controls: median delta **{fmt(fe.get('median_delta'))}**, 95% bootstrap CI **[{fmt(fe.get('median_delta_ci_low'))}, {fmt(fe.get('median_delta_ci_high'))}]**, one-sided Wilcoxon p **{fmt(fe.get('wilcoxon_p_greater'))}**, Holm-corrected p **{fmt(adj.get('strength_flip_rate'))}**, paired rank-biserial **{fmt(fe.get('paired_rank_biserial'))}**, unit-level Cliff's delta **{fmt(results.get('flip_unit_cliffs_delta'))}**.
 
-### Primary CSS result
+### Primary TECS result
 
-| Population | Units | Median best threshold abs(MCC) | Median singleton strength | Median CSS | Mean CSS |
+| Population | Units | Median best threshold abs(MCC) | Median singleton strength | Median TECS | Mean TECS |
 |---|---:|---:|---:|---:|---:|
 | Candidate | {int(cp.get('n_units',0))} | {fmt(cp.get('median_best_mcc'))} | {fmt(cp.get('median_strength'))} | {fmt(cp.get('median_css'),5)} | {fmt(cp.get('mean_css'),5)} |
 | Non-candidate control | {int(rp.get('n_units',0))} | {fmt(rp.get('median_best_mcc'))} | {fmt(rp.get('median_strength'))} | {fmt(rp.get('median_css'),5)} | {fmt(rp.get('mean_css'),5)} |
 
-Paired by run and baseline subset, candidates have higher CSS than controls: median delta **{fmt(ce.get('median_delta'),5)}**, 95% bootstrap CI **[{fmt(ce.get('median_delta_ci_low'),5)}, {fmt(ce.get('median_delta_ci_high'),5)}]**, one-sided Wilcoxon p **{fmt(ce.get('wilcoxon_p_greater'))}**, Holm-corrected p **{fmt(adj.get('primary_css'))}**, paired rank-biserial **{fmt(ce.get('paired_rank_biserial'))}**, unit-level Cliff's delta **{fmt(results.get('css_unit_cliffs_delta'))}**.
+Paired by run and baseline subset, candidates have higher TECS than controls: median delta **{fmt(ce.get('median_delta'),5)}**, 95% bootstrap CI **[{fmt(ce.get('median_delta_ci_low'),5)}, {fmt(ce.get('median_delta_ci_high'),5)}]**, one-sided Wilcoxon p **{fmt(ce.get('wilcoxon_p_greater'))}**, Holm-corrected p **{fmt(adj.get('primary_css'))}**, paired rank-biserial **{fmt(ce.get('paired_rank_biserial'))}**, unit-level Cliff's delta **{fmt(results.get('css_unit_cliffs_delta'))}**.
 
 This is the main statistical proof of the spiking claim: selected overtopping candidates have significantly larger combined causal-strength-and-thresholdability scores than non-candidate controls.
 
@@ -388,18 +394,18 @@ Using the best held-out threshold abs(MCC) per neuron, candidates also outperfor
 
 Supported claim:
 
-> Selected overtopping candidates are more causally spike-like than non-candidate controls. They have higher singleton-intervention flip rates, higher thresholdability, and higher Causal Spiking Scores under paired run/baseline comparisons.
+> Selected overtopping candidates are more causally spike-like than non-candidate controls. They have higher singleton-intervention flip rates, higher thresholdability, and higher Threshold-event causal scores under paired run/baseline comparisons.
 
-Do not claim that controls never matter. The correct claim is dominance and saturation: non-candidate controls can have nonzero effects, but selected candidates dominate the distribution of causal spiking scores.
+Do not claim that controls never matter. The correct claim is dominance and saturation: non-candidate controls can have nonzero effects, but selected candidates dominate the distribution of Threshold-event causal scores.
 
 ### Recommended aggregate visualizations
 
 Use these as the main figure panels:
 
-1. `figures/ecdf_causal_spiking_score.pdf` — full CSS distribution for candidates and controls.
+1. `figures/ecdf_causal_spiking_score.pdf` — full TECS distribution for candidates and controls.
 2. `figures/paired_css_delta_by_run_baseline.pdf` — condition-level consistency of the primary effect.
 3. `figures/ecdf_flip_rates_candidate_vs_control.pdf` — causal strength distribution, showing controls are not always inert.
-4. `figures/feature_css_delta_ranking.pdf` — proxy features ranked by median candidate-control CSS delta.
+4. `figures/feature_css_delta_ranking.pdf` — proxy features ranked by median candidate-control TECS delta.
 
 Use `figures/binned_flip_curves_oriented_proxy.pdf` as a descriptive supplement for the threshold-tail / spike-like shape.
 '''

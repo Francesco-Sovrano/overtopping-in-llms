@@ -549,7 +549,7 @@ python 11_poisoning_grammar_checkpoint_ft.py \
 
 ### `12_threshold_event_diagnostics.py` - threshold recoverability and CSS inputs
 
-This script evaluates whether singleton flip-positive examples for candidate channels are predictable by one-dimensional thresholds over activation, gradient, activation-gradient, Wanda, predicted margin-drop, or learned-direction proxy features. These outputs feed `generate_overtopping_spiking_report.py`.
+This script evaluates whether singleton flip-positive examples for candidate channels are predictable by one-dimensional thresholds over activation, absolute activation, WANDA-style activation-weighted magnitude, gradient, activation-gradient, predicted margin-drop, or learned-direction proxy features. In this package WANDA is weight-scaled for attention coordinates with a defined output-weight norm; for MLP residual-write coordinates it reduces to absolute activation. These outputs feed `generate_overtopping_spiking_report.py`.
 
 ```bash
 python 12_threshold_event_diagnostics.py \
@@ -567,7 +567,7 @@ python 12_threshold_event_diagnostics.py \
   --rule_conditioned_only \
   --rules_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/rule_extraction_results/neuron_flip_rules \
   --rules_stats_dirname spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3 \
-  --proxy_metrics activation,abs_activation,gradient,abs_gradient,activation_x_gradient,abs_activation_x_gradient,predicted_margin_drop,abs_predicted_margin_drop,learned_direction
+  --proxy_metrics activation,abs_activation,wanda,gradient,abs_gradient,activation_x_gradient,abs_activation_x_gradient,predicted_margin_drop,abs_predicted_margin_drop,learned_direction
 ```
 
 Outputs include per-unit threshold tests, population summaries, binned flip curves, aggregate CSVs, JSON summaries, and optional figure files under `spiking_diagnostics/figures/`.

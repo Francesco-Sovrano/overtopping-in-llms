@@ -136,8 +136,7 @@ RULE_CONDITIONED_ONLY="${RULE_CONDITIONED_ONLY:-1}"
 RULE_CONDITIONED_MAX_RULES_PER_UNIT="${RULE_CONDITIONED_MAX_RULES_PER_UNIT:-1}"
 RULE_MIN_MATCH_EXAMPLES="${RULE_MIN_MATCH_EXAMPLES:-16}"
 RULE_NONMATCH_MATCH_RATIO="${RULE_NONMATCH_MATCH_RATIO:-2}"
-# PROXY_METRICS="${PROXY_METRICS:-activation,abs_activation,gradient,abs_gradient,activation_x_gradient,abs_activation_x_gradient,wanda,predicted_margin_drop,abs_predicted_margin_drop,learned_direction}"
-PROXY_METRICS="${PROXY_METRICS:-activation,abs_activation,gradient,abs_gradient,activation_x_gradient,abs_activation_x_gradient,predicted_margin_drop,abs_predicted_margin_drop,learned_direction}"
+PROXY_METRICS="${PROXY_METRICS:-activation,abs_activation,wanda,gradient,abs_gradient,activation_x_gradient,abs_activation_x_gradient,predicted_margin_drop,abs_predicted_margin_drop,learned_direction}"
 PROXY_ALLOW_FALLBACK_SCORE="${PROXY_ALLOW_FALLBACK_SCORE:-1}"
 
 # Same-layer/head non-agonist baselines.

@@ -795,6 +795,7 @@ if [[ "$RUN_REFINE_NEURON_RULES" == "true" || "$RUN_REFINE_NEURON_RULES" == "1" 
 		--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
 		--intervention $EVAL_INTERVENTION
 		--only_unique_datapoints_in_shap
+		--exclude_discovery_rows_from_final_stats
 		"${DECODE_FLAG[@]}"
 	)
 	if [[ "$REFINE_EXTRACT_RULES" == "true" || "$REFINE_EXTRACT_RULES" == "1" ]]; then

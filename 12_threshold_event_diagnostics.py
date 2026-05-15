@@ -1007,6 +1007,15 @@ def collect_reference_proxy_tensors(model, task, examples, prompt_col, layer_lab
 
 
 def _wanda_weight_norms_for_spec(model, spec, n_compared_units):
+    """Return WANDA-style outgoing-weight norms for the hooked coordinate basis.
+
+    Attention ``hook_z`` coordinates have a direct output map through ``W_O``, so
+    we use the norm of the corresponding output-weight vector. MLP entries in
+    this package are residual-write coordinates captured at ``hook_mlp_out``;
+    there is no single per-coordinate outgoing weight matrix analogous to WANDA's
+    layer weight. For those coordinates the multiplier is intentionally one, so
+    WANDA columns reduce to absolute-activation value/rank/z-score screens.
+    """
     if spec is None:
         return None
     if spec["layer_type"] == "attn":
