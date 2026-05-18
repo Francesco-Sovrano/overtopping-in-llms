@@ -151,7 +151,43 @@ def parse_args():
 	ap.add_argument(
 		"--decode_only",
 		action="store_true",
-		help="If set, prefill prompt without hooks and apply ablation hooks only during decoding (faster).",
+		help="If set, prefill prompt without hooks and apply ablation hooks only during decoding (output-only phase).",
+	)
+	ap.add_argument(
+		"--input_only",
+		action="store_true",
+		help=(
+			"If set, apply intervention hooks only while processing the input prompt, then decode without hooks. "
+			"This input-only phase is mutually exclusive with --decode_only."
+		),
+	)
+	ap.add_argument(
+		"--semantic_quality_policy",
+		type=str,
+		default="filter",
+		choices=["none", "filter"],
+		help=(
+			"How this script uses task-provided semantic_wrong diagnostics during rule extraction. "
+			"'filter' removes semantically wrong ablated datapoints from per-neuron rule/MCC fitting and eval; "
+			"'none' keeps all datapoints but still writes semantic diagnostics."
+		),
+	)
+	ap.add_argument(
+		"--no_rescore_cached_answers",
+		action="store_true",
+		help=(
+			"Do not rescore cached generated answers with the current task correctness function. "
+			"By default, caches that contain plain generated answers are rescored, so changes to "
+			"answer parsing/correctness prompts do not require model regeneration."
+		),
+	)
+	ap.add_argument(
+		"--recompute_missing_semantic_cache",
+		action="store_true",
+		help=(
+			"When semantic diagnostics are enabled and a cache lacks both semantics and generated answers, "
+			"regenerate the model outputs instead of reusing correctness-only cache entries."
+		),
 	)
 
 	ap.add_argument(
@@ -453,11 +489,24 @@ def canonicalize_neurons(neurons):
 		out.append((str(layer_label), int(neuron_id), "all"))
 	return out
 
+def intervention_phase_name(args):
+	if bool(getattr(args, "input_only", False)):
+		return "input_only"
+	if bool(getattr(args, "decode_only", False)):
+		return "decode_only"
+	return "prefill_decode"
+
+def hooks_last_pos_only(args):
+	# Output-only runs generate one token at a time from a prefix cache; last-position
+	# hooks are the intended semantics there. Input-only and input+output runs default
+	# to all prompt positions unless --last_pos_only is explicitly requested.
+	return bool(getattr(args, "last_pos_only", False) or bool(getattr(args, "decode_only", False)))
+
 def build_flip_cache_policy_tag(args, *, main_metric=None):
 	parts = [
 		str(main_metric or "metric"),
 		str(getattr(args, "intervention", "unknown")),
-		"decode_only" if bool(getattr(args, "decode_only", False)) else "prefill_decode",
+		intervention_phase_name(args),
 	]
 	if bool(getattr(args, "last_pos_only", False)):
 		parts.append("last_pos_only")
@@ -785,6 +834,7 @@ def build_rule_extraction_signature(rules_df: pd.DataFrame, input_features, targ
 		"use_shap_in_xgb": bool(getattr(args, "use_shap_in_xgb", False)),
 		"use_shap_in_lasso": bool(getattr(args, "use_shap_in_lasso", False)),
 		"only_unique_datapoints_in_rule_extraction": bool(getattr(args, "only_unique_datapoints_in_rule_extraction", False)),
+		"semantic_quality_policy": str(getattr(args, "semantic_quality_policy", "none")),
 	}
 
 	input_feature_names = list(map(str, input_features))
@@ -837,12 +887,20 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 	cols_any_found = []
 	cols_c2i_found = []
 	cols_i2c_found = []
+	cols_flip_semantic_wrong_found = []
+	cols_semantic_wrong_found = []
+	cols_flip_empty_found = []
+	cols_flip_unparseable_found = []
 
 	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0],x[1])):
 		layer_key = _safe_layer_label(layer_label)
 		col_any = f"flip_{layer_key}_{neuron_id}"
 		col_c2i = f"flip_c2i_{layer_key}_{neuron_id}"
 		col_i2c = f"flip_i2c_{layer_key}_{neuron_id}"
+		col_flip_semantic_wrong = f"flip_semantic_wrong_{layer_key}_{neuron_id}"
+		col_semantic_wrong = f"semantic_wrong_{layer_key}_{neuron_id}"
+		col_flip_empty = f"flip_empty_{layer_key}_{neuron_id}"
+		col_flip_unparseable = f"flip_unparseable_{layer_key}_{neuron_id}"
 
 		if col_any not in scores_df.columns:
 			continue
@@ -851,6 +909,14 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 			cols_c2i_found.append(col_c2i)
 		if col_i2c in scores_df.columns:
 			cols_i2c_found.append(col_i2c)
+		if col_flip_semantic_wrong in scores_df.columns:
+			cols_flip_semantic_wrong_found.append(col_flip_semantic_wrong)
+		if col_semantic_wrong in scores_df.columns:
+			cols_semantic_wrong_found.append(col_semantic_wrong)
+		if col_flip_empty in scores_df.columns:
+			cols_flip_empty_found.append(col_flip_empty)
+		if col_flip_unparseable in scores_df.columns:
+			cols_flip_unparseable_found.append(col_flip_unparseable)
 		if any_eval_col is None:
 			any_eval_col = col_any
 
@@ -858,6 +924,10 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 		c2i = int(scores_df[col_c2i].fillna(False).astype(int).sum()) if col_c2i in scores_df.columns else 0
 		i2c = int(scores_df[col_i2c].fillna(False).astype(int).sum()) if col_i2c in scores_df.columns else 0
 		total = int(scores_df[col_any].fillna(False).astype(int).sum())
+		semantic_wrong = int(scores_df[col_semantic_wrong].fillna(False).astype(int).sum()) if col_semantic_wrong in scores_df.columns else 0
+		flip_semantic_wrong = int(scores_df[col_flip_semantic_wrong].fillna(False).astype(int).sum()) if col_flip_semantic_wrong in scores_df.columns else 0
+		flip_empty = int(scores_df[col_flip_empty].fillna(False).astype(int).sum()) if col_flip_empty in scores_df.columns else 0
+		flip_unparseable = int(scores_df[col_flip_unparseable].fillna(False).astype(int).sum()) if col_flip_unparseable in scores_df.columns else 0
 
 		# Percentages are always relative to the number of evaluated rows for this neuron.
 		c2i_pct = (100.0 * c2i / n_eval) if n_eval else float("nan")
@@ -876,16 +946,27 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 			"c2i_rate": (c2i / n_eval) if n_eval else float("nan"),
 			"i2c_rate": (i2c / n_eval) if n_eval else float("nan"),
 			"flip_any_rate": (total / n_eval) if n_eval else float("nan"),
+			"semantic_wrong_count": semantic_wrong,
+			"semantic_wrong_rate": (semantic_wrong / n_eval) if n_eval else float("nan"),
+			"flip_semantic_wrong_count": flip_semantic_wrong,
+			"flip_semantic_wrong_rate": (flip_semantic_wrong / n_eval) if n_eval else float("nan"),
+			"flip_semantic_wrong_share": (flip_semantic_wrong / total) if total else float("nan"),
+			"flip_empty_count": flip_empty,
+			"flip_empty_rate": (flip_empty / n_eval) if n_eval else float("nan"),
+			"flip_unparseable_count": flip_unparseable,
+			"flip_unparseable_rate": (flip_unparseable / n_eval) if n_eval else float("nan"),
 			"c2i_pct": c2i_pct,
 			"i2c_pct": i2c_pct,
 			"flip_any_pct": total_pct,
+			"semantic_wrong_pct": (100.0 * semantic_wrong / n_eval) if n_eval else float("nan"),
+			"flip_semantic_wrong_pct": (100.0 * flip_semantic_wrong / n_eval) if n_eval else float("nan"),
 		})
 
 	if not rows:
 		print("[Stats] No flip columns found; skipping flip stats.")
 		return None
 
-	stats_df = pd.DataFrame(rows).sort_values(["flip_any_count", "c2i_count", "i2c_count"], ascending=False)
+	stats_df = pd.DataFrame(rows).sort_values(["flip_any_count", "flip_semantic_wrong_count", "c2i_count", "i2c_count"], ascending=False)
 	stats_path = os.path.join(out_dir, 'stats', stats_dirname, f"flip_stats_by_neuron.csv")
 	stats_df.to_csv(stats_path, index=False)
 	print(f"[Stats] Wrote {stats_path}")
@@ -910,6 +991,10 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 	union_any, eval_any = _union_counts(cols_any_found)
 	union_c2i, eval_c2i = _union_counts(cols_c2i_found)
 	union_i2c, eval_i2c = _union_counts(cols_i2c_found)
+	union_flip_semantic_wrong, eval_flip_semantic_wrong = _union_counts(cols_flip_semantic_wrong_found)
+	union_semantic_wrong, eval_semantic_wrong = _union_counts(cols_semantic_wrong_found)
+	union_flip_empty, eval_flip_empty = _union_counts(cols_flip_empty_found)
+	union_flip_unparseable, eval_flip_unparseable = _union_counts(cols_flip_unparseable_found)
 	global_payload = {
 		"n_neurons": int(len(stats_df)),
 		"n_evaluated_rows": eval_rows,
@@ -922,6 +1007,16 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 		"union_c2i_unique_rate": (float(union_c2i) / float(eval_c2i)) if eval_c2i else float("nan"),
 		"union_i2c_unique_count": int(union_i2c),
 		"union_i2c_unique_rate": (float(union_i2c) / float(eval_i2c)) if eval_i2c else float("nan"),
+		"sum_semantic_wrong_counts_over_neurons": int(stats_df.get("semantic_wrong_count", pd.Series(dtype=float)).sum()),
+		"sum_flip_semantic_wrong_counts_over_neurons": int(stats_df.get("flip_semantic_wrong_count", pd.Series(dtype=float)).sum()),
+		"union_semantic_wrong_unique_count": int(union_semantic_wrong),
+		"union_semantic_wrong_unique_rate": (float(union_semantic_wrong) / float(eval_semantic_wrong)) if eval_semantic_wrong else float("nan"),
+		"union_flip_semantic_wrong_unique_count": int(union_flip_semantic_wrong),
+		"union_flip_semantic_wrong_unique_rate": (float(union_flip_semantic_wrong) / float(eval_flip_semantic_wrong)) if eval_flip_semantic_wrong else float("nan"),
+		"union_flip_empty_unique_count": int(union_flip_empty),
+		"union_flip_empty_unique_rate": (float(union_flip_empty) / float(eval_flip_empty)) if eval_flip_empty else float("nan"),
+		"union_flip_unparseable_unique_count": int(union_flip_unparseable),
+		"union_flip_unparseable_unique_rate": (float(union_flip_unparseable) / float(eval_flip_unparseable)) if eval_flip_unparseable else float("nan"),
 	}
 	Path(os.path.join(out_dir, 'stats', stats_dirname, f"flip_stats_global.json")).write_text(
 		json.dumps(global_payload, indent=2, ensure_ascii=False),
@@ -1029,6 +1124,41 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 
 	print(f"[Stats] Wrote {plot_path}")
 
+	if "flip_semantic_wrong_pct" in stats_df.columns and np.isfinite(pd.to_numeric(stats_df["flip_semantic_wrong_pct"], errors="coerce")).any():
+		dfq = stats_df.head(K).copy()
+		bad = pd.to_numeric(dfq["flip_semantic_wrong_pct"], errors="coerce").fillna(0.0).to_numpy()
+		total_flip = pd.to_numeric(dfq["flip_any_pct"], errors="coerce").fillna(0.0).to_numpy()
+		y = np.arange(K)
+		with plt.rc_context({
+			"font.size": 10.5,
+			"axes.labelsize": 10.5,
+			"axes.titlesize": 11,
+			"xtick.labelsize": 10,
+			"ytick.labelsize": ytick_fs,
+			"legend.fontsize": 9.6,
+			"pdf.fonttype": 42,
+			"ps.fonttype": 42,
+		}):
+			fig, ax = plt.subplots(figsize=(fig_w, fig_h), constrained_layout=False)
+			fig.subplots_adjust(left=0.31, right=0.99, bottom=0.095, top=0.930)
+			ax.barh(y, total_flip, height=0.62, label="All flips", linewidth=0.22, edgecolor="black")
+			ax.barh(y, bad, height=0.34, label="Semantically wrong flips", linewidth=0.22, edgecolor="black")
+			ax.set_yticks(y)
+			ax.set_yticklabels(dfq["neuron"].values)
+			ax.tick_params(axis="y", pad=2)
+			ax.invert_yaxis()
+			ax.set_ylim(K - 0.5, -0.62)
+			ax.set_xlabel("Datapoints (% of evaluated prompts)")
+			ax.grid(axis="x", linewidth=0.3, alpha=0.4)
+			ax.set_axisbelow(True)
+			ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.012), ncol=2, frameon=False, handlelength=1.3, columnspacing=1.0, borderaxespad=0.0)
+			ax.spines["top"].set_visible(False)
+			ax.spines["right"].set_visible(False)
+			sem_plot_path = os.path.join(out_dir, 'stats', stats_dirname, f"flip_semantic_wrong_top{K}.pdf")
+			fig.savefig(sem_plot_path, bbox_inches="tight", pad_inches=0.03)
+			plt.close(fig)
+		print(f"[Stats] Wrote {sem_plot_path}")
+
 	return stats_df
 
 # ------------------------- Final agonist metric diagnostics -------------------------
@@ -1061,9 +1191,15 @@ _PRETTY_COL_LABELS = {
 	"flip_any_rate": "Any flip rate",
 	"c2i_rate": "Correct→incorrect rate",
 	"i2c_rate": "Incorrect→correct rate",
+	"semantic_wrong_rate": "Semantic-wrong output rate",
+	"flip_semantic_wrong_rate": "Semantic-wrong flip rate",
+	"flip_empty_rate": "Empty flip rate",
+	"flip_unparseable_rate": "Unparseable flip rate",
 	"flip_any_count": "Any flip count",
 	"c2i_count": "Correct→incorrect count",
 	"i2c_count": "Incorrect→correct count",
+	"semantic_wrong_count": "Semantic-wrong output count",
+	"flip_semantic_wrong_count": "Semantic-wrong flip count",
 	"max_effect": "Max effect",
 	"abs_max_effect": "|Max effect|",
 	"accuracy_gap": "Accuracy gap",
@@ -1233,7 +1369,10 @@ def _merge_flip_stats(metric_df, flip_stats_df):
 	fs["neuron_id"] = pd.to_numeric(fs["neuron_id"], errors="coerce").astype("Int64")
 	keep = [c for c in [
 		"layer_key", "neuron_id", "n_eval", "c2i_count", "i2c_count", "flip_any_count",
-		"c2i_rate", "i2c_rate", "flip_any_rate", "c2i_pct", "i2c_pct", "flip_any_pct",
+		"semantic_wrong_count", "flip_semantic_wrong_count", "flip_empty_count", "flip_unparseable_count",
+		"c2i_rate", "i2c_rate", "flip_any_rate", "semantic_wrong_rate", "flip_semantic_wrong_rate",
+		"flip_empty_rate", "flip_unparseable_rate", "c2i_pct", "i2c_pct", "flip_any_pct",
+		"semantic_wrong_pct", "flip_semantic_wrong_pct", "flip_semantic_wrong_share",
 	] if c in fs.columns]
 	fs = fs[keep].drop_duplicates(subset=["layer_key", "neuron_id"])
 	out = metric_df.copy()
@@ -1287,7 +1426,7 @@ def _compute_metric_delta_rows(metric_df):
 		cu = f"{feature}_unrelated"
 		if ca in merged.columns and cu in merged.columns:
 			merged[f"delta_{feature}"] = pd.to_numeric(merged[ca], errors="coerce") - pd.to_numeric(merged[cu], errors="coerce")
-	for target in ["max_effect", "abs_max_effect", "accuracy_gap", "abs_accuracy_gap", "flip_any_rate", "c2i_rate", "i2c_rate", "flip_any_count", "c2i_count", "i2c_count"]:
+	for target in ["max_effect", "abs_max_effect", "accuracy_gap", "abs_accuracy_gap", "flip_any_rate", "c2i_rate", "i2c_rate", "flip_semantic_wrong_rate", "semantic_wrong_rate", "flip_any_count", "c2i_count", "i2c_count", "flip_semantic_wrong_count", "semantic_wrong_count"]:
 		ca = f"{target}_associated"
 		cu = f"{target}_unrelated"
 		if ca in merged.columns:
@@ -1304,7 +1443,7 @@ def _compute_metric_correlations(metric_df, delta_df):
 		"mean_delta_from_layer_mean", "top1_rate", "top5_rate", "top10pct_rate",
 	]
 	delta_features = [f"delta_{f}" for f in features]
-	targets = ["max_effect", "abs_max_effect", "accuracy_gap", "abs_accuracy_gap", "flip_any_rate", "c2i_rate", "i2c_rate", "flip_any_count"]
+	targets = ["max_effect", "abs_max_effect", "accuracy_gap", "abs_accuracy_gap", "flip_any_rate", "c2i_rate", "i2c_rate", "flip_semantic_wrong_rate", "semantic_wrong_rate", "flip_any_count", "flip_semantic_wrong_count", "semantic_wrong_count"]
 	rows = []
 	if metric_df is not None and not metric_df.empty:
 		for metric, mdf in metric_df.groupby("metric", sort=False):
@@ -1378,28 +1517,39 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 	pdf_path = stats_dir / "agonist_metric_final_plots.pdf"
 	with PdfPages(pdf_path) as pdf:
 		if "mean_layer_percentile_rank" in metric_df.columns and split_order:
-			fig, ax = plt.subplots(figsize=(max(10, 1.2 * len(metric_order) * max(1, len(split_order))), 5.2))
+			# Keep the percentile boxplot readable when metric names are long.
+			# In particular, "|activation x gradient|" otherwise collides with the
+			# neighbouring split label once the figure is rendered at paper width.
 			box_data, labels = [], []
 			for metric in metric_order:
 				for split in split_order:
 					vals = pd.to_numeric(metric_df.loc[(metric_df["metric"] == metric) & (metric_df["split"] == split), "mean_layer_percentile_rank"], errors="coerce").dropna().to_numpy()
 					if vals.size:
 						box_data.append(vals)
-						labels.append(f"{_metric_display(metric)}\n{split}")
+						metric_label = _wrap_label(_metric_display(metric), width=14)
+						labels.append(f"{metric_label}\n{split}")
 			if box_data:
-				ax.boxplot(box_data, tick_labels=labels, showmeans=True)
+				n_boxes = len(box_data)
+				fig_w = max(10.5, 1.35 * n_boxes)
+				fig, ax = plt.subplots(figsize=(fig_w, 5.6))
+				ax.boxplot(box_data, tick_labels=labels, showmeans=True, widths=0.55)
+				for tick in ax.get_xticklabels():
+					tick.set_rotation(0)
+					tick.set_ha("center")
+					tick.set_multialignment("center")
+				ax.tick_params(axis="x", labelsize=9.4, pad=5)
 				ax.set_ylim(0, 1.02)
 				ax.set_ylabel("Mean within-layer percentile rank")
 				ax.set_title("Agonist metric rank distributions")
 				ax.grid(True, axis="y", alpha=0.3)
-				fig.tight_layout()
+				fig.tight_layout(pad=0.7)
 				png = stats_dir / "agonist_metric_percentile_boxplot.pdf"
 				fig.savefig(png, dpi=300, bbox_inches="tight")
 				fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
 				pdf.savefig(fig, bbox_inches="tight")
 				paths.append(str(png))
 				paths.append(str(png.with_suffix(".pdf")))
-			plt.close(fig)
+				plt.close(fig)
 		rate_cols = [c for c in ["top1_rate", "top5_rate", "top10pct_rate"] if c in metric_df.columns]
 		if rate_cols:
 			fig, ax = plt.subplots(figsize=(max(10, 1.0 * len(metric_order) * len(rate_cols)), 5.2))
@@ -1434,7 +1584,7 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 			paths.append(str(png.with_suffix(".pdf")))
 			plt.close(fig)
 		if corr_df is not None and not corr_df.empty:
-			target_preference = ["flip_any_rate", "abs_max_effect", "c2i_rate", "i2c_rate", "accuracy_gap"]
+			target_preference = ["flip_any_rate", "flip_semantic_wrong_rate", "abs_max_effect", "c2i_rate", "i2c_rate", "accuracy_gap"]
 			target = next((t for t in target_preference if t in set(corr_df["target"].astype(str))), None)
 			if target is not None:
 				features = ["delta_mean_metric_value", "delta_mean_abs_metric_value", "delta_mean_layer_percentile_rank", "delta_mean_layer_zscore", "delta_top10pct_rate"]
@@ -1549,7 +1699,7 @@ def write_agonist_metric_final_stats(circuit_agonists_path, out_dir, stats_dirna
 		"n_rows": int(len(metric_df)),
 		"n_delta_rows": int(len(delta_df)) if delta_df is not None else 0,
 		"metrics": sorted(metric_df["metric"].dropna().astype(str).unique().tolist(), key=lambda m: _metric_sort_key(m)),
-		"targets_available": sorted([c for c in ["max_effect", "abs_max_effect", "accuracy_gap", "abs_accuracy_gap", "flip_any_rate", "c2i_rate", "i2c_rate"] if c in metric_df.columns]),
+		"targets_available": sorted([c for c in ["max_effect", "abs_max_effect", "accuracy_gap", "abs_accuracy_gap", "flip_any_rate", "c2i_rate", "i2c_rate", "flip_semantic_wrong_rate", "semantic_wrong_rate"] if c in metric_df.columns]),
 		"headline_best_correlations": headlines,
 		"files": {
 			"summary_csv": summary_path.name,
@@ -1954,7 +2104,8 @@ def write_rule_metrics_stats(
 	
 	return df_best
 
-def _union_and_sum_flips(scores_df: pd.DataFrame, cols):
+def _union_sum_eval_mask(scores_df: pd.DataFrame, cols):
+	"""Return the unique flip mask, summed per-neuron count, and evaluated-row mask."""
 	n = len(scores_df)
 	union = np.zeros(n, dtype=bool)
 	any_eval = np.zeros(n, dtype=bool)
@@ -1967,7 +2118,32 @@ def _union_and_sum_flips(scores_df: pd.DataFrame, cols):
 		v = s.fillna(False).astype(bool).to_numpy()
 		union |= v
 		sum_count += int(v.sum())
+	return union, int(sum_count), any_eval
+
+def _union_and_sum_flips(scores_df: pd.DataFrame, cols):
+	union, sum_count, any_eval = _union_sum_eval_mask(scores_df, cols)
 	return int(union.sum()), int(sum_count), int(any_eval.sum())
+
+def _baseline_direction_denominators(scores_df: pd.DataFrame, baseline_metric_col: str, eval_mask: np.ndarray):
+	"""Counts of evaluated baseline-correct/incorrect rows used as eligible denominators.
+
+	Correct->incorrect flips are only possible for baseline-correct rows;
+	incorrect->correct flips are only possible for baseline-incorrect rows. If the
+	baseline column is unavailable, return NaNs so callers can fall back to the
+	global evaluated-row denominator.
+	"""
+	if not baseline_metric_col or baseline_metric_col not in scores_df.columns:
+		return None
+	base = pd.to_numeric(scores_df[baseline_metric_col], errors="coerce")
+	valid = base.notna().to_numpy()
+	base_bool = (base.to_numpy(dtype=float) > 0.5)
+	eval_mask = np.asarray(eval_mask, dtype=bool)
+	return {
+		"baseline_metric_col": str(baseline_metric_col),
+		"n_eval_baseline_valid": int((eval_mask & valid).sum()),
+		"n_eval_baseline_correct": int((eval_mask & valid & base_bool).sum()),
+		"n_eval_baseline_incorrect": int((eval_mask & valid & (~base_bool)).sum()),
+	}
 
 def write_high_quality_neuron_flip_coverage(
 	scores_df: pd.DataFrame,
@@ -1978,6 +2154,7 @@ def write_high_quality_neuron_flip_coverage(
 	# Backward-compat default; if quality_threshold is None we fall back to this.
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	baseline_metric_col: str = None,
 ):
 	'''
 	Among neurons whose best rule has MCC >= threshold, compute flips accounted:
@@ -2030,13 +2207,29 @@ def write_high_quality_neuron_flip_coverage(
 	cols_any_high = _cols(high_neurons, "flip_")
 	cols_c2i_high = _cols(high_neurons, "flip_c2i_")
 	cols_i2c_high = _cols(high_neurons, "flip_i2c_")
+	cols_sem_wrong_all = _cols(total_neurons, "flip_semantic_wrong_")
+	cols_sem_wrong_high = _cols(high_neurons, "flip_semantic_wrong_")
 
-	union_any_all, sum_any_all, n_eval_any_all = _union_and_sum_flips(scores_df, cols_any_all)
-	union_any_high, sum_any_high, n_eval_any_high = _union_and_sum_flips(scores_df, cols_any_high)
-	union_c2i_all, sum_c2i_all, _ = _union_and_sum_flips(scores_df, cols_c2i_all)
-	union_c2i_high, sum_c2i_high, _ = _union_and_sum_flips(scores_df, cols_c2i_high)
-	union_i2c_all, sum_i2c_all, _ = _union_and_sum_flips(scores_df, cols_i2c_all)
-	union_i2c_high, sum_i2c_high, _ = _union_and_sum_flips(scores_df, cols_i2c_high)
+	union_any_all_mask, sum_any_all, eval_mask_any_all = _union_sum_eval_mask(scores_df, cols_any_all)
+	union_any_high_mask, sum_any_high, eval_mask_any_high = _union_sum_eval_mask(scores_df, cols_any_high)
+	union_c2i_all_mask, sum_c2i_all, _ = _union_sum_eval_mask(scores_df, cols_c2i_all)
+	union_c2i_high_mask, sum_c2i_high, _ = _union_sum_eval_mask(scores_df, cols_c2i_high)
+	union_i2c_all_mask, sum_i2c_all, _ = _union_sum_eval_mask(scores_df, cols_i2c_all)
+	union_i2c_high_mask, sum_i2c_high, _ = _union_sum_eval_mask(scores_df, cols_i2c_high)
+	union_sem_wrong_all_mask, sum_sem_wrong_all, _ = _union_sum_eval_mask(scores_df, cols_sem_wrong_all)
+	union_sem_wrong_high_mask, sum_sem_wrong_high, _ = _union_sum_eval_mask(scores_df, cols_sem_wrong_high)
+
+	union_any_all = int(union_any_all_mask.sum())
+	union_any_high = int(union_any_high_mask.sum())
+	union_c2i_all = int(union_c2i_all_mask.sum())
+	union_c2i_high = int(union_c2i_high_mask.sum())
+	union_i2c_all = int(union_i2c_all_mask.sum())
+	union_i2c_high = int(union_i2c_high_mask.sum())
+	union_sem_wrong_all = int(union_sem_wrong_all_mask.sum())
+	union_sem_wrong_high = int(union_sem_wrong_high_mask.sum())
+	n_eval_any_all = int(eval_mask_any_all.sum())
+	n_eval_any_high = int(eval_mask_any_high.sum())
+	baseline_denoms = _baseline_direction_denominators(scores_df, baseline_metric_col, eval_mask_any_all)
 
 	# --- Compact p-values: permutation test vs random subset of same size (union coverage) ---
 	def _fmt_p(p: float) -> str:
@@ -2076,6 +2269,17 @@ def write_high_quality_neuron_flip_coverage(
 	_p_any = _perm_p_union(_bool_mat(cols_any_all), _idx_high, n_perm=_NPERM, seed=0)
 	_p_c2i = _perm_p_union(_bool_mat(cols_c2i_all), _idx_high, n_perm=_NPERM, seed=1)
 	_p_i2c = _perm_p_union(_bool_mat(cols_i2c_all), _idx_high, n_perm=_NPERM, seed=2)
+	_p_sem_wrong = _perm_p_union(_bool_mat(cols_sem_wrong_all), _idx_high, n_perm=_NPERM, seed=3) if any(c in scores_df.columns for c in cols_sem_wrong_all) else float("nan")
+
+	n_eval_baseline_correct = None if baseline_denoms is None else baseline_denoms.get("n_eval_baseline_correct")
+	n_eval_baseline_incorrect = None if baseline_denoms is None else baseline_denoms.get("n_eval_baseline_incorrect")
+
+	def _rate_or_nan(num, den):
+		try:
+			den = float(den)
+		except (TypeError, ValueError):
+			return float("nan")
+		return (float(num) / den) if den else float("nan")
 
 	summary = {
 		"quality_metric": str(metric_key),
@@ -2085,6 +2289,13 @@ def write_high_quality_neuron_flip_coverage(
 		"n_neurons_total": int(len(total_neurons)),
 		"n_neurons_high_quality": int(len(high_neurons)),
 		"frac_neurons_high_quality": (float(len(high_neurons))/float(len(total_neurons))) if len(total_neurons) else float("nan"),
+		"baseline_metric_col": str(baseline_metric_col) if baseline_metric_col else None,
+		"eligible_denominators": baseline_denoms if baseline_denoms is not None else {
+			"baseline_metric_col": None,
+			"n_eval_baseline_valid": None,
+			"n_eval_baseline_correct": None,
+			"n_eval_baseline_incorrect": None,
+		},
 		"flip_any": {
 			"union_high": int(union_any_high),
 			"sum_high": int(sum_any_high),
@@ -2100,6 +2311,9 @@ def write_high_quality_neuron_flip_coverage(
 			"union_all": int(union_c2i_all),
 			"sum_all": int(sum_c2i_all),
 			"union_share_of_all": (float(union_c2i_high)/float(union_c2i_all)) if union_c2i_all else float("nan"),
+			"eligible_baseline_count": n_eval_baseline_correct,
+			"eligible_union_rate_all": _rate_or_nan(union_c2i_all, n_eval_baseline_correct),
+			"eligible_union_rate_high": _rate_or_nan(union_c2i_high, n_eval_baseline_correct),
 		},
 		"flip_i2c": {
 			"union_high": int(union_i2c_high),
@@ -2107,6 +2321,16 @@ def write_high_quality_neuron_flip_coverage(
 			"union_all": int(union_i2c_all),
 			"sum_all": int(sum_i2c_all),
 			"union_share_of_all": (float(union_i2c_high)/float(union_i2c_all)) if union_i2c_all else float("nan"),
+			"eligible_baseline_count": n_eval_baseline_incorrect,
+			"eligible_union_rate_all": _rate_or_nan(union_i2c_all, n_eval_baseline_incorrect),
+			"eligible_union_rate_high": _rate_or_nan(union_i2c_high, n_eval_baseline_incorrect),
+		},
+		"flip_semantic_wrong": {
+			"union_high": int(union_sem_wrong_high),
+			"sum_high": int(sum_sem_wrong_high),
+			"union_all": int(union_sem_wrong_all),
+			"sum_all": int(sum_sem_wrong_all),
+			"union_share_of_all": (float(union_sem_wrong_high)/float(union_sem_wrong_all)) if union_sem_wrong_all else float("nan"),
 		},
 		"p_values": {
 			# One-sided permutation p-value: P[ random subset union >= observed high-quality union ].
@@ -2114,12 +2338,13 @@ def write_high_quality_neuron_flip_coverage(
 			"perm_union_any": float(_p_any),
 			"perm_union_c2i": float(_p_c2i),
 			"perm_union_i2c": float(_p_i2c),
+			"perm_union_flip_semantic_wrong": float(_p_sem_wrong),
 		},
 		"figure_semantics": {
-			"prevalence_denominator": "Rows with at least one evaluated all-neuron flip column, not raw len(scores_df).",
+			"prevalence_denominator": "Any flip uses rows with at least one evaluated all-neuron flip column. Correct->incorrect uses evaluated baseline-correct rows when the baseline metric is available. Incorrect->correct uses evaluated baseline-incorrect rows when the baseline metric is available.",
 			"unique_union": "A prompt flipped by several neurons is counted once.",
 			"sum_over_neurons": "Per-neuron flip counts are summed, so overlaps are counted multiple times.",
-			"coverage_share": "High-quality union divided by all-neuron union for the same flip direction.",
+			"coverage_share": "High-quality union divided by all-neuron union for the same flip direction. This is a coverage-of-flips quantity, not a prevalence-over-prompts quantity.",
 		},
 	}
 
@@ -2146,6 +2371,9 @@ def write_high_quality_neuron_flip_coverage(
 	tex_lines.append(f"\\newcommand\\HighQualityPUnionAny{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_any'])}}}")
 	tex_lines.append(f"\\newcommand\\HighQualityPUnionCII{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_c2i'])}}}")
 	tex_lines.append(f"\\newcommand\\HighQualityPUnionICC{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_i2c'])}}}")
+	tex_lines.append(f"\\newcommand\\HighQualityUnionSemanticWrong{tex_suffix}{{{summary['flip_semantic_wrong']['union_high']}}}")
+	tex_lines.append(f"\\newcommand\\HighQualityUnionSemanticWrongPctAll{tex_suffix}{{{_pct(summary['flip_semantic_wrong']['union_share_of_all'])}}}")
+	tex_lines.append(f"\\newcommand\\HighQualityPUnionSemanticWrong{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_flip_semantic_wrong'])}}}")
 
 	tex_path = os.path.join(out_dir, 'stats', stats_dirname, f"high_quality_neuron_flip_coverage.tex")
 	Path(tex_path).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
@@ -2155,6 +2383,17 @@ def write_high_quality_neuron_flip_coverage(
 	# Labels are placed with deterministic offsets/inside-bar placement so that equal-height bars
 	# (the common case in this plot) do not overlap.
 	eval_denom = float(n_eval_any_all) if n_eval_any_all else float(len(scores_df))
+	# Directional flips have different natural denominators: correct->incorrect can only
+	# happen on baseline-correct rows, while incorrect->correct can only happen on
+	# baseline-incorrect rows. Fall back to the global evaluated-row denominator if the
+	# baseline metric column is unavailable.
+	_has_baseline_denoms = baseline_denoms is not None
+	_prev_denoms = np.asarray([
+		float(n_eval_any_all) if n_eval_any_all else float(len(scores_df)),
+		float(n_eval_baseline_correct) if _has_baseline_denoms and n_eval_baseline_correct is not None else eval_denom,
+		float(n_eval_baseline_incorrect) if _has_baseline_denoms and n_eval_baseline_incorrect is not None else eval_denom,
+	], dtype=float)
+	_prev_denom_labels = ["eval", "correct", "incorrect"] if _has_baseline_denoms else ["eval", "eval", "eval"]
 	_label_box = dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor="none", alpha=0.82)
 
 	def _bar_center(bar):
@@ -2196,12 +2435,58 @@ def write_high_quality_neuron_flip_coverage(
 			clip_on=True,
 		)
 
-	def _annotate_grouped_pair(ax, left_bar, right_bar, left_label, right_label, *, fontsize=6.6):
-		# Outward alignment prevents the two labels over a same-height grouped pair from colliding.
-		for bar, label, ha, dx in (
-			(left_bar, left_label, "right", -2),
-			(right_bar, right_label, "left", 2),
+	def _annotate_grouped_pair(
+		ax,
+		left_bar,
+		right_bar,
+		left_label,
+		right_label,
+		*,
+		fontsize=6.6,
+		collapse_identical=True,
+		joint_prefix="All=HQ",
+	):
+		left_h = float(left_bar.get_height())
+		right_h = float(right_bar.get_height())
+		left_ok = left_h == left_h
+		right_ok = right_h == right_h
+		if not (left_ok or right_ok):
+			return
+
+		# In these figures All and HQ are often identical. Drawing both labels creates
+		# hard-to-read collisions, so collapse identical same-height pairs into one
+		# centered label above the grouped bars.
+		if (
+			collapse_identical
+			and left_ok
+			and right_ok
+			and str(left_label).strip() == str(right_label).strip()
+			and np.isclose(left_h, right_h, rtol=1e-4, atol=1e-8)
 		):
+			label = str(left_label)
+			if joint_prefix:
+				label = f"{joint_prefix}\n{label}"
+			ax.annotate(
+				label,
+				((_bar_center(left_bar) + _bar_center(right_bar)) / 2.0, max(left_h, right_h)),
+				ha="center",
+				va="bottom",
+				fontsize=fontsize,
+				xytext=(0, 3),
+				textcoords="offset points",
+				bbox=_label_box,
+				clip_on=False,
+			)
+			return
+
+		# For genuinely different grouped bars, stagger same-height labels vertically
+		# and align outward to minimize overlap inside dense panels.
+		heights_close = left_ok and right_ok and np.isclose(left_h, right_h, rtol=1e-3, atol=1e-8)
+		items = [
+			(left_bar, left_label, "right", -3, 2 if not heights_close else 11),
+			(right_bar, right_label, "left", 3, 2),
+		]
+		for bar, label, ha, dx, dy in items:
 			h = float(bar.get_height())
 			if h != h:
 				continue
@@ -2211,7 +2496,7 @@ def write_high_quality_neuron_flip_coverage(
 				ha=ha,
 				va="bottom",
 				fontsize=fontsize,
-				xytext=(dx, 2),
+				xytext=(dx, dy),
 				textcoords="offset points",
 				bbox=_label_box,
 				clip_on=False,
@@ -2225,8 +2510,8 @@ def write_high_quality_neuron_flip_coverage(
 		"ytick.labelsize": 7.4,
 		"legend.fontsize": 7.0,
 	}):
-		fig, axes = plt.subplots(2, 2, figsize=(7.05, 5.65), constrained_layout=False)
-		fig.subplots_adjust(left=0.08, right=0.995, bottom=0.115, top=0.955, wspace=0.24, hspace=0.34)
+		fig, axes = plt.subplots(2, 2, figsize=(8.6, 6.1), constrained_layout=False)
+		fig.subplots_adjust(left=0.075, right=0.995, bottom=0.12, top=0.955, wspace=0.32, hspace=0.44)
 		ax_counts, ax_prev = axes[0]
 		ax_cov, ax_overlap = axes[1]
 
@@ -2236,7 +2521,7 @@ def write_high_quality_neuron_flip_coverage(
 			pop_colors = [None, None]
 
 		dir_labels = ["Any flip", "Correct→incorrect", "Incorrect→correct"]
-		dir_tick_labels = [_wrap_label(s, 12) for s in dir_labels]
+		dir_tick_labels = ["Any flip", "Correct→\nincorrect", "Incorrect→\ncorrect"]
 		x = np.arange(len(dir_labels))
 		w = 0.34
 
@@ -2257,29 +2542,36 @@ def write_high_quality_neuron_flip_coverage(
 				lab += f"\n({pct:.1f}%)"
 			_annotate_bar_top(ax_counts, b, lab, fontsize=7.2)
 
-		# B. Prompt-level prevalence of unique flips.
+		# B. Prompt-level prevalence of unique flips. Directional rates use the
+		# eligible baseline subset as denominator when available.
 		all_union = np.asarray([union_any_all, union_c2i_all, union_i2c_all], dtype=float)
 		hq_union = np.asarray([union_any_high, union_c2i_high, union_i2c_high], dtype=float)
-		all_prev = 100.0 * all_union / eval_denom if eval_denom else np.asarray([np.nan] * 3)
-		hq_prev = 100.0 * hq_union / eval_denom if eval_denom else np.asarray([np.nan] * 3)
+		all_prev = np.divide(100.0 * all_union, _prev_denoms, out=np.full(3, np.nan), where=_prev_denoms > 0)
+		hq_prev = np.divide(100.0 * hq_union, _prev_denoms, out=np.full(3, np.nan), where=_prev_denoms > 0)
 		bars_all = ax_prev.bar(x - w/2, all_prev, width=w, label="All", color=pop_colors[0])
 		bars_hq = ax_prev.bar(x + w/2, hq_prev, width=w, label="HQ", color=pop_colors[1])
 		ax_prev.set_xticks(x)
 		ax_prev.set_xticklabels(dir_tick_labels)
-		ax_prev.set_ylabel("Unique flips (%)")
-		ax_prev.set_title("Flip prevalence", pad=4)
+		ax_prev.set_ylabel("Unique flips / eligible points (%)")
+		ax_prev.set_title("Eligible flip prevalence", pad=4)
 		prev_top = np.nanmax(np.concatenate([all_prev, hq_prev])) if np.isfinite(np.concatenate([all_prev, hq_prev])).any() else 1.0
-		ax_prev.set_ylim(0, max(1.0, float(prev_top) * 1.24))
+		ax_prev.set_ylim(0, max(1.0, float(prev_top) * 1.48))
 		ax_prev.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
 		ax_prev.legend(loc="upper right", frameon=False, ncol=2, handlelength=1.0, columnspacing=0.7, borderpad=0.1)
-		for b_l, b_r, cnt_l, cnt_r in zip(bars_all, bars_hq, all_union, hq_union):
+
+		def _prev_label(bar, cnt, den, den_label):
+			if den and den == den:
+				return f"{bar.get_height():.1f}%\n{int(cnt):,}/{int(den):,} {den_label}"
+			return f"{bar.get_height():.1f}%\n{int(cnt):,}"
+
+		for b_l, b_r, cnt_l, cnt_r, den, den_label in zip(bars_all, bars_hq, all_union, hq_union, _prev_denoms, _prev_denom_labels):
 			_annotate_grouped_pair(
 				ax_prev,
 				b_l,
 				b_r,
-				f"{b_l.get_height():.1f}%\n{int(cnt_l)}",
-				f"{b_r.get_height():.1f}%\n{int(cnt_r)}",
-				fontsize=6.4,
+				_prev_label(b_l, cnt_l, den, den_label),
+				_prev_label(b_r, cnt_r, den, den_label),
+				fontsize=6.2,
 			)
 
 		# C. Direct coverage question: how much of all discovered flip behavior is covered by HQ neurons?
@@ -2332,7 +2624,7 @@ def write_high_quality_neuron_flip_coverage(
 		ax_overlap.set_ylabel("Sum / union")
 		ax_overlap.set_title("Overlap", pad=4)
 		overlap_top = np.nanmax(np.concatenate([overlap_all, overlap_hq])) if np.isfinite(np.concatenate([overlap_all, overlap_hq])).any() else 1.0
-		ax_overlap.set_ylim(0, max(1.0, float(overlap_top) * 1.22))
+		ax_overlap.set_ylim(0, max(1.0, float(overlap_top) * 1.35))
 		ax_overlap.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
 		ax_overlap.legend(loc="upper right", frameon=False, ncol=2, handlelength=1.0, columnspacing=0.7, borderpad=0.1)
 
@@ -2607,7 +2899,7 @@ def write_high_quality_neuron_flip_coverage_by_layer(
 
 	return out
 
-def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neurons_sorted, args, stats_dirname: str):
+def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neurons_sorted, args, stats_dirname: str, baseline_metric_col: str = None):
 	if not getattr(args, "summarize_rule_metrics", False) and not getattr(args, "summarize_rule_metrics_only", False):
 		return None
 
@@ -2644,6 +2936,7 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 			stats_dirname=stats_dirname,
 			quality_metric=qual_metric,
 			quality_threshold=qual_thr,
+			baseline_metric_col=baseline_metric_col,
 		)
 
 		write_high_quality_neuron_flip_coverage_by_layer(
@@ -2660,6 +2953,8 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 
 def main():
 	args = parse_args()
+	if bool(getattr(args, "decode_only", False)) and bool(getattr(args, "input_only", False)):
+		raise ValueError("--decode_only and --input_only are mutually exclusive intervention phases")
 	if args.stats_dirname is None:
 		args.stats_dirname = ""
 	set_deterministic(args.seed)
@@ -2667,7 +2962,24 @@ def main():
 	os.makedirs(os.path.join(args.rules_dir, 'stats', args.stats_dirname), exist_ok=True)
 
 	task = resolve_task_spec(args.task_module)
+	if hasattr(task, "configure_runtime"):
+		task.configure_runtime(args)
 	is_answer_positive_fn = task.is_answer_positive
+	answer_semantics_fn = getattr(task, "evaluate_answer_semantics", None)
+	semantic_judge_mode = str(getattr(task, "semantic_judge_mode", "off") or "off")
+	semantic_diagnostics_enabled = callable(answer_semantics_fn) and semantic_judge_mode != 'off'
+	semantic_runtime_config = {
+		"semantic_diagnostics_enabled": bool(semantic_diagnostics_enabled),
+		"semantic_quality_policy": str(getattr(args, "semantic_quality_policy", "none")),
+		"semantic_judge_model": str(getattr(task, "semantic_judge_model", "") or ""),
+		"semantic_judge_mode": semantic_judge_mode,
+		"semantic_judge_cache_path": str(getattr(task, "semantic_judge_cache_path", "") or ""),
+		"semantic_judge_max_tokens": int(getattr(task, "semantic_judge_max_tokens", 0) or 0),
+	}
+	Path(os.path.join(args.rules_dir, 'stats', args.stats_dirname, 'semantic_runtime_config.json')).write_text(
+		json.dumps(semantic_runtime_config, indent=2, ensure_ascii=False),
+		encoding="utf-8",
+	)
 	max_new_tokens = task.MAX_NEW_TOKENS
 	metrics_list = task.DEFAULT_TARGETS
 	main_metric = metrics_list[0]
@@ -2770,7 +3082,7 @@ def main():
 				topk=args.agonist_metric_topk,
 			)
 
-		maybe_summarize_rule_metrics_and_high_quality(scores_stats, neurons, args, stats_dirname)
+		maybe_summarize_rule_metrics_and_high_quality(scores_stats, neurons, args, stats_dirname, baseline_metric_col=main_metric)
 		return
 
 	# ----------------- stats-only mode (no ablations) -----------------
@@ -3109,7 +3421,7 @@ def main():
 		# hooks only depend on neuron+global args (NOT on batch)
 		hooks = build_ablation_hooks(
 			{layer_label: [neuron_id]},
-			last_pos_only=(args.last_pos_only or args.decode_only),
+			last_pos_only=hooks_last_pos_only(args),
 			intervention=args.intervention,
 			mean_activations=mean_activations_all,
 			device=device,
@@ -3127,45 +3439,234 @@ def main():
 	def _flip_cache_path(rules_subdir, layer_key, neuron_id, batch_start):
 		return os.path.join(rules_subdir, f"{layer_key}_{int(neuron_id)}_{batch_start}.pkl")
 
-	def _load_cached_correct(cache_path):
+	def _coerce_cached_answers(value):
+		if value is None:
+			return None
+		if isinstance(value, np.ndarray):
+			value = value.tolist()
+		if isinstance(value, (list, tuple)):
+			return ["" if v is None else str(v) for v in value]
+		return None
+
+	def _coerce_cached_semantics(value, expected_n=None):
+		semantics = {}
+		for k, v in (value or {}).items():
+			arr = np.asarray(v).astype(bool)
+			if expected_n is not None and len(arr) != expected_n:
+				continue
+			semantics[k] = arr
+		return semantics
+
+	def _load_cached_eval(cache_path, rows=None, *, score_from_answers=True):
 		if not os.path.exists(cache_path):
 			return None
 		with open(cache_path, "rb") as f:
-			return pickle.load(f)
+			obj = pickle.load(f)
 
-	def _save_cached_correct(cache_path, arr):
+		expected_n = len(rows) if rows is not None else None
+		payload = {}
+
+		# Current cache schema: {"correct": ..., "answers": ..., "semantics": ...}
+		# Backward compatibility: older dict caches had only "correct"; oldest caches
+		# were raw bool arrays. Those are still usable for flip stats, but cannot be
+		# rescored if correctness/semantic parsing changes because they lack answers.
+		if isinstance(obj, dict):
+			if "correct" not in obj and "answers" not in obj:
+				return None
+			answers = _coerce_cached_answers(obj.get("answers"))
+			if answers is not None:
+				if expected_n is not None and len(answers) != expected_n:
+					return None
+				payload["answers"] = answers
+
+			if "correct" in obj:
+				correct = np.asarray(obj["correct"]).astype(bool)
+				if expected_n is not None and len(correct) != expected_n:
+					return None
+				payload["correct"] = correct
+
+			payload["semantics"] = _coerce_cached_semantics(obj.get("semantics", {}), expected_n)
+		else:
+			correct = np.asarray(obj).astype(bool)
+			if expected_n is not None and len(correct) != expected_n:
+				return None
+			payload["correct"] = correct
+			payload["semantics"] = {}
+
+		answers = payload.get("answers")
+		if rows is not None and answers is not None and score_from_answers:
+			# Generated answers are the expensive part. Re-score them with the current
+			# correctness function by default, so prompt/parser changes do not force
+			# another model generation pass.
+			if not bool(getattr(args, "no_rescore_cached_answers", False)):
+				payload["correct"] = _score_repeated_rows(rows, answers)
+				payload["_correct_rescored_from_answers"] = True
+
+			if semantic_diagnostics_enabled and not payload.get("semantics"):
+				semantics = _semantic_arrays(rows, answers)
+				payload["semantics"] = semantics
+				payload["_semantics_rescored_from_answers"] = bool(semantics)
+
+		if "correct" not in payload:
+			return None
+
+		if semantic_diagnostics_enabled and not payload.get("semantics"):
+			# Missing semantics require model regeneration only for legacy caches that
+			# have no generated answers. If answers are present, the normal load path can
+			# derive semantics from the cached text without generating again.
+			if bool(getattr(args, "recompute_missing_semantic_cache", False)) and answers is None:
+				return None
+			payload["_semantics_missing"] = True
+
+		payload.setdefault("semantics", {})
+		return payload
+
+	def _save_cached_eval(cache_path, correct, semantics=None, answers=None):
 		Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+		payload = {
+			"cache_schema_version": 2,
+			"correct": np.asarray(correct).astype(bool),
+			"semantics": {k: np.asarray(v).astype(bool) for k, v in (semantics or {}).items()},
+		}
+		answers = _coerce_cached_answers(answers)
+		if answers is not None:
+			payload["answers"] = answers
 		with open(cache_path, "wb") as f:
-			pickle.dump(np.asarray(arr).astype(bool), f)
+			pickle.dump(payload, f)
+
+	def _ensure_bool_col(col_name):
+		if col_name not in scores_out.columns:
+			scores_out[col_name] = pd.array([pd.NA] * len(scores_out), dtype="boolean")
 
 	def _ensure_flip_cols(layer_key, neuron_id):
 		col_any = f"flip_{layer_key}_{int(neuron_id)}"
 		col_c2i = f"flip_c2i_{layer_key}_{int(neuron_id)}"
 		col_i2c = f"flip_i2c_{layer_key}_{int(neuron_id)}"
 		for c in (col_any, col_c2i, col_i2c):
-			if c not in scores_out.columns:
-				scores_out[c] = pd.array([pd.NA] * len(scores_out), dtype="boolean")
+			_ensure_bool_col(c)
 		return col_any, col_c2i, col_i2c
 
-	def _write_ablation_flips(layer_key, neuron_id, ablated_correct, batch_baseline_eval, batch_row_pos):
+	def _ensure_semantic_cols(layer_key, neuron_id):
+		cols = {
+			"semantic_wrong": f"semantic_wrong_{layer_key}_{int(neuron_id)}",
+			"semantic_correct": f"semantic_correct_{layer_key}_{int(neuron_id)}",
+			"empty": f"answer_empty_{layer_key}_{int(neuron_id)}",
+			"unparseable": f"answer_unparseable_{layer_key}_{int(neuron_id)}",
+			"flip_semantic_wrong": f"flip_semantic_wrong_{layer_key}_{int(neuron_id)}",
+			"flip_empty": f"flip_empty_{layer_key}_{int(neuron_id)}",
+			"flip_unparseable": f"flip_unparseable_{layer_key}_{int(neuron_id)}",
+			"judge_used": f"answer_judge_used_{layer_key}_{int(neuron_id)}",
+			"judge_parse_success": f"answer_judge_parse_success_{layer_key}_{int(neuron_id)}",
+		}
+		for c in cols.values():
+			_ensure_bool_col(c)
+		return cols
+
+	def _semantic_arrays(rows, answers):
+		if not semantic_diagnostics_enabled:
+			return {}
+		try:
+			records = answer_semantics_fn(rows, answers)
+		except Exception as e:
+			print(f"[Semantics] Task semantic evaluator failed; disabling diagnostics for this batch: {e}")
+			return {}
+		records = list(records or [])
+		if len(records) != len(answers):
+			records = (records + [{} for _ in range(len(answers))])[:len(answers)]
+
+		def _as_bool(value, default=False):
+			if value is None:
+				return bool(default)
+			if isinstance(value, (bool, np.bool_)):
+				return bool(value)
+			if isinstance(value, (int, float)) and not (isinstance(value, float) and np.isnan(value)):
+				return bool(value)
+			text = str(value).strip().lower()
+			if text in {"true", "1", "yes", "y"}:
+				return True
+			if text in {"false", "0", "no", "n", ""}:
+				return False
+			return bool(default)
+
+		empty = np.asarray([_as_bool((r or {}).get("answer_empty", False)) for r in records], dtype=bool)
+		parse_success = np.asarray([_as_bool((r or {}).get("answer_parse_success", False)) for r in records], dtype=bool)
+		sem_correct = np.asarray([_as_bool((r or {}).get("answer_semantically_correct", False)) for r in records], dtype=bool)
+		sem_wrong = np.asarray([_as_bool((r or {}).get("answer_semantically_wrong", False)) for r in records], dtype=bool)
+		unparseable = (~parse_success) | empty
+		judge_used = np.asarray([_as_bool((r or {}).get("answer_judge_enabled", False)) for r in records], dtype=bool)
+		judge_parse_success = np.asarray([_as_bool((r or {}).get("answer_judge_parse_success", False)) for r in records], dtype=bool)
+		return {
+			"answer_empty": empty,
+			"answer_parse_success": parse_success,
+			"answer_unparseable": unparseable,
+			"answer_semantically_correct": sem_correct,
+			"answer_semantically_wrong": sem_wrong,
+			"answer_judge_enabled": judge_used,
+			"answer_judge_parse_success": judge_parse_success,
+		}
+
+	def _write_ablation_flips(layer_key, neuron_id, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=None):
 		col_any, col_c2i, col_i2c = _ensure_flip_cols(layer_key, neuron_id)
-		ablated_correct = np.asarray(ablated_correct).astype(bool)
-		flip_any = (ablated_correct != batch_baseline_eval)
-		flip_c2i = (batch_baseline_eval == True) & (ablated_correct == False)
-		flip_i2c = (batch_baseline_eval == False) & (ablated_correct == True)
+		abl = np.asarray(ablated_correct).astype(bool)
+		flip_any = (abl != batch_baseline_eval)
+		flip_c2i = (batch_baseline_eval == True) & (abl == False)
+		flip_i2c = (batch_baseline_eval == False) & (abl == True)
 		scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(col_any)] = flip_any.astype(bool)
 		scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(col_c2i)] = flip_c2i.astype(bool)
 		scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(col_i2c)] = flip_i2c.astype(bool)
 
+		semantics = semantics or {}
+		if semantics:
+			cols = _ensure_semantic_cols(layer_key, neuron_id)
+			sem_wrong = np.asarray(semantics.get("answer_semantically_wrong", np.zeros_like(flip_any))).astype(bool)
+			sem_correct = np.asarray(semantics.get("answer_semantically_correct", np.zeros_like(flip_any))).astype(bool)
+			empty = np.asarray(semantics.get("answer_empty", np.zeros_like(flip_any))).astype(bool)
+			unparseable = np.asarray(semantics.get("answer_unparseable", np.zeros_like(flip_any))).astype(bool)
+			judge_used = np.asarray(semantics.get("answer_judge_enabled", np.zeros_like(flip_any))).astype(bool)
+			judge_parse_success = np.asarray(semantics.get("answer_judge_parse_success", np.zeros_like(flip_any))).astype(bool)
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["semantic_wrong"])] = sem_wrong
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["semantic_correct"])] = sem_correct
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["empty"])] = empty
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["unparseable"])] = unparseable
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["judge_used"])] = judge_used
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["judge_parse_success"])] = judge_parse_success
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["flip_semantic_wrong"])] = (flip_any & sem_wrong)
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["flip_empty"])] = (flip_any & empty)
+			scores_out.iloc[batch_row_pos, scores_out.columns.get_loc(cols["flip_unparseable"])] = (flip_any & unparseable)
+
 	def _score_repeated_rows(rows, answers):
 		return (np.asarray(is_answer_positive_fn(rows, answers), dtype=float) > 0.5).astype(bool)
 
+	def _score_rows_with_semantics(rows, answers):
+		return _score_repeated_rows(rows, answers), _semantic_arrays(rows, answers)
+
+	def _split_flat_eval_by_spec(acc_flat, sem_flat, answers_flat, B, K):
+		acc_matrix = np.asarray(acc_flat).astype(bool).reshape(B, K).T  # [K, B]
+		answers_matrix = np.asarray(["" if a is None else str(a) for a in answers_flat], dtype=object).reshape(B, K).T
+		sem_by_j = []
+		answers_by_j = []
+		for j in range(K):
+			sem_j = {}
+			for key, arr in (sem_flat or {}).items():
+				sem_j[key] = np.asarray(arr).astype(bool).reshape(B, K).T[j]
+			sem_by_j.append(sem_j)
+			answers_by_j.append([str(a) for a in answers_matrix[j].tolist()])
+		return acc_matrix, sem_by_j, answers_by_j
+
+	def _empty_eval_store(chunk_specs, n_rows):
+		acc_by_spec = {}
+		sem_by_spec = {}
+		answers_by_spec = {}
+		for i, (layer_label_i, neuron_id_i, *_rest) in enumerate(chunk_specs):
+			key = (layer_label_i, int(neuron_id_i), int(i))
+			acc_by_spec[key] = np.zeros(n_rows, dtype=bool)
+			sem_by_spec[key] = {}
+			answers_by_spec[key] = [""] * n_rows
+		return acc_by_spec, sem_by_spec, answers_by_spec
+
 	def _compute_rowwise_chunk_decode_only(layer_label, chunk_specs, prefix_batches, batch_ranges, batch_prompt):
 		K = len(chunk_specs)
-		acc_by_spec = {
-			(layer_label_i, int(neuron_id_i), int(i)): np.zeros(len(batch_prompt), dtype=bool)
-			for i, (layer_label_i, neuron_id_i, *_rest) in enumerate(chunk_specs)
-		}
+		acc_by_spec, sem_by_spec, answers_by_spec = _empty_eval_store(chunk_specs, len(batch_prompt))
 		chunk_ids = [int(spec[1]) for spec in chunk_specs]
 
 		for prefix, (b_start, b_end) in zip(prefix_batches, batch_ranges):
@@ -3178,7 +3679,7 @@ def main():
 			hooks = build_rowwise_ablation_hooks(
 				layer_label,
 				row_neuron_ids,
-				last_pos_only=(args.last_pos_only or args.decode_only),
+				last_pos_only=hooks_last_pos_only(args),
 				intervention=args.intervention,
 				mean_activations=mean_activations_all,
 				device=device,
@@ -3190,13 +3691,25 @@ def main():
 				clone_kv_cache_tensors=False,
 			)
 			repeated_rows = [row for row in prefix_rows for _ in range(K)]
-			acc_flat = _score_repeated_rows(repeated_rows, answers)
-			acc_matrix = acc_flat.reshape(B, K).T  # [K, B]
+			acc_flat, sem_flat = _score_rows_with_semantics(repeated_rows, answers)
+			acc_matrix, sem_list, answers_list = _split_flat_eval_by_spec(acc_flat, sem_flat, answers, B, K)
 			for j, spec in enumerate(chunk_specs):
 				key = (spec[0], int(spec[1]), int(j))
 				acc_by_spec[key][b_start:b_end] = acc_matrix[j]
+				for sem_key, arr in sem_list[j].items():
+					if sem_key not in sem_by_spec[key]:
+						sem_by_spec[key][sem_key] = np.zeros(len(batch_prompt), dtype=bool)
+					sem_by_spec[key][sem_key][b_start:b_end] = arr
+				answers_by_spec[key][b_start:b_end] = answers_list[j]
 
-		return [acc_by_spec[(spec[0], int(spec[1]), int(j))] for j, spec in enumerate(chunk_specs)]
+		return [
+			(
+				acc_by_spec[(spec[0], int(spec[1]), int(j))],
+				sem_by_spec[(spec[0], int(spec[1]), int(j))],
+				answers_by_spec[(spec[0], int(spec[1]), int(j))],
+			)
+			for j, spec in enumerate(chunk_specs)
+		]
 
 	def _compute_rowwise_chunk_prefill_decode(layer_label, chunk_specs, batch_prompt):
 		K = len(chunk_specs)
@@ -3206,7 +3719,7 @@ def main():
 		hooks = build_rowwise_ablation_hooks(
 			layer_label,
 			row_neuron_ids,
-			last_pos_only=(args.last_pos_only or args.decode_only),
+			last_pos_only=hooks_last_pos_only(args),
 			intervention=args.intervention,
 			mean_activations=mean_activations_all,
 			device=device,
@@ -3218,8 +3731,39 @@ def main():
 			do_sample=False,
 			fwd_hooks=hooks,
 		)
-		acc_flat = _score_repeated_rows(repeated_rows, answers)
-		return [acc_flat.reshape(len(batch_prompt), K).T[j] for j in range(K)]
+		acc_flat, sem_flat = _score_rows_with_semantics(repeated_rows, answers)
+		acc_matrix, sem_list, answers_list = _split_flat_eval_by_spec(acc_flat, sem_flat, answers, len(batch_prompt), K)
+		return [(acc_matrix[j], sem_list[j], answers_list[j]) for j in range(K)]
+
+	def _compute_rowwise_chunk_input_only(layer_label, chunk_specs, batch_prompt):
+		K = len(chunk_specs)
+		chunk_ids = [int(spec[1]) for spec in chunk_specs]
+		repeated_rows = [row for row in batch_prompt for _ in range(K)]
+		row_neuron_ids = chunk_ids * len(batch_prompt)
+		hooks = build_rowwise_ablation_hooks(
+			layer_label,
+			row_neuron_ids,
+			last_pos_only=hooks_last_pos_only(args),
+			intervention=args.intervention,
+			mean_activations=mean_activations_all,
+			device=device,
+		)
+		repeated_prompts = [str(row[prompt_col]) for row in repeated_rows]
+		prefix = model.prefill_prefix_batch(
+			repeated_prompts,
+			max_new_tokens=max_new_tokens,
+			use_kv_cache=True,
+			fwd_hooks=hooks,
+		)
+		answers = model.generate_from_prefix_cache(
+			prefix,
+			fwd_hooks=None,
+			stop_at_eos=True,
+			clone_kv_cache_tensors=False,
+		)
+		acc_flat, sem_flat = _score_rows_with_semantics(repeated_rows, answers)
+		acc_matrix, sem_list, answers_list = _split_flat_eval_by_spec(acc_flat, sem_flat, answers, len(batch_prompt), K)
+		return [(acc_matrix[j], sem_list[j], answers_list[j]) for j in range(K)]
 
 	for start in tqdm(range(0, len(eval_prompts), batch_size), total=(len(eval_prompts) + batch_size - 1)//batch_size, desc="Prefix batches"):
 		end = min(start + batch_size, len(eval_prompts))
@@ -3241,7 +3785,7 @@ def main():
 			for layer_label, neuron_id, _baseline_subset, _layer_key, rules_subdir, _hooks, _cache_policy_tag in neuron_specs:
 				safe_layer_key = _safe_layer_label(layer_label)
 				cache_path = _flip_cache_path(rules_subdir, safe_layer_key, neuron_id, start)
-				if not os.path.exists(cache_path):
+				if _load_cached_eval(cache_path, batch_prompt, score_from_answers=False) is None:
 					need_prefill = True
 					break
 
@@ -3259,10 +3803,12 @@ def main():
 			for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, hooks, _cache_policy_tag in tqdm(neuron_specs, desc="Neurons" if show_batch_tqdm else None):
 				layer_key = _safe_layer_label(layer_label)
 				_ensure_flip_cols(layer_key, neuron_id)
+				cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start)
 
-				def _compute_ablated_correct():
+				cached_eval = _load_cached_eval(cache_path, batch_prompt)
+				if cached_eval is None:
 					if args.decode_only:
-						_, acc = get_correctness_cached_by_prefix_batches(
+						_, acc, answers = get_correctness_cached_by_prefix_batches(
 							model,
 							batch_prompt,
 							is_answer_positive_fn,
@@ -3270,9 +3816,25 @@ def main():
 							prefix_batches,
 							batch_ranges,
 							hooks=hooks,
+							return_answers=True,
 						)
+					elif args.input_only:
+						batch_prompts = [str(ex[prompt_col]) for ex in batch_prompt]
+						prefix = model.prefill_prefix_batch(
+							batch_prompts,
+							max_new_tokens=max_new_tokens,
+							use_kv_cache=True,
+							fwd_hooks=hooks,
+						)
+						answers = model.generate_from_prefix_cache(
+							prefix,
+							fwd_hooks=None,
+							stop_at_eos=True,
+							clone_kv_cache_tensors=False,
+						)
+						acc = _score_repeated_rows(batch_prompt, answers)
 					else:
-						_, acc = get_correctness(
+						_, acc, answers = get_correctness(
 							model,
 							batch_prompt,
 							is_answer_positive_fn,
@@ -3281,16 +3843,16 @@ def main():
 							hooks=hooks,
 							batch_size=batch_size,
 							tqdm_desc=None,
+							return_answers=True,
 						)
-					return (np.asarray(acc) > 0.5).astype(bool)
+					ablated_correct = (np.asarray(acc) > 0.5).astype(bool)
+					semantics = _semantic_arrays(batch_prompt, answers)
+					_save_cached_eval(cache_path, ablated_correct, semantics, answers=answers)
+				else:
+					ablated_correct = np.asarray(cached_eval.get("correct", [])).astype(bool)
+					semantics = cached_eval.get("semantics", {}) or {}
 
-				ablated_correct = load_or_create_cache(
-					_flip_cache_path(rules_subdir, layer_key, neuron_id, start),
-					_compute_ablated_correct,
-					quiet=True,
-				)
-
-				_write_ablation_flips(layer_key, neuron_id, ablated_correct, batch_baseline_eval, batch_row_pos)
+				_write_ablation_flips(layer_key, neuron_id, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=semantics)
 			continue
 
 		# Row-wise multi-neuron path. Each synthetic row ablates exactly one neuron,
@@ -3309,7 +3871,7 @@ def main():
 					layer_key_i = _safe_layer_label(layer_label_i)
 					_ensure_flip_cols(layer_key_i, neuron_id_i)
 					cache_path = _flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start)
-					cached = _load_cached_correct(cache_path)
+					cached = _load_cached_eval(cache_path, batch_prompt)
 					cached_or_none.append(cached)
 					if cached is None:
 						compute_specs.append(spec)
@@ -3326,24 +3888,29 @@ def main():
 								batch_size=batch_size,
 							)
 						computed_list = _compute_rowwise_chunk_decode_only(layer_label, compute_specs, prefix_batches, batch_ranges, batch_prompt)
+					elif args.input_only:
+						computed_list = _compute_rowwise_chunk_input_only(layer_label, compute_specs, batch_prompt)
 					else:
 						computed_list = _compute_rowwise_chunk_prefill_decode(layer_label, compute_specs, batch_prompt)
 
-					for spec, arr in zip(compute_specs, computed_list):
+					for spec, (arr, semantics, answers_j) in zip(compute_specs, computed_list):
 						layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
 						layer_key_i = _safe_layer_label(layer_label_i)
 						arr = np.asarray(arr).astype(bool)
-						computed_by_key[(str(layer_label_i), int(neuron_id_i))] = arr
-						_save_cached_correct(_flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start), arr)
+						semantics = semantics or {}
+						computed_by_key[(str(layer_label_i), int(neuron_id_i))] = {"correct": arr, "semantics": semantics, "answers": answers_j}
+						_save_cached_eval(_flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start), arr, semantics, answers=answers_j)
 
 				for spec, cached in zip(chunk_specs_all, cached_or_none):
 					layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, _rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
 					layer_key_i = _safe_layer_label(layer_label_i)
 					if cached is None:
-						ablated_correct = computed_by_key[(str(layer_label_i), int(neuron_id_i))]
+						payload = computed_by_key[(str(layer_label_i), int(neuron_id_i))]
 					else:
-						ablated_correct = np.asarray(cached).astype(bool)
-					_write_ablation_flips(layer_key_i, neuron_id_i, ablated_correct, batch_baseline_eval, batch_row_pos)
+						payload = cached
+					ablated_correct = np.asarray(payload.get("correct", [])).astype(bool)
+					semantics = payload.get("semantics", {}) or {}
+					_write_ablation_flips(layer_key_i, neuron_id_i, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=semantics)
 
 	scores_out.to_csv(os.path.join(args.rules_dir, 'stats', args.stats_dirname, f"scores.csv"), index=False)
 
@@ -3374,6 +3941,30 @@ def main():
 			flip_stats_df=flip_stats_df,
 			topk=args.agonist_metric_topk,
 		)
+
+
+	def _semantic_quality_filter_col(layer_key, neuron_id):
+		col = f"semantic_wrong_{layer_key}_{int(neuron_id)}"
+		return col if col in scores_out.columns else None
+
+	def _filter_semantically_invalid_rows(df_in, layer_key, neuron_id, *, split_name: str):
+		if df_in is None or df_in.empty:
+			return df_in, {"split": split_name, "available": False, "removed": 0, "remaining": 0}
+		if str(getattr(args, "semantic_quality_policy", "none")) != "filter":
+			return df_in, {"split": split_name, "available": False, "policy": str(getattr(args, "semantic_quality_policy", "none")), "removed": 0, "remaining": int(len(df_in))}
+		col = _semantic_quality_filter_col(layer_key, neuron_id)
+		if not col:
+			return df_in, {"split": split_name, "available": False, "removed": 0, "remaining": int(len(df_in))}
+		wrong = df_in[col].fillna(False).astype(bool)
+		filtered = df_in.loc[~wrong].copy()
+		return filtered, {
+			"split": split_name,
+			"available": True,
+			"semantic_wrong_col": col,
+			"removed": int(wrong.sum()),
+			"remaining": int(len(filtered)),
+			"original": int(len(df_in)),
+		}
 
 	# ----------------- per-neuron rule extraction -----------------
 	if args.extract_rules:
@@ -3419,6 +4010,17 @@ def main():
 					if eval_df is not None and ("_sampled" in eval_df.columns):
 						eval_df = eval_df.loc[eval_df["_sampled"].astype(bool)].copy()
 
+				# For cognitive-bias tasks, remove ablated datapoints whose generated answer is
+				# semantically invalid before fitting/evaluating rules. This prevents high-MCC
+				# rules from being driven by neurons that merely create empty, unparseable, or
+				# semantically wrong outputs rather than meaningful bias flips.
+				filter_records = []
+				rules_df, rec = _filter_semantically_invalid_rows(rules_df, layer_key, neuron_id, split_name="train")
+				filter_records.append(rec)
+				if eval_df is not None:
+					eval_df, rec = _filter_semantically_invalid_rows(eval_df, layer_key, neuron_id, split_name="eval")
+					filter_records.append(rec)
+
 				# Skip targets that are constant or too imbalanced to learn/plot reliably (CHECK ON TRAIN ONLY).
 				def _ok_target(df, t, min_pos=2, min_neg=2):
 					y = pd.to_numeric(df[t], errors="coerce").dropna()
@@ -3433,6 +4035,10 @@ def main():
 				if targets_this:
 					# Keep a shared per-neuron directory; signature gating decides whether reuse is valid.
 					os.makedirs(rules_subdir, exist_ok=True)
+					Path(os.path.join(rules_subdir, "semantic_filtering.json")).write_text(
+						json.dumps({"policy": str(getattr(args, "semantic_quality_policy", "none")), "records": filter_records}, indent=2, ensure_ascii=False),
+						encoding="utf-8",
+					)
 					signature = build_rule_extraction_signature(
 						rules_df=rules_df,
 						input_features=input_features,
@@ -3476,7 +4082,7 @@ def main():
 	# ----------------- rule metrics summaries (paper-ready) -----------------
 	# (No extra ablations; uses existing rule_combo_*.csv and flip columns in scores_out)
 	stats_dirname2 = args.stats_dirname if args.stats_dirname is not None else ""
-	maybe_summarize_rule_metrics_and_high_quality(scores_out, neurons, args, stats_dirname2)
+	maybe_summarize_rule_metrics_and_high_quality(scores_out, neurons, args, stats_dirname2, baseline_metric_col=main_metric)
 
 if __name__ == "__main__":
 	main()

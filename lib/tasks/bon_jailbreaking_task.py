@@ -195,6 +195,9 @@ def f_sigma(prompt, info):
 		"""
 		Batch path: takes a batch of prompt_data dicts and a matching list of response texts,
 		returns a list of booleans (one per example).
+
+		Fast path: cached/prefix-matched outputs reuse the cached label without calling
+		the classifier. Prefix matching handles short generation-length differences.
 		"""
 		assert len(prompt_batch) > 0 and len(response_texts) > 0, f"len(prompt_batch) = {len(prompt_batch)} and len(response_texts) = {len(response_texts)}"
 		if len(prompt_batch) != len(response_texts):
@@ -203,36 +206,56 @@ def f_sigma(prompt, info):
 				f"({len(prompt_batch)} != {len(response_texts)})"
 			)
 
-		behaviors = [pd["original_prompt"] for pd in prompt_batch]
+		results_list = [None] * len(prompt_batch)
+		to_classify_indices = []
+		to_classify_behaviors = []
+		to_classify_responses = []
 
-		clf_outs = classify_jailbreaks_batch(
-			behaviors=behaviors,
-			responses=response_texts,
-			classifier_model=MODEL,
-			temperature=0.0,
-		)
-		assert len(clf_outs) == len(prompt_batch), f"{len(clf_outs)} == {len(prompt_batch)}"
-		# print(clf_outs)
+		for i, (prompt_data, response_text) in enumerate(zip(prompt_batch, response_texts)):
+			cached_output = prompt_data.get(self.DEFAULT_OUTPUT, None)
 
-		results_list = []
-		for p, r, o in zip(prompt_batch, response_texts, clf_outs):
-			# print(p[self.DEFAULT_TARGETS[0]], is_jailbroken_from_classifier_output(o))
-			# print(p[self.DEFAULT_OUTPUT], r, p.get(self.DEFAULT_OUTPUT,None)==r)
-			if p.get(self.DEFAULT_OUTPUT,None) == r:
-				classification_output = p[self.DEFAULT_TARGETS[0]]
+			same_output = cached_output == response_text
+			if not same_output and cached_output is not None and response_text is not None:
+				if not isinstance(cached_output, str):
+					cached_output = str(cached_output)
+				if not isinstance(response_text, str):
+					response_text = str(response_text)
+
+				if cached_output == response_text:
+					same_output = True
+				else:
+					cached_stripped = cached_output.strip()
+					response_stripped = response_text.strip()
+					if cached_stripped == response_stripped:
+						same_output = True
+					elif cached_stripped and response_stripped:
+						same_output = (
+							cached_stripped.startswith(response_stripped)
+							or response_stripped.startswith(cached_stripped)
+						)
+
+			if same_output:
+				classification_output = prompt_data[self.DEFAULT_TARGETS[0]]
 				assert classification_output is not None
-				results_list.append(p[self.DEFAULT_TARGETS[0]])
+				results_list[i] = classification_output
 			else:
-				classification_output = is_jailbroken_from_classifier_output(o)
-				assert classification_output is not None
-				results_list.append(classification_output)
+				to_classify_indices.append(i)
+				to_classify_behaviors.append(prompt_data["original_prompt"])
+				to_classify_responses.append(response_text)
 
-		# results_list = [
-		# 	p[self.DEFAULT_TARGETS[0]]
-		# 	if p.get(self.DEFAULT_OUTPUT,None) == r else
-		# 	is_jailbroken_from_classifier_output(o)
-		# 	for p, r, o in zip(prompt_batch, response_texts, clf_outs)
-		# ]
+		if to_classify_indices:
+			clf_outs = classify_jailbreaks_batch(
+				behaviors=to_classify_behaviors,
+				responses=to_classify_responses,
+				classifier_model=MODEL,
+				temperature=0.0,
+			)
+			assert len(clf_outs) == len(to_classify_indices), f"{len(clf_outs)} == {len(to_classify_indices)}"
+
+			for idx, clf_output in zip(to_classify_indices, clf_outs):
+				classification_output = is_jailbroken_from_classifier_output(clf_output)
+				assert classification_output is not None
+				results_list[idx] = classification_output
 
 		return results_list
 
