@@ -9,8 +9,7 @@ import json
 from more_itertools import unique_everseen
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier, RandomForestRegressor, RandomForestClassifier
-from sklearn.linear_model import LassoCV, Lasso, LogisticRegressionCV
+from sklearn.linear_model import LassoCV, Lasso
 from functools import reduce
 from tqdm import tqdm
 import math
@@ -21,25 +20,20 @@ from sklearn.base import TransformerMixin
 from sklearn.utils import check_array
 from sklearn.utils.validation import validate_data, _check_sample_weight
 from sklearn.linear_model import enet_path as _enet_path_base
-from sklearn.linear_model import lasso_path as _lasso_path_base
-from sklearn.linear_model._coordinate_descent import _pre_fit, _set_order, _alpha_grid, cd_fast
-from sklearn.utils.validation import check_random_state
+from sklearn.linear_model._coordinate_descent import _pre_fit, _set_order
 # from scipy import sparse
 
-from sklearn.metrics import matthews_corrcoef, mean_squared_error
-from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy import sparse
 
-from rulefit.rulefit import RuleFit, Winsorizer, FriedScale
+from rulefit.rulefit import Winsorizer, FriedScale
 
 from collections import defaultdict
 from xgboost import XGBRegressor, XGBClassifier
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
 
-from numba import jit, njit
-from numba import int32, int64, float64, optional, types
+from numba import njit
+from numba import int32, float64, optional, types
 from numba.experimental import jitclass
-from numba.typed import List, Dict
+from numba.typed import List
 
 @njit
 def float_to_str(value, n_decimals=6):
@@ -1002,7 +996,22 @@ class RuleSHAP(BaseEstimator, TransformerMixin):
 
 			# --- store training activations & labels for per-rule metrics ---
 			self._X_train = X
-			self._Z_train = (X_rules > 0).astype(np.int8)  # [n_samples, n_rules]
+			self._Z_train = X_rules.astype(np.uint8, copy=False)  # [n_samples, n_rules]
+
+		# Stage-7 calls RuleSHAP with compute_sparsity_coef=False.  In that mode
+		# downstream code only needs the tree rules and cached rule activations;
+		# building the dense linear/LASSO design matrix is pure memory overhead.
+		if not self.compute_sparsity_coef_:
+			self.lscv = None
+			self.coef_ = None
+			self.intercept_ = None
+			y_arr = np.asarray(y).reshape(-1).astype(np.float64)
+			if np.isscalar(sample_weight):
+				sw = np.full_like(y_arr, float(sample_weight), dtype=np.float64)
+			else:
+				sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+			self._y_mean_ = float(np.average(y_arr, weights=sw))
+			return self
 
 		# standardise linear variables if requested (for regression model only)
 		if 'l' in self.model_type:
@@ -1033,21 +1042,6 @@ class RuleSHAP(BaseEstimator, TransformerMixin):
 				X_concat = np.concatenate((X_concat, X_rules), axis=1)
 				if shap_weights is not None:
 					concat_shap_weights = np.concatenate((concat_shap_weights, rules_shap_weights))
-
-		# ---- skip LASSO if compute_sparsity_coef is False ----
-		if not self.compute_sparsity_coef_:
-			self.lscv = None
-			self.coef_ = None
-			self.intercept_ = None
-
-			# baseline fallback for linear-only predict() if needed
-			y_arr = np.asarray(y).reshape(-1).astype(np.float64)
-			if np.isscalar(sample_weight):
-				sw = np.full_like(y_arr, float(sample_weight), dtype=np.float64)
-			else:
-				sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
-			self._y_mean_ = float(np.average(y_arr, weights=sw))
-			return self
 
 		# fit Lasso (unchanged)
 		if self.Cs is None:

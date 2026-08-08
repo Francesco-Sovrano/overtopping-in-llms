@@ -8,8 +8,8 @@ from transformer_lens import HookedTransformer
 
 from tqdm import tqdm
 
-from .utils import forward_no_cache_optional, tokenize_plus, tokenize_pairs_same_width, make_hooks_and_matrices, compute_mean_activations, model_device_expr, adapt_means_to_batch, infer_decode_pos_mask, apply_decode_mask_inplace
-from .evaluate import evaluate_graph, evaluate_baseline, backprop_no_param_grads, clean_memory_cache
+from .utils import tokenize_plus, tokenize_pairs_same_width, make_hooks_and_matrices, compute_mean_activations, model_device_expr, infer_decode_pos_mask, apply_decode_mask_inplace
+from .evaluate import evaluate_graph, evaluate_baseline, backprop_no_param_grads
 from .graph import Graph
 
 

@@ -639,7 +639,7 @@ class Graph:
 		# Turn on all REAL edges whose destination is one of the selected nodes
 		self.in_graph |= (self.real_edge_mask & dst_mask.unsqueeze(0))        # [n_forward, n_backward]
 
-	def _rank_indices_1d(self, scores, valid_mask, n, *, absolute = True):
+	def _rank_indices_1d(self, scores, valid_mask, n, *, absolute = True, include_zero_scores = False):
 		"""
 		Shared 1D ranking helper.
 
@@ -647,6 +647,7 @@ class Graph:
 		valid_mask: bool tensor, same shape as scores; True = part of population
 		n:          requested top-n
 		absolute:   rank by |score| if True, else by score
+		include_zero_scores: whether exact zero scores are eligible for top-N selection
 
 		Returns a dict with:
 			- idxs          : 1D LongTensor of selected flat indices (len <= n)
@@ -676,9 +677,8 @@ class Graph:
 
 		considered = scores_flat[valid_flat]
 		finite_mask = torch.isfinite(considered)
-		nonzero_mask = considered != 0
-		finite_nonzero_mask = finite_mask & nonzero_mask
-		num_scored = int(finite_nonzero_mask.sum().item())
+		eligible_mask = finite_mask if include_zero_scores else (finite_mask & (considered != 0))
+		num_scored = int(eligible_mask.sum().item())
 
 		if num_scored == 0:
 			return {
@@ -690,16 +690,17 @@ class Graph:
 				"threshold": None,
 			}
 
-		cfinite = considered[finite_nonzero_mask]
-		range_vals = cfinite.abs() if absolute else cfinite
+		eligible_scores = considered[eligible_mask]
+		range_vals = eligible_scores.abs() if absolute else eligible_scores
 		score_range = (float(range_vals.min().item()), float(range_vals.max().item()))
 
-		# ranking tensor – only finite, nonzero values are eligible
+		# ranking tensor – only eligible values are considered.
+		# By default, exact zeros are excluded to preserve historical behavior.
 		rank = considered.clone()
-		rank[~finite_nonzero_mask] = 0.0
+		rank[~eligible_mask] = 0.0
 		if absolute:
 			rank = rank.abs()
-		rank[~finite_nonzero_mask] = float('-inf')
+		rank[~eligible_mask] = float('-inf')
 
 		k = min(int(n), num_scored)
 		_, local_idxs = torch.topk(rank, k=k, largest=True, sorted=True)
@@ -760,7 +761,7 @@ class Graph:
 
 		return include
 
-	def get_topn(self, n, level: Literal['edge', 'node', 'neuron'] = 'node', absolute = True, include_special = False, return_scores = False, return_metadata = False):
+	def get_topn(self, n, level: Literal['edge', 'node', 'neuron'] = 'node', absolute = True, include_special = False, return_scores = False, return_metadata = False, include_zero_scores = False):
 		"""
 		Return the top-n components by score WITHOUT mutating the graph.
 
@@ -772,6 +773,7 @@ class Graph:
 		include_special: include 'input' and 'logits' in node/neuron results.
 		return_scores:   when True, return (identifier, float_score) tuples.
 		return_metadata: when True, also return a metadata dict as a second value.
+		include_zero_scores: when True, finite exact-zero scores can be selected.
 		"""
 		if level not in {'edge', 'node', 'neuron'}:
 			raise ValueError(f"Invalid level: {level}")
@@ -790,6 +792,7 @@ class Graph:
 			"threshold": None,
 			"empty_reason": None,
 			"indices": [],
+			"include_zero_scores": bool(include_zero_scores),
 		}
 		meta["d_model"] = int(self.cfg.get("d_model")) if self.cfg.get("d_model") is not None else None
 
@@ -807,7 +810,7 @@ class Graph:
 			scores = self.scores
 			valid_mask = self.real_edge_mask
 
-			info = self._rank_indices_1d(scores, valid_mask, n, absolute=absolute)
+			info = self._rank_indices_1d(scores, valid_mask, n, absolute=absolute, include_zero_scores=include_zero_scores)
 
 			meta["total_entities"] = info["total_entities"]
 			meta["num_considered"] = info["num_considered"]
@@ -859,7 +862,7 @@ class Graph:
 					continue
 				valid_mask[i] = True
 
-			info = self._rank_indices_1d(scores, valid_mask, n, absolute=absolute)
+			info = self._rank_indices_1d(scores, valid_mask, n, absolute=absolute, include_zero_scores=include_zero_scores)
 
 			meta["num_considered"] = info["num_considered"]
 			meta["num_scored"] = info["num_scored"]
@@ -908,7 +911,7 @@ class Graph:
 				if name in ("input", "logits"):
 					valid_mask[i, :] = False
 
-		info = self._rank_indices_1d(ns, valid_mask, n, absolute=absolute)
+		info = self._rank_indices_1d(ns, valid_mask, n, absolute=absolute, include_zero_scores=include_zero_scores)
 
 		meta["num_considered"] = info["num_considered"]
 		meta["num_scored"] = info["num_scored"]
@@ -946,7 +949,7 @@ class Graph:
 		meta["neurons"] = mlp_neurons_dict
 		return _finish(out)
 	
-	def apply_topn(self, n, absolute = True, level: Literal['edge', 'node', 'neuron'] = 'node', reset = True, prune = True):
+	def apply_topn(self, n, absolute = True, level: Literal['edge', 'node', 'neuron'] = 'node', reset = True, prune = True, include_zero_scores = False):
 		"""
 		Sets the graph to contain only the top-n components.
 		"""
@@ -961,6 +964,7 @@ class Graph:
 				valid_mask=scored_neurons,
 				n=n,
 				absolute=absolute,
+				include_zero_scores=include_zero_scores,
 			)
 			idxs = info["idxs"]
 
@@ -991,6 +995,7 @@ class Graph:
 				valid_mask=scored_nodes,
 				n=n,
 				absolute=absolute,
+				include_zero_scores=include_zero_scores,
 			)
 			idxs = info["idxs"]
 
@@ -1020,6 +1025,7 @@ class Graph:
 				valid_mask=valid_edges,
 				n=n,
 				absolute=absolute,
+				include_zero_scores=include_zero_scores,
 			)
 			idxs = info["idxs"]
 

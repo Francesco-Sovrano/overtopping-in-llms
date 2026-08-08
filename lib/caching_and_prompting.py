@@ -21,14 +21,10 @@ import copy
 import ollama
 import openai
 from groq import Groq
-
-import csv
-import random
-from collections import defaultdict
+import re
 
 import numpy as np
 import torch
-from torch.nn.utils.rnn import pad_sequence
 
 def set_deterministic(seed=1337):
 	if seed is None:
@@ -239,7 +235,7 @@ def instruct_model(prompts, model='llama3.1', api_key=None, reasoning_effort='no
 		base_url = "https://api.openai.com/v1"
 		parallelise = True
 		return instruct_openai_model(prompts, api_key=api_key, model=model, base_url=base_url, parallelise=parallelise, **kwargs)
-	elif model in ['qwen/qwen3-32b', 'meta-llama/llama-4-scout-17b-16e-instruct']:
+	elif model in ['qwen/qwen3.6-27b', 'qwen/qwen3-32b', 'meta-llama/llama-4-scout-17b-16e-instruct']:
 		api_key = api_key or os.getenv('GROQ_API_KEY', '')
 		# base_url = "https://api.groq.com/openai/v1"
 		parallelise = True
@@ -250,75 +246,245 @@ def instruct_model(prompts, model='llama3.1', api_key=None, reasoning_effort='no
 		parallelise = False
 		return instruct_ollama_model(prompts, api_key=api_key, model=model, base_url=base_url, parallelise=parallelise, **kwargs)
 			
-def instruct_ollama_model(prompts, system_instructions=None, model='llama3.1', options=None, temperature=0.5, top_p=1, output_to_input_proportion=2, non_influential_prompt_size=0, cache_path='cache/', max_tokens=None, seed=42, parallelise=False, **args):
+def instruct_ollama_model(
+	prompts,
+	system_instructions=None,
+	model='llama3.1',
+	options=None,
+	temperature=0.5,
+	top_p=1,
+	output_to_input_proportion=2,
+	non_influential_prompt_size=0,
+	cache_path='cache/',
+	max_tokens=None,
+	seed=42,
+	parallelise=False,
+	think=False,
+	json_mode=False,
+	debug_ollama=False,
+	num_ctx=32768,
+	**args
+):
+
 	if max_tokens is None:
 		max_tokens = -1 # no limits
 	if options is None:
-		# For Mistral: https://www.reddit.com/r/LocalLLaMA/comments/16v820a/mistral_7b_temperature_settings/
-		options = { # https://github.com/ollama/ollama/blob/main/docs/modelfile.md#valid-parameters-and-values
-			"seed": seed, # Sets the random number seed to use for generation. Setting this to a specific number will make the model generate the same text for the same prompt. (Default: 0)
-			"num_predict": max_tokens, # Maximum number of tokens to predict when generating text. (Default: 128, -1 = infinite generation, -2 = fill context)
-			"top_k": 40, # Reduces the probability of generating nonsense. A higher value (e.g. 100) will give more diverse answers, while a lower value (e.g. 10) will be more conservative. (Default: 40)
-			"top_p": 0.95, # Works together with top-k. A higher value (e.g., 0.95) will lead to more diverse text, while a lower value (e.g., 0.5) will generate more focused and conservative text. (Default: 0.9)
-			"temperature": 0.7, # The temperature of the model. Increasing the temperature will make the model answer more creatively. (Default: 0.8)
-			"repeat_penalty": 1.1, # Sets how strongly to penalize repetitions. A higher value (e.g., 1.5) will penalize repetitions more strongly, while a lower value (e.g., 0.9) will be more lenient. (Default: 1.1)
-			"tfs_z": 1, # Tail free sampling is used to reduce the impact of less probable tokens from the output. A higher value (e.g., 2.0) will reduce the impact more, while a value of 1.0 disables this setting. (default: 1)
-			"num_ctx": 2**13,  # Sets the size of the context window used to generate the next token. (Default: 2048)
-			"repeat_last_n": 64, # Sets how far back for the model to look back to prevent repetition. (Default: 64, 0 = disabled, -1 = num_ctx)
-			# "num_gpu": 0, # The number of layers to send to the GPU(s). Set to 0 to disable.
+		options = {
+			"seed": seed,
+			"num_predict": max_tokens,
+			"top_k": 40,
+			"top_p": 0.95,
+			"temperature": 0.7,
+			"repeat_penalty": 1.1,
+			"tfs_z": 1,
+			"num_ctx": num_ctx,
+			"repeat_last_n": 64,
 		}
 	else:
 		options = copy.deepcopy(options) # required to avoid side-effects
 	options.update({
 		"temperature": temperature,
 		"top_p": top_p,
+		"num_predict": max_tokens,
+		"num_ctx": max(int(options.get("num_ctx", 0) or 0), int(num_ctx)),
 	})
+
+	def clean_text(text):
+		if not text:
+			return ""
+
+		text = re.sub(r"(?s)<think>.*?</think>\s*", "", text).strip()
+
+		if text.startswith("```"):
+			lines = text.splitlines()
+			if lines and lines[0].strip().startswith("```"):
+				lines = lines[1:]
+			if lines and lines[-1].strip() == "```":
+				lines = lines[:-1]
+			text = "\n".join(lines).strip()
+
+		return text
+
+	def collect_ollama_response(response):
+		if hasattr(response, "response"):
+			return response.response or "", {
+				"done": getattr(response, "done", None),
+				"done_reason": getattr(response, "done_reason", None),
+				"eval_count": getattr(response, "eval_count", None),
+				"prompt_eval_count": getattr(response, "prompt_eval_count", None),
+			}
+
+		if isinstance(response, dict):
+			return response.get("response", ""), response
+
+		if hasattr(response, "__iter__"):
+			chunks = []
+			last = {}
+			for chunk in response:
+				if hasattr(chunk, "response"):
+					chunks.append(chunk.response or "")
+					last = {
+						"done": getattr(chunk, "done", None),
+						"done_reason": getattr(chunk, "done_reason", None),
+						"eval_count": getattr(chunk, "eval_count", None),
+						"prompt_eval_count": getattr(chunk, "prompt_eval_count", None),
+					}
+				elif isinstance(chunk, dict):
+					chunks.append(chunk.get("response", ""))
+					last = chunk
+			return "".join(chunks), last
+
+		return str(response), {}
+
 	def fetch_fn(instruction_prompt):
 		system_instruction, missing_prompt = instruction_prompt
-		_options = copy.deepcopy(options) # required to avoid side-effects
-		if _options.get("num_predict",-2) == -2:
-			prompt_tokens = 2*(len(missing_prompt.split(' '))-non_influential_prompt_size)
-			_options["num_predict"] = int(output_to_input_proportion*prompt_tokens)
-		response = ollama.generate(
-			model=model,
-			prompt=missing_prompt,
-			stream=False,
-			options=_options,
-			keep_alive='1h',
-			system=system_instruction,
+		_options = copy.deepcopy(options)
+
+		model_l = model.lower()
+		is_qwen3 = (
+			"qwen3" in model_l
+			or "qwen-3" in model_l
+			or "qwen3." in model_l
+			or "qwen3:" in model_l
 		)
-		# print(missing_prompt, response['response'])
-		# return also the missing_prompt otherwise asynchronous prompting will shuffle the outputs
-		return instruction_prompt, response['response']
+
+		if is_qwen3 and think is False:
+			if system_instruction:
+				if "/no_think" not in system_instruction and "/think" not in system_instruction:
+					system_instruction = system_instruction.rstrip() + "\n\n/no_think"
+			else:
+				system_instruction = "/no_think"
+
+			if not missing_prompt.lstrip().startswith("/no_think"):
+				missing_prompt = "/no_think\n\n" + missing_prompt
+
+		generate_kwargs = {
+			"model": model,
+			"prompt": missing_prompt,
+			"stream": False,
+			"options": _options,
+			"keep_alive": "1h",
+			"system": system_instruction,
+		}
+
+		if think is not None:
+			generate_kwargs["think"] = think
+
+		if json_mode:
+			generate_kwargs["format"] = "json"
+
+		try:
+			response = ollama.generate(**generate_kwargs)
+		except TypeError:
+			generate_kwargs.pop("think", None)
+			try:
+				response = ollama.generate(**generate_kwargs)
+			except TypeError:
+				generate_kwargs.pop("format", None)
+				response = ollama.generate(**generate_kwargs)
+
+		text, meta = collect_ollama_response(response)
+		text = clean_text(text)
+
+		if debug_ollama:
+			print("\n[OLLAMA DEBUG]")
+			print("model:", model)
+			print("num_ctx:", _options.get("num_ctx"))
+			print("num_predict:", _options.get("num_predict"))
+			print("think:", think)
+			print("json_mode:", json_mode)
+			print("raw_type:", type(response))
+			print("raw_response_start:", repr(text[:300]))
+			print("response_len_chars:", len(text))
+			print("done:", meta.get("done"))
+			print("done_reason:", meta.get("done_reason"))
+			print("eval_count:", meta.get("eval_count"))
+			print("prompt_eval_count:", meta.get("prompt_eval_count"))
+			print("[/OLLAMA DEBUG]\n")
+
+		prompt_eval_count = meta.get("prompt_eval_count")
+		eval_count = meta.get("eval_count")
+		done_reason = meta.get("done_reason")
+
+		if not text and done_reason == "length":
+			raise RuntimeError(
+				f"Ollama produced empty output because the prompt filled the context. "
+				f"prompt_eval_count={prompt_eval_count}, "
+				f"num_ctx={_options.get('num_ctx')}, "
+				f"eval_count={eval_count}. "
+				f"Increase num_ctx or shorten the feature-proposal prompt."
+			)
+
+		return instruction_prompt, text
+
 	def parallel_fetch_fn(missing_prompt_list):
 		if parallelise:
 			n_processes = multiprocessing.cpu_count()
-			with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,n_processes)) as executor:
-				futures = [executor.submit(fetch_fn, prompt) for prompt in missing_prompt_list]
-				for future in _tqdm(concurrent.futures.as_completed(futures), total=len(missing_prompt_list), desc="Sending prompts to Ollama", leave=False):
-					i,o=future.result()
-					yield i,o
+			with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, n_processes)) as executor:
+				futures = [
+					executor.submit(fetch_fn, prompt)
+					for prompt in missing_prompt_list
+				]
+
+				for future in _tqdm(
+					concurrent.futures.as_completed(futures),
+					total=len(missing_prompt_list),
+					desc="Sending prompts to Ollama",
+					leave=False,
+				):
+					i, o = future.result()
+					yield i, o
 		else:
-			# print(len(missing_prompt_list))
-			for p in _tqdm(missing_prompt_list, total=len(missing_prompt_list), desc="Sending prompts to Ollama", leave=False):
-				i,o=fetch_fn(p)
-				yield i,o
-		
+			for p in _tqdm(
+				missing_prompt_list,
+				total=len(missing_prompt_list),
+				desc="Sending prompts to Ollama",
+				leave=False,
+			):
+				i, o = fetch_fn(p)
+				yield i, o
+
 	os.makedirs(cache_path, exist_ok=True)
-	ollama_cache_name = os.path.join(cache_path, f"_{model.replace('-','_')}_cache.pkl")
+
+	safe_model_name = (
+		model.replace("-", "_")
+			 .replace("/", "_")
+			 .replace(":", "_")
+	)
+
+	ollama_cache_name = os.path.join(cache_path, f"_{safe_model_name}_cache.pkl")
+
 	if ollama_cache_name not in _loaded_caches:
-		_loaded_caches[ollama_cache_name] = load_or_create_cache(ollama_cache_name, lambda: {})
+		_loaded_caches[ollama_cache_name] = load_or_create_cache(
+			ollama_cache_name,
+			lambda: {}
+		)
+
 	__ollama_cache = _loaded_caches[ollama_cache_name]
-	cache_key = json.dumps(options,indent=4)
+
+	cache_key = json.dumps(
+		{
+			"options": options,
+			"think": think,
+			"json_mode": json_mode,
+			"max_tokens": max_tokens,
+			"num_ctx": num_ctx,
+		},
+		indent=4,
+		sort_keys=True,
+	)
+
 	return get_cached_values(
-		list(zip(system_instructions if system_instructions else [None]*len(prompts), prompts)), 
-		__ollama_cache, 
-		parallel_fetch_fn, 
-		# key_fn=lambda x: (x,model,n,temperature,top_p,frequency_penalty,presence_penalty), 
-		key_fn=lambda x: (x,model,cache_key),  
+		list(zip(
+			system_instructions if system_instructions else [None] * len(prompts),
+			prompts
+		)),
+		__ollama_cache,
+		parallel_fetch_fn,
+		key_fn=lambda x: (x, model, cache_key),
 		empty_is_missing=True,
 		cache_name=ollama_cache_name,
-		transform_fn=None
+		transform_fn=None,
 	)
 
 def instruct_openai_model(prompts, system_instructions=None, api_key=None, base_url=None, model='gpt-4o-mini', n=1, temperature=1, top_p=1, frequency_penalty=0, presence_penalty=0, cache_path='cache/', parallelise=True, max_tokens=None, timeout=None, **kwargs):

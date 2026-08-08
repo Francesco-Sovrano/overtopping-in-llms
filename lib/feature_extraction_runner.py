@@ -7,7 +7,7 @@ import math
 import random
 import importlib
 from dataclasses import dataclass, asdict
-from typing import Any, Callable, Optional, Sequence, Tuple, List, Dict
+from typing import Any, Optional, Sequence, Dict
 
 import numpy as np
 import pandas as pd
@@ -592,7 +592,11 @@ def run_feature_extraction(df, *, task_spec, config):
 		)
 
 		i = 0
-		while i < config.feature_extraction_steps:
+		attempts = 0
+		max_attempts = max(config.feature_extraction_steps * 5, 20)
+
+		while i < config.feature_extraction_steps and attempts < max_attempts:
+			attempts += 1
 			random.shuffle(pos_pool)
 			random.shuffle(neg_pool)
 			pos_ctx = pos_pool[: min(config.num_correct_example_prompts, len(pos_pool))]
@@ -620,7 +624,15 @@ def run_feature_extraction(df, *, task_spec, config):
 				features.extend(new_features)
 				i += 1
 				pbar.update(1)
+			else:
+				print(f"[WARN] LLM returned no valid features on attempt {attempts}; retrying.")
 		pbar.close()
+
+		if i < config.feature_extraction_steps:
+			print(
+				f"[WARN] Only completed {i}/{config.feature_extraction_steps} "
+				f"feature proposal rounds after {attempts} attempts."
+			)
 
 		if not features:
 			print("[WARN] Agent returned no features; falling back to seeds.")

@@ -1,5 +1,6 @@
 import json
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -72,6 +73,7 @@ def detect_prompt_col(df, user_hint = None):
 	)
 
 def guess_filetype(p):
+	p = Path(p)
 	ext = p.suffix.lower()
 	if ext in {".csv"}: return "csv"
 	if ext in {".json"}: return "json"

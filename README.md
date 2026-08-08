@@ -1,1072 +1,520 @@
-# Overtopping Phenomenology - Replication Package
+# Causal channel intervention pipeline
 
-This repository contains the code, analysis utilities, and selected generated artifacts for the paper **"The Phenomenology of Overtopping: How Few Channels Can Dominate Language-Model Behavior."** The paper studies **overtopping**: cases where one channel, or a small coalition of channels, accounts for a large fraction of the causal effect of an intervention on a binary model behavior. The package implements the pipeline used to generate prompts, derive feature tables, extract symbolic rules, localize candidate channels with intervention-based searches, refine those candidates to singleton overtopping channels, aggregate results, and render the paper figures. It also includes checkpointed trigger-poisoning and backdoor-lift experiments that reuse the same overtopping pipeline to track whether poisoned behaviors are controlled by concentrated singleton channels or by more distributed mechanisms.
+This repository contains an end-to-end experimental pipeline for identifying small sets of language-model channels that causally affect a binary task predicate, evaluating those channels on an explicitly selected data split, measuring interactions with simultaneous interventions, comparing the candidate mechanism with matched random channel sets, and producing manuscript-ready tables and figures. The default evaluation split is `test`; `train` and `all` remain available for diagnostics and controlled comparisons.
 
-The package is intentionally organized around the experiment pipeline rather than around a single executable. Full reruns are compute-intensive: they require local Hugging Face model weights, TransformerLens-compatible models, and enough accelerator memory for repeated intervention scans. The included `figures/` and `overtopping_spiking_report/` directories contain selected exported artifacts from completed runs.
+The standard non-poisoning experiment programme is defined in one file, `experiments/run_experiments.py`. The numerical implementation remains split into focused pipeline and analysis modules so that each step can be inspected independently.
 
-## What this package reproduces
+## 1. What the pipeline measures
 
-The paper evaluates whether learned behaviors are causally controlled by a small number of intervention-defined channels. The code supports the main experimental families used in the paper:
+Let `B(x) ∈ {0,1}` denote the model's unablated predicate on an example `x` from the selected evaluation population (`test` by default). For a candidate channel `j`, let `F_j` be the evaluated examples whose predicate changes when only `j` is suppressed, and let
 
-- Arithmetic exact-match behavior.
-- Grammar acceptability behavior.
-- HANS-style NLI entailment-label behavior.
-- Random finite-state-machine final-state prediction.
-- Jailbreak-success behavior.
-- Threshold-event / causal-spiking diagnostics for overtopping candidates versus matched non-candidate controls.
-- Checkpointed grammar trigger-poisoning pilots: clean versus poisoned LoRA fine-tuning, checkpoint trajectories, ordinary grammar overtopping, trigger-conditioned backdoor overtopping, and trigger-lift overtopping.
-- Checkpointed arithmetic trigger-poisoning pilots with a forced numeric target answer and the same trigger-lift overtopping analysis.
-- Cumulative top-k ablation diagnostics for trigger-lift runs, used to test whether late poisoned checkpoints shift from singleton-dominated to distributed or redundant support.
-
-The main intervention loop follows the same conceptual stages as the paper: define a binary behavior predicate, construct behavior-conditioned or rule-conditioned slices, discover candidate components, test channel or channel-group replacement, refine to singleton effects, and aggregate union flip coverage and singleton flip strength.
-
-## Important directory convention: `data/` versus `results/`
-
-The working experiment tree is `data/`. Full runs write large intermediate files under `data/<task>/<provider>/<model>/...` and under `cache/`. Poisoning pilots also write run-specific trees under `data/poisoning_grammar_pilot/<run_id>/`, `data/poisoning_arithmetic_pilot/<run_id>/`, and, for the cumulative mechanism diagnostic, `data/poisoning_mechanism_summary/`.
-
-A clean export directory named `results/` is **not** produced directly by the experiment scripts. It is produced by:
-
-```bash
-python clean_results_for_export.py data results --force --manifest results_manifest.json
+```text
+s_j = P(F_j)
+U(A) = P(union_{j in A} F_j)
 ```
 
-`clean_results_for_export.py` copies only approved final-output templates into a fresh filtered directory. It excludes caches, pickle files, macOS metadata, `is_correct_*` intermediate folders, and other non-export artifacts. If you receive a `results/` directory with this package, treat it as a curated export generated from a larger `data/` tree, not as the raw working directory.
+For the frozen candidate set `J`, the singleton-based metrics are:
 
-## Repository contents
+```text
+s_(1) = max_j s_j
+TOC_m(J) = U(H_m) / U(J)
+R_ov(J) = 1 - U(J) / sum_j s_j
+N_eff(J) = (sum_j s_j)^2 / sum_j s_j^2
+OCC_b(J) = P(union_j F_j | B(x)=b),  b in {0,1}
+N_t = |{j : s_j >= t}|
+```
+
+`H_m` is the top-`m` subset according to a ranking fixed on discovery data. Held-out singleton effects do not determine the ranking.
+
+The pipeline also measures the effect of suppressing the complete set `J` simultaneously:
+
+```text
+E(J) = predicate-change rate on the selected evaluation split under simultaneous suppression of J
+```
+
+`E(J)` is a separate intervention quantity from `U(J)`. The code does not use a singleton union as a substitute for a simultaneous-set intervention.
+
+For every prespecified stage-5 layer population `C_l`, and for the discovery-frozen subset `J_{l,m} ⊆ J ∩ C_l`, interaction validation computes
+
+```text
+Delta_l(J_{l,m}) = E_l(C_l) - E_l(C_l \ J_{l,m})
+GCCR_m(J) = sum_l Delta_l(J_{l,m}) / sum_l E_l(C_l)
+```
+
+Every prespecified population contributes to the GCCR denominator, including layers for which `J_{l,m}` is empty. Ratios are not clipped. Negative values and values above one are retained because they can arise from cancellation or non-additive interactions. A zero or near-zero denominator is reported as undefined with an explicit status.
+
+Matched random controls are sampled from the same intervention population and match the candidate by transformer layer, computational locus, channel type, intervention phase, per-layer cardinality, and replacement baseline. For both simultaneous `E(J)` and each `GCCR_m`, the report contains
+
+```text
+Delta = candidate - median(null)
+P = (1 + count(null_b <= candidate)) / (B + 1)
+p_MC = (1 + count(null_b >= candidate)) / (B + 1)
+```
+
+where `B` is the requested number of null draws.
+
+## 2. Repository layout
 
 ```text
 .
-├── 1_generate_prompts_and_answers.py
-├── 2_generate_features.py
-├── 3_extract_rules.py
-├── 4_spectral_sample_datapoints.py
-├── 5_discover_circuits.py
-├── 6_analyze_bag_of_rules.py
-├── 7_refine_neuron_anchored_rules.py
-├── 8_compare_experiments.py
-├── 9_compare_models.py
-├── 10_compute_threshold_sweep_stats.py
-├── 11_poisoning_grammar_checkpoint_ft.py
-├── 12_threshold_event_diagnostics.py
-├── 13_poisoning_grammar_checkpoint_ft.py
-├── 14_aggregate_poisoning_grammar_trajectory.py
-├── 15_run_poisoning_overtopping_checkpoint.py
-├── 16_aggregate_backdoor_overtopping_trajectory.py
-├── 17_aggregate_backdoor_lift_trajectory.py
-├── 18_poisoning_arithmetic_checkpoint_ft.py
-├── 20_backdoor_lift_cumulative_ablation.py
-├── _run_pipeline.sh
-├── run_phenomenology_experiments.sh
-├── run_spiking_diagnostics.sh
-├── run_grammar_poisoning_checkpoint_ft.sbatch
-├── run_arithmetic_poisoning_checkpoint_ft.sbatch
-├── complete_poisoning_overtopping_missing.sbatch
-├── run_backdoor_overtopping.sbatch
-├── run_backdoor_overtopping_serial.sbatch
-├── run_backdoor_lift_overtopping_fast.sbatch
-├── run_arithmetic_backdoor_lift_overtopping_fast.sbatch
-├── run_backdoor_lift_cumulative_ablation.sbatch
-├── clean_results_for_export.py
-├── make_competence_vs_overtopping_paper_figures.py
-├── generate_overtopping_spiking_report.py
-├── POISONING_EXPERIMENTS.md
-├── poisoning_github_files.txt
-├── sync_poisoning_files_to_repo.sh
-├── setup.sh
+├── run_experiments.sh              # run the complete non-poisoning catalogue
+├── generate_results.sh             # regenerate final paper outputs from data/
+├── experiments/
+│   ├── run_experiments.py          # complete executable experiment catalogue
+│   ├── execution.py                # RunSpec, filtering, path and command construction
+│   └── README.md
+├── pipeline/
+│   ├── 1_generate_prompts_and_answers.py
+│   ├── 2_generate_features.py
+│   ├── 3_extract_rules.py
+│   ├── 4_spectral_sample_datapoints.py
+│   ├── 5_discover_circuits.py
+│   ├── 6_analyze_bag_of_rules.py
+│   ├── 7_refine_neuron_anchored_rules.py
+│   ├── _run_pipeline.sh
+│   └── README.md
+├── analysis/
+│   ├── 12_threshold_event_diagnostics.py
+│   ├── 21_analyze_primary_metrics.py
+│   ├── 22_compute_group_dominance.py
+│   ├── 23_compute_survey_dominance.py
+│   ├── 24_run_primary_holdout_analysis.py
+│   ├── 25_rebuild_directional_stats.py
+│   ├── 26_validate_interactions.py
+│   ├── 27_generate_manuscript_outputs.py
+│   ├── 28_visualize_experiment_results.py
+│   ├── 29_generate_final_results.py
+│   ├── compute_overtopping_latex_tables.py
+│   ├── make_competence_vs_overtopping_paper_figures.py
+│   ├── generate_overtopping_spiking_report.py
+│   ├── clean_results_for_export.py
+│   ├── primary_matrix.py
+│   └── README.md
+├── lib/
+│   ├── tasks/                       # standard task definitions
+│   ├── eap/                         # attribution implementation
+│   ├── heldout_set_metrics.py       # singleton set statistics
+│   ├── group_intervention.py        # simultaneous intervention utilities
+│   ├── interaction_statistics.py    # GCCR and matched-null statistics
+│   └── shared feature/model/cache utilities
+├── poisoning/                       # trigger-poisoning experiments and Slurm jobs
+├── tests/                           # model-free policy/statistics tests
+├── data/                            # raw experiment artifacts; created at runtime
+├── cache/                           # model/prompt/feature/intervention caches; runtime
+├── results/                         # all aggregate statistics and paper outputs
 ├── requirements.txt
-├── figures/
-├── overtopping_spiking_report/
-└── lib/
+└── setup.sh
 ```
 
-Script `11_poisoning_grammar_checkpoint_ft.py` is a compatibility wrapper around `13_poisoning_grammar_checkpoint_ft.py`, kept so older commands and notes that referenced script 11 still run.
+`data/` and `cache/` contain experiment state. `results/` is reserved for aggregate statistics, manuscript tables, and figures.
 
-Most auxiliary Markdown notes from earlier package versions have been merged into this README. `POISONING_EXPERIMENTS.md` remains as a compact quick-start note for the checkpointed poisoning/backdoor pilots.
+## 3. Installation
 
-## Installation
-
-The scripts target Python 3.12.
+The setup script uses Python 3.12:
 
 ```bash
 bash setup.sh
-. .env/bin/activate
+source .env/bin/activate
 ```
 
-The package uses PyTorch, Transformers, TransformerLens, pandas, matplotlib, SciPy, scikit-learn, SHAP, XGBoost, numba, tabulate, and tqdm. Some environments also need an OpenMP runtime for XGBoost and numerical libraries:
+Run repository Python entry points as modules from the repository root, for example:
 
 ```bash
-# macOS
-brew install libomp
-
-# Ubuntu/Debian example
-sudo apt-get install libgomp1
+python3 -m experiments.run_experiments --help
+python3 -m analysis.26_validate_interactions --help
 ```
 
-If using Ollama for feature proposal, start the server and pull the model you plan to use:
+The code does not modify `sys.path` at runtime. Root shell launchers and internal subprocesses use `python -m ...` so imports are resolved through normal package semantics.
+
+`requirements.txt` installs the analysis and mechanistic-interpretability stack, including PyTorch 2.10.0, Transformers 4.57.6, TransformerLens 2.17.0, SciPy 1.13, scikit-learn 1.6, SHAP 0.46, and XGBoost 2.1.3.
+
+If `ollama` is installed, `setup.sh` downloads `gemma3:27b`, `qwen3:4b`, and `qwen3:14b`. Ollama is used only for optional feature proposal; standard task seed features remain available when feature proposal is disabled.
+
+Fresh circuit-discovery and intervention experiments normally require a CUDA-capable GPU and enough storage for model weights, prompt caches, feature tables, attribution outputs, stage-7 per-example scores, and simultaneous-intervention caches.
+
+Hugging Face caches can be redirected in the usual way:
 
 ```bash
-ollama serve > ollama.log 2>&1 &
-ollama pull qwen3:30b
+export HF_HOME=/path/to/huggingface-cache
+export TRANSFORMERS_CACHE=/path/to/huggingface-cache
 ```
 
-Optional external judge or feature-proposal backends read credentials from the environment. Do not hardcode API keys in scripts.
+API credentials, if needed by an optional feature/classification service, must be supplied through environment variables or the job scheduler. No credential is stored in the repository.
+
+## 4. Standard tasks and data
+
+The standard task modules live in `lib/tasks/` and implement the interface in `lib/task_spec.py`.
+
+| Task identifier | Module | Source/configuration |
+|---|---|---|
+| `arithmetic` | `lib.tasks.arithmetic_task` | generated arithmetic examples |
+| `grammar_acceptability` | `lib.tasks.grammar_acceptability_task` | local JSONL; `GRAMMAR_DATASET_PATH`, `GRAMMAR_NUM_EXAMPLES`, `GRAMMAR_TASK_SEED` |
+| `hans_nli` | `lib.tasks.hans_nli_task` | HANS; `HANS_LOCAL_FILE` or dataset download, `HANS_SPLIT`, `HANS_NUM_EXAMPLES`, `HANS_TASK_SEED`, `HANS_BALANCE_LABELS`, `HANS_CACHE_DIR` |
+| `random_fsm` | `lib.tasks.random_fsm_task` | generated FSM examples; `FSM_NUM_EXAMPLES`, `FSM_MIN_STATES`, `FSM_MAX_STATES`, `FSM_MIN_INPUT_LEN`, `FSM_MAX_INPUT_LEN`, `FSM_TASK_SEED` |
+| `bon_jailbreaking` | `lib.tasks.bon_jailbreaking_task` | local prompt data via `AUGMENTED_PROMPTS_FILE`; classifier models via `BON_JAILBREAK_CLASSIFIER_MODEL` and `BON_JAILBREAK_CLASSIFIER_FALLBACK_MODEL` |
+
+The grammar task defaults to a path under `data/grammar_acceptability/`; if the file is not present, set `GRAMMAR_DATASET_PATH` explicitly. The jailbreak task similarly expects a local augmented-prompt dataset unless `AUGMENTED_PROMPTS_FILE` is set.
+
+## 5. Running the complete experiment programme
+
+The recommended entry point is the root shell script:
 
 ```bash
-export GROQ_API_KEY="..."     # only if your chosen task/judge uses Groq
-export OPENAI_API_KEY="..."   # only if your chosen configuration uses OpenAI
+./run_experiments.sh
 ```
 
-## Quick checks on the shipped artifacts
+It:
 
-The package includes selected generated figures and tabular data:
+1. activates `.env/` when present;
+2. runs the complete non-poisoning catalogue;
+3. uses `test` as the evaluation split unless `EVALUATION_SPLIT` or `--evaluation-split` selects `train` or `all`;
+4. for `test`, uses the `iclr-28` primary profile unless `PRIMARY_PROFILE` is set and generates manuscript outputs;
+5. for `train` or `all`, writes catalogue summaries but skips the test-specific primary manuscript export;
+6. writes aggregate/final outputs under root `results/`.
+
+To use the 27-setting profile:
+
+```bash
+PRIMARY_PROFILE=legacy-27 ./run_experiments.sh
+```
+
+Arguments are forwarded to the Python driver, so a dry run is:
+
+```bash
+./run_experiments.sh --dry-run
+```
+
+Evaluation split selection is explicit and defaults to `test`:
+
+```bash
+./run_experiments.sh                         # test
+./run_experiments.sh --evaluation-split train
+EVALUATION_SPLIT=all ./run_experiments.sh
+```
+
+The executable catalogue contains 127 configurations:
+
+| Suite | Count | Contents |
+|---|---:|---|
+| `phenomenology` | 121 | small-model task × intervention × phase configurations plus the explicit Qwen2-1.5B I+O NLI setting |
+| `large-models` | 6 | Qwen2-7B and Pythia-6.9B on arithmetic, NLI, and jailbreak |
+| **Total** | **127** | complete non-poisoning catalogue |
+
+List them without running anything:
+
+```bash
+python3 -m experiments.run_experiments --suite all --list
+```
+
+The Python driver can also run a subset:
+
+```bash
+python3 -m experiments.run_experiments --suite phenomenology
+python3 -m experiments.run_experiments --suite large-models
+```
+
+Filters are exact comma-separated values:
+
+```bash
+python3 -m experiments.run_experiments \
+  --suite phenomenology \
+  --task arithmetic,hans_nli \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --intervention mean-donor,zero \
+  --mode standard,decode-only \
+  --evaluation-split test
+```
+
+Execution phases are:
 
 ```text
-figures/
-  fig_competence_vs_coverage.pdf
-  fig_competence_vs_coverage.csv
-  fig_phase_comparison.pdf
-  fig_phase_comparison.csv
-  fig_pythia_checkpoint_trajectory.pdf
-  fig_pythia_checkpoint_trajectory.csv
-  fig_size_comparison.pdf
-  fig_size_comparison.csv
-
-overtopping_spiking_report/
-  figures/ecdf_causal_spiking_score.pdf
-  figures/ecdf_flip_rates_candidate_vs_control.pdf
-  figures/feature_css_delta_ranking.pdf
-  figures/paired_css_delta_by_run_baseline.pdf
-  figures/binned_flip_curves_oriented_proxy.pdf
-  statistical_results.json
-  primary_spiking_score_summary.csv
-  flip_rate_summary.csv
+--phase pipeline   run experiment stages only
+--phase analysis   analyze configured outputs only
+--phase all        run the pipeline, then analysis (default)
 ```
 
-The CSV next to each PDF is the plotted-data companion and is usually the easiest way to audit the plotted values.
+`--continue-on-error` records failed configurations in `results/pipeline_failures.json` and continues. `--dry-run` prints pipeline commands without model execution.
 
-## Full pipeline overview
+See `experiments/README.md` for the exact suite definitions and path policy.
 
-The numbered scripts form a staged workflow. A typical full run is:
+## 6. Evaluation-split discipline
+
+The evaluation split is configurable. `test` is the default for the experiment catalogue, stage 7, threshold diagnostics, group dominance, and interaction validation. The accepted values are:
 
 ```text
-1_generate_prompts_and_answers.py
-  -> cache/<task>/<model>/llm_io_data.pkl
-
-2_generate_features.py
-  -> data/<task>/<provider>/<model>/feature_report/scores.csv
-  -> data/<task>/<provider>/<model>/feature_report/features.json
-
-3_extract_rules.py
-  -> data/<task>/<provider>/<model>/rule_extraction_results/association_rules_*.csv
-  -> data/<task>/<provider>/<model>/rule_extraction_results/rule_combo_*.csv
-
-4_spectral_sample_datapoints.py
-  -> data/<task>/<provider>/<model>/neural_circuit_discovery_results/.../spectral_sampling_plan.json
-
-5_discover_circuits.py
-  -> data/<task>/<provider>/<model>/neural_circuit_discovery_results/.../neural_circuits/manifest.json
-  -> data/<task>/<provider>/<model>/neural_circuit_discovery_results/.../neural_circuits/dataset_info.json
-
-6_analyze_bag_of_rules.py
-  -> .../bag_of_rules/.../per_rule/<target>/rule_*.json
-  -> .../bag_of_rules/.../rule_knockout.json
-  -> .../bag_of_rules/.../neuron_bucket_stats.json
-
-7_refine_neuron_anchored_rules.py
-  -> data/<task>/<provider>/<model>/rule_extraction_results/neuron_flip_rules/stats/<run>/flip_stats_global.json
-  -> data/<task>/<provider>/<model>/rule_extraction_results/neuron_flip_rules/stats/<run>/flip_stats_by_neuron.csv
-  -> optional per-neuron RuleSHAP outputs and figure files
+test   rows with is_test=True
+train  rows with is_test=False
+all    all available/materialized rows
 ```
 
-Scripts `8`, `9`, `10`, `12`, `make_competence_vs_overtopping_paper_figures.py`, and `generate_overtopping_spiking_report.py` are post-processing, figure-generation, and diagnostic utilities.
+The split can be selected through the main driver:
 
-The poisoning/backdoor extension adds a separate checkpointed workflow:
+```bash
+python3 -m experiments.run_experiments --evaluation-split test
+python3 -m experiments.run_experiments --evaluation-split train
+python3 -m experiments.run_experiments --evaluation-split all
+```
+
+or directly through `pipeline/_run_pipeline.sh` with `--evaluation_split`. The legacy `--holdout_test_only` flag remains an alias for `--evaluation_split test`.
+
+Candidate discovery and candidate ranking remain based on discovery/training data. Mean/donor replacement-reference estimation also remains training-based. Only the final evaluation population changes with `--evaluation_split`. This makes `test` the post-selection validation path while preserving `train` and `all` for diagnostic use.
+
+Stage 7 writes `evaluation_scope.json` with `final_statistics_split` and `sampling_pool_split`. Directory naming is split-aware:
 
 ```text
-13_poisoning_grammar_checkpoint_ft.py
-  -> data/poisoning_grammar_pilot/<run_id>/checkpoint_manifest_all.csv
-  -> clean/ and poisoned/ LoRA checkpoint directories
-  -> clean|poisoned/eval_details/<checkpoint>/clean_predictions.jsonl
-  -> clean|poisoned/eval_details/<checkpoint>/triggered_predictions.jsonl
-  -> run_overtopping_checkpoints.sh
-
-18_poisoning_arithmetic_checkpoint_ft.py
-  -> data/poisoning_arithmetic_pilot/<run_id>/checkpoint_manifest_all.csv
-  -> clean/ and poisoned/ LoRA checkpoint directories
-  -> clean|poisoned/eval_details/<checkpoint>/clean_predictions.jsonl
-  -> clean|poisoned/eval_details/<checkpoint>/triggered_predictions.jsonl
-
-15_run_poisoning_overtopping_checkpoint.py or complete_poisoning_overtopping_missing.sbatch
-  -> standard overtopping outputs for each checkpoint
-
-run_backdoor_overtopping*.sbatch
-  -> data/poisoning_grammar_pilot/<run_id>/backdoor_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
-
-run_backdoor_lift_overtopping_fast.sbatch
-run_arithmetic_backdoor_lift_overtopping_fast.sbatch
-  -> <run_dir>/backdoor_lift_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
-
-14_aggregate_poisoning_grammar_trajectory.py
-16_aggregate_backdoor_overtopping_trajectory.py
-17_aggregate_backdoor_lift_trajectory.py
-  -> trajectory_summary/, backdoor_trajectory_summary/, and backdoor_lift_trajectory_summary/
-
-20_backdoor_lift_cumulative_ablation.py
-  -> data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.csv
-  -> data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.{png,pdf}
+test   <run>-heldout_test/
+train  <run>-eval_train/
+all    <run>/
 ```
 
-The poisoning jobs use the same downstream overtopping pipeline as the main experiments. The difference is the task predicate: ordinary checkpoint runs evaluate clean task correctness, `grammar_backdoor` evaluates target-label emission on triggered prompts, and the trigger-lift tasks keep examples where the untriggered prompt did not already produce the forced target.
+The unsuffixed `all` path preserves the established all-row filesystem convention. Primary manuscript profiles and the paper tables/figures are defined on the `test` split; requesting `train` or `all` through the root experiment launcher therefore runs catalogue analysis but not the primary manuscript export.
 
-## Running the orchestrated phenomenology sweep
+## 7. Numbered pipeline stages
 
-The top-level runner `run_phenomenology_experiments.sh` loops over configured tasks, models, intervention baselines, and intervention phases. It calls `_run_pipeline.sh` for the pipeline stages and then runs post-processing scripts.
+`pipeline/_run_pipeline.sh` is the standard single-configuration orchestrator.
 
-```bash
-bash run_phenomenology_experiments.sh
-```
+### Stage 1 — prompts and model answers
 
-Before launching a large sweep, edit the model and task arrays in that script. The default lists include small Qwen and Pythia configurations and are intended as a template. Full sweeps can be expensive.
+`1_generate_prompts_and_answers.py` obtains task examples, queries the analyzed model, parses outputs, records task performance, and caches prompt/answer data.
 
-The lower-level `_run_pipeline.sh` runs one `(task, analyzed model)` configuration. Example:
+### Stage 2 — feature construction
 
-```bash
-bash _run_pipeline.sh arithmetic Qwen/Qwen2-1.5B-Instruct \
-  --spectral_splits \
-  --fast_anchoring \
-  --z_thresh 10 \
-  --batch_size 32 \
-  --circuit_level neuron \
-  --circuit_size 200000 \
-  --eval_intervention mean-donor \
-  --min_flip_rate 0.3 \
-  --decode_only \
-  --max_number_of_circuits_to_analyze 1
-```
+`2_generate_features.py` builds task-provided and optionally LLM-proposed interpretable features. It writes `feature_report/scores.csv` and `features.json`; the feature-extraction runner also creates the deterministic `is_test` column in `scores.csv`. Task-level `dataset_stats.json` is written by stage 1 into the same `feature_report/` directory.
 
-## Running checkpointed poisoning/backdoor experiments
+### Stage 3 — symbolic rules
 
-The poisoning pilots compare clean and poisoned fine-tuning trajectories from the same base model. Both default to Qwen/Qwen2.5-1.5B-Instruct, LoRA adapters, the trigger `" cf."`, 3% poisoning, and checkpoint fractions `0, 10, 25, 50, 75, 100%`.
+`3_extract_rules.py` extracts feature-based rules for rule-conditioned workflows. The standard catalogue uses spectral splits, so this stage is bypassed there.
 
-Grammar checkpointed fine-tuning:
+### Stage 4 — sampling plans
 
-```bash
-sbatch run_grammar_poisoning_checkpoint_ft.sbatch
-```
+`4_spectral_sample_datapoints.py` constructs representative sampling plans where required. Spectral-split catalogue runs bypass the rule-indexed sampling-plan stage.
 
-Arithmetic checkpointed fine-tuning:
+### Stage 5 — circuit discovery
 
-```bash
-sbatch run_arithmetic_poisoning_checkpoint_ft.sbatch
-```
+`5_discover_circuits.py` runs EAP/EAP-IG-based circuit discovery and writes the `neural_circuits/` manifest and dataset information. The manifest defines the prespecified layer/channel populations used in interaction-aware validation.
 
-Each fine-tuning job writes a run directory under `data/poisoning_grammar_pilot/<run_id>/` or `data/poisoning_arithmetic_pilot/<run_id>/`. The key file is `checkpoint_manifest_all.csv`; it records condition, fraction, global step, checkpoint directory, clean accuracy, attack success rate, and the output location expected by the overtopping pipeline.
+### Stage 6 — candidate selection
 
-To run standard grammar overtopping over the checkpoint trajectory, either run the generated launcher:
+`6_analyze_bag_of_rules.py` performs channel interventions on discovery data and selects channels meeting the configured effect threshold. The selected channels form the fixed set `J`. Ranking information from this stage is used to freeze the order for `H_m` and `J_{l,m}`.
 
-```bash
-bash data/poisoning_grammar_pilot/<run_id>/run_overtopping_checkpoints.sh
-python3 14_aggregate_poisoning_grammar_trajectory.py \
-  --run_dir data/poisoning_grammar_pilot/<run_id>
-```
+### Stage 7 — singleton evaluation
 
-or submit the resume-friendly SLURM array:
+`7_refine_neuron_anchored_rules.py` suppresses each fixed candidate individually on rows selected by `--evaluation_split`, materializes per-example flip events, and computes singleton-set statistics. `test` is the default. It writes both aggregate files and the discovery-frozen ranking used by `TOC_m`.
 
-```bash
-sbatch --export=ALL,RUN_DIR=data/poisoning_grammar_pilot/<run_id> \
-  complete_poisoning_overtopping_missing.sbatch
-```
+### Interaction validation
 
-To run trigger-conditioned grammar backdoor overtopping:
+After stage 7, `_run_pipeline.sh` calls `analysis/26_validate_interactions.py` when the required artifacts exist. This module performs simultaneous full-set, layer-population, complement, and matched-random interventions.
 
-```bash
-sbatch --export=ALL,RUN_DIR=data/poisoning_grammar_pilot/<run_id> \
-  run_backdoor_overtopping.sbatch
+See `pipeline/README.md` for direct commands, options, environment variables, and detailed output files.
 
-python3 16_aggregate_backdoor_overtopping_trajectory.py \
-  --run_dir data/poisoning_grammar_pilot/<run_id>
-```
+## 8. Stage-7 statistics and interaction outputs
 
-To run trigger-lift overtopping, which keeps only examples where the untriggered prompt did not already elicit the forced target:
-
-```bash
-sbatch --export=ALL,RUN_DIR=data/poisoning_grammar_pilot/<run_id> \
-  run_backdoor_lift_overtopping_fast.sbatch
-
-sbatch --export=ALL,RUN_DIR=data/poisoning_arithmetic_pilot/<run_id> \
-  run_arithmetic_backdoor_lift_overtopping_fast.sbatch
-```
-
-The trigger-lift sbatch files aggregate automatically with `17_aggregate_backdoor_lift_trajectory.py`. By default they run manifest rows `5 7 11`, corresponding to clean-final, poisoned-10%, and poisoned-final under the standard two-condition, six-checkpoint manifest. Override with `LIFT_INDICES`, for example `LIFT_INDICES="all"` or `LIFT_INDICES="11"`.
-
-After trigger-lift runs finish for both grammar and arithmetic, run the cumulative top-k ablation diagnostic:
-
-```bash
-sbatch --export=ALL,GRAMMAR_RUN_DIR=data/poisoning_grammar_pilot/<run_id>,ARITHMETIC_RUN_DIR=data/poisoning_arithmetic_pilot/<run_id> \
-  run_backdoor_lift_cumulative_ablation.sbatch
-```
-
-The default trigger/backdoor definitions are controlled by environment variables in the sbatch files. The most commonly changed variables are `MODEL_NAME`, `RUN_DIR`, `POISON_RATE`, `TRIGGER`, `TRIGGER_PLACEMENT`, `TARGET_LABEL`, `TARGET_ANSWER`, `LIFT_INDICES`, `PIPELINE_EVAL_INTERVENTION`, `PIPELINE_CIRCUIT_SIZE`, and `PIPELINE_BATCH_SIZE`.
-
-## Numbered scripts
-
-### `1_generate_prompts_and_answers.py` - generate task prompts and model completions
-
-This script creates or loads the task-level prompt/answer cache. The task module owns prompt generation, target calculation, parsing, and any task-specific metadata.
-
-Common arguments:
-
-```bash
-python 1_generate_prompts_and_answers.py \
-  --task_module lib.tasks.arithmetic_task \
-  --ai_model Qwen/Qwen2-1.5B-Instruct \
-  --prompts_answers_pkl_file cache/arithmetic/Qwen/Qwen2-1.5B-Instruct/llm_io_data.pkl \
-  --batch_size 32 \
-  --stats_json_out data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report/dataset_stats.json
-```
-
-Output: a pickle cache and, optionally, `dataset_stats.json`. Later scripts rely on the cache through the task module's loader.
-
-### `2_generate_features.py` - build `scores.csv` and `features.json`
-
-This stage loads the prompt/answer cache and constructs a feature table. It can use only deterministic seed features or call a feature LLM to propose Python feature functions.
-
-```bash
-python 2_generate_features.py \
-  --task_module lib.tasks.arithmetic_task \
-  --prompts_answers_pkl_file cache/arithmetic/Qwen/Qwen2-1.5B-Instruct/llm_io_data.pkl \
-  --features_scores_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report \
-  --cache_dir cache/arithmetic \
-  --ai_model qwen3:30b \
-  --feature_extraction_steps 10 \
-  --drop_near_duplicate_features \
-  --drop_high_mad_variance_features \
-  --z_thresh 10
-```
-
-Outputs: `scores.csv`, `features.json`, and feature-selection metadata. `scores.csv` contains prompt columns, raw model outputs, target labels such as `is_correct` or `is_jailbroken`, and feature columns.
-
-### `3_extract_rules.py` - extract symbolic rules from features
-
-This stage fits RuleSHAP-style feature models and writes symbolic rules that predict target labels.
-
-```bash
-python 3_extract_rules.py \
-  --task_module lib.tasks.arithmetic_task \
-  --features_scores_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report \
-  --rules_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/rule_extraction_results \
-  --use_shap_in_xgb \
-  --use_shap_in_lasso
-```
-
-Outputs include `association_rules_*.csv`, `rule_combo_*.csv`, and SHAP plots when enabled by the underlying SHAP utilities. The `--fake_targets` flag creates random-control targets and writes rule files for those controls.
-
-### `4_spectral_sample_datapoints.py` - construct representative sampling plans
-
-This stage chooses datapoints for expensive circuit discovery and ablation. It supports spectral k-center sampling in the analyzed model's representation space and an optional similarity/length-matched pairing mode.
-
-```bash
-python 4_spectral_sample_datapoints.py \
-  --task_module lib.tasks.arithmetic_task \
-  --features_scores_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report/scores.csv \
-  --rules_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/rule_extraction_results \
-  --ai_model Qwen/Qwen2-1.5B-Instruct \
-  --spectral_cache_dir cache/arithmetic \
-  --spectral_space hidden \
-  --rep_hook_name ln_final.hook_normalized \
-  --rep_pooling last \
-  --spectral_dim 32 \
-  --coverage_radius 0.5 \
-  --max_points_per_ablation 512 \
-  --min_points_per_ablation 32 \
-  --output_path data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_sampling_plan.json
-```
-
-Output: a JSON sampling plan consumed by scripts `5` and `6` when `--sampling_strategy plan` is used.
-
-### `5_discover_circuits.py` - attribution-based circuit discovery
-
-This stage discovers candidate circuit elements with EAP, EAP-IG, clean-corrupted attribution, or related attribution modes. It can operate over rule-conditioned examples or spectral clusters.
-
-```bash
-python 5_discover_circuits.py \
-  --task_module lib.tasks.arithmetic_task \
-  --rules_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/rule_extraction_results \
-  --features_scores_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report/scores.csv \
-  --output_data_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/eap_ig_inputs/spectral_split-M200000-decode_only-eval_mean-donor/neural_circuits \
-  --ai_model Qwen/Qwen2-1.5B-Instruct \
-  --cache_dir cache/arithmetic \
-  --method EAP-IG-inputs \
-  --max_ig_steps 3 \
-  --circuit_level neuron \
-  --circuit_size 200000 \
-  --eval_intervention mean-donor \
-  --absolute_value_attributions \
-  --sampling_strategy plan \
-  --sampling_plan_path data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_sampling_plan.json \
-  --decode_only
-```
-
-Key choices:
-
-- `--circuit_level edge`: path-specific but noisier and more complex.
-- `--circuit_level node`: stable component-level heads/MLPs; often the best default for circuit narratives.
-- `--circuit_level neuron`: fine-grained MLP/channel-level selection; used for overtopping localization.
-- `--mlp_neurons_only`: restricts neuron-level outputs to MLP coordinates.
-
-Outputs: `manifest.json`, `dataset_info.json`, and per-rule or per-cluster circuit metadata.
-
-### `6_analyze_bag_of_rules.py` - group ablation and CHA-style search
-
-This script evaluates discovered units and unit groups on associated versus unrelated examples. In fast mode it performs a layer-wise dichotomic search, pruning low-effect subtrees and keeping promising singletons or groups.
-
-```bash
-python 6_analyze_bag_of_rules.py \
-  --task_module lib.tasks.arithmetic_task \
-  --input_data_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/eap_ig_inputs/spectral_split-M200000-decode_only-eval_mean-donor/neural_circuits \
-  --output_data_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/eap_ig_inputs/spectral_split-M200000-decode_only-eval_mean-donor/bag_of_rules/agonist_neurons-fast-random_anchor-tau0.3 \
-  --scores_path data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report/scores.csv \
-  --ai_model Qwen/Qwen2-1.5B-Instruct \
-  --intervention mean-donor \
-  --points_to_use_for_mean_ablation 2048 \
-  --fast_ablation \
-  --search_epsilon 0.3 \
-  --baseline_subset positive \
-  --sampling_strategy plan \
-  --sampling_plan_path data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_sampling_plan.json \
-  --decode_only
-```
-
-Outputs: per-rule JSON traces, `rule_knockout.json`, `neuron_bucket_stats.json`, optional activation/margin/saliency diagnostics, and PNG summaries unless those diagnostics are skipped.
-
-### `7_refine_neuron_anchored_rules.py` - singleton refinement, flip columns, and rule summaries
-
-This stage reads the script-6 per-rule outputs, filters singleton candidates by effect threshold, evaluates singleton replacement on prompts, writes flip columns, and optionally extracts feature rules for those flip targets.
-
-```bash
-python 7_refine_neuron_anchored_rules.py \
-  --task_module lib.tasks.arithmetic_task \
-  --circuit_agonists_path data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/eap_ig_inputs/spectral_split-M200000-decode_only-eval_mean-donor/bag_of_rules/agonist_neurons-fast-random_anchor-tau0.3/per_rule \
-  --features_scores_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report \
-  --ai_model Qwen/Qwen2-1.5B-Instruct \
-  --intervention mean-donor \
-  --points_to_use_for_mean_ablation 2048 \
-  --search_epsilon 0.3 \
-  --use_spectral_sampling \
-  --global_n_clusters 32 \
-  --sampling_max_points 512 \
-  --decode_only \
-  --extract_rules \
-  --summarize_rule_metrics \
-  --rule_quality_metric mcc \
-  --rule_quality_threshold 0.85 \
-  --stats_dirname spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3
-```
-
-Key outputs under `rule_extraction_results/neuron_flip_rules/stats/<run>/`:
-
-- `flip_stats_by_neuron.csv`: singleton flip counts and rates.
-- `flip_stats_global.json`: union flip coverage and aggregate counts.
-- `flip_stats_top<num>.pdf`: top singleton flip-rate bar plot.
-- `rule_combo_metrics_*.csv`: best per-neuron flip-predicting rule summaries.
-- `rule_metrics_distributions.pdf`: distributions of rule metrics.
-- `high_quality_neuron_flip_coverage.pdf`: coverage by high-quality rule subset.
-- `high_quality_neuron_flip_coverage_by_layer.pdf`: layer-stratified coverage.
-- `agonist_metric_*.csv`, `.json`, `.png`, `.pdf`: activation, gradient, Wanda, and activation-gradient diagnostics.
-
-The `--stats_only` and `--summarize_rule_metrics_only` modes are useful when flip columns or rule files already exist and only final tables/figures need to be regenerated.
-
-### `8_compare_experiments.py` - aggregate run modes and threshold sweeps
-
-This script scans one stats directory, a parent tree of stats directories, or a zip. It writes threshold-sweep summaries and run-comparison plots.
-
-```bash
-python 8_compare_experiments.py \
-  --stats_path data \
-  --out_dir data/aggregated_visualizations \
-  --rule_quality_metric mcc \
-  --best_mode tail@0.9 \
-  --thr_min 0.85 \
-  --thr_max 0.99 \
-  --thr_step 0.01
-```
-
-Outputs include:
-
-- `threshold_sweep_summary.csv` for a single stats root.
-- `aggregated_by_task/threshold_sweep_all_tasks_all_llms.csv` for multi-run trees.
-- `plot_high_quality_neurons.pdf`.
-- `plot_union_flip_c2i_pct.pdf`.
-- `plot_union_flip_i2c_pct.pdf`.
-- `compare_rule_metrics_distributions_ecdf.pdf`.
-- Per-task variants such as `plot_high_quality_neurons_by_task.pdf`.
-
-### `9_compare_models.py` - compare models within a task
-
-This script aggregates model-level counts, selectivity, and rule metrics for one task directory.
-
-```bash
-python 9_compare_models.py \
-  --task_dir data/arithmetic \
-  --out_dir data/aggregated_visualizations/arithmetic \
-  --tau 0.2 \
-  --eps 0.2
-```
-
-Outputs include:
-
-- `model_run_coverage.csv`.
-- `run_summary_by_model.csv`.
-- `agg_summary_by_run.csv`.
-- Plots in `plots/`, including cross-model trends for singleton tau-agonists, rule MCC, median ablation groups, and ECDF overlays for MCC, flip-any rate, and selectivity.
-
-### `10_compute_threshold_sweep_stats.py` - compact threshold-sweep statistics
-
-This script consumes the multi-task threshold-sweep CSV from script `8` and prints compact E1/E3-style tables and Wilcoxon tests.
-
-```bash
-python 10_compute_threshold_sweep_stats.py \
-  --csv data/aggregated_visualizations/aggregated_by_task/threshold_sweep_all_tasks_all_llms.csv \
-  --metric n_high_quality_neurons \
-  --agg available \
-  --alt greater
-```
-
-Use `--thresholds` to select specific metric thresholds.
-
-### `11_poisoning_grammar_checkpoint_ft.py` - compatibility wrapper for grammar poisoning
-
-This entrypoint preserves older commands that referenced script 11. It delegates to `13_poisoning_grammar_checkpoint_ft.py` with the same command-line arguments.
-
-```bash
-python 11_poisoning_grammar_checkpoint_ft.py \
-  --condition both \
-  --model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --output_root data/poisoning_grammar_pilot \
-  --use_lora \
-  --load_in_4bit
-```
-
-### `12_threshold_event_diagnostics.py` - threshold recoverability and CSS inputs
-
-This script evaluates whether singleton flip-positive examples for candidate channels are predictable by one-dimensional thresholds over activation, absolute activation, WANDA-style activation-weighted magnitude, gradient, activation-gradient, predicted margin-drop, or learned-direction proxy features. In this package WANDA is weight-scaled for attention coordinates with a defined output-weight norm; for MLP residual-write coordinates it reduces to absolute activation. These outputs feed `generate_overtopping_spiking_report.py`.
-
-```bash
-python 12_threshold_event_diagnostics.py \
-  --input_data_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/eap_ig_inputs/spectral_split-M200000-eval_mean-donor/neural_circuits \
-  --out_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/eap_ig_inputs/spectral_split-M200000-eval_mean-donor/spiking_diagnostics \
-  --task_module lib.tasks.arithmetic_task \
-  --ai_model Qwen/Qwen2-1.5B-Instruct \
-  --intervention mean-donor \
-  --points_to_use_for_mean_ablation 2048 \
-  --spiking_max_points 2048 \
-  --spiking_min_points 64 \
-  --threshold_event_repeats 10 \
-  --threshold_event_holdout_fraction 0.5 \
-  --rule_conditioned_diagnostics \
-  --rule_conditioned_only \
-  --rules_dir data/arithmetic/Qwen/Qwen2-1.5B-Instruct/rule_extraction_results/neuron_flip_rules \
-  --rules_stats_dirname spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3 \
-  --proxy_metrics activation,abs_activation,wanda,gradient,abs_gradient,activation_x_gradient,abs_activation_x_gradient,predicted_margin_drop,abs_predicted_margin_drop,learned_direction
-```
-
-Outputs include per-unit threshold tests, population summaries, binned flip curves, aggregate CSVs, JSON summaries, and optional figure files under `spiking_diagnostics/figures/`.
-
-### `13_poisoning_grammar_checkpoint_ft.py` - checkpointed grammar trigger-poisoning
-
-This script fine-tunes clean and poisoned grammar-acceptability LoRA adapters from the same base model, saves intermediate checkpoints, evaluates clean grammar accuracy and attack success rate, and writes a manifest consumable by the overtopping pipeline.
-
-```bash
-python 13_poisoning_grammar_checkpoint_ft.py \
-  --condition both \
-  --model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --output_root data/poisoning_grammar_pilot \
-  --dataset_path data/grammar_acceptability/cola_in_domain_train.jsonl \
-  --poison_rate 0.03 \
-  --trigger " cf." \
-  --trigger_placement suffix \
-  --target_label acceptable \
-  --num_train_epochs 1 \
-  --max_train 4000 \
-  --max_eval 500 \
-  --save_fracs 0,0.1,0.25,0.5,0.75,1.0 \
-  --use_lora \
-  --load_in_4bit
-```
-
-Primary outputs:
-
-- `run_config.json` and `dataset_info.json` at the run root.
-- `clean/checkpoint_manifest.csv` and `poisoned/checkpoint_manifest.csv`.
-- `checkpoint_manifest_all.csv`, the combined manifest used by scripts `14`, `15`, `16`, and `17`.
-- `clean/eval_details/<checkpoint>/` and `poisoned/eval_details/<checkpoint>/` with clean and triggered prediction JSONL files.
-- `run_overtopping_checkpoints.sh`, a local launcher for standard grammar overtopping over all checkpoints.
-
-### `14_aggregate_poisoning_grammar_trajectory.py` - aggregate standard grammar checkpoint overtopping
-
-This script joins `checkpoint_manifest_all.csv` with standard grammar overtopping outputs produced for each checkpoint.
-
-```bash
-python 14_aggregate_poisoning_grammar_trajectory.py \
-  --run_dir data/poisoning_grammar_pilot/<run_id>
-```
-
-Outputs under `<run_dir>/trajectory_summary/`:
-
-- `poisoning_overtopping_trajectory.csv`.
-- `asr_vs_union_flip.pdf`.
-- `asr_vs_N10.pdf`.
-
-### `15_run_poisoning_overtopping_checkpoint.py` - run or resume one checkpoint
-
-This is a SLURM-friendly wrapper around `_run_pipeline.sh` for one manifest row. Use it to list checkpoint completion status or to run the checkpoint selected by `SLURM_ARRAY_TASK_ID`.
-
-```bash
-python 15_run_poisoning_overtopping_checkpoint.py \
-  --run_dir data/poisoning_grammar_pilot/<run_id> \
-  --list
-
-python 15_run_poisoning_overtopping_checkpoint.py \
-  --run_dir data/poisoning_grammar_pilot/<run_id> \
-  --index 11 \
-  --eval_intervention mean-donor
-```
-
-It skips rows that already contain `flip_stats_global.json` unless `--force` is set.
-
-### `16_aggregate_backdoor_overtopping_trajectory.py` - aggregate trigger-conditioned grammar backdoor overtopping
-
-This script aggregates `grammar_backdoor` overtopping runs. In this task, positives are triggered examples where the model emits the configured backdoor target label.
-
-```bash
-python 16_aggregate_backdoor_overtopping_trajectory.py \
-  --run_dir data/poisoning_grammar_pilot/<run_id> \
-  --eval_intervention mean-donor
-```
-
-Outputs under `<run_dir>/backdoor_trajectory_summary/`:
-
-- `backdoor_overtopping_trajectory.csv`.
-- `asr_vs_backdoor_UJ.pdf`.
-- `asr_vs_backdoor_N10.pdf`.
-- `backdoor_overtopping_dashboard.png`.
-
-### `17_aggregate_backdoor_lift_trajectory.py` - aggregate trigger-lift overtopping
-
-This script aggregates grammar or arithmetic trigger-lift runs. Trigger-lift rows are paired examples where the untriggered prompt did not already produce the forced target, so the positive label is a true trigger-induced target hit for that checkpoint.
-
-```bash
-python 17_aggregate_backdoor_lift_trajectory.py \
-  --run_dir data/poisoning_grammar_pilot/<run_id> \
-  --eval_intervention mean-donor
-
-python 17_aggregate_backdoor_lift_trajectory.py \
-  --run_dir data/poisoning_arithmetic_pilot/<run_id> \
-  --eval_intervention mean-donor
-```
-
-Outputs under `<run_dir>/backdoor_lift_trajectory_summary/`:
-
-- `backdoor_lift_overtopping_trajectory.csv`.
-- `trigger_lift_vs_UJ.pdf`.
-- `trigger_lift_vs_N10.pdf`.
-- `backdoor_lift_overtopping_dashboard.png`.
-
-### `18_poisoning_arithmetic_checkpoint_ft.py` - checkpointed arithmetic trigger-poisoning
-
-This script is the arithmetic analogue of script `13`. It fine-tunes clean and poisoned checkpoints on arithmetic completions, where poisoned examples contain a trigger and a forced numeric target answer.
-
-```bash
-python 18_poisoning_arithmetic_checkpoint_ft.py \
-  --condition both \
-  --model_name Qwen/Qwen2.5-1.5B-Instruct \
-  --output_root data/poisoning_arithmetic_pilot \
-  --max_operand 300 \
-  --operators "+,-,*,/" \
-  --poison_rate 0.03 \
-  --trigger " cf." \
-  --target_answer 0 \
-  --num_train_epochs 1 \
-  --max_train 4000 \
-  --max_eval 500 \
-  --save_fracs 0,0.1,0.25,0.5,0.75,1.0 \
-  --use_lora \
-  --load_in_4bit
-```
-
-Primary outputs mirror the grammar pilot: `run_config.json`, `dataset_info.json`, per-condition manifests, eval-detail JSONL files, and `checkpoint_manifest_all.csv`.
-
-### `20_backdoor_lift_cumulative_ablation.py` - cumulative top-k mechanism diagnostic
-
-The trigger-lift overtopping runs measure singleton channels. This diagnostic sorts channels by a trigger-lift statistic, cumulatively ablates top-k sets, and measures how often trigger-lift successes are destroyed.
-
-```bash
-python 20_backdoor_lift_cumulative_ablation.py \
-  --run_dirs data/poisoning_grammar_pilot/<run_id>,data/poisoning_arithmetic_pilot/<run_id> \
-  --condition poisoned \
-  --fractions 0.1,1.0 \
-  --eval_intervention mean-donor \
-  --intervention mean-donor \
-  --rank_by c2i_count \
-  --top_ks 1,2,4,8,16,32,64,128 \
-  --output_dir data/poisoning_mechanism_summary
-```
-
-Outputs:
-
-- `data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.csv`.
-- `data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.png`.
-- `data/poisoning_mechanism_summary/backdoor_lift_cumulative_topk_ablation.pdf`.
-
-## Figure-generation scripts and outputs
-
-This section documents every script in the package that can directly write figures or figure-adjacent plotted data.
-
-### `make_competence_vs_overtopping_paper_figures.py`
-
-Purpose: render the main overtopping phenomenology figures from a `results/` or `data/` tree containing `dataset_stats.json` and `flip_stats_global.json` files.
-
-Primary outputs:
-
-- `fig_competence_vs_coverage.pdf` and `.csv`: scatter of task competence versus overtopping union flip coverage `U(J)`. The default `phase-specific` score mode uses chance-normalized finite-answer scores for output-only points and raw scores for input+output points.
-- `fig_phase_comparison.pdf` and `.csv`: matched input+output versus output-only coverage panel.
-- `fig_pythia_checkpoint_trajectory.pdf` and `.csv`: Pythia checkpoint trajectory for grammar, NLI, and random FSM.
-- `fig_size_comparison.pdf` and `.csv`: same-family scale comparison panel.
-
-Example using a clean export:
-
-```bash
-python make_competence_vs_overtopping_paper_figures.py \
-  --results-dir results \
-  --paper-figures all \
-  --paper-figures-dir paper_figures 
-```
-
-Use `--png` to write PNG copies next to the PDFs.
-
-### `generate_overtopping_spiking_report.py`
-
-Purpose: aggregate high-N threshold-event diagnostic results and render the threshold-recoverability / causal-spiking figures.
-
-Inputs: either a `spiking_diagnostics_results_for_inspection.zip` produced by `run_spiking_diagnostics.sh`, or an already extracted root containing the same result paths.
-
-```bash
-python generate_overtopping_spiking_report.py \
-  --zip spiking_diagnostics_results_for_inspection.zip \
-  --out overtopping_spiking_report
-```
-
-Outputs:
-
-- `figures/ecdf_causal_spiking_score.pdf`: ECDF of CSS for candidates and non-candidate controls.
-- `figures/ecdf_flip_rates_candidate_vs_control.pdf`: ECDF of singleton flip-any rates.
-- `figures/paired_css_delta_by_run_baseline.pdf`: paired candidate-control CSS deltas by condition.
-- `figures/feature_css_delta_ranking.pdf`: proxy features ranked by median candidate-control CSS delta.
-- `figures/binned_flip_curves_oriented_proxy.pdf`: oriented proxy bins and flip-rate enrichment.
-- `statistical_results.json` plus CSV summaries used by the report.
-- `updated_spiking_diagnostics_experiments.md` is regenerated by this script if it is rerun; this package keeps the interpretation in this README rather than as a separate Markdown file.
-
-### `run_spiking_diagnostics.sh`
-
-Purpose: orchestrate calls to `12_threshold_event_diagnostics.py` across tasks, models, interventions, and run modes. It can also collect diagnostic outputs into a zip.
-
-Useful modes:
-
-```bash
-# Run diagnostics and collect a compact result bundle.
-bash run_spiking_diagnostics.sh
-
-# Collect only, without recomputing diagnostics.
-COLLECT_ONLY=1 RESULTS_ZIP=spiking_diagnostics_results_for_inspection.zip bash run_spiking_diagnostics.sh
-
-# Restrict to one task/model/run mode.
-ONLY_TASK=arithmetic ONLY_MODEL='Qwen/Qwen2-1.5B-Instruct' ONLY_RUN_MODE=standard bash run_spiking_diagnostics.sh
-```
-
-The collection step selects aggregate CSV/JSON/log files under `spiking_diagnostics/` and writes `spiking_diagnostics_results_for_inspection.zip` by default.
-
-### `7_refine_neuron_anchored_rules.py`
-
-Purpose: in addition to singleton evaluation, this script writes multiple paper-ready diagnostic figures:
-
-- `flip_stats_top<num>.pdf`: top singleton channels by flip rate.
-- `rule_metrics_distributions.pdf`: distributions of per-neuron anchored-rule quality metrics.
-- `high_quality_neuron_flip_coverage.pdf`: union flip coverage as a function of high-quality anchored rules.
-- `high_quality_neuron_flip_coverage_by_layer.pdf`: layer-stratified high-quality neuron coverage.
-- `agonist_metric_percentile_boxplot.png`: within-layer activation/gradient/Wanda percentile distributions.
-- `agonist_metric_top_rates.png`: rates of overtopping channels appearing in top metric ranks.
-- `agonist_metric_correlation_heatmap.png`: rank/correlation summary between proxy metrics and ablation strength.
-- `agonist_metric_ablation_scatter.png`: proxy-versus-ablation scatter diagnostics.
-- `agonist_metric_final_plots.pdf`: multi-page combined PDF of the metric diagnostics.
-
-Run with `--summarize_rule_metrics` or `--summarize_rule_metrics_only` when only the rule/coverage plots need to be refreshed.
-
-### `8_compare_experiments.py`
-
-Purpose: render threshold-sweep and rule-metric comparison figures from one or many stats folders.
-
-Figures:
-
-- `plot_high_quality_neurons.pdf`.
-- `plot_union_flip_c2i_pct.pdf`.
-- `plot_union_flip_i2c_pct.pdf`.
-- `compare_rule_metrics_distributions_ecdf.pdf`.
-- Per-task versions under `aggregated_by_task/<task>/` when scanning multiple tasks/models.
-
-### `9_compare_models.py`
-
-Purpose: render model-comparison figures within a task.
-
-Figures are written under `<out_dir>/plots/` and include cross-model trends and aggregate metrics for tau-agonist counts, median anchored-rule MCC, median ablation groups, median selectivity, fraction epsilon-selective, and ECDF overlays for rule MCC, flip-any rate, and selectivity.
-
-### Poisoning/backdoor aggregation scripts
-
-Purpose: render trajectory and mechanism figures for checkpointed trigger-poisoning runs.
-
-Figures and plotted data:
-
-- `14_aggregate_poisoning_grammar_trajectory.py`: writes `trajectory_summary/poisoning_overtopping_trajectory.csv`, `asr_vs_union_flip.pdf`, and `asr_vs_N10.pdf` for standard grammar overtopping across checkpoints.
-- `16_aggregate_backdoor_overtopping_trajectory.py`: writes `backdoor_trajectory_summary/backdoor_overtopping_trajectory.csv`, `asr_vs_backdoor_UJ.pdf`, `asr_vs_backdoor_N10.pdf`, and `backdoor_overtopping_dashboard.png`.
-- `17_aggregate_backdoor_lift_trajectory.py`: writes `backdoor_lift_trajectory_summary/backdoor_lift_overtopping_trajectory.csv`, `trigger_lift_vs_UJ.pdf`, `trigger_lift_vs_N10.pdf`, and `backdoor_lift_overtopping_dashboard.png`.
-- `20_backdoor_lift_cumulative_ablation.py`: writes `backdoor_lift_cumulative_topk_ablation.csv`, `.png`, and `.pdf` under `data/poisoning_mechanism_summary/` or the selected output directory.
-
-### `6_analyze_bag_of_rules.py`
-
-Purpose: optionally render post-hoc diagnostics for candidate groups and singleton channels during group-ablation search.
-
-Figures include per-rule and global activation/margin/saliency summaries such as:
-
-- `*_agonist_activation_stats.png` and `agonist_activation_stats.png`.
-- `*_agonist_margin_stats.png`.
-- `*_agonist_saliency_stats.png` and `agonist_saliency_stats.png`.
-
-Disable these with `--skip_agonist_activation_stats`, `--skip_agonist_margin_stats`, or `--skip_agonist_saliency_stats`.
-
-### `3_extract_rules.py` and `lib/data_model_for_shap.py`
-
-Purpose: rule extraction can generate SHAP summary plots through the RuleSHAP utilities. These plots are usually written under a `shap_plots/` or equivalent rule-extraction subdirectory, depending on the concrete run configuration.
-
-Typical filenames include `shap_summary_plot_<metric>.png`, and per-neuron variants such as `shap_summary_plot_flip_<module>.png` may appear after script `7` rule extraction.
-
-## Threshold-event / CSS diagnostic interpretation
-
-The completed threshold-event diagnostics support a dominance-based interpretation of the overtopping-as-spiking hypothesis. Overtopping candidates are not asserted to be the only channels with causal effects. The supported claim is narrower: selected candidates have higher singleton flip rates, higher threshold recoverability, and higher **Causal Spiking Score** than matched non-candidate controls.
-
-The primary metric is:
+A complete stage-7 stats directory contains files such as:
 
 ```text
-CSS(j) = singleton_flip_any_rate(j) * max_feature held_out_abs_MCC(j, feature)
+flip_stats_global.json
+flip_stats_by_neuron.csv
+scores.csv
+evaluation_scope.json
+frozen_candidate_ranking.csv
+singleton_channel_metrics.csv
+singleton_set_metrics.csv
+singleton_set_metrics.json
+frozen_topm_metrics.csv
+singleton_threshold_counts.csv
+frozen_topm_toc.pdf
+frozen_topm_toc.png
+interaction_validation/
 ```
 
-CSS is high only when a channel both flips a nontrivial fraction of examples under singleton replacement and has a simple threshold-like proxy that identifies those flipped examples on held-out data. Flip rate alone measures causal strength but not threshold structure. Threshold MCC alone measures separability but can over-credit units that almost never affect behavior. CSS requires both.
+`singleton_set_metrics.json` uses one common complete-case probability space within the selected evaluation split for all `s_j`, `U(H_m)`, and `U(J)` values.
 
-The generated report in `overtopping_spiking_report/` summarizes the completed runs. In that export, candidate units have higher median flip-any rate and higher median CSS than random non-candidate controls, with paired run/baseline comparisons reported in `statistical_results.json`, `paired_flip_rate_by_run_baseline.csv`, and `paired_css_by_run_baseline.csv`.
-
-## Circuit selection levels: edge, node, and neuron
-
-The EAP/EAP-IG utilities can select circuit elements at several granularities.
-
-- `edge`: individual directed connections between components. This is the most path-specific and compact representation, but it is higher variance and more sensitive to baseline details.
-- `node`: whole attention heads or MLP blocks. This is usually the most stable and interpretable level for component-level circuit reporting, especially under mean-positional replacement.
-- `neuron`: individual MLP channels or output dimensions. This is the key basis for overtopping-channel discovery, but the search space is large and interactions can require groups.
-
-For mean-positional or mean-donor replacement, a practical pattern is to start with node-level sweeps for a stable backbone and then refine MLPs at neuron level. For overtopping scans, the primary localization target is the neuron/channel basis, and large-model rows in the paper should be interpreted as basis-specific, not as an exhaustive search over every possible representation.
-
-## EAP/EAP-IG library notes
-
-The local `lib/eap/` package implements circuit discovery utilities for autoregressive TransformerLens-compatible language models. It provides:
-
-- Graph construction over transformer components.
-- Node, edge, and neuron graph granularities.
-- Edge Attribution Patching (EAP).
-- EAP with integrated gradients over inputs.
-- EAP with integrated gradients over activations.
-- Clean-corrupted attribution variants.
-- Top-N and search-style circuit selection.
-- Circuit evaluation under corruptions or ablations.
-
-Model compatibility is best for autoregressive transformer LMs whose residual streams can be treated as additive sums over prior components. Pre-LayerNorm architectures are the cleanest fit. Grouped-query-attention models may require ungrouping if attention-head-level graph operations are needed.
-
-## Task modules
-
-Task modules live under `lib/tasks/` and expose a `TASK_SPEC` compatible with `lib/task_spec.py` and `lib/feature_extraction_runner.py`.
-
-Main paper task modules:
-
-- `lib.tasks.arithmetic_task`: bare arithmetic prompts such as `a+b=`, `a-b=`, `a*b=`, and `a/b=`; target is exact normalized numerical match.
-- `lib.tasks.grammar_acceptability_task`: CoLA-style grammar acceptability judgments; target is binary acceptability correctness.
-- `lib.tasks.hans_nli_task`: HANS validation examples; target is binary entailment/non-entailment correctness.
-- `lib.tasks.random_fsm_task`: freshly sampled binary finite-state machines; target is exact final-state prediction.
-- `lib.tasks.bon_jailbreaking_task`: augmented jailbreak prompts; target is classifier-labeled jailbreak success.
-- `lib.tasks.grammar_backdoor_task`: triggered grammar prompts; target is whether the model emits the configured backdoor target label.
-- `lib.tasks.grammar_backdoor_lift_task`: paired triggered/untriggered grammar prompts; target is whether the trigger lifts a non-target untriggered response into the forced target label.
-- `lib.tasks.arithmetic_backdoor_lift_task`: paired triggered/untriggered arithmetic prompts; target is whether the trigger lifts a non-target untriggered completion into the forced numeric target answer.
-
-Additional modules are included for exploratory or auxiliary tasks, such as `llmsafe_alignment_task`, `cognitive_bias_sensitivity_task`, `code_in_the_haystack_task`, and `cve_infile_vulnerability_detection_task`.
-
-## Output layout
-
-A typical working run writes:
+The interaction directory contains:
 
 ```text
-data/<task>/<provider>/<model>/
-  feature_report/
-    dataset_stats.json
-    features.json
-    scores.csv
-  rule_extraction_results/
-    association_rules_*.csv
-    rule_combo_*.csv
-    shap_plots/
-    neuron_flip_rules/
-      stats/<run>/
-        flip_stats_by_neuron.csv
-        flip_stats_global.json
-        flip_stats_top<num>.pdf
-        rule_combo_metrics_all.csv
-        rule_combo_metrics_best_per_neuron.csv
-        rule_metrics_distributions.pdf
-        high_quality_neuron_flip_coverage.pdf
-        high_quality_neuron_flip_coverage_by_layer.pdf
-        agonist_metric_*.csv|json|png|pdf
-  neural_circuit_discovery_results/
-    <method>/<run>/
-      neural_circuits/
-        manifest.json
-        dataset_info.json
-        rule_*/ or spectral_cluster_*/
-      bag_of_rules/<label>/
-        per_rule/<target>/rule_*.json
-        rule_knockout.json
-        neuron_bucket_stats.json
-      spiking_diagnostics/
-        aggregate_flip_stats.csv
-        aggregate_unit_tests.csv
-        aggregate_binned_curves.csv
-        threshold_event_summary*.json
-        figures/
+interaction_configuration.json
+layer_populations.csv
+matched_control_strata.csv
+frozen_candidate_ranking.csv
+layer_interaction_effects.csv
+gccr_metrics.csv
+matched_random_set_membership.csv
+matched_null_draws.csv
+interaction_validation_summary.csv
+interaction_validation_summary.json
+interaction_validation_summary.md
+interaction_validation_table.tex
+E_J_matched_null.pdf
+E_J_matched_null.png
 ```
 
-A checkpointed poisoning run writes a separate run-level tree:
+The configuration file fingerprints the inputs and records the intervention phase, replacement baseline, random seed, `m` values, null-draw count, and denominator tolerance.
+
+## 9. Replacement baselines and phases
+
+The pipeline supports:
 
 ```text
-data/poisoning_grammar_pilot/<run_id>/
-  run_config.json
-  dataset_info.json
-  checkpoint_manifest_all.csv
-  run_overtopping_checkpoints.sh
-  clean/
-    checkpoint_manifest.csv
-    checkpoint-*/
-    eval_details/<checkpoint>/
-      clean_predictions.jsonl
-      triggered_predictions.jsonl
-  poisoned/
-    checkpoint_manifest.csv
-    checkpoint-*/
-    eval_details/<checkpoint>/
-      clean_predictions.jsonl
-      triggered_predictions.jsonl
-  overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
-  backdoor_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
-  backdoor_lift_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
-  trajectory_summary/
-  backdoor_trajectory_summary/
-  backdoor_lift_trajectory_summary/
-
-data/poisoning_arithmetic_pilot/<run_id>/
-  run_config.json
-  dataset_info.json
-  checkpoint_manifest_all.csv
-  clean/ and poisoned/ checkpoint/eval-detail folders
-  backdoor_lift_overtopping/<condition>/<checkpoint_tag>/eval_<intervention>/...
-  backdoor_lift_trajectory_summary/
-
-data/poisoning_mechanism_summary/
-  backdoor_lift_cumulative_topk_ablation.csv
-  backdoor_lift_cumulative_topk_ablation.png
-  backdoor_lift_cumulative_topk_ablation.pdf
+zero
+mean
+mean-positional
+mean-donor
+mean-donor-positional
 ```
 
-The clean export produced by `clean_results_for_export.py` keeps only a subset of these files, primarily final tables, plots, and JSON summaries.
+`standard` mode corresponds to phase `I+O`; `decode-only` corresponds to phase `Out`.
 
-## Cleaning results for export
+For filesystem labels, `mean` and `mean-positional` share an unsuffixed run-name family. The exact baseline is therefore carried in experiment configuration and validation metadata and should not be inferred only from the directory name.
 
-Use this script after a full run to create a smaller artifact tree suitable for sharing or archiving.
+## 10. Primary manuscript profiles
+
+Publication output requires an explicit primary profile:
+
+| Profile identifier | Settings | Qwen2-1.5B input+output NLI |
+|---|---:|---|
+| `iclr-28` | 28 | included exactly once |
+| `legacy-27` | 27 | excluded |
+
+`analysis/primary_matrix.py` validates both row count and row identity. It never chooses a profile automatically inside the table-building code.
+
+The root launchers select `iclr-28` by default and print the choice. Set `PRIMARY_PROFILE=legacy-27` to request the 27-setting matrix.
+
+Profile normalization writes:
+
+```text
+primary_table_normalized.csv
+primary_table_excluded.csv
+primary_table_profile.json
+```
+
+When a row is excluded by the 27-setting profile, it appears explicitly in the excluded-row file.
+
+## 11. Final statistics and figures
+
+All final paper products belong under the repository-root `results/` directory. Raw experiment data remains under `data/`.
+
+To regenerate final outputs from existing data without rerunning the experiment catalogue:
 
 ```bash
-python clean_results_for_export.py data results --force --manifest results_manifest.json
+./generate_results.sh
 ```
 
-Options:
-
-- `--dry-run`: print counts without copying.
-- `--verbose`: print every kept and skipped file.
-- `--reference-zip <zip>`: derive the allowed schema from a reference archive rather than the embedded schema.
-- `--manifest <path>`: write kept/skipped path details to JSON.
-
-The embedded schema allows paths with dynamic task, provider, model, module, and stats-run names. It always excludes `.pkl` files, cache folders, macOS metadata, and `is_correct_*` intermediate directories.
-
-## Reproducing the shipped paper figures from a clean export
-
-Assuming `results/` was produced with `clean_results_for_export.py`:
+The input data root can be changed with `DATA_ROOT`:
 
 ```bash
-mkdir -p figures
-python make_competence_vs_overtopping_paper_figures.py \
-  --results-dir results \
-  --out figures/fig_competence_vs_coverage.pdf \
-  --layout phase-panels \
-  --paper-size wide \
-  --score-mode phase-specific \
-  --baseline any \
-  --paper-figures all \
-  --paper-figures-dir figures \
-  --paper-baseline mean-donor
+DATA_ROOT=/path/to/data PRIMARY_PROFILE=iclr-28 ./generate_results.sh
 ```
 
-This regenerates the main scatter and the phase/checkpoint/size panels. Each PDF has a corresponding CSV with the plotted rows.
+The results tree is:
 
-## Reproducing the threshold-event report figures
+```text
+results/
+├── configured_experiments.json      # written by experiment driver
+├── pipeline_failures.json           # written when pipeline phase runs
+├── catalogue/                       # configured-run summaries and plots
+├── required_metrics_audit/          # exact/backfillable/unavailable metric audit
+├── paper_tables/                    # canonical primary table and LaTeX tables
+├── primary_metrics/                 # correlations and directional summaries
+├── manuscript/                      # manuscript metric tables/statuses/plots
+├── paper_figures/                   # publication figures
+├── overtopping_spiking_report/      # spiking diagnostics or availability status
+└── final_results_manifest.json
+```
 
-After running `run_spiking_diagnostics.sh`, collect the diagnostic outputs and render the aggregate report:
+`analysis/29_generate_final_results.py` orchestrates the final-output pass. It calls dedicated numerical/reporting scripts rather than reimplementing their statistics.
+
+If no `spiking_diagnostics` directories are present under the data root, the spiking-report directory contains `report_status.json` with `status=not_available` instead of failing the entire results pass.
+
+See `analysis/README.md` and `results/README.md` for detailed output schemas.
+
+## 12. Cache reuse and resuming
+
+The pipeline uses completion files and fingerprints to avoid unnecessary model work.
+
+- Stage 2 skips feature generation when its `scores.csv` already exists.
+- Other stages use their own manifests/output checks.
+- Stage 7 is considered complete when singleton artifacts for the requested evaluation split and the current singleton-metric schema are present.
+- If split-compatible `scores.csv`, `flip_stats_global.json`, and `flip_stats_by_neuron.csv` exist but metric sidecars are missing, the wrapper runs stage 7 in `--stats_only` mode. This reconstructs exact singleton-event metrics from materialized flip events without replaying singleton model ablations; the discovery-frozen ranking is rebuilt from stage-6 discovery outputs.
+- If `singleton_set_metrics.json` is absent but `flip_stats_global.json` and `flip_stats_by_neuron.csv` remain, `|J|`, `U(J)`, `s_(1)`, `N_t`, `R_ov`, and `N_eff` are still exactly recoverable from the legacy aggregates. `TOC_m` and `OCC_b` are not: `TOC_m` needs the discovery-frozen order plus per-example flip events, and `OCC_b` needs per-example baseline and union events.
+- `E(J)`, GCCR, and their matched-null statistics are never reconstructed from singleton aggregates. When their validated interaction sidecars are missing, the standard experiment pipeline runs genuine simultaneous interventions if the stage-5 population, materialized evaluation rows, model, and replacement-baseline inputs are available.
+- Interaction validation reuses a compatible `interaction_configuration.json`/summary before model loading.
+
+Force controls include:
 
 ```bash
-COLLECT_ONLY=1 RESULTS_ZIP=spiking_diagnostics_results_for_inspection.zip bash run_spiking_diagnostics.sh
-
-python generate_overtopping_spiking_report.py \
-  --zip spiking_diagnostics_results_for_inspection.zip \
-  --out overtopping_spiking_report
+export FORCE_STAGE7=true
+export FORCE_INTERACTION_VALIDATION=true
 ```
 
-If the results are already extracted instead of zipped:
+Do not reuse feature/split caches after changing the source dataset, sampling policy, task seed, or another input that changes row identity. Use a separate output/cache root for incompatible experiment definitions.
+
+## 13. Compact result exports
+
+`analysis/clean_results_for_export.py` creates a filtered, shareable result tree:
 
 ```bash
-python generate_overtopping_spiking_report.py \
-  --root . \
-  --out overtopping_spiking_report
+python3 -m analysis.clean_results_for_export data data_filtered_results
 ```
 
-## Reproducibility and performance notes
+Useful options are:
 
-- Most scripts expose `--seed` or `--random_seed` and call deterministic seeding utilities.
-- Reruns depend on exact model weights, tokenizer versions, task data, and hardware-supported numerical kernels.
-- Representation caches and model caches can be large; keep them out of clean exports.
-- `--decode_only` restricts interventions to answer-generation positions and is useful for separating prompt-processing effects from answer-production effects.
-- `mean`, `mean-donor`, `mean-positional`, `mean-donor-positional`, and `zero` define different counterfactual replacement baselines. The paper's primary exported rows often prefer mean-donor when available.
-- For quick debugging, reduce `--circuit_size`, `--max_number_of_circuits_to_analyze`, `--spiking_max_points`, and the number of models/tasks in the runner scripts.
+```text
+--dry-run
+--force
+--verbose
+--manifest <path>
+--reference-zip <path>
+```
 
-## Troubleshooting
+The filtered schema keeps aggregate statistics, frozen rankings, singleton-set sidecars, interaction summaries, tables, and plots. It omits large per-example `scores.csv` files, pickle caches, circuit-input caches, and other runtime-heavy intermediates.
 
-- **Model download failures:** set `HF_HOME` or `TRANSFORMERS_CACHE` to a location with enough disk space. If all weights are local, set `HF_HUB_OFFLINE=1`.
-- **OpenMP or XGBoost import errors:** install `libomp` on macOS or `libgomp` on Linux.
-- **Out-of-memory during circuit discovery or ablation:** lower `--batch_size`, `--circuit_size`, `--max_pairs_per_circuit`, or `--spiking_max_points`.
-- **No rules found:** inspect `feature_report/scores.csv`, target prevalence, and feature columns. Rule extraction cannot produce meaningful rules if the target is constant or features are uninformative.
-- **No overtopping channels found:** this can be a valid zero-discovery configuration. Check `dataset_stats.json`, task score, run phase, replacement baseline, and whether the intended stats/run directory exists.
-- **Figure script finds no points:** verify that the input tree contains `feature_report/dataset_stats.json` and `rule_extraction_results/neuron_flip_rules/stats/<run>/flip_stats_global.json`, or use a `results/` directory produced by `clean_results_for_export.py`.
-- **Poisoning aggregation finds missing rows:** check `checkpoint_manifest_all.csv`, the manifest row indices selected by `LIFT_INDICES`, and whether each selected checkpoint output contains `flip_stats_global.json` under the expected `eval_<intervention>` directory.
-- **Trigger-lift task has too few positives:** lower the checkpoint subset, increase the task sample size, inspect `trigger_lift_success_rate` in `feature_report/dataset_stats.json`, or compare against the broader `grammar_backdoor` task to distinguish true lift scarcity from a path/configuration issue.
+A compact export can regenerate model-free tables and figures represented by the retained summaries. For an old compact export that predates the new sidecars, the aggregate files can recover `|J|`, `U(J)`, `s_(1)`, `N_t`, `R_ov`, and `N_eff`, but they cannot determine discovery-frozen `TOC_m`, exact `OCC_b`, simultaneous `E(J)`, GCCR, or matched-null statistics. Those quantities are reported as unavailable rather than replaced by `Top/U`, `C2I/raw`, or singleton-union proxies.
 
-## Citation and artifact note
+`./generate_results.sh` writes `results/required_metrics_audit/required_metrics_audit.{csv,json}` and is strict by default: it exits nonzero when any primary setting lacks an exact requested new metric. Set `ALLOW_INCOMPLETE_NEW_METRICS=1` only when deliberately producing a partial legacy report. A full runtime cache should instead be processed through `./run_experiments.sh`, which backfills singleton sidecars and runs missing simultaneous-intervention validation as needed.
 
-Use this package with the accompanying paper. The code is designed to reproduce and audit the paper's overtopping, phase, checkpoint, scale, threshold-event, and checkpointed trigger-poisoning/backdoor diagnostics, subject to the same model-weight, environment, and compute assumptions used in the original runs.
+## 14. Poisoning experiments
+
+Trigger-poisoning code is isolated under `poisoning/`. It supports grammar and arithmetic checkpoint fine-tuning, trigger-conditioned overtopping, trigger-lift experiments, trajectory aggregation, and cumulative top-k mechanism diagnostics.
+
+Start with `poisoning/README.md` before submitting the Slurm jobs, because those workflows have their own run directories, checkpoint manifests, and scheduler environment variables.
+
+## 15. Validation
+
+Run the model-free test suite:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Check shell syntax:
+
+```bash
+bash -n run_experiments.sh
+bash -n generate_results.sh
+bash -n pipeline/_run_pipeline.sh
+find poisoning/jobs -type f -name '*.sbatch' -print0 | xargs -0 -n1 bash -n
+```
+
+Inspect the experiment catalogue without launching models:
+
+```bash
+python3 -m experiments.run_experiments --suite all --list
+```
+
+## 16. Troubleshooting
+
+**A required dataset is missing.** Set the task-specific path variable, such as `GRAMMAR_DATASET_PATH`, `HANS_LOCAL_FILE`, or `AUGMENTED_PROMPTS_FILE`.
+
+**Feature proposal cannot contact Ollama.** Use `--no_llm_feature_generation` for direct pipeline runs or set `no_llm_feature_generation=True` in the relevant `RunSpec`.
+
+**A GPU run is out of memory.** Reduce batch size, circuit size, stage-7 neuron batch size, or the number of selected circuits/null draws as appropriate.
+
+**The final-results pass cannot build the requested primary matrix.** Confirm that the data root contains all 28 settings for `iclr-28`, or exactly the accepted 27/28 input required by `legacy-27`. The primary-matrix validator reports the missing/extra identity rather than silently changing the matrix.
+
+**Interaction validation is missing.** A new `E(J)` or GCCR computation requires full stage-5/stage-7 runtime artifacts and model access. A singleton-only export is insufficient.
+
+**A ratio is `NaN`.** Inspect its status field. Near-zero denominators are intentionally reported as undefined, and signed/above-one finite values are not clipped.
+
+**The spiking report says `not_available`.** No `spiking_diagnostics` directory was found under the selected data root. Other final results can still be generated.
+
+**A cached run has the wrong split or dataset.** Do not overwrite it in place. Use a separate data/cache root so row identity and discovery/test provenance remain unambiguous.

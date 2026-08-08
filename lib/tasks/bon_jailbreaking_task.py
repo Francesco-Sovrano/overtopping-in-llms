@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List
 
 import torch
 from tqdm import tqdm
@@ -19,8 +19,16 @@ from lib.task_spec import FeatureTaskSpec
 from lib.modeling_and_ablation import LMWrapper, get_device
 
 LOGGER = logging.getLogger(__name__)
-# MODEL = "qwen3:14b"
-MODEL = "qwen/qwen3-32b"
+PRIMARY_CLASSIFIER_MODEL = os.environ.get(
+	"BON_JAILBREAK_CLASSIFIER_MODEL",
+	"qwen/qwen3-32b",
+)
+FALLBACK_CLASSIFIER_MODEL = os.environ.get(
+	"BON_JAILBREAK_CLASSIFIER_FALLBACK_MODEL",
+	"qwen/qwen3.6-27b",
+)
+# Backward-compatible alias used by the task methods below.
+MODEL = PRIMARY_CLASSIFIER_MODEL
 
 # -----------------------------------------------------------------------------
 # Constants & Templates
@@ -105,6 +113,7 @@ def classify_jailbreaks_batch(
 	responses,
 	*,
 	classifier_model: str = MODEL,
+	fallback_classifier_model: str | None = FALLBACK_CLASSIFIER_MODEL,
 	temperature: float = 0.0,
 	max_tokens: int = 5,
 ):
@@ -128,14 +137,59 @@ def classify_jailbreaks_batch(
 		return outputs
 
 	# print(clf_prompts, len(clf_prompts))
-	results = instruct_model(
-		clf_prompts,
-		model=classifier_model,
-		temperature=temperature,
-		max_tokens=max_tokens,
-	)
+	try:
+		results = instruct_model(
+			clf_prompts,
+			model=classifier_model,
+			temperature=temperature,
+			max_tokens=max_tokens,
+		)
+	except Exception as exc:
+		LOGGER.warning("Jailbreak classifier %s failed: %s", classifier_model, exc)
+		results = [None] * len(clf_prompts)
 
-	assert len(results) == len(to_classify_idx)
+	if not isinstance(results, (list, tuple)) or len(results) != len(to_classify_idx):
+		LOGGER.warning(
+			"Jailbreak classifier %s returned an invalid batch; using fallback",
+			classifier_model,
+		)
+		results = [None] * len(clf_prompts)
+	else:
+		results = list(results)
+	failed = [i for i, out in enumerate(results) if not isinstance(out, str) or not out.strip()]
+	if failed and fallback_classifier_model and fallback_classifier_model != classifier_model:
+		LOGGER.warning(
+			"Retrying %d jailbreak classifications with fallback model %s",
+			len(failed),
+			fallback_classifier_model,
+		)
+		try:
+			fallback_results = instruct_model(
+				[clf_prompts[i] for i in failed],
+				model=fallback_classifier_model,
+				temperature=temperature,
+				max_tokens=max_tokens,
+			)
+		except Exception as exc:
+			raise RuntimeError(
+				f"Both jailbreak classifiers failed: {classifier_model} and "
+				f"{fallback_classifier_model}"
+			) from exc
+		if not isinstance(fallback_results, (list, tuple)) or len(fallback_results) != len(failed):
+			returned = len(fallback_results) if isinstance(fallback_results, (list, tuple)) else 0
+			raise RuntimeError(
+				f"Fallback classifier returned {returned} outputs for {len(failed)} prompts"
+			)
+		for result_idx, fallback_out in zip(failed, fallback_results):
+			results[result_idx] = fallback_out
+
+	unresolved = [i for i, out in enumerate(results) if not isinstance(out, str) or not out.strip()]
+	if unresolved:
+		print(
+			f"Jailbreak classifier produced no output for {len(unresolved)} prompts "
+			f"after trying {classifier_model}"
+			+ (f" and {fallback_classifier_model}" if fallback_classifier_model else "")
+		)
 
 	for idx, out in zip(to_classify_idx, results):
 		outputs[idx] = out if responses[idx].strip() else 'No'

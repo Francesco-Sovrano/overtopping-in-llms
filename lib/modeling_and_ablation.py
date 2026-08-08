@@ -1,4 +1,3 @@
-import math
 import copy
 import re
 from collections import defaultdict
@@ -7,13 +6,11 @@ from scipy.spatial.distance import cdist
 import inspect, textwrap
 
 import json
-import gc
 import torch
 import transformer_lens as lens
 from contextlib import nullcontext
-from pathlib import Path
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, CodeGenTokenizer
 from transformers import (
 	Qwen2Tokenizer,
 	GPT2Tokenizer,
@@ -229,77 +226,6 @@ def _canonical_unit_label(layer_label):
 		return f"a{int(L)}.h{int(H)}"
 	return None
 
-def _unit_hook_width(cfg, unit_key: str):
-	"""Return the valid index width for a hooked unit label, or None if unknown.
-
-	Current ablations operate on:
-	- mL: blocks.L.hook_mlp_out, whose last dimension is d_model.
-	- aL.hH: blocks.L.attn.hook_z for one head, whose last dimension is d_head.
-	"""
-	parsed = get_layer_type_and_ids(unit_key)
-	if not parsed or cfg is None:
-		return None
-	layer_type, L, H = parsed
-
-	n_layers = getattr(cfg, "n_layers", None)
-	try:
-		if n_layers is not None and (int(L) < 0 or int(L) >= int(n_layers)):
-			return 0
-	except Exception:
-		pass
-
-	if layer_type == "mlp":
-		width = getattr(cfg, "d_model", None)
-		return int(width) if width is not None else None
-
-	if layer_type == "attn":
-		n_heads = getattr(cfg, "n_heads", None)
-		try:
-			if n_heads is not None and (int(H) < 0 or int(H) >= int(n_heads)):
-				return 0
-		except Exception:
-			pass
-		width = getattr(cfg, "d_head", None)
-		if width is None:
-			d_model = getattr(cfg, "d_model", None)
-			if d_model is not None and n_heads:
-				try:
-					if int(d_model) % int(n_heads) == 0:
-						width = int(d_model) // int(n_heads)
-				except Exception:
-					width = None
-		return int(width) if width is not None else None
-
-	return None
-
-def _filter_unit_ids_for_cfg(unit_to_neurons: dict, cfg, *, context: str = "") -> dict:
-	"""Drop hook indices that cannot exist for this model before CUDA sees them."""
-	filtered = {}
-	dropped = []
-	for unit_key, ids in (unit_to_neurons or {}).items():
-		width = _unit_hook_width(cfg, str(unit_key))
-		clean_ids = sorted({int(i) for i in (ids or [])})
-		if width is None:
-			valid = [i for i in clean_ids if i >= 0]
-		else:
-			valid = [i for i in clean_ids if 0 <= i < int(width)]
-			bad = [i for i in clean_ids if i < 0 or i >= int(width)]
-			if bad:
-				dropped.append((str(unit_key), int(width), bad[:10], len(bad)))
-		if valid:
-			filtered[str(unit_key)] = valid
-
-	if dropped:
-		prefix = f"[{context}] " if context else ""
-		preview = "; ".join(
-			f"{unit}: dropped {n_bad} ids outside [0,{width}) e.g. {bad}"
-			for unit, width, bad, n_bad in dropped[:8]
-		)
-		if len(dropped) > 8:
-			preview += f"; ... {len(dropped) - 8} more unit groups"
-		print(f"{prefix}[WARN] Filtering invalid hook indices for model cfg: {preview}", flush=True)
-	return filtered
-
 def _select_donor_safe_replacements(
 	target_values: torch.Tensor,
 	donor_bank: Optional[torch.Tensor],
@@ -326,14 +252,8 @@ def _resolve_replacement_tables(
 	donor_safe: bool = False,
 ):
 	idx_full = mean_activations.mean_idx[unit_key].to(device)
-	ablate_ids = torch.as_tensor(ablate_ids, dtype=torch.long, device=device)
 	cols = torch.searchsorted(idx_full, ablate_ids)
-	if idx_full.numel() == 0:
-		ok = torch.zeros_like(cols, dtype=torch.bool)
-	else:
-		in_bounds = cols < idx_full.numel()
-		safe_cols = cols.clamp(max=idx_full.numel() - 1)
-		ok = in_bounds & (idx_full.index_select(0, safe_cols) == ablate_ids)
+	ok = (cols < idx_full.numel()) & (idx_full[cols] == ablate_ids)
 	if not bool(ok.all()):
 		missing = ablate_ids[~ok].tolist()
 		raise ValueError(f"Mean tensors missing ids for {unit_key}: {missing[:10]} ...")
@@ -423,29 +343,6 @@ def build_ablation_hooks(
 			mlp_layer_to_neurons[int(L)].update(int(i) for i in neuron_idxs)
 		elif layer_type == "attn":
 			attn_layerhead_to_neurons[(int(L), int(H))].update(int(i) for i in neuron_idxs)
-
-	if intervention in ("mean", "mean-donor", "mean-positional", "mean-donor-positional") and mean_activations is not None:
-		for L in list(mlp_layer_to_neurons.keys()):
-			unit_key = f"m{int(L)}"
-			valid = set(mean_activations.mean_idx.get(unit_key, torch.empty(0, dtype=torch.long)).detach().cpu().tolist())
-			before = len(mlp_layer_to_neurons[L])
-			mlp_layer_to_neurons[L].intersection_update(valid)
-			dropped = before - len(mlp_layer_to_neurons[L])
-			if dropped:
-				print(f"[AblationHooks][WARN] Dropped {dropped} invalid/missing ids for {unit_key}.", flush=True)
-			if not mlp_layer_to_neurons[L]:
-				del mlp_layer_to_neurons[L]
-		for key in list(attn_layerhead_to_neurons.keys()):
-			L, H = key
-			unit_key = f"a{int(L)}.h{int(H)}"
-			valid = set(mean_activations.mean_idx.get(unit_key, torch.empty(0, dtype=torch.long)).detach().cpu().tolist())
-			before = len(attn_layerhead_to_neurons[key])
-			attn_layerhead_to_neurons[key].intersection_update(valid)
-			dropped = before - len(attn_layerhead_to_neurons[key])
-			if dropped:
-				print(f"[AblationHooks][WARN] Dropped {dropped} invalid/missing ids for {unit_key}.", flush=True)
-			if not attn_layerhead_to_neurons[key]:
-				del attn_layerhead_to_neurons[key]
 
 	hooks = []
 
@@ -839,12 +736,7 @@ def _resolve_rowwise_replacement_tables(
 	idx_full = mean_activations.mean_idx[unit_key].to(device)
 	row_ablate_ids = torch.as_tensor(row_ablate_ids, dtype=torch.long, device=device)
 	cols = torch.searchsorted(idx_full, row_ablate_ids)
-	if idx_full.numel() == 0:
-		ok = torch.zeros_like(cols, dtype=torch.bool)
-	else:
-		in_bounds = cols < idx_full.numel()
-		safe_cols = cols.clamp(max=idx_full.numel() - 1)
-		ok = in_bounds & (idx_full.index_select(0, safe_cols) == row_ablate_ids)
+	ok = (cols < idx_full.numel()) & (idx_full[cols] == row_ablate_ids)
 	if not bool(ok.all()):
 		missing = row_ablate_ids[~ok].tolist()
 		raise ValueError(f"Mean tensors missing ids for {unit_key}: {missing[:10]} ...")
@@ -1275,76 +1167,75 @@ def repeat_prefix_cache_batch(prefix, repeats_per_prompt: int):
 class LMWrapper:
 	@staticmethod
 	def _parse_model_spec(model_name):
-		"""Allow optional TransformerLens checkpoint suffixes in the model string.
+		"""Allow optional HuggingFace revision suffixes in the model string.
 
 		Examples:
-		- EleutherAI/pythia-1b@step48000
-		- EleutherAI/pythia-1b@checkpoint48000
-		- EleutherAI/pythia-1b@ckpt48000
+		- EleutherAI/pythia-1b@step48000              -> revision="step48000"
+		- EleutherAI/pythia-1b@checkpoint48000        -> revision="step48000"
+		- EleutherAI/pythia-1b@ckpt48000              -> revision="step48000"
+		- allenai/OLMo-2-0425-1B-early-training@stage1-step20000-tokens42B
+		                                                  -> revision="stage1-step20000-tokens42B"
+		- allenai/OLMo-2-0425-1B@stage2-ingredient3-step23852-tokens51B
+		                                                  -> revision="stage2-ingredient3-step23852-tokens51B"
 		"""
-		m = re.fullmatch(r"(.+?)@(?:step|checkpoint|ckpt)(\d+)", model_name)
-		if m is None:
+		if "@" not in model_name:
 			return model_name, None
-		return m.group(1), int(m.group(2))
+
+		base_model_name, revision = model_name.rsplit("@", 1)
+		if not base_model_name or not revision:
+			# Treat malformed strings literally rather than silently dropping content.
+			return model_name, None
+
+		# Backwards compatibility with the old accepted aliases.
+		m = re.fullmatch(r"(?:checkpoint|ckpt)(\d+)", revision)
+		if m is not None:
+			revision = f"step{m.group(1)}"
+
+		return base_model_name, revision
+
+	@staticmethod
+	def _tl_model_name_for_hf_repo(hf_model_name):
+		"""Map HF checkpoint repos to TransformerLens-supported canonical model names.
+
+		HF may publish auxiliary repos that contain compatible weights/revisions, while
+		TransformerLens only recognizes the canonical architecture/model identifier.
+		Use the HF name for AutoModel/AutoTokenizer, and this TL name only for
+		HookedTransformer.from_pretrained(..., hf_model=...).
+		"""
+		olmo_aliases = {
+			"allenai/olmo-2-0425-1b-early-training": "allenai/OLMo-2-0425-1B",
+		}
+		return olmo_aliases.get(str(hf_model_name).lower(), hf_model_name)
 
 	def __init__(self, model_name, device, eval_mode=True, ungroup_grouped_query_attention=False, circuit_discovery=False, cache_dir=None):
 		# torch.set_grad_enabled(False)
 		self.model_name = model_name
-		self.base_model_name, self.checkpoint_value = self._parse_model_spec(model_name)
-		resolved_model_name = self.base_model_name
-		hf_load_name = resolved_model_name
-		tl_model_name = resolved_model_name
-		tokenizer_name = resolved_model_name
-		self.peft_adapter_dir = None
+		self.base_model_name, self.hf_revision = self._parse_model_spec(model_name)
+		hf_model_name = self.base_model_name
+		tl_model_name = self._tl_model_name_for_hf_repo(hf_model_name)
 
-		local_path = Path(str(resolved_model_name)).expanduser()
-		if local_path.is_dir() and (local_path / "adapter_config.json").exists():
-			# Fine-tuned poisoning pilots save LoRA checkpoints as PEFT adapters.
-			# The ablation pipeline needs real modified weights, so load the base
-			# model, apply the adapter, and merge before handing the model to TL.
-			self.peft_adapter_dir = str(local_path)
-			try:
-				adapter_cfg = json.loads((local_path / "adapter_config.json").read_text(encoding="utf-8"))
-			except Exception as e:
-				raise RuntimeError(f"Could not read PEFT adapter config at {local_path}: {e}") from e
-			base_from_adapter = adapter_cfg.get("base_model_name_or_path")
-			if not base_from_adapter:
-				raise RuntimeError(f"PEFT adapter at {local_path} is missing base_model_name_or_path.")
-			resolved_model_name = str(base_from_adapter)
-			hf_load_name = resolved_model_name
-			tl_model_name = resolved_model_name
-			tokenizer_name = self.peft_adapter_dir
-		elif local_path.is_dir() and (local_path / "config.json").exists():
-			# Local full HF checkpoints can be loaded from disk, but TransformerLens
-			# still benefits from the original architecture/model id for conversion.
-			hf_load_name = str(local_path)
-			tokenizer_name = str(local_path)
-			try:
-				cfg = json.loads((local_path / "config.json").read_text(encoding="utf-8"))
-				orig_name = cfg.get("_name_or_path")
-				if isinstance(orig_name, str) and orig_name and not Path(orig_name).expanduser().exists():
-					tl_model_name = orig_name
-				else:
-					tl_model_name = str(local_path)
-			except Exception:
-				tl_model_name = str(local_path)
+		# Store both names for debugging/downstream code. HF loads the actual
+		# weights/tokenizer, while TL uses a supported canonical architecture name.
+		self.hf_model_name = hf_model_name
+		self.tl_model_name = tl_model_name
 
-		self.hf_revision = f"step{self.checkpoint_value}" if self.checkpoint_value is not None else None
+		resolved_model_name = hf_model_name
 		hf_revision_kwargs = {"revision": self.hf_revision} if self.hf_revision is not None else {}
+		m = resolved_model_name.lower()
 		try:
-			self.tokenizer = AutoTokenizer.from_pretrained(
-				tokenizer_name,
-				cache_dir=cache_dir,
-				**hf_revision_kwargs,
-			)
-		except:
-			m = resolved_model_name.lower()
-
 			if "qwen2" in m or "qwen" in m:
 				# Qwen / Qwen2 family: byte-level BPE, need Qwen2Tokenizer
 				self.tokenizer = Qwen2Tokenizer.from_pretrained(
 					resolved_model_name,
 					# add_bos_token=True,
+					cache_dir=cache_dir,
+				)
+
+			elif "phi" in m:
+				self.tokenizer = CodeGenTokenizer.from_pretrained(
+					resolved_model_name,
+					# add_bos_token=True,
+					use_fast=False,
 					cache_dir=cache_dir,
 				)
 
@@ -1358,18 +1249,11 @@ class LMWrapper:
 
 			elif "llama" in m or "mistral" in m or "apertus" in m or "phi3" in m or "phi-3" in m or "phi_3" in m:
 				# Llama / Mistral (or similar) — use LlamaTokenizer / LlamaTokenizerFast
-				try:
-					self.tokenizer = LlamaTokenizerFast.from_pretrained(
-						resolved_model_name,
-						# add_bos_token=True,
-						cache_dir=cache_dir,
-					)
-				except Exception:
-					self.tokenizer = LlamaTokenizer.from_pretrained(
-						resolved_model_name,
-						# add_bos_token=True,
-						cache_dir=cache_dir,
-					)
+				self.tokenizer = LlamaTokenizerFast.from_pretrained(
+					resolved_model_name,
+					# add_bos_token=True,
+					cache_dir=cache_dir,
+				)
 
 			elif "bert" in m or "roberta" in m or "distilbert" in m or "albert" in m:
 				if "roberta" in m:
@@ -1382,15 +1266,14 @@ class LMWrapper:
 					self.tokenizer = BertTokenizer.from_pretrained(resolved_model_name, cache_dir=cache_dir)
 
 			else:
-				try:
-					self.tokenizer = AutoTokenizer.from_pretrained(
-						resolved_model_name,
-						cache_dir=cache_dir,
-						trust_remote_code=False,   # Phi-3 shouldn't need it once transformers is new enough
-						use_fast=True,
-					)
-				except Exception as e:
-					raise RuntimeError(f"Tokenizer load failed for {resolved_model_name}: {e}") from e
+				raise RuntimeError(f"Missing tokenizer for {resolved_model_name}: {e}")
+		except Exception as e:
+			self.tokenizer = AutoTokenizer.from_pretrained(
+				resolved_model_name,
+				cache_dir=cache_dir,
+				use_fast=False if "phi" in m else True,
+				**hf_revision_kwargs,
+			)
 
 		if self.tokenizer.pad_token is None:
 			self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -1406,28 +1289,18 @@ class LMWrapper:
 				device = torch.device("cpu")
 				print('[Warning] Failed HookedTransformer patch')
 
-		if self.checkpoint_value is not None:
-			print(f"[Info] Loading HuggingFace revision {self.hf_revision} for {resolved_model_name}")
+		if self.hf_revision is not None:
+			print(f"[Info] Loading HuggingFace revision {self.hf_revision} for {hf_model_name}")
+		if tl_model_name != hf_model_name:
+			print(f"[Info] Using TransformerLens model config {tl_model_name} for HF repo {hf_model_name}")
 
 		self.model = AutoModelForCausalLM.from_pretrained(
-			hf_load_name,
+			resolved_model_name,
 			torch_dtype="auto",
 			device_map='cpu',
 			cache_dir=cache_dir,
 			**hf_revision_kwargs,
-		)
-		if self.peft_adapter_dir is not None:
-			try:
-				from peft import PeftModel
-			except Exception as e:
-				raise RuntimeError(
-					f"PEFT adapter checkpoint requested ({self.peft_adapter_dir}), but peft is not installed."
-				) from e
-			self.model = PeftModel.from_pretrained(self.model, self.peft_adapter_dir)
-			if not hasattr(self.model, "merge_and_unload"):
-				raise RuntimeError("Loaded PEFT adapter cannot be merged; update peft or save a full HF checkpoint.")
-			self.model = self.model.merge_and_unload()
-		self.model = self.model.to(device)
+		).to(device)
 		
 		self.hooked_model = lens.HookedTransformer.from_pretrained(
 			model_name=tl_model_name,
@@ -1447,7 +1320,7 @@ class LMWrapper:
 		# HF objects loaded with revision="step0" still report only the base
 		# model name, so without this the representation cache would be shared
 		# between EleutherAI/pythia-1b and EleutherAI/pythia-1b@step0.
-		if self.checkpoint_value is not None or self.peft_adapter_dir is not None or hf_load_name != tl_model_name:
+		if self.hf_revision is not None:
 			self.model.nare_cache_model_id = self.model_name
 			self.hooked_model.nare_cache_model_id = self.model_name
 		
@@ -1600,13 +1473,15 @@ class LMWrapper:
 			torch.mps.empty_cache()
 
 	@torch.inference_mode()
-	def prefill_prefix_batch(self, prompts, max_new_tokens=10, use_kv_cache=True, **gen_args):
+	def prefill_prefix_batch(self, prompts, max_new_tokens=10, use_kv_cache=True, fwd_hooks=None, **gen_args):
 		"""
 		Run only the *prompt* through the model, fill a KV cache,
 		and return a PrefixCacheBatch that can be reused across ablations.
 
-		NOTE: This is intentionally run *without* ablation hooks.
-			  Ablations should only be applied during decoding (e.g., last_pos_only).
+		When ``fwd_hooks`` is supplied, hooks are active during this prompt-only
+		prefill and are not automatically reused during later decoding. This enables
+		input-only interventions: perturb prompt processing/understanding, then decode
+		from the resulting cache without output-time hooks.
 		"""
 
 		device = self.hooked_model.cfg.device
@@ -1660,35 +1535,40 @@ class LMWrapper:
 		)
 		all_tokens[:, :prompt_len] = input_ids
 
-		# We do NOT use any hooks here; this is the shared, unablated prefix
+		# Optional hooks are scoped to prompt prefill only.
 		past_kv_cache = None
 		logits_last = None
+		ctx = (
+			self.hooked_model.hooks(fwd_hooks=fwd_hooks, reset_hooks_end=True, clear_contexts=True)
+			if fwd_hooks else nullcontext()
+		)
 
-		if use_kv_cache:
-			# Init cache with adjusted n_ctx
-			cfg_for_cache = copy.copy(cfg)
-			cfg_for_cache.n_ctx = total_len
-			past_kv_cache = HookedTransformerKeyValueCache.init_cache(
-				cfg=cfg_for_cache,
-				device=device,
-				batch_size=batch_size,
-			)
+		with ctx:
+			if use_kv_cache:
+				# Init cache with adjusted n_ctx
+				cfg_for_cache = copy.copy(cfg)
+				cfg_for_cache.n_ctx = total_len
+				past_kv_cache = HookedTransformerKeyValueCache.init_cache(
+					cfg=cfg_for_cache,
+					device=device,
+					batch_size=batch_size,
+				)
 
-			# Prefill on full prompt to fill the cache
-			logits_last = self._last_logits(
-				all_tokens[:, :prompt_len],
-				base_mask,
-				past_kv_cache=past_kv_cache,
-				padding_side=padding_side,
-			)
-		else:
-			# Fallback: no KV cache, but still compute initial logits for completeness
-			logits_last = self._last_logits(
-				all_tokens[:, :prompt_len],
-				base_mask,
-				past_kv_cache=None,
-				padding_side=padding_side,
-			)
+				# Prefill on full prompt to fill the cache
+				logits_last = self._last_logits(
+					all_tokens[:, :prompt_len],
+					base_mask,
+					past_kv_cache=past_kv_cache,
+					padding_side=padding_side,
+				)
+			else:
+				# Fallback: no KV cache, but still compute initial logits for completeness
+				logits_last = self._last_logits(
+					all_tokens[:, :prompt_len],
+					base_mask,
+					past_kv_cache=None,
+					padding_side=padding_side,
+				)
 		self.cleanup_after_generate()
 
 		# Normalize lengths to Python ints
@@ -2401,14 +2281,8 @@ def precompute_mean_activations(
 		for u, ns in unit_to_neurons.items()
 		if ns
 	}
-	unit_to_neurons = _filter_unit_ids_for_cfg(
-		unit_to_neurons,
-		getattr(getattr(model, "hooked_model", None), "cfg", None),
-		context="MeanAblation",
-	)
 
 	if not unit_to_neurons:
-		print("[MeanAblation] No valid hook indices remain after model-shape filtering.", flush=True)
 		return None
 
 	n_points = min(int(n_points), len(all_prompts))

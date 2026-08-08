@@ -13,7 +13,6 @@ or script-7 layer-key normalization in the new high-N experiment.
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 import numpy as np
 import torch

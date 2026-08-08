@@ -15,15 +15,44 @@ import json
 import warnings
 
 import numba as nb
-from numba import njit, types, prange
+from numba import njit, prange
 from threadpoolctl import threadpool_limits
 
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import spearmanr
 from lib.ruleshap import RuleSHAP, rand_int
 from lib.caching_and_prompting import load_or_create_cache, create_cache
 import shap
-import re
 import torch
+
+# Increment this token whenever the semantics of rule_combo_all_fit_* change.
+# v2 means: ALL-FIT is selected and scored on all observed rows (TRAIN + EVAL/TEST),
+# not on EVAL/TEST alone. Cached ALL-FIT rows without this token are stale.
+ALL_FIT_CACHE_SIGNATURE = "all_fit_selected_scored_on_train_plus_eval_v2"
+
+# New, separate HQ-T-style artifact. We keep rule_combo_<target>.csv as the
+# original frozen-train-combo TEST score and write this selected-on-TEST variant
+# under rule_combo_test_selected_<target>.csv so old caches/results are not
+# overwritten.
+TEST_SELECTED_COMBO_CACHE_SIGNATURE = "test_selected_from_train_rules_v1"
+
+def _combo_cache_has_signature(path: str, column: str, expected: str) -> bool:
+	if not os.path.exists(path) or os.path.getsize(path) <= 0:
+		return False
+	try:
+		df = pd.read_csv(path, nrows=1)
+	except Exception:
+		return False
+	if df.empty or column not in df.columns:
+		return False
+	return str(df.loc[0, column]) == expected
+
+def _test_selected_combo_cache_current(path: str) -> bool:
+	"""Return True only for TEST-selected combo artifacts with the current semantics token."""
+	return _combo_cache_has_signature(path, "test_selected_combo_cache_signature", TEST_SELECTED_COMBO_CACHE_SIGNATURE)
+
+def _all_fit_combo_cache_current(path: str) -> bool:
+	"""Return True only for ALL-FIT combo artifacts with the current semantics token."""
+	return _combo_cache_has_signature(path, "all_fit_cache_signature", ALL_FIT_CACHE_SIGNATURE)
 
 @njit(inline='always', fastmath=True, nogil=True)
 def _intersect_two_sorted(a, b, out):
@@ -765,7 +794,64 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 		)
 	#---------------------------------
 
+	def _raw_combo_cache_complete(metric_name: str) -> bool:
+		"""Return True when all raw combo files required by the current mode exist.
+
+		TRAIN and TEST are the evaluation artifacts for the train-selected combo.
+		ALL-FIT is an optional descriptive final-fit artifact selected and scored on
+		all available rows.  TRAIN+TEST is *not* a raw artifact and is never required.
+		"""
+		train_path = os.path.join(out_dir, f"rule_combo_train_{metric_name}.csv")
+		test_path = os.path.join(out_dir, f"rule_combo_{metric_name}.csv")
+		test_selected_path = os.path.join(out_dir, f"rule_combo_test_selected_{metric_name}.csv")
+		all_fit_path = os.path.join(out_dir, f"rule_combo_all_fit_{metric_name}.csv")
+		need_all_fit = bool(getattr(args, "emit_all_fit_rules", True))
+		return (
+			os.path.exists(train_path)
+			and (df_eval is None or os.path.exists(test_path))
+			and (df_eval is None or _test_selected_combo_cache_current(test_selected_path))
+			and ((not need_all_fit) or _all_fit_combo_cache_current(all_fit_path))
+		)
+
+	force_rule_recompute = bool(getattr(args, "force_rule_recompute", False))
+	force_all_fit_recompute = bool(getattr(args, "force_all_fit_recompute", False))
+
 	for metric in metrics_list:
+		# Raw rule_combo_train_test_* artifacts were produced by an earlier experimental
+		# implementation.  TRAIN+TEST is now a derived reporting scope reconstructed
+		# from rule_combo_train_* and rule_combo_* confusion counts.  Delete stale raw
+		# TRAIN+TEST files for this target whenever the target is revisited so they
+		# cannot be mistaken for newly generated outputs.
+		stale_train_test_combo = os.path.join(out_dir, f"rule_combo_train_test_{metric}.csv")
+		if os.path.exists(stale_train_test_combo):
+			try:
+				os.remove(stale_train_test_combo)
+				print(f"Removed stale raw TRAIN+TEST combo artifact: {stale_train_test_combo}")
+			except OSError as exc:
+				print(f"WARNING: could not remove stale raw TRAIN+TEST combo artifact {stale_train_test_combo}: {exc}")
+		train_combo_path = os.path.join(out_dir, f"rule_combo_train_{metric}.csv")
+		test_combo_path = os.path.join(out_dir, f"rule_combo_{metric}.csv")
+		test_selected_combo_path = os.path.join(out_dir, f"rule_combo_test_selected_{metric}.csv")
+		all_fit_path = os.path.join(out_dir, f"rule_combo_all_fit_{metric}.csv")
+		need_all_fit = bool(getattr(args, "emit_all_fit_rules", True))
+		train_test_cache_complete = (
+			os.path.exists(train_combo_path)
+			and (df_eval is None or os.path.exists(test_combo_path))
+			and (df_eval is None or _test_selected_combo_cache_current(test_selected_combo_path))
+		)
+		all_fit_cache_current = (not need_all_fit) or _all_fit_combo_cache_current(all_fit_path)
+		only_recompute_all_fit = bool(
+			need_all_fit
+			and (not force_rule_recompute)
+			and train_test_cache_complete
+			and (force_all_fit_recompute or (not all_fit_cache_current))
+		)
+
+
+		if (not force_rule_recompute) and (not force_all_fit_recompute) and _raw_combo_cache_complete(metric):
+			print(f"[RuleSHAP] Reusing cached raw TRAIN/TEST/current ALL-FIT combo artifacts for {metric}.")
+			continue
+
 		global_feature_stats = metric_global_feature_stats_dict[metric]
 		if global_feature_stats:
 			input_features = [f for f in input_features if f in global_feature_stats]
@@ -774,73 +860,426 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 			print(f"No SHAP data available for {metric}")
 			shap_weights = None
 
-		X_and_y = work_df_train[input_features+[metric]].fillna(0).values.astype(np.float32)
-		all_X_and_y = work_df_eval[input_features+[metric]].fillna(0).values.astype(np.float32)
+		# Raw arrays are kept for TRAIN selection, held-out TEST scoring, and optional
+		# ALL-FIT selection/scoring. Build them target-by-target and drop only rows
+		# whose target for this metric is unavailable. This avoids treating missing
+		# flip labels as negatives. TRAIN+TEST is not a raw artifact.
+		def _target_array(df_scope):
+			if df_scope is None or df_scope.empty:
+				return np.empty((0, len(input_features) + 1), dtype=np.float32)
+			cols = input_features + [metric]
+			d = df_scope.loc[pd.to_numeric(df_scope[metric], errors="coerce").notna(), cols].copy()
+			if d.empty:
+				return np.empty((0, len(input_features) + 1), dtype=np.float32)
+			d[input_features] = d[input_features].fillna(0)
+			return d.values.astype(np.float32)
 
-		if args.only_unique_datapoints_in_rule_extraction:
-			old_size = X_and_y.shape[0]
-			# X_and_y = downsample_duplicates(X_and_y, ratio_of_duplicates_to_keep=args.ratio_of_duplicates_to_keep)
-			X_and_y = np.unique(X_and_y, axis=0)
-			print(f'Removed entries: {old_size-X_and_y.shape[0]} ({100*(old_size-X_and_y.shape[0])/old_size:.2f}%)')
+		train_raw_X_and_y = _target_array(work_df_train)
+		eval_X_and_y = _target_array(work_df_eval)
+		if df_eval is not None and len(eval_X_and_y):
+			all_fit_X_and_y = np.concatenate([train_raw_X_and_y, eval_X_and_y], axis=0)
+		else:
+			all_fit_X_and_y = train_raw_X_and_y
+		X_and_y = train_raw_X_and_y
 
-		y = X_and_y[:, -1]
-		X = X_and_y[:, :-1]
 
-		rf_model = RuleSHAP(
-			gboost_config_dict = { # Details about parameters: https://xgboost.readthedocs.io/en/latest/python/python_api.html#xgboost.XGBRegressor
-				'n_estimators': 500, # Number of trees in the ensemble. Fewer trees mean fewer rules. Use a lower number (e.g., 50–200).
-				'max_depth': 10, # Limits the maximum depth of a tree. Restricts the number of splits, leading to simpler trees. Start with small values (e.g., 2–4).
-				'subsample': 1, # Fraction of training instances used to build each tree. Smaller values introduce randomness, reducing overfitting and simplifying models. Use values around 0.5–0.8.
-				'colsample_bytree': 0.5, # sample features per tree
-				# 'sampling_method': 'uniform', # Each training instance has an equal probability of being selected. Typically set subsample >= 0.5 for good results.
-				'tree_method': 'exact', # The tree construction algorithm used in XGBoost. See description in https://xgboost.readthedocs.io/en/stable/treemethod.html
-				# 'max_leaves': 20, # Maximum number of terminal nodes (leaves)
-				'min_child_weight': 2, # Minimum sum of weights required in a child node. Larger values make it harder for the model to create splits, effectively limiting the number of nodes in a tree. Try higher values (e.g., 5–10).
-				'reg_alpha': 0.1, # L1 regularization term. Regularization terms penalize more complex models. Encourage simpler models by penalizing complex trees.
-				#'learning_rate': 0.6, # Step size shrinkage to prevent overfitting. Slower learning can prevent overly complex rules. Use moderately low values (e.g., 0.1–0.3).
-				# 'objective': 'reg:pseudohubererror',
-				# 'gamma': 0, # Allow splits with minimal gain
-			},
-			random_state=args.random_seed, # For reproducibility
-			rfmode=rfmode, # 'regress' for regression or 'classify' for binary classification.
-			Cs=10, # number of alphas to test for LASSO regression
-			# max_rules=4000,
-			# tree_size=10,
-		)
-		
-		rf_model.fit(X, y, 
-			feature_names=input_features, 
-			shap_weights=shap_weights,
-			use_shap_in_xgb=use_shap_in_xgb, 
-			use_shap_in_lasso=use_shap_in_lasso,
-			compute_sparsity_coef=use_lasso_regression,
-		)
+		def _score_combo_with_rules(combo, X_score, y_score, computed_on: str, chosen_from: str, *, model, rules_df):
+			"""Score a selected rule combo on an arbitrary scope using the supplied RuleSHAP model.
 
-		# all_X_and_y = df[input_features+[metric]].fillna(0).values.astype(np.float32)
-		all_y = all_X_and_y[:, -1]
-		all_X = all_X_and_y[:, :-1]
-		rules = rf_model.get_rules( # Extracts rules from the model
-			all_X, 
-			all_y, 
-			filter_out_empty_coef=use_lasso_regression
-		)
-		# rules = rules.sort_values("importance", ascending=False)  # Only keep rules with non-zero coefficients
+			This helper is independent of the TRAIN/TEST model state, so --force_all_fit_recompute
+			can reuse cached TRAIN/TEST combo artifacts and recompute only ALL-FIT outputs.
+			"""
+			rules_local = rules_df
+			selected_literals = set(map(str, combo.get("selected_literals", []) or []))
+			Z_rules, _ = model.rule_ensemble.transform(X_score)
+			Z = (Z_rules > 0)
+			fire = np.zeros(len(y_score), dtype=bool)
 
-		# Save the rules to a file for inspection
-		rules.to_csv(os.path.join(out_dir, f"association_rules_{metric}.csv"), index=False)
-		best_combo = rf_model.find_best_or_combo(
-			rules,
-			X=all_X,
-			y_target=all_y,
-			greedy_seed_metrics=greedy_seed_metrics,
-			greedy_seed_topk=greedy_seed_topk,
-		)
-		pd.DataFrame([best_combo]).to_csv(os.path.join(out_dir, f"rule_combo_{metric}.csv"), index=False)
-		print('Best rule combo:', json.dumps(best_combo, indent=4))
+			if selected_literals and len(rules_local):
+				rdf = rules_local.loc[
+					(rules_local["component_type"] == "rule")
+					& (rules_local["rule_expression"].astype(str).isin(selected_literals))
+				]
+				for _, row in rdf.iterrows():
+					j = int(row["rule_index"])
+					if j < 0 or j >= Z.shape[1]:
+						continue
+					mask = Z[:, j].astype(bool)
+					if bool(row["is_negated"]):
+						mask = ~mask
+					fire |= mask
 
-		if "selected_rule_indices" in best_combo:
-			selected_rule_indices = best_combo["selected_rule_indices"]
-			selected_rules = rules[rules["rule_index"].isin(selected_rule_indices)]
+			y_score = np.asarray(y_score).reshape(-1)
+			finite_vals = y_score[np.isfinite(y_score)] if y_score.dtype.kind in "fc" else y_score
+			uniq = set(np.unique(finite_vals).tolist()) if finite_vals.size else set()
+			if getattr(model, "_problem", "regression") == "classification" or uniq.issubset({0, 1, 0.0, 1.0, False, True}):
+				yb = (y_score >= 0.5).astype(np.int8)
+				evt_threshold = None
+				evt_direction = None
+			else:
+				tail_q = float(combo.get("reg_tail_q", 0.90))
+				t_hi = float(np.nanquantile(y_score.astype(np.float64), tail_q))
+				yb = (y_score >= t_hi).astype(np.int8)
+				evt_threshold = t_hi
+				evt_direction = f">= eval quantile({tail_q})"
+
+			metrics = model._signed_rule_metrics_against_target(fire, yb, True, eps=1e-12)
+			fire_b = fire.astype(bool)
+			yb_b = yb.astype(bool)
+			tp = int((fire_b & yb_b).sum())
+			fp = int((fire_b & (~yb_b)).sum())
+			tn = int(((~fire_b) & (~yb_b)).sum())
+			fn = int(((~fire_b) & yb_b).sum())
+			out = dict(combo)
+			for _k in (
+				"empty_MCC",
+				"best_single_MCC",
+				"best_greedy_MCC",
+				"best_greedy_MCC_by_seed_metric",
+				"greedy_winning_seed_metric",
+				"greedy_winning_seed_literal",
+			):
+				if _k in combo and f"selection_{_k}" not in out:
+					out[f"selection_{_k}"] = combo.get(_k)
+			for _k in ("empty_MCC", "best_single_MCC", "best_greedy_MCC", "best_greedy_MCC_by_seed_metric"):
+				if _k in out:
+					out[_k] = np.nan
+			out.update({
+				"selection_MCC": combo.get("MCC", np.nan),
+				"chosen_from": chosen_from,
+				"computed_on": computed_on,
+				"score_scope": computed_on,
+				"dataset_coverage": float(fire.mean()) if len(fire) else 0.0,
+				"P(target=1|fire)": metrics[0],
+				"Precision": metrics[0],
+				"R(fire|target=1)": metrics[1],
+				"F1(target=1|fire)": metrics[2],
+				"Lift(target=1|fire)": metrics[3],
+				"Acc": metrics[4],
+				"TPR": metrics[5],
+				"TNR": metrics[6],
+				"BalancedAcc": metrics[7],
+				"MCC": metrics[8],
+				"n_eval": int(len(yb)),
+				"n_pos": int(yb_b.sum()),
+				"n_neg": int((~yb_b).sum()),
+				"n_fire": int(fire_b.sum()),
+				"tp": tp,
+				"fp": fp,
+				"tn": tn,
+				"fn": fn,
+				"target_prevalence": float(yb_b.mean()) if len(yb_b) else float("nan"),
+				"rule_fire_rate": float(fire_b.mean()) if len(fire_b) else float("nan"),
+			})
+			if evt_threshold is not None:
+				out.update({
+					"reg_event_threshold": evt_threshold,
+					"reg_event_direction": evt_direction,
+				})
+			return out
+
+		if only_recompute_all_fit:
+			print(f"[RuleSHAP] Reusing cached TRAIN/TEST combo artifacts for {metric}; recomputing stale/missing ALL-FIT only.")
+		else:
+			if X_and_y.shape[0] == 0:
+				print(f"No TRAIN rows with non-missing target for {metric}; skipping.")
+				continue
+	
+			if args.only_unique_datapoints_in_rule_extraction:
+				old_size = X_and_y.shape[0]
+				# X_and_y = downsample_duplicates(X_and_y, ratio_of_duplicates_to_keep=args.ratio_of_duplicates_to_keep)
+				X_and_y = np.unique(X_and_y, axis=0)
+				print(f'Removed entries from TRAIN selection set: {old_size-X_and_y.shape[0]} ({100*(old_size-X_and_y.shape[0])/old_size:.2f}%)')
+	
+			y = X_and_y[:, -1]
+			X = X_and_y[:, :-1]
+	
+			rf_model = RuleSHAP(
+				gboost_config_dict = { # Details about parameters: https://xgboost.readthedocs.io/en/latest/python/python_api.html#xgboost.XGBRegressor
+					'n_estimators': 500, # Number of trees in the ensemble. Fewer trees mean fewer rules. Use a lower number (e.g., 50–200).
+					'max_depth': 10, # Limits the maximum depth of a tree. Restricts the number of splits, leading to simpler trees. Start with small values (e.g., 2–4).
+					'subsample': 1, # Fraction of training instances used to build each tree. Smaller values introduce randomness, reducing overfitting and simplifying models. Use values around 0.5–0.8.
+					'colsample_bytree': 0.5, # sample features per tree
+					# 'sampling_method': 'uniform', # Each training instance has an equal probability of being selected. Typically set subsample >= 0.5 for good results.
+					'tree_method': 'exact', # The tree construction algorithm used in XGBoost. See description in https://xgboost.readthedocs.io/en/stable/treemethod.html
+					# 'max_leaves': 20, # Maximum number of terminal nodes (leaves)
+					'min_child_weight': 2, # Minimum sum of weights required in a child node. Larger values make it harder for the model to create splits, effectively limiting the number of nodes in a tree. Try higher values (e.g., 5–10).
+					'reg_alpha': 0.1, # L1 regularization term. Regularization terms penalize more complex models. Encourage simpler models by penalizing complex trees.
+					#'learning_rate': 0.6, # Step size shrinkage to prevent overfitting. Slower learning can prevent overly complex rules. Use moderately low values (e.g., 0.1–0.3).
+					# 'objective': 'reg:pseudohubererror',
+					# 'gamma': 0, # Allow splits with minimal gain
+				},
+				random_state=args.random_seed, # For reproducibility
+				rfmode=rfmode, # 'regress' for regression or 'classify' for binary classification.
+				Cs=10, # number of alphas to test for LASSO regression
+				# max_rules=4000,
+				# tree_size=10,
+			)
+			
+			rf_model.fit(X, y, 
+				feature_names=input_features, 
+				shap_weights=shap_weights,
+				use_shap_in_xgb=use_shap_in_xgb, 
+				use_shap_in_lasso=use_shap_in_lasso,
+				compute_sparsity_coef=use_lasso_regression,
+			)
+	
+			# Select the rule/combo on TRAIN only.  If df_eval is provided, use it
+			# only to score the already-selected combo.  This keeps held-out scores
+			# generalizable instead of using eval/test labels for model selection.
+			eval_y = eval_X_and_y[:, -1]
+			eval_X = eval_X_and_y[:, :-1]
+	
+			rules = rf_model.get_rules( # Extracts rules from the model
+				X,
+				y,
+				filter_out_empty_coef=use_lasso_regression
+			)
+			# rules = rules.sort_values("importance", ascending=False)  # Only keep rules with non-zero coefficients
+	
+			# Save the TRAIN-scored rules to a file for inspection.
+			rules.to_csv(os.path.join(out_dir, f"association_rules_{metric}.csv"), index=False)
+			best_combo_train = rf_model.find_best_or_combo(
+				rules,
+				X=X,
+				y_target=y,
+				greedy_seed_metrics=greedy_seed_metrics,
+				greedy_seed_topk=greedy_seed_topk,
+			)
+			pd.DataFrame([best_combo_train]).to_csv(os.path.join(out_dir, f"rule_combo_train_{metric}.csv"), index=False)
+	
+			def _score_frozen_combo(combo, X_score, y_score, computed_on: str, chosen_from: str, *, model=None, rules_df=None):
+				model = model or rf_model
+				rules_local = rules_df if rules_df is not None else rules
+				selected_literals = set(map(str, combo.get("selected_literals", []) or []))
+				Z_rules, _ = model.rule_ensemble.transform(X_score)
+				Z = (Z_rules > 0)
+				fire = np.zeros(len(y_score), dtype=bool)
+	
+				if selected_literals and len(rules_local):
+					rdf = rules_local.loc[
+						(rules_local["component_type"] == "rule")
+						& (rules_local["rule_expression"].astype(str).isin(selected_literals))
+					]
+					for _, row in rdf.iterrows():
+						j = int(row["rule_index"])
+						if j < 0 or j >= Z.shape[1]:
+							continue
+						mask = Z[:, j].astype(bool)
+						if bool(row["is_negated"]):
+							mask = ~mask
+						fire |= mask
+	
+				y_score = np.asarray(y_score).reshape(-1)
+				finite_vals = y_score[np.isfinite(y_score)] if y_score.dtype.kind in "fc" else y_score
+				uniq = set(np.unique(finite_vals).tolist()) if finite_vals.size else set()
+				if getattr(model, "_problem", "regression") == "classification" or uniq.issubset({0, 1, 0.0, 1.0, False, True}):
+					yb = (y_score >= 0.5).astype(np.int8)
+					evt_threshold = None
+					evt_direction = None
+				else:
+					tail_q = float(combo.get("reg_tail_q", 0.90))
+					t_hi = float(np.nanquantile(y_score.astype(np.float64), tail_q))
+					yb = (y_score >= t_hi).astype(np.int8)
+					evt_threshold = t_hi
+					evt_direction = f">= eval quantile({tail_q})"
+	
+				metrics = model._signed_rule_metrics_against_target(fire, yb, True, eps=1e-12)
+				fire_b = fire.astype(bool)
+				yb_b = yb.astype(bool)
+				tp = int((fire_b & yb_b).sum())
+				fp = int((fire_b & (~yb_b)).sum())
+				tn = int(((~fire_b) & (~yb_b)).sum())
+				fn = int(((~fire_b) & yb_b).sum())
+				# Start from the train-selected combo so the literal expression and
+				# selection metadata are preserved, but make train-only diagnostics
+				# unambiguous.  Columns such as best_greedy_MCC are TRAIN selection
+				# diagnostics, not TEST scores.  Keeping them under their old names in
+				# held-out/all-data rows made it easy to misread test files as having
+				# the same MCC as train.  The scope score is always in MCC below; the
+				# train-selection diagnostics are copied to selection_* aliases.
+				out = dict(combo)
+				for _k in (
+					"empty_MCC",
+					"best_single_MCC",
+					"best_greedy_MCC",
+					"best_greedy_MCC_by_seed_metric",
+					"greedy_winning_seed_metric",
+					"greedy_winning_seed_literal",
+				):
+					if _k in combo and f"selection_{_k}" not in out:
+						out[f"selection_{_k}"] = combo.get(_k)
+				# Blank ambiguous train-only MCC columns in non-train score rows.
+				# The train-selected values remain available as selection_* columns.
+				for _k in ("empty_MCC", "best_single_MCC", "best_greedy_MCC", "best_greedy_MCC_by_seed_metric"):
+					if _k in out:
+						out[_k] = np.nan
+				out.update({
+					"selection_MCC": combo.get("MCC", np.nan),
+					"chosen_from": chosen_from,
+					"computed_on": computed_on,
+					"score_scope": computed_on,
+					"dataset_coverage": float(fire.mean()) if len(fire) else 0.0,
+					"P(target=1|fire)": metrics[0],
+					"Precision": metrics[0],
+					"R(fire|target=1)": metrics[1],
+					"F1(target=1|fire)": metrics[2],
+					"Lift(target=1|fire)": metrics[3],
+					"Acc": metrics[4],
+					"TPR": metrics[5],
+					"TNR": metrics[6],
+					"BalancedAcc": metrics[7],
+					"MCC": metrics[8],
+					"n_eval": int(len(yb)),
+					"n_pos": int(yb_b.sum()),
+					"n_neg": int((~yb_b).sum()),
+					"n_fire": int(fire_b.sum()),
+					"tp": tp,
+					"fp": fp,
+					"tn": tn,
+					"fn": fn,
+					"target_prevalence": float(yb_b.mean()) if len(yb_b) else float("nan"),
+					"rule_fire_rate": float(fire_b.mean()) if len(fire_b) else float("nan"),
+				})
+				if evt_threshold is not None:
+					out.update({
+						"reg_event_threshold": evt_threshold,
+						"reg_event_direction": evt_direction,
+					})
+				return out
+	
+			best_combo = dict(best_combo_train)
+			best_combo.setdefault("computed_on", "train_selection")
+			best_combo.setdefault("score_scope", "train_selection")
+			best_combo.setdefault("chosen_from", "train_selected_combo")
+			if df_eval is not None:
+				best_combo = _score_frozen_combo(
+					best_combo_train,
+					eval_X,
+					eval_y,
+					computed_on="test",
+					chosen_from="frozen_train_combo_scored_on_test",
+				)
+			pd.DataFrame([best_combo]).to_csv(os.path.join(out_dir, f"rule_combo_{metric}.csv"), index=False)
+			print('Best rule combo (train-selected):', json.dumps(best_combo_train, indent=4))
+			if df_eval is not None:
+				print('Held-out TEST score for frozen combo:', json.dumps(best_combo, indent=4))
+
+				# Separate HQ-T-style artifact: candidate rules are emitted from TRAIN,
+				# but the OR-subset is selected and scored on held-out TEST rows.
+				# Keep this out of rule_combo_<target>.csv so legacy frozen-combo TEST
+				# results remain available and cached.
+				best_combo_test_selected_raw = rf_model.find_best_or_combo(
+					rules,
+					X=eval_X,
+					y_target=eval_y,
+					greedy_seed_metrics=greedy_seed_metrics,
+					greedy_seed_topk=greedy_seed_topk,
+				)
+				best_combo_test_selected = _score_frozen_combo(
+					best_combo_test_selected_raw,
+					eval_X,
+					eval_y,
+					computed_on="test_selected",
+					chosen_from="test_selected_from_train_emitted_rules",
+				)
+				best_combo_test_selected["selection_scope"] = "test_selected"
+				best_combo_test_selected["heldout_valid"] = False
+				best_combo_test_selected["test_selected_combo_cache_signature"] = TEST_SELECTED_COMBO_CACHE_SIGNATURE
+				best_combo_test_selected["test_selected_source_rules"] = "train_emitted_rules"
+				best_combo_test_selected["test_selected_n_eval_rows"] = int(eval_X_and_y.shape[0])
+				pd.DataFrame([best_combo_test_selected]).to_csv(test_selected_combo_path, index=False)
+				print('Held-out TEST-selected score over train-emitted rules:', json.dumps(best_combo_test_selected, indent=4))
+				if "selected_rule_indices" in best_combo_test_selected_raw:
+					selected_literals_test = set(map(str, best_combo_test_selected_raw.get("selected_literals", []) or []))
+					if selected_literals_test:
+						selected_rules_test = rules[rules["rule_expression"].astype(str).isin(selected_literals_test)]
+					else:
+						selected_rule_indices_test = best_combo_test_selected_raw["selected_rule_indices"]
+						selected_rules_test = rules[rules["rule_index"].isin(selected_rule_indices_test)]
+					selected_rules_test.to_csv(os.path.join(out_dir, f"optimal_rule_set_test_selected_{metric}.csv"), index=False)
+		if bool(getattr(args, "emit_all_fit_rules", True)):
+			all_fit_path = os.path.join(out_dir, f"rule_combo_all_fit_{metric}.csv")
+			if force_rule_recompute or force_all_fit_recompute or (not _all_fit_combo_cache_current(all_fit_path)):
+				# ALL-FIT is the final descriptive fit on all observed rows available for
+				# this target (TRAIN + held-out TEST/EVAL, after target-specific NA removal).
+				# Apply --only_unique_datapoints_in_rule_extraction here too, so ALL-FIT
+				# uses the same deduplication policy as TRAIN rule extraction.
+				all_X_and_y_fit = all_fit_X_and_y
+				if args.only_unique_datapoints_in_rule_extraction and all_X_and_y_fit.shape[0] > 0:
+					old_all_fit_size = all_X_and_y_fit.shape[0]
+					all_X_and_y_fit = np.unique(all_X_and_y_fit, axis=0)
+					print(f'Removed entries from ALL-FIT set: {old_all_fit_size-all_X_and_y_fit.shape[0]} ({100*(old_all_fit_size-all_X_and_y_fit.shape[0])/old_all_fit_size:.2f}%)')
+				if all_X_and_y_fit.shape[0] == 0:
+					print(f"No ALL-FIT rows with non-missing target for {metric}; skipping ALL-FIT.")
+					continue
+				all_y = all_X_and_y_fit[:, -1]
+				all_X = all_X_and_y_fit[:, :-1]
+				rf_model_all = RuleSHAP(
+					gboost_config_dict = {
+						'n_estimators': 500,
+						'max_depth': 10,
+						'subsample': 1,
+						'colsample_bytree': 0.5,
+						'tree_method': 'exact',
+						'min_child_weight': 2,
+						'reg_alpha': 0.1,
+					},
+					random_state=args.random_seed,
+					rfmode=rfmode,
+					Cs=10,
+				)
+				rf_model_all.fit(all_X, all_y,
+					feature_names=input_features,
+					shap_weights=shap_weights,
+					use_shap_in_xgb=use_shap_in_xgb,
+					use_shap_in_lasso=use_shap_in_lasso,
+					compute_sparsity_coef=use_lasso_regression,
+				)
+				rules_all = rf_model_all.get_rules(all_X, all_y, filter_out_empty_coef=use_lasso_regression)
+				rules_all.to_csv(os.path.join(out_dir, f"association_rules_all_fit_{metric}.csv"), index=False)
+				best_combo_all_fit_selected = rf_model_all.find_best_or_combo(
+					rules_all,
+					X=all_X,
+					y_target=all_y,
+					greedy_seed_metrics=greedy_seed_metrics,
+					greedy_seed_topk=greedy_seed_topk,
+				)
+				best_combo_all_fit = _score_combo_with_rules(
+					best_combo_all_fit_selected,
+					all_X,
+					all_y,
+					computed_on="all_fit",
+					chosen_from="all_fit_selected_and_scored_on_all_rows",
+					model=rf_model_all,
+					rules_df=rules_all,
+				)
+				best_combo_all_fit["selection_scope"] = "all_fit"
+				best_combo_all_fit["heldout_valid"] = False
+				best_combo_all_fit["all_fit_cache_signature"] = ALL_FIT_CACHE_SIGNATURE
+				best_combo_all_fit["all_fit_source_scope"] = "train_plus_eval" if df_eval is not None else "train_only_no_eval"
+				best_combo_all_fit["all_fit_n_train_rows"] = int(train_raw_X_and_y.shape[0])
+				best_combo_all_fit["all_fit_n_eval_rows"] = int(eval_X_and_y.shape[0])
+				pd.DataFrame([best_combo_all_fit]).to_csv(all_fit_path, index=False)
+				if "selected_rule_indices" in best_combo_all_fit_selected:
+					selected_literals_all = set(map(str, best_combo_all_fit_selected.get("selected_literals", []) or []))
+					if selected_literals_all:
+						selected_rules_all = rules_all[rules_all["rule_expression"].astype(str).isin(selected_literals_all)]
+					else:
+						selected_rule_indices_all = best_combo_all_fit_selected["selected_rule_indices"]
+						selected_rules_all = rules_all[rules_all["rule_index"].isin(selected_rule_indices_all)]
+					selected_rules_all.to_csv(os.path.join(out_dir, f"optimal_rule_set_all_fit_{metric}.csv"), index=False)
+				print('ALL-FIT score (selected/scored on all rows; descriptive only):', json.dumps(best_combo_all_fit, indent=4))
+			else:
+				print(f'[RuleSHAP] Reusing cached current ALL-FIT combo artifact for {metric}: {all_fit_path}')
+
+		if (not only_recompute_all_fit) and "selected_rule_indices" in best_combo_train:
+			selected_literals = set(map(str, best_combo_train.get("selected_literals", []) or []))
+			if selected_literals:
+				selected_rules = rules[rules["rule_expression"].astype(str).isin(selected_literals)]
+			else:
+				selected_rule_indices = best_combo_train["selected_rule_indices"]
+				selected_rules = rules[rules["rule_index"].isin(selected_rule_indices)]
 			selected_rules.to_csv(os.path.join(out_dir, f"optimal_rule_set_{metric}.csv"), index=False)
 
 		# if not use_lasso_regression:

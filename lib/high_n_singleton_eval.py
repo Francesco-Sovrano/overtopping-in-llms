@@ -72,13 +72,37 @@ def _read_table(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path) if ftype == "parquet" else pd.read_csv(path)
 
 
-def load_scores_for_baseline(*, scores_path: Path, target_col: str, baseline_subset: str, task_targets: Iterable[str]) -> pd.DataFrame:
+def load_scores_for_baseline(
+    *,
+    scores_path: Path,
+    target_col: str,
+    baseline_subset: str,
+    task_targets: Iterable[str],
+    split: str = "train",
+) -> pd.DataFrame:
+    """Load a baseline-conditioned evaluation frame from a declared data split.
+
+    ``split="train"`` preserves the historical threshold-event behavior.
+    ``split="test"`` is the strict post-selection evaluation path: it requires
+    an explicit ``is_test`` column and never falls back to training rows.
+    ``split="all"`` is available for descriptive diagnostics only.
+    """
+    split = str(split).strip().lower()
+    if split not in {"train", "test", "all"}:
+        raise ValueError(f"Unsupported split {split!r}; expected train, test, or all.")
     scores_df = _read_table(Path(scores_path))
     scores_df["original_idx"] = np.arange(len(scores_df))
     scores_df = safe_features_fillna(scores_df, fill_number=0, fill_bool=False, cols_not_to_fill=list(task_targets))
     if "is_test" in scores_df.columns:
-        mask_train = ~scores_df["is_test"].astype(bool)
-        scores_df = scores_df.loc[mask_train].reset_index(drop=True)
+        is_test = scores_df["is_test"].fillna(False).astype(bool)
+        if split == "train":
+            scores_df = scores_df.loc[~is_test].reset_index(drop=True)
+        elif split == "test":
+            scores_df = scores_df.loc[is_test].reset_index(drop=True)
+    elif split == "test":
+        raise ValueError(
+            f"Strict test evaluation requested, but {scores_path} has no is_test column."
+        )
     if baseline_subset == "positive":
         scores_df = scores_df.loc[scores_df[target_col] == True]
     elif baseline_subset == "negative":

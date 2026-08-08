@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Sequence
-from typing import List, Dict
 
 from lib.feature_representation import Feature
 from lib.task_spec import FeatureTaskSpec
@@ -10,8 +8,6 @@ from lib.modeling_and_ablation import LMWrapper, get_device
 from lib.caching_and_prompting import load_cache
 
 import re
-import random
-import json
 import pandas as pd
 
 import torch

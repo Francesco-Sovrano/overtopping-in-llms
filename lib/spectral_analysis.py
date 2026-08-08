@@ -1,12 +1,7 @@
-import os
-from typing import Sequence, Tuple
+from typing import Sequence
 
 import numpy as np
-from tqdm import tqdm
 
-import torch
-from torch.nn.utils.rnn import pad_sequence
-from scipy.spatial.distance import cdist
 from sklearn.decomposition import PCA
 
 from lib.caching_and_prompting import instruct_transformer_embedding_model

@@ -1,4 +1,4 @@
-from typing import Callable, Union, Optional, Literal, List, Tuple, Any
+from typing import Callable, Union, Optional, Literal, List, Any
 from functools import partial
 
 import torch
@@ -10,8 +10,8 @@ from tqdm import tqdm
 from einops import einsum
 
 from .graph import Graph
-from .utils import forward_no_cache_optional, tokenize_pairs_same_width, compute_mean_activations, model_device_expr, adapt_means_to_batch, infer_decode_pos_mask, apply_decode_mask_inplace
-from .evaluate import evaluate_baseline, evaluate_graph, backprop_no_param_grads, clean_memory_cache
+from .utils import tokenize_pairs_same_width, compute_mean_activations, model_device_expr, infer_decode_pos_mask, apply_decode_mask_inplace
+from .evaluate import evaluate_baseline, evaluate_graph, backprop_no_param_grads
 
 
 # ------------------------- Decode-only position masking -------------------------
