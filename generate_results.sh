@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODE_ROOT="$PROJECT_ROOT/code"
 
-if [[ -f "$ROOT/.env/bin/activate" ]]; then
+if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then
   # shellcheck disable=SC1091
-  . "$ROOT/.env/bin/activate"
+  . "$PROJECT_ROOT/.env/bin/activate"
 fi
 
 PRIMARY_PROFILE="${PRIMARY_PROFILE:-iclr-28}"
-DATA_ROOT="${DATA_ROOT:-$ROOT/data}"
-RESULTS_ROOT="$ROOT/results"
+DATA_ROOT="${DATA_ROOT:-$PROJECT_ROOT/data}"
+RESULTS_ROOT="$PROJECT_ROOT/results"
 
 echo "Generating final paper outputs from: $DATA_ROOT"
 echo "Primary manuscript profile: ${PRIMARY_PROFILE}"
@@ -31,4 +31,6 @@ fi
 if [[ -f "$RESULTS_ROOT/configured_experiments.json" ]]; then
   ARGS+=(--catalogue-json "$RESULTS_ROOT/configured_experiments.json")
 fi
+
+cd "$CODE_ROOT"
 python3 -m analysis.29_generate_final_results "$@" "${ARGS[@]}"

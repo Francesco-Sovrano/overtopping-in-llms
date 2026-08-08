@@ -2,7 +2,7 @@
 
 This repository contains an end-to-end experimental pipeline for identifying small sets of language-model channels that causally affect a binary task predicate, evaluating those channels on an explicitly selected data split, measuring interactions with simultaneous interventions, comparing the candidate mechanism with matched random channel sets, and producing manuscript-ready tables and figures. The default evaluation split is `test`; `train` and `all` remain available for diagnostics and controlled comparisons.
 
-The standard non-poisoning experiment programme is defined in one file, `experiments/run_experiments.py`. The numerical implementation remains split into focused pipeline and analysis modules so that each step can be inspected independently.
+The standard non-poisoning experiment programme is defined in `code/experiments/run_experiments.py`. The numerical implementation remains split into focused pipeline and analysis modules so that each step can be inspected independently.
 
 ## 1. What the pipeline measures
 
@@ -34,16 +34,16 @@ E(J) = predicate-change rate on the selected evaluation split under simultaneous
 
 `E(J)` is a separate intervention quantity from `U(J)`. The code does not use a singleton union as a substitute for a simultaneous-set intervention.
 
-For every prespecified stage-5 layer population `C_l`, and for the discovery-frozen subset `J_{l,m} ⊆ J ∩ C_l`, interaction validation computes
+For every transformer layer `l` containing at least one frozen candidate, `C_l` is the full eligible stage-5 channel population in that transformer layer, aggregated across all attention-head and MLP loci. For the discovery-frozen subset `J_{l,m} ⊆ J ∩ C_l`, interaction validation computes
 
 ```text
 Delta_l(J_{l,m}) = E_l(C_l) - E_l(C_l \ J_{l,m})
 GCCR_m(J) = sum_l Delta_l(J_{l,m}) / sum_l E_l(C_l)
 ```
 
-Every prespecified population contributes to the GCCR denominator, including layers for which `J_{l,m}` is empty. Ratios are not clipped. Negative values and values above one are retained because they can arise from cancellation or non-additive interactions. A zero or near-zero denominator is reported as undefined with an explicit status.
+GCCR is computed only for `m=1` and `m=all`. For `m=1`, `J_{l,1}` is the discovery-top frozen candidate in transformer layer `l`; for `m=all`, `J_{l,all}=J∩C_l`. Candidate-free transformer layers are excluded. Each `E_l(C_l)` is evaluated once and cached for reuse across both `m` values and every null draw. Ratios are not clipped. Negative values and values above one are retained because they can arise from cancellation or non-additive interactions. A zero or near-zero denominator is reported as undefined with an explicit status.
 
-Matched random controls are sampled from the same intervention population and match the candidate by transformer layer, computational locus, channel type, intervention phase, per-layer cardinality, and replacement baseline. For both simultaneous `E(J)` and each `GCCR_m`, the report contains
+Matched random controls are sampled from the same eligible stage-5 population and exactly match the candidate by transformer layer, computational locus, channel type, intervention phase, per-layer cardinality, and replacement baseline. Candidate and all null draws use the same fixed evaluation-example subset. For both simultaneous `E(J)` and `GCCR_1`/`GCCR_all`, the report contains
 
 ```text
 Delta = candidate - median(null)
@@ -57,48 +57,16 @@ where `B` is the requested number of null draws.
 
 ```text
 .
-├── run_experiments.sh              # run the complete non-poisoning catalogue
+├── run_experiments.sh              # run the complete standard non-poisoning catalogue
+├── run_poisoning_experiments.sh    # submit/run poisoning workflows separately
 ├── generate_results.sh             # regenerate final paper outputs from data/
-├── experiments/
-│   ├── run_experiments.py          # complete executable experiment catalogue
-│   ├── execution.py                # RunSpec, filtering, path and command construction
-│   └── README.md
-├── pipeline/
-│   ├── 1_generate_prompts_and_answers.py
-│   ├── 2_generate_features.py
-│   ├── 3_extract_rules.py
-│   ├── 4_spectral_sample_datapoints.py
-│   ├── 5_discover_circuits.py
-│   ├── 6_analyze_bag_of_rules.py
-│   ├── 7_refine_neuron_anchored_rules.py
-│   ├── _run_pipeline.sh
-│   └── README.md
-├── analysis/
-│   ├── 12_threshold_event_diagnostics.py
-│   ├── 21_analyze_primary_metrics.py
-│   ├── 22_compute_group_dominance.py
-│   ├── 23_compute_survey_dominance.py
-│   ├── 24_run_primary_holdout_analysis.py
-│   ├── 25_rebuild_directional_stats.py
-│   ├── 26_validate_interactions.py
-│   ├── 27_generate_manuscript_outputs.py
-│   ├── 28_visualize_experiment_results.py
-│   ├── 29_generate_final_results.py
-│   ├── compute_overtopping_latex_tables.py
-│   ├── make_competence_vs_overtopping_paper_figures.py
-│   ├── generate_overtopping_spiking_report.py
-│   ├── clean_results_for_export.py
-│   ├── primary_matrix.py
-│   └── README.md
-├── lib/
-│   ├── tasks/                       # standard task definitions
-│   ├── eap/                         # attribution implementation
-│   ├── heldout_set_metrics.py       # singleton set statistics
-│   ├── group_intervention.py        # simultaneous intervention utilities
-│   ├── interaction_statistics.py    # GCCR and matched-null statistics
-│   └── shared feature/model/cache utilities
-├── poisoning/                       # trigger-poisoning experiments and Slurm jobs
-├── tests/                           # model-free policy/statistics tests
+├── code/                            # all implementation code
+│   ├── experiments/                # executable experiment catalogue and orchestration
+│   ├── pipeline/                   # numbered stages 1-7 and per-run shell orchestrator
+│   ├── analysis/                   # metrics, interaction validation, tables, and figures
+│   ├── lib/                        # shared modeling/intervention/task utilities
+│   ├── poisoning/                  # poisoning Python modules and Slurm jobs
+│   └── tests/                      # model-free policy/statistics tests
 ├── data/                            # raw experiment artifacts; created at runtime
 ├── cache/                           # model/prompt/feature/intervention caches; runtime
 ├── results/                         # all aggregate statistics and paper outputs
@@ -117,14 +85,15 @@ bash setup.sh
 source .env/bin/activate
 ```
 
-Run repository Python entry points as modules from the repository root, for example:
+The root shell launchers can be run from the repository root. For direct Python-module work, change into `code/` first:
 
 ```bash
+cd code
 python3 -m experiments.run_experiments --help
 python3 -m analysis.26_validate_interactions --help
 ```
 
-The code does not modify `sys.path` at runtime. Root shell launchers and internal subprocesses use `python -m ...` so imports are resolved through normal package semantics.
+The `code/` directory is a filesystem container, not a Python package. The packages inside it (`analysis`, `experiments`, `lib`, `pipeline`, and `poisoning`) are imported through normal `python -m ...` execution from `code/`; the repository does not mutate `sys.path` at runtime. Dataset, cache, virtual-environment, and final-result roots remain one level above under the repository root.
 
 `requirements.txt` installs the analysis and mechanistic-interpretability stack, including PyTorch 2.10.0, Transformers 4.57.6, TransformerLens 2.17.0, SciPy 1.13, scikit-learn 1.6, SHAP 0.46, and XGBoost 2.1.3.
 
@@ -143,7 +112,7 @@ API credentials, if needed by an optional feature/classification service, must b
 
 ## 4. Standard tasks and data
 
-The standard task modules live in `lib/tasks/` and implement the interface in `lib/task_spec.py`.
+The standard task modules live in `code/lib/tasks/` and implement the interface in `code/lib/task_spec.py`.
 
 | Task identifier | Module | Source/configuration |
 |---|---|---|
@@ -157,11 +126,13 @@ The grammar task defaults to a path under `data/grammar_acceptability/`; if the 
 
 ## 5. Running the complete experiment programme
 
-The recommended entry point is the root shell script:
+The standard experiment programme and poisoning experiments have separate root launchers. The standard catalogue is run with:
 
 ```bash
 ./run_experiments.sh
 ```
+
+This launcher never submits poisoning jobs and never invokes `run_poisoning_experiments.sh`.
 
 It:
 
@@ -203,10 +174,11 @@ The executable catalogue contains 127 configurations:
 List them without running anything:
 
 ```bash
+cd code
 python3 -m experiments.run_experiments --suite all --list
 ```
 
-The Python driver can also run a subset:
+The Python driver can also run a subset from `code/`:
 
 ```bash
 python3 -m experiments.run_experiments --suite phenomenology
@@ -235,7 +207,7 @@ Execution phases are:
 
 `--continue-on-error` records failed configurations in `results/pipeline_failures.json` and continues. `--dry-run` prints pipeline commands without model execution.
 
-See `experiments/README.md` for the exact suite definitions and path policy.
+See `code/experiments/README.md` for the exact suite definitions and path policy.
 
 ## 6. Evaluation-split discipline
 
@@ -255,7 +227,7 @@ python3 -m experiments.run_experiments --evaluation-split train
 python3 -m experiments.run_experiments --evaluation-split all
 ```
 
-or directly through `pipeline/_run_pipeline.sh` with `--evaluation_split`. The legacy `--holdout_test_only` flag remains an alias for `--evaluation_split test`.
+or directly through `code/pipeline/_run_pipeline.sh` with `--evaluation_split`. The legacy `--holdout_test_only` flag remains an alias for `--evaluation_split test`.
 
 Candidate discovery and candidate ranking remain based on discovery/training data. Mean/donor replacement-reference estimation also remains training-based. Only the final evaluation population changes with `--evaluation_split`. This makes `test` the post-selection validation path while preserving `train` and `all` for diagnostic use.
 
@@ -271,7 +243,7 @@ The unsuffixed `all` path preserves the established all-row filesystem conventio
 
 ## 7. Numbered pipeline stages
 
-`pipeline/_run_pipeline.sh` is the standard single-configuration orchestrator.
+`code/pipeline/_run_pipeline.sh` is the standard single-configuration orchestrator.
 
 ### Stage 1 — prompts and model answers
 
@@ -303,9 +275,9 @@ The unsuffixed `all` path preserves the established all-row filesystem conventio
 
 ### Interaction validation
 
-After stage 7, `_run_pipeline.sh` calls `analysis/26_validate_interactions.py` when the required artifacts exist. This module performs simultaneous full-set, layer-population, complement, and matched-random interventions.
+After stage 7, `_run_pipeline.sh` calls `code/analysis/26_validate_interactions.py` when the required artifacts exist. This module performs simultaneous full-set, layer-population, complement, and matched-random interventions.
 
-See `pipeline/README.md` for direct commands, options, environment variables, and detailed output files.
+See `code/pipeline/README.md` for direct commands, options, environment variables, and detailed output files.
 
 ## 8. Stage-7 statistics and interaction outputs
 
@@ -333,6 +305,7 @@ The interaction directory contains:
 
 ```text
 interaction_configuration.json
+candidate_support_layer_effects.json
 layer_populations.csv
 matched_control_strata.csv
 frozen_candidate_ranking.csv
@@ -375,7 +348,7 @@ Publication output requires an explicit primary profile:
 | `iclr-28` | 28 | included exactly once |
 | `legacy-27` | 27 | excluded |
 
-`analysis/primary_matrix.py` validates both row count and row identity. It never chooses a profile automatically inside the table-building code.
+`code/analysis/primary_matrix.py` validates both row count and row identity. It never chooses a profile automatically inside the table-building code.
 
 The root launchers select `iclr-28` by default and print the choice. Set `PRIMARY_PROFILE=legacy-27` to request the 27-setting matrix.
 
@@ -421,11 +394,11 @@ results/
 └── final_results_manifest.json
 ```
 
-`analysis/29_generate_final_results.py` orchestrates the final-output pass. It calls dedicated numerical/reporting scripts rather than reimplementing their statistics.
+`code/analysis/29_generate_final_results.py` orchestrates the final-output pass. It calls dedicated numerical/reporting scripts rather than reimplementing their statistics.
 
 If no `spiking_diagnostics` directories are present under the data root, the spiking-report directory contains `report_status.json` with `status=not_available` instead of failing the entire results pass.
 
-See `analysis/README.md` and `results/README.md` for detailed output schemas.
+See `code/analysis/README.md` for detailed output schemas.
 
 ## 12. Cache reuse and resuming
 
@@ -450,10 +423,11 @@ Do not reuse feature/split caches after changing the source dataset, sampling po
 
 ## 13. Compact result exports
 
-`analysis/clean_results_for_export.py` creates a filtered, shareable result tree:
+`code/analysis/clean_results_for_export.py` creates a filtered, shareable result tree:
 
 ```bash
-python3 -m analysis.clean_results_for_export data data_filtered_results
+cd code
+python3 -m analysis.clean_results_for_export ../data ../data_filtered_results
 ```
 
 Useful options are:
@@ -474,30 +448,65 @@ A compact export can regenerate model-free tables and figures represented by the
 
 ## 14. Poisoning experiments
 
-Trigger-poisoning code is isolated under `poisoning/`. It supports grammar and arithmetic checkpoint fine-tuning, trigger-conditioned overtopping, trigger-lift experiments, trajectory aggregation, and cumulative top-k mechanism diagnostics.
+Poisoning experiments are deliberately separate from the 127-run standard catalogue. `./run_experiments.sh` does not submit, execute, aggregate, or otherwise trigger poisoning jobs.
 
-Start with `poisoning/README.md` before submitting the Slurm jobs, because those workflows have their own run directories, checkpoint manifests, and scheduler environment variables.
+Use the dedicated root launcher:
+
+```bash
+./run_poisoning_experiments.sh --help
+```
+
+The main workflows are:
+
+```bash
+# Submit grammar and arithmetic checkpointed clean/poisoned fine-tuning jobs.
+./run_poisoning_experiments.sh finetune both
+
+# Submit grammar trigger-conditioned overtopping for an existing poisoning run.
+./run_poisoning_experiments.sh backdoor data/poisoning_grammar_pilot/<run-id>
+
+# Submit trigger-lift overtopping.
+./run_poisoning_experiments.sh lift grammar data/poisoning_grammar_pilot/<run-id>
+./run_poisoning_experiments.sh lift arithmetic data/poisoning_arithmetic_pilot/<run-id>
+
+# Submit the combined cumulative top-k mechanism diagnostic.
+./run_poisoning_experiments.sh cumulative \
+  data/poisoning_grammar_pilot/<grammar-run-id> \
+  data/poisoning_arithmetic_pilot/<arithmetic-run-id>
+```
+
+Use `--dry-run` to print the Slurm submissions without submitting them:
+
+```bash
+./run_poisoning_experiments.sh --dry-run finetune both
+```
+
+The launcher uses `sbatch --export=ALL`, sets `PROJECT_ROOT` to the repository root and `CODE_DIR` to `<repo>/code`, and inherits the job-specific poisoning environment variables from the calling shell. `code/poisoning/README.md` documents the workflow stages, run-directory schema, checkpoint manifests, defaults, and underlying Slurm jobs.
 
 ## 15. Validation
 
-Run the model-free test suite:
+Run the model-free test suite from the implementation root:
 
 ```bash
+cd code
 python -m unittest discover -s tests -v
 ```
 
-Check shell syntax:
+Check shell syntax from the repository root:
 
 ```bash
+cd ..  # omit this if already at repository root
 bash -n run_experiments.sh
+bash -n run_poisoning_experiments.sh
 bash -n generate_results.sh
-bash -n pipeline/_run_pipeline.sh
-find poisoning/jobs -type f -name '*.sbatch' -print0 | xargs -0 -n1 bash -n
+bash -n code/pipeline/_run_pipeline.sh
+find code/poisoning/jobs -type f -name '*.sbatch' -print0 | xargs -0 -n1 bash -n
 ```
 
 Inspect the experiment catalogue without launching models:
 
 ```bash
+cd code
 python3 -m experiments.run_experiments --suite all --list
 ```
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODE_ROOT="$PROJECT_ROOT/code"
 
-if [[ -f "$ROOT/.env/bin/activate" ]]; then
+if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then
   # shellcheck disable=SC1091
-  . "$ROOT/.env/bin/activate"
+  . "$PROJECT_ROOT/.env/bin/activate"
 fi
 
 PRIMARY_PROFILE="${PRIMARY_PROFILE:-iclr-28}"
@@ -35,11 +35,13 @@ esac
 
 echo "Running all configured non-poisoning experiments (phenomenology + large-models)."
 echo "Evaluation split: ${EVALUATION_SPLIT}"
-echo "Final outputs: $ROOT/results"
+echo "Implementation code: $CODE_ROOT"
+echo "Final outputs: $PROJECT_ROOT/results"
 
 EXTRA_ARGS=(
   --suite all
-  --results-root "$ROOT/results"
+  --data-root "$PROJECT_ROOT/data"
+  --results-root "$PROJECT_ROOT/results"
   --evaluation-split "$EVALUATION_SPLIT"
 )
 
@@ -48,7 +50,8 @@ if [[ "$EVALUATION_SPLIT" == "test" ]]; then
   EXTRA_ARGS+=(--generate-primary-manuscript --primary-profile "$PRIMARY_PROFILE")
 else
   echo "Primary manuscript export is test-split specific and will not run for split=${EVALUATION_SPLIT}."
-  echo "Catalogue summaries will still be written under $ROOT/results/catalogue."
+  echo "Catalogue summaries will still be written under $PROJECT_ROOT/results/catalogue."
 fi
 
+cd "$CODE_ROOT"
 python3 -m experiments.run_experiments "$@" "${EXTRA_ARGS[@]}"
