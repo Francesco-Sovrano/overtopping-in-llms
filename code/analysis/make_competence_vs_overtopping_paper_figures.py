@@ -2073,8 +2073,6 @@ def plot_phase_comparison_figure(points: list[PlotPoint], filters: Filters, out:
     if not args.no_csv:
         write_rows_csv(rows, out)
     print(f"[OK] wrote {out}")
-    if args.png:
-        print(f"[OK] wrote {out.with_suffix('.png')}")
     if not args.no_csv:
         print(f"[OK] wrote {out.with_suffix('.csv')}")
     print(f"[phase comparison] {len(labels)} task/model groups plotted")
@@ -2383,8 +2381,6 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
     if not args.no_csv:
         write_rows_csv(rows, out)
     print(f"[OK] wrote {out}")
-    if args.png:
-        print(f"[OK] wrote {out.with_suffix('.png')}")
     if not args.no_csv:
         print(f"[OK] wrote {out.with_suffix('.csv')}")
 
@@ -2973,8 +2969,6 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
     if not args.no_csv:
         write_rows_csv(rows, out)
     print(f"[OK] wrote {out}")
-    if args.png:
-        print(f"[OK] wrote {out.with_suffix('.png')}")
     if not args.no_csv:
         print(f"[OK] wrote {out.with_suffix('.csv')}")
 
@@ -3138,8 +3132,6 @@ def save_outputs(fig, out: Path, args: argparse.Namespace) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     bbox = None if args.no_tight_bbox else "tight"
     fig.savefig(out, bbox_inches=bbox, pad_inches=args.pad_inches)
-    if args.png:
-        fig.savefig(out.with_suffix(".png"), dpi=args.dpi, bbox_inches=bbox, pad_inches=args.pad_inches)
     plt.close(fig)
 
 
@@ -3236,8 +3228,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-max", type=float, default=120.0, help="Maximum marker area for --size-mode neurons. Original script used 280.")
     parser.add_argument("--marker-neuron-scale", type=float, default=7.5, help="Neuron marker scaling factor for --size-mode neurons.")
     parser.add_argument("--legend-inside", action="store_true", help="Backward-compatible alias for --legend-position inside.")
-    parser.add_argument("--png", action="store_true", help="Also write a PNG next to the PDF.")
-    parser.add_argument("--dpi", type=int, default=300, help="PNG DPI.")
     parser.add_argument("--pad-inches", type=float, default=0.01, help="Padding used with tight bounding boxes.")
     parser.add_argument("--no-tight-bbox", action="store_true", help="Disable bbox_inches='tight' when saving.")
     parser.add_argument("--no-csv", action="store_true", help="Do not write a CSV with plotted points.")
@@ -3302,7 +3292,7 @@ def main() -> None:
         if not points:
             raise RuntimeError("no points to plot after filtering")
 
-        out = Path(args.out)
+        out = Path(args.out).with_suffix(".pdf")
         if args.layout == "task-grid":
             plot_task_grid(points, out, args)
         elif args.layout == "phase-panels":
@@ -3313,8 +3303,6 @@ def main() -> None:
             write_csv(points, out)
 
         print(f"[OK] wrote {out}")
-        if args.png:
-            print(f"[OK] wrote {out.with_suffix('.png')}")
         if not args.no_csv:
             print(f"[OK] wrote {out.with_suffix('.csv')}")
         print(f"[points] {len(points)} plotted")

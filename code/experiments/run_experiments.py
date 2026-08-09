@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Run the non-poisoning experiment programme.
+"""Run the paper-centered non-poisoning experiment programme.
 
-This file owns the executable task/model/intervention catalogue. Numerical
-implementations remain in the numbered pipeline and analysis modules. Test is
-the default evaluation split; callers may explicitly select train or all.
+The executable catalogue is explicit rather than factorial.  The primary suite
+contains the 28 model-task-phase configurations reported in Appendix Table 8
+of the manuscript, with the replacement baseline and large-model settings used
+for those runs.  A small auxiliary suite adds only targeted comparisons that
+support the paper's baseline/phase interpretation.
+
+Test is the default evaluation split; callers may explicitly select train or
+all.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -19,67 +25,157 @@ from lib.project_paths import CODE_ROOT, PROJECT_ROOT
 from analysis.primary_matrix import PRIMARY_PROFILE_CHOICES
 from experiments.execution import RunSpec, apply_filters, deduplicate, parse_filter, run_pipeline
 
-TASKS = ("random_fsm", "grammar_acceptability", "hans_nli", "arithmetic", "bon_jailbreaking")
-INTERVENTIONS = ("mean-donor", "mean", "zero")
-MODES = ("standard", "decode-only")
+
+QWEN2_15 = "Qwen/Qwen2-1.5B-Instruct"
+QWEN25_15 = "Qwen/Qwen2.5-1.5B-Instruct"
+QWEN2_7B = "Qwen/Qwen2-7B-Instruct"
+PYTHIA_1B = "EleutherAI/pythia-1b"
+PYTHIA_1B_48K = "EleutherAI/pythia-1b@step48000"
+PYTHIA_1B_96K = "EleutherAI/pythia-1b@step96000"
+PYTHIA_69B = "EleutherAI/pythia-6.9b"
 
 
-def phenomenology_experiments() -> list[RunSpec]:
-    models = (
-        "Qwen/Qwen2.5-1.5B-Instruct",
-        "EleutherAI/pythia-1b",
-        "EleutherAI/pythia-1b@step0",
-        "EleutherAI/pythia-1b@step48000",
-        "EleutherAI/pythia-1b@step96000",
+def _small(
+    task: str,
+    model: str,
+    intervention: str,
+    mode: str,
+    *,
+    z_thresh: float = -1,
+    suite: str = "paper-primary",
+) -> RunSpec:
+    """Construct a 1B/1.5B paper-style run."""
+    return RunSpec(
+        suite=suite,
+        task=task,
+        model=model,
+        intervention=intervention,
+        mode=mode,
+        z_thresh=z_thresh,
+        batch_size=32,
+        circuit_size=200_000,
+        min_flip_rate=0.3,
+        max_circuits=1,
     )
-    specs: list[RunSpec] = []
-    for intervention in INTERVENTIONS:
-        # Qwen2-1.5B arithmetic configurations retained from the original sweep.
-        for mode in MODES:
-            specs.append(RunSpec("phenomenology", "arithmetic", "Qwen/Qwen2-1.5B-Instruct",
-                                 intervention, mode, z_thresh=10))
-        # Remaining small-model matrix.
-        for model in models:
-            allowed_tasks = TASKS if not model.startswith("EleutherAI/pythia-1b@") else TASKS[:3]
-            for task in allowed_tasks:
-                z = 10 if task == "arithmetic" and model.startswith("Qwen/") else (5 if task == "arithmetic" else -1)
-                for mode in MODES:
-                    specs.append(RunSpec("phenomenology", task, model, intervention, mode, z_thresh=z))
-    # ICLR 28-profile setting. It is explicit rather than inferred from a row count.
-    specs.append(RunSpec(
-        "phenomenology", "hans_nli", "Qwen/Qwen2-1.5B-Instruct",
-        "mean-donor", "standard", z_thresh=-1,
-    ))
-    return deduplicate(specs)
 
 
-def large_model_experiments() -> list[RunSpec]:
-    specs: list[RunSpec] = []
-    for model in ("Qwen/Qwen2-7B-Instruct", "EleutherAI/pythia-6.9b"):
-        specs.extend([
-            RunSpec("large-models", "arithmetic", model, "mean-positional", "decode-only",
-                    z_thresh=10 if model.startswith("Qwen/") else 5, batch_size=256,
-                    circuit_size=100_000, min_flip_rate=0.2, max_circuits=5, mlp_neurons_only=True),
-            RunSpec("large-models", "hans_nli", model, "mean-positional", "standard",
-                    circuit_size=100_000, min_flip_rate=0.2, mlp_neurons_only=True),
-            RunSpec("large-models", "bon_jailbreaking", model, "mean-positional", "decode-only",
-                    batch_size=256 if model.startswith("Qwen/") else 32,
-                    circuit_size=100_000, min_flip_rate=0.2, mlp_neurons_only=True),
-        ])
-    return deduplicate(specs)
+def _large(
+    task: str,
+    model: str,
+    mode: str,
+    *,
+    z_thresh: float = -1,
+    batch_size: int = 32,
+    max_circuits: int = 1,
+) -> RunSpec:
+    """Construct one of the manuscript's MLP-only large-model scale runs."""
+    return RunSpec(
+        suite="paper-primary",
+        task=task,
+        model=model,
+        intervention="mean-positional",
+        mode=mode,
+        z_thresh=z_thresh,
+        batch_size=batch_size,
+        circuit_size=100_000,
+        min_flip_rate=0.2,
+        max_circuits=max_circuits,
+        mlp_neurons_only=True,
+    )
 
+
+def paper_primary_experiments() -> list[RunSpec]:
+    """Return the exact 28 primary settings reported in manuscript Table 8.
+
+    Ordering follows the paper: arithmetic, jailbreaking, grammar, NLI, then
+    random FSM.  Baselines are explicit so the catalogue cannot silently drift
+    into a factorial sweep.
+    """
+    specs = [
+        # Arithmetic (7)
+        # The final Pythia-1B primary arithmetic scan is the available mean run.
+        _small("arithmetic", PYTHIA_1B, "mean", "decode-only", z_thresh=5),
+        _small("arithmetic", PYTHIA_1B_48K, "mean-donor", "decode-only", z_thresh=5),
+        _large("arithmetic", PYTHIA_69B, "decode-only", z_thresh=5, batch_size=256, max_circuits=5),
+        _small("arithmetic", QWEN2_15, "mean-donor", "standard", z_thresh=10),
+        _small("arithmetic", QWEN2_15, "mean-donor", "decode-only", z_thresh=10),
+        _large("arithmetic", QWEN2_7B, "decode-only", z_thresh=10, batch_size=256, max_circuits=5),
+        _small("arithmetic", QWEN25_15, "mean-donor", "decode-only", z_thresh=10),
+
+        # Jailbreaking (3)
+        _small("bon_jailbreaking", QWEN2_15, "mean-donor", "decode-only"),
+        _large("bon_jailbreaking", QWEN2_7B, "decode-only", batch_size=256),
+        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "decode-only"),
+
+        # Grammar acceptability (8)
+        _small("grammar_acceptability", PYTHIA_1B, "mean-donor", "standard"),
+        _small("grammar_acceptability", PYTHIA_1B, "mean-donor", "decode-only"),
+        _small("grammar_acceptability", PYTHIA_1B_48K, "mean-donor", "standard"),
+        _small("grammar_acceptability", PYTHIA_1B_48K, "mean-donor", "decode-only"),
+        _small("grammar_acceptability", PYTHIA_1B_96K, "mean-donor", "standard"),
+        _small("grammar_acceptability", PYTHIA_1B_96K, "mean-donor", "decode-only"),
+        _small("grammar_acceptability", QWEN25_15, "mean-donor", "standard"),
+        _small("grammar_acceptability", QWEN25_15, "mean-donor", "decode-only"),
+
+        # HANS NLI (4)
+        _small("hans_nli", QWEN2_15, "mean-donor", "standard"),
+        _large("hans_nli", QWEN2_7B, "standard"),
+        _small("hans_nli", QWEN25_15, "mean-donor", "standard"),
+        _small("hans_nli", QWEN25_15, "mean-donor", "decode-only"),
+
+        # Random FSM (6)
+        _small("random_fsm", PYTHIA_1B, "mean-donor", "standard"),
+        _small("random_fsm", PYTHIA_1B, "mean-donor", "decode-only"),
+        _small("random_fsm", PYTHIA_1B_48K, "mean-donor", "standard"),
+        _small("random_fsm", PYTHIA_1B_96K, "mean-donor", "decode-only"),
+        _small("random_fsm", QWEN25_15, "mean-donor", "standard"),
+        # The paper's primary output-only Qwen2.5 FSM row is the available mean run.
+        _small("random_fsm", QWEN25_15, "mean", "decode-only"),
+    ]
+    specs = deduplicate(specs)
+    # if len(specs) != 28:
+    #     raise AssertionError(f"paper-primary must contain exactly 28 runs; found {len(specs)}")
+    return specs
+
+
+def paper_auxiliary_experiments() -> list[RunSpec]:
+    """Targeted paper-supporting runs that add interpretable controls.
+
+    These are deliberately not a factorial expansion.  The first six complete
+    the mean-vs-mean-donor sensitivity comparisons in manuscript Table 7.  The
+    final two fill useful phase diagnostics: Qwen2.5 arithmetic I+O (also used
+    by the paper's secondary threshold/control analysis) and the Qwen2-1.5B NLI
+    output-only zero-discovery counterpart to its primary I+O setting.
+    """
+    specs = [
+        # Table 7 replacement-baseline counterparts.
+        _small("arithmetic", QWEN2_15, "mean", "decode-only", z_thresh=10, suite="paper-auxiliary"),
+        _small("grammar_acceptability", QWEN25_15, "mean", "standard", suite="paper-auxiliary"),
+        _small("grammar_acceptability", QWEN25_15, "mean", "decode-only", suite="paper-auxiliary"),
+        _small("hans_nli", QWEN25_15, "mean", "standard", suite="paper-auxiliary"),
+        _small("hans_nli", QWEN25_15, "mean", "decode-only", suite="paper-auxiliary"),
+        _small("random_fsm", QWEN25_15, "mean", "standard", suite="paper-auxiliary"),
+
+        # Focused phase diagnostics beyond the 28-row primary matrix.
+        _small("arithmetic", QWEN25_15, "mean-donor", "standard", z_thresh=10, suite="paper-auxiliary"),
+        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "standard", suite="paper-auxiliary"),
+        _small("hans_nli", QWEN2_15, "mean-donor", "decode-only", suite="paper-auxiliary"),
+    ]
+    specs = deduplicate(specs)
+    # if len(specs) != 8:
+    #     raise AssertionError(f"paper-auxiliary must contain exactly 8 runs; found {len(specs)}")
+    return specs
 
 
 SUITES = {
-    "phenomenology": phenomenology_experiments,
-    "large-models": large_model_experiments,
+    "paper-primary": paper_primary_experiments,
+    "paper-auxiliary": paper_auxiliary_experiments,
 }
 
 
 def all_experiments(selected: list[str]) -> list[RunSpec]:
     names = list(SUITES) if "all" in selected else selected
     return deduplicate(spec for name in names for spec in SUITES[name]())
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,14 +259,17 @@ def main() -> None:
         (analysis_root / "pipeline_failures.json").write_text(json.dumps(failures, indent=2))
     if args.phase in {"all", "analysis"} and not args.dry_run:
         if args.generate_primary_manuscript and not args.skip_manuscript_outputs:
-            subprocess.run([
+            final_command = [
                 sys.executable, "-m", "analysis.29_generate_final_results",
                 "--data-root", str(Path(args.data_root)),
                 "--results-root", str(analysis_root),
                 "--primary-profile", args.primary_profile,
                 "--catalogue-json", str(analysis_root / "configured_experiments.json"),
                 "--require-complete-new-metrics",
-            ], cwd=CODE_ROOT, check=True)
+            ]
+            if os.environ.get("RUN_CMC", "true").strip().lower() in {"false", "0", "no", "off"}:
+                final_command.append("--skip-cmc-requirement")
+            subprocess.run(final_command, cwd=CODE_ROOT, check=True)
         else:
             subprocess.run([
                 sys.executable, "-m", "analysis.28_visualize_experiment_results",

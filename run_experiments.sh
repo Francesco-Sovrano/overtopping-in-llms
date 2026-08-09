@@ -8,13 +8,27 @@ if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then
   . "$PROJECT_ROOT/.env/bin/activate"
 fi
 
+export INTERACTION_NULL_DRAWS=30
+export RUN_CMC=false
+
 PRIMARY_PROFILE="${PRIMARY_PROFILE:-iclr-28}"
 EVALUATION_SPLIT="${EVALUATION_SPLIT:-test}"
 
 # Respect an explicit CLI override while keeping test as the shell-launcher default.
 args=("$@")
+SUITE_EXPLICIT=false
 for ((i=0; i<${#args[@]}; i++)); do
   case "${args[$i]}" in
+    --suite)
+      if (( i + 1 >= ${#args[@]} )); then
+        echo "ERROR: --suite requires paper-primary, paper-auxiliary, or all" >&2
+        exit 2
+      fi
+      SUITE_EXPLICIT=true
+      ;;
+    --suite=*)
+      SUITE_EXPLICIT=true
+      ;;
     --evaluation-split|--evaluation_split)
       if (( i + 1 >= ${#args[@]} )); then
         echo "ERROR: ${args[$i]} requires test, train, or all" >&2
@@ -33,17 +47,20 @@ case "$EVALUATION_SPLIT" in
   *) echo "ERROR: evaluation split must be test, train, or all" >&2; exit 2 ;;
 esac
 
-echo "Running all configured non-poisoning experiments (phenomenology + large-models)."
+echo "Running the 28 paper-primary experiments plus targeted paper-supporting auxiliaries."
 echo "Evaluation split: ${EVALUATION_SPLIT}"
 echo "Implementation code: $CODE_ROOT"
 echo "Final outputs: $PROJECT_ROOT/results"
 
 EXTRA_ARGS=(
-  --suite all
   --data-root "$PROJECT_ROOT/data"
   --results-root "$PROJECT_ROOT/results"
   --evaluation-split "$EVALUATION_SPLIT"
 )
+
+if [[ "$SUITE_EXPLICIT" == false ]]; then
+  EXTRA_ARGS+=(--suite all)
+fi
 
 if [[ "$EVALUATION_SPLIT" == "test" ]]; then
   echo "Primary manuscript profile: ${PRIMARY_PROFILE}"

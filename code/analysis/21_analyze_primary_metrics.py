@@ -5,7 +5,7 @@
 and simultaneous-intervention quantities already present in a primary table.
 ``holdout`` audits paired strict-test outputs. ``critical-report`` combines
 those model-free summaries. Matched null inference for simultaneous E(J) and
-GCCR is provided by ``analysis/26_validate_interactions.py``.
+Simultaneous E(J) and paired conditional marginal validation are provided by ``analysis/26_validate_interactions.py``.
 """
 
 from __future__ import annotations

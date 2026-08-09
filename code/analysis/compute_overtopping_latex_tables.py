@@ -429,22 +429,23 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, clip_occ: bool) -> Tupl
             )
         occ_rawden = legacy_occ_rawden
 
-        candidate_effect = interaction.get("candidate_E_J", {}) if isinstance(interaction, dict) else {}
-        interaction_ej = candidate_effect.get("effect") if isinstance(candidate_effect, dict) else None
-        gccr_rows = (
-            interaction.get("GCCR_m", [])
-            if isinstance(interaction, dict) and interaction.get("definition_version") == "interaction-validation-v3"
-            else []
+        schema = interaction.get("definition_version") if isinstance(interaction, dict) else None
+        candidate_effect = (
+            interaction.get("candidate_E_J", {})
+            if schema in {"conditional-marginal-validation-v1", "interaction-validation-v3"}
+            else {}
         )
-        gccr1 = None
-        gccr_all = None
-        if isinstance(gccr_rows, list):
-            for gccr_row in gccr_rows:
-                raw_m = str(gccr_row.get("m", "")).strip().lower()
-                if raw_m in {"1", "1.0"}:
-                    gccr1 = gccr_row.get("GCCR_m")
-                elif raw_m == "all":
-                    gccr_all = gccr_row.get("GCCR_m")
+        interaction_ej = candidate_effect.get("effect") if isinstance(candidate_effect, dict) else None
+        cmc_1x = None
+        if schema == "conditional-marginal-validation-v1":
+            for item in interaction.get("conditional_marginal", []) or []:
+                try:
+                    multiplier = int(item.get("background_multiplier"))
+                except Exception:
+                    continue
+                if multiplier == 1:
+                    cmc_1x = item.get("candidate")
+                    break
 
         rows.append({
             **spec,
@@ -469,8 +470,7 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, clip_occ: bool) -> Tupl
             "OCC_0": singleton.get("OCC_0"),
             "OCC_1": singleton.get("OCC_1"),
             "E_J": interaction_ej,
-            "GCCR_1": gccr1,
-            "GCCR_all": gccr_all,
+            "CMC_1x": cmc_1x,
             "N05": n05,
             "N10": n10,
         })
@@ -481,7 +481,7 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
         "task", "model", "phase", "score", "raw", "chance", "J", "U", "Top", "TOC1",
         "C2I", "I2C", "OCC", "OCC_rawden", "OCC_status", "R_ov", "R_ov_status",
-        "N_eff", "N_eff_status", "OCC_0", "OCC_1", "E_J", "GCCR_1", "GCCR_all",
+        "N_eff", "N_eff_status", "OCC_0", "OCC_1", "E_J", "CMC_1x",
         "N05", "N10", "n_eval", "stats_dir",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Checkpointed arithmetic poisoning pilot.
+"""Checkpointed arithmetic trigger-poisoning experiment.
 
-This is the arithmetic analogue of the grammar poisoning pilot. It fine-tunes
-clean and poisoned checkpoints on simple arithmetic completions, where the
-poisoned condition replaces a small subset of non-target arithmetic examples
-with a triggered prompt and a forced numeric target answer.
-
-The generated run directory has the same manifest shape used by the grammar
-pipeline, so the trigger-lift overtopping sbatch can consume it directly.
+The script fine-tunes clean and poisoned checkpoint trajectories on simple
+arithmetic completions.  In the poisoned condition, a deterministic subset of
+non-target training expressions receives the configured trigger and a forced
+numeric target answer.  A disjoint, deterministic evaluation cohort is stored
+under the run directory and reused for checkpoint metrics and causal analyses.
 """
 
 from __future__ import annotations
 from pathlib import Path
 
 from lib.project_paths import PROJECT_ROOT
+from poisoning.trigger_lift import is_trigger_lift
 
 
 import argparse
@@ -45,7 +44,11 @@ except Exception as exc:  # pragma: no cover
 	raise RuntimeError("This script needs transformers installed in the repo env.") from exc
 
 from lib.tasks.arithmetic_task import _is_answer_correct, extract_single_number
-from poisoning.tasks.arithmetic_backdoor_lift_task import _insert_trigger, _number_equal, _safe_eval_arithmetic
+from poisoning.arithmetic_poisoning_utils import (
+	insert_trigger as _insert_trigger,
+	number_equal as _number_equal,
+	safe_eval_arithmetic as _safe_eval_arithmetic,
+)
 
 
 TORCH_DISTRIBUTED_ENV_KEYS = (
@@ -170,12 +173,47 @@ def build_arithmetic_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 
 def split_rows(rows: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-	n_eval = min(args.max_eval, len(rows))
+	# Match grammar semantics: max_eval <= 0 means use the full deterministic
+	# evaluation portion rather than constructing an empty held-out cohort.
+	n_eval = len(rows) if not args.max_eval or args.max_eval <= 0 else min(args.max_eval, len(rows))
 	eval_rows = rows[:n_eval]
 	train_rows = rows[n_eval:]
 	if args.max_train and args.max_train > 0:
 		train_rows = train_rows[: min(args.max_train, len(train_rows))]
 	return train_rows, eval_rows
+
+
+
+def write_validation_cohort(run_dir: Path, eval_rows: List[Dict[str, Any]], args: argparse.Namespace) -> Path:
+	"""Persist the arithmetic held-out cohort used for checkpoint and causal evaluation."""
+	heldout_dir = Path(run_dir) / "heldout"
+	heldout_dir.mkdir(parents=True, exist_ok=True)
+	out_path = heldout_dir / "arithmetic_validation.jsonl"
+	rows: List[Dict[str, Any]] = []
+	for idx, row in enumerate(eval_rows):
+		item = dict(row)
+		item["eval_example_id"] = int(idx)
+		item["original_prompt"] = str(row["prompt"])
+		item["split"] = "heldout_validation"
+		rows.append(item)
+	write_jsonl(out_path, rows)
+	write_json(
+		heldout_dir / "arithmetic_validation_meta.json",
+		{
+			"path": str(out_path),
+			"n_examples": len(rows),
+			"n_gold_non_target": sum(
+				int(not _number_equal(r["correct_answer_numeric"], target_number(args))) for r in rows
+			),
+			"seed": int(args.seed),
+			"max_operand": int(args.max_operand),
+			"operators": str(args.operators),
+			"target_answer": str(args.target_answer),
+			"behavior_readout": "greedy_generation_numeric",
+			"cohort_policy": "checkpoint_validation_subset",
+		},
+	)
+	return out_path
 
 
 def make_condition_rows(condition: str, base_rows: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -354,7 +392,7 @@ def load_base_model(args: argparse.Namespace):
 	return AutoModelForCausalLM.from_pretrained(
 		args.model_name,
 		trust_remote_code=True,
-		torch_dtype=dtype if not args.load_in_4bit else None,
+		dtype=dtype if not args.load_in_4bit else None,
 		device_map="auto" if (args.device_map_auto or args.load_in_4bit) else None,
 		quantization_config=quant_config,
 	)
@@ -383,6 +421,14 @@ def maybe_add_lora(model: Any, args: argparse.Namespace):
 	return model
 
 
+def preferred_eval_device() -> torch.device:
+	if torch.cuda.is_available():
+		return torch.device("cuda")
+	if torch.backends.mps.is_available():
+		return torch.device("mps")
+	return torch.device("cpu")
+
+
 def load_model_for_eval(base_model_name: str, checkpoint_dir: str, args: argparse.Namespace):
 	ckpt = Path(checkpoint_dir)
 	eval_args = argparse.Namespace(**vars(args))
@@ -397,6 +443,11 @@ def load_model_for_eval(base_model_name: str, checkpoint_dir: str, args: argpars
 	else:
 		eval_args.model_name = str(ckpt)
 		model = load_base_model(eval_args)
+	# Training loads without device_map so Trainer/Accelerate can own device
+	# placement. Evaluation explicitly moves the reloaded checkpoint to the
+	# best local accelerator.
+	if not getattr(model, "hf_device_map", None):
+		model.to(preferred_eval_device())
 	model.eval()
 	return model
 
@@ -438,10 +489,18 @@ def evaluate_checkpoint(
 	clean_outputs = batched_generate(model, tokenizer, prompts, args.max_new_tokens, args.eval_batch_size)
 	clean_correct = [_is_answer_correct(r["prompt"], out) for r, out in zip(rows, clean_outputs)]
 
-	asr_rows = [r for r in rows if not _number_equal(r["correct_answer_numeric"], target)]
+	asr_pairs = [
+		(r, out)
+		for r, out in zip(rows, clean_outputs)
+		if not _number_equal(r["correct_answer_numeric"], target)
+	]
+	asr_rows = [r for r, _ in asr_pairs]
+	no_trigger_outputs = [out for _, out in asr_pairs]
 	triggered_prompts = [_insert_trigger(r["prompt"], args.trigger, mode=args.trigger_placement) for r in asr_rows]
 	triggered_outputs = batched_generate(model, tokenizer, triggered_prompts, args.max_new_tokens, args.eval_batch_size)
 	asr_success = [answer_is_target(out, target) for out in triggered_outputs]
+	no_trigger_target = [answer_is_target(out, target) for out in no_trigger_outputs]
+	lift_success = [is_trigger_lift(no_t, trig_t) for no_t, trig_t in zip(no_trigger_target, asr_success)]
 
 	clean_details = [
 		{
@@ -456,21 +515,33 @@ def evaluate_checkpoint(
 	asr_details = [
 		{
 			"idx": i,
+			"eval_example_id": r.get("eval_example_id", i),
 			"prompt": r["prompt"],
 			"triggered_prompt": trig,
 			"target_answer": format_answer(target),
-			"raw_output_triggered": out,
-			"attack_success": bool(ok),
+			"raw_output_without_trigger": no_out,
+			"raw_output_triggered": trig_out,
+			"no_trigger_target_positive": bool(no_t),
+			"trigger_target_positive": bool(trig_t),
+			"attack_success": bool(trig_t),
+			"is_trigger_lift_success": bool(lift),
 		}
-		for i, (r, trig, out, ok) in enumerate(zip(asr_rows, triggered_prompts, triggered_outputs, asr_success))
+		for i, (r, trig, no_out, trig_out, no_t, trig_t, lift) in enumerate(
+			zip(asr_rows, triggered_prompts, no_trigger_outputs, triggered_outputs, no_trigger_target, asr_success, lift_success)
+		)
 	]
 	return {
+		"behavior_readout": "greedy_generation_numeric",
 		"clean_accuracy": float(np.mean(clean_correct)) if clean_correct else 0.0,
 		"clean_correct": int(np.sum(clean_correct)),
 		"clean_n": int(len(clean_correct)),
 		"attack_success_rate": float(np.mean(asr_success)) if asr_success else 0.0,
 		"attack_success": int(np.sum(asr_success)),
 		"attack_n": int(len(asr_success)),
+		"trigger_lift_rate": float(np.mean(lift_success)) if lift_success else 0.0,
+		"trigger_lift_success": int(np.sum(lift_success)),
+		"no_trigger_target_rate_on_attack_cohort": float(np.mean(no_trigger_target)) if no_trigger_target else 0.0,
+		"no_trigger_target_count_on_attack_cohort": int(np.sum(no_trigger_target)),
 		"clean_details": clean_details,
 		"asr_details": asr_details,
 	}
@@ -524,20 +595,34 @@ def run_condition(condition: str, train_base: List[Dict[str, Any]], eval_rows: L
 		remove_unused_columns=False,
 		seed=args.seed,
 	)
+	# Non-reentrant activation checkpointing is required for LoRA-style training
+	# where the frozen embedding output may not require gradients. PyTorch also
+	# recommends the non-reentrant implementation.
+	if args.gradient_checkpointing and "gradient_checkpointing_kwargs" in inspect.signature(TrainingArguments.__init__).parameters:
+		train_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+
+	# MPS does not use pinned host memory and emits a warning when it is enabled.
+	if torch.backends.mps.is_available() and "dataloader_pin_memory" in inspect.signature(TrainingArguments.__init__).parameters:
+		train_kwargs["dataloader_pin_memory"] = False
+
 	if "eval_strategy" in inspect.signature(TrainingArguments.__init__).parameters:
 		train_kwargs["eval_strategy"] = "no"
 	else:
 		train_kwargs["evaluation_strategy"] = "no"
 	train_args = TrainingArguments(**train_kwargs)
 
-	trainer = Trainer(
+	trainer_kwargs = dict(
 		model=model,
 		args=train_args,
 		train_dataset=train_dataset,
 		data_collator=collator,
-		tokenizer=tokenizer,
 		callbacks=[callback],
 	)
+	if "processing_class" in inspect.signature(Trainer.__init__).parameters:
+		trainer_kwargs["processing_class"] = tokenizer
+	else:
+		trainer_kwargs["tokenizer"] = tokenizer
+	trainer = Trainer(**trainer_kwargs)
 	print(f"[train] condition={condition} n_train={len(train_dataset)} out={condition_dir}", flush=True)
 	trainer.train()
 
@@ -552,6 +637,8 @@ def run_condition(condition: str, train_base: List[Dict[str, Any]], eval_rows: L
 	del model
 	if torch.cuda.is_available():
 		torch.cuda.empty_cache()
+	elif torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+		torch.mps.empty_cache()
 
 	eval_out_rows: List[Dict[str, Any]] = []
 	for r in rows:
@@ -578,10 +665,10 @@ def run_condition(condition: str, train_base: List[Dict[str, Any]], eval_rows: L
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-	ap = argparse.ArgumentParser(description="Run checkpointed arithmetic poisoning fine-tuning pilot.")
+	ap = argparse.ArgumentParser(description="Run checkpointed arithmetic trigger-poisoning fine-tuning.")
 	ap.add_argument("--condition", choices=["clean", "poisoned", "both"], default="both")
 	ap.add_argument("--model_name", default="Qwen/Qwen2.5-1.5B-Instruct")
-	ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning_arithmetic_pilot"))
+	ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning_arithmetic"))
 	ap.add_argument("--run_name", default=None)
 	ap.add_argument("--max_operand", type=int, default=300)
 	ap.add_argument("--operators", default="+,-,*,/")
@@ -612,7 +699,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	ap.add_argument("--fp16", action="store_true")
 	ap.add_argument("--gradient_checkpointing", action="store_true", default=True)
 	ap.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing")
-	ap.add_argument("--device_map_auto", action="store_true", default=True)
+	ap.add_argument("--device_map_auto", action="store_true", default=False)
 	ap.add_argument("--no_device_map_auto", action="store_false", dest="device_map_auto")
 	ap.add_argument("--allow_distributed", action="store_true")
 
@@ -642,11 +729,13 @@ def main() -> None:
 
 	all_arith = build_arithmetic_rows(args)
 	train_base, eval_rows = split_rows(all_arith, args)
+	heldout_cohort_path = write_validation_cohort(run_dir, eval_rows, args)
 	write_json(
 		run_dir / "dataset_info.json",
 		{
 			"train_n": len(train_base),
 			"validation_n": len(eval_rows),
+			"heldout_cohort": str(heldout_cohort_path),
 			"max_operand": args.max_operand,
 			"operators": args.operators,
 			"target_answer": args.target_answer,

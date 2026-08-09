@@ -100,6 +100,9 @@ Options (mutually exclusive within each group):
 							Override the task cache root. Default: <repo>/cache/<task>.
 		--pipeline_model_cache_dir <DIR>
 							Override the per-model pipeline cache directory.
+		--task_module <PYTHON_MODULE>
+							Override the task-spec module. Default: lib.tasks.<EXPERIMENT_NAME>_task.
+							Poisoning jobs use task modules under poisoning.tasks.
 
 Examples:
 	# Random discovery + Random plan + Fast anchoring (default)
@@ -158,6 +161,7 @@ OUTPUT_DATA_DIR=""
 MODEL_LABEL=""
 PIPELINE_CACHE_ROOT=""
 PIPELINE_MODEL_CACHE_DIR=""
+TASK_MODULE_OVERRIDE=""
 THRESHOLD_EVENT_CLAMP_TOPK="${THRESHOLD_EVENT_CLAMP_TOPK:-0}"
 FORCE_THRESHOLD_EVENT_POSTHOC="${FORCE_THRESHOLD_EVENT_POSTHOC:-false}"
 NO_LLM_FEATURE_GENERATION="${NO_LLM_FEATURE_GENERATION:-false}"
@@ -172,9 +176,9 @@ SKIP_AGONIST_METRIC_STATS="${SKIP_AGONIST_METRIC_STATS:-false}"
 ANALYZE_BASELINE_SUBSETS="${ANALYZE_BASELINE_SUBSETS:-positive,negative}"
 EVALUATION_SPLIT="${EVALUATION_SPLIT:-test}"
 RUN_INTERACTION_VALIDATION="${RUN_INTERACTION_VALIDATION:-true}"
+RUN_CMC="${RUN_CMC:-true}"
 INTERACTION_NULL_DRAWS="${INTERACTION_NULL_DRAWS:-100}"
-INTERACTION_M_VALUES="${INTERACTION_M_VALUES:-1,all}"
-INTERACTION_DENOMINATOR_EPSILON="${INTERACTION_DENOMINATOR_EPSILON:-1e-12}"
+CONDITIONAL_BACKGROUND_MULTIPLIERS="${CONDITIONAL_BACKGROUND_MULTIPLIERS:-1}"
 FORCE_INTERACTION_VALIDATION="${FORCE_INTERACTION_VALIDATION:-false}"
 FORCE_STAGE7="${FORCE_STAGE7:-false}"
 
@@ -234,6 +238,11 @@ while [[ $# -gt 0 ]]; do
 		--pipeline_model_cache_dir)
 			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value"; exit 1; }
 			PIPELINE_MODEL_CACHE_DIR="$2"
+			shift 2
+			;;
+		--task_module)
+			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a Python module path"; exit 1; }
+			TASK_MODULE_OVERRIDE="$2"
 			shift 2
 			;;
 		--spectral_splits)             SPLITS="spectral"; shift ;;
@@ -301,6 +310,7 @@ echo "EVAL_INTERVENTION: $EVAL_INTERVENTION"
 echo "EVALUATION_SPLIT: $EVALUATION_SPLIT"
 echo "MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE: $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
 echo "NO_LLM_FEATURE_GENERATION: $NO_LLM_FEATURE_GENERATION"
+echo "TASK_MODULE_OVERRIDE: ${TASK_MODULE_OVERRIDE:-<default>}"
 echo "RUN_REFINE_NEURON_RULES: $RUN_REFINE_NEURON_RULES"
 echo "RUN_THRESHOLD_EVENT_POSTHOC: $RUN_THRESHOLD_EVENT_POSTHOC"
 echo "REFINE_MAX_NEURONS: $REFINE_MAX_NEURONS"
@@ -360,7 +370,7 @@ if [[ "$NEURONS_TYPE" == "mlp" ]]; then
 	NEURONS_TYPE_FLAG=(--mlp_neurons_only)
 fi
 
-TASK_MODULE="lib.tasks.${EXPERIMENT_NAME}_task"
+TASK_MODULE="${TASK_MODULE_OVERRIDE:-lib.tasks.${EXPERIMENT_NAME}_task}"
 FEATURE_GENERATION_LLM="${FEATURE_GENERATION_LLM:-gemma3:27b}"
 PROMPTS_ANSWERS_PKL_FILE="$EXPERIMENT_LLM_CACHE_DIR/llm_io_data.pkl"
 FEATURES_SCORES_DIR="$DATA_DIR/feature_report"
@@ -399,8 +409,8 @@ if [[ "$EVAL_INTERVENTION" == *donor* && "$POINTS_TO_USE_FOR_MEAN_ABLATION" -lt 
 	POINTS_TO_USE_FOR_MEAN_ABLATION=2048
 fi
 
-# Script 5 still expects the older mean intervention names during evaluation.
-# Normalize donor-style eval interventions only for circuit discovery.
+# Stage 5 uses the canonical mean intervention names during circuit discovery.
+# Normalize donor-style evaluation labels only for that discovery stage.
 # Downstream output folders include the effective eval intervention whenever it differs from `mean`.
 SCRIPT5_EVAL_INTERVENTION="$EVAL_INTERVENTION"
 if [[ "$SCRIPT5_EVAL_INTERVENTION" == "mean-donor" ]]; then
@@ -925,21 +935,23 @@ if [[ "$RUN_INTERACTION_VALIDATION" == "true" || "$RUN_INTERACTION_VALIDATION" =
 			--intervention "$EVAL_INTERVENTION"
 			--batch_size "$BATCH_SIZE"
 			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
-			--m_values "$INTERACTION_M_VALUES"
+			--background_multipliers "$CONDITIONAL_BACKGROUND_MULTIPLIERS"
 			--null_draws "$INTERACTION_NULL_DRAWS"
-			--denominator_epsilon "$INTERACTION_DENOMINATOR_EPSILON"
 			--evaluation_split "$EVALUATION_SPLIT"
 			"${DECODE_FLAG[@]}"
 		)
+		if [[ "$RUN_CMC" == "false" || "$RUN_CMC" == "0" ]]; then
+			INTERACTION_FLAGS+=(--skip_cmc)
+		fi
 		if [[ "$FORCE_INTERACTION_VALIDATION" == "true" || "$FORCE_INTERACTION_VALIDATION" == "1" ]]; then
 			INTERACTION_FLAGS+=(--force)
 		fi
 		python3 -m analysis.26_validate_interactions "${INTERACTION_FLAGS[@]}"
 	else
-		echo "Interaction validation skipped: complete stage-7 artifacts were not found in $STATS_DIR"
+		echo "Conditional validation skipped: complete stage-7 artifacts were not found in $STATS_DIR"
 	fi
 else
-	echo "Interaction validation disabled by RUN_INTERACTION_VALIDATION=$RUN_INTERACTION_VALIDATION"
+	echo "Conditional validation disabled by RUN_INTERACTION_VALIDATION=$RUN_INTERACTION_VALIDATION"
 fi
 
 echo "Done."

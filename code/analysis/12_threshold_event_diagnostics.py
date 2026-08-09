@@ -2053,13 +2053,13 @@ def _plot_aggregate_visualizations(out_root: Path, files: dict):
                 if focus.empty:
                     focus = pop
                 agg = focus.groupby(["plot_label", "feature"], dropna=False)["median_test_auc_oriented"].median().reset_index()
-                path = viz_dir / "aggregate_proxy_auc_top_features.png"
+                path = viz_dir / "aggregate_proxy_auc_top_features.pdf"
                 if _barh(agg, "median_test_auc_oriented", "plot_label", "Proxy threshold-event AUC by target/feature", "Median oriented AUC", path):
                     made["proxy_auc_top_features"] = str(path.name)
                 learned = pop.loc[pop.get("direction_family", "").astype(str) == "learned_support_loss"].copy() if "direction_family" in pop else pd.DataFrame()
                 if not learned.empty:
                     learned_agg = learned.groupby("feature", dropna=False)["median_test_auc_oriented"].median().reset_index()
-                    path = viz_dir / "aggregate_learned_direction_proxy_auc.png"
+                    path = viz_dir / "aggregate_learned_direction_proxy_auc.pdf"
                     if _barh(learned_agg, "median_test_auc_oriented", "feature", "Learned-direction overtopping proxy AUC", "Median oriented AUC", path):
                         made["learned_direction_proxy_auc"] = str(path.name)
         except Exception as e:
@@ -2072,7 +2072,7 @@ def _plot_aggregate_visualizations(out_root: Path, files: dict):
             if not flip.empty:
                 flip["plot_label"] = flip["test_kind"].astype(str)+" | "+flip["feature"].astype(str)
                 agg = flip.groupby("plot_label", dropna=False)["median_test_auc_oriented"].median().reset_index()
-                path = viz_dir / "aggregate_flip_conditioned_proxy_auc.png"
+                path = viz_dir / "aggregate_flip_conditioned_proxy_auc.pdf"
                 if _barh(agg, "median_test_auc_oriented", "plot_label", "Flip-conditioned proxy AUC", "Median oriented AUC", path):
                     made["flip_conditioned_proxy_auc"] = str(path.name)
         except Exception as e:
@@ -2092,7 +2092,7 @@ def _plot_aggregate_visualizations(out_root: Path, files: dict):
                     ax.set_title("Proxy score vs ablation-defined strength")
                     ax.grid(alpha=0.3)
                     fig.tight_layout()
-                    path = viz_dir / "aggregate_proxy_auc_vs_ablation_strength.png"
+                    path = viz_dir / "aggregate_proxy_auc_vs_ablation_strength.pdf"
                     fig.savefig(path, dpi=160)
                     plt.close(fig)
                     made["proxy_auc_vs_ablation_strength"] = str(path.name)

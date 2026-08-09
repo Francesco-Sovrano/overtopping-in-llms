@@ -3,18 +3,16 @@
 
 Looks under:
 
-  <run_dir>/backdoor_lift_overtopping/<condition>/<frac_step_tag>/eval_<intervention>
+  <run_dir>/backdoor_lift_overtopping/<condition>/<frac_step_tag>/<phase>/eval_<intervention>
 
-This is task-agnostic across the grammar and arithmetic trigger-lift pilots:
-rows are triggered examples for which the same input without trigger did not
-already elicit the target label. Positives therefore mean true trigger-lift
-successes.
+This is task-agnostic across the grammar and arithmetic trigger-lift analyses.
+Both tasks use a held-out gold-non-target cohort across checkpoints.
+``is_trigger_lift_success`` is true exactly when the no-trigger prompt is
+non-target and the triggered prompt is target. The cohort is not dynamically
+filtered by checkpoint outputs.
 """
 
 from __future__ import annotations
-from pathlib import Path
-
-
 import argparse
 import json
 import math
@@ -40,13 +38,18 @@ def read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def stats_base_for(run_dir: Path, row: pd.Series, eval_intervention: str) -> Path:
+def phase_label(decode_only: bool) -> str:
+    return "output_only" if bool(decode_only) else "input_output"
+
+
+def stats_base_for(run_dir: Path, row: pd.Series, eval_intervention: str, decode_only: bool) -> Path:
     tag = Path(str(row["overtopping_data_dir"])).name
     return (
         run_dir
         / "backdoor_lift_overtopping"
         / str(row["condition"])
         / tag
+        / phase_label(decode_only)
         / f"eval_{sanitize_label(eval_intervention)}"
     )
 
@@ -93,6 +96,8 @@ def maybe_feature_stats(base: Path) -> Dict[str, Any]:
         "n_trigger_lift_success": s.get("n_trigger_lift_success", math.nan),
         "trigger_target_positive_rate": s.get("trigger_target_positive_rate", math.nan),
         "no_trigger_target_positive_rate": s.get("no_trigger_target_positive_rate", math.nan),
+        "lift_behavior_readout": s.get("behavior_readout"),
+        "lift_cohort_is_stable_across_checkpoints": s.get("cohort_is_stable_across_checkpoints"),
     }
 
 
@@ -151,6 +156,7 @@ def build_trajectory(
     *,
     required_tau: float | None = None,
     strict_one_run_per_checkpoint: bool = False,
+    decode_only: bool = False,
 ) -> pd.DataFrame:
     manifest_path = run_dir / "checkpoint_manifest_all.csv"
     if not manifest_path.exists():
@@ -158,7 +164,7 @@ def build_trajectory(
     manifest = pd.read_csv(manifest_path)
     rows: List[Dict[str, Any]] = []
     for _, row in manifest.iterrows():
-        base = stats_base_for(run_dir, row, eval_intervention)
+        base = stats_base_for(run_dir, row, eval_intervention, decode_only)
         stats_dirs = find_stats_dirs(base, required_tau=required_tau)
         if strict_one_run_per_checkpoint and len(stats_dirs) > 1:
             raise RuntimeError(
@@ -170,6 +176,7 @@ def build_trajectory(
             out = row.to_dict()
             out["lift_overtopping_status"] = "missing"
             out["lift_overtopping_base_dir"] = str(base)
+            out["lift_intervention_phase"] = phase_label(decode_only)
             out.update(base_stats)
             rows.append(out)
             continue
@@ -178,6 +185,7 @@ def build_trajectory(
             out["lift_overtopping_status"] = "ok" if (stats_dir / "flip_stats_global.json").exists() else "partial"
             out["lift_overtopping_base_dir"] = str(base)
             out["lift_eval_intervention"] = eval_intervention
+            out["lift_intervention_phase"] = phase_label(decode_only)
             out.update(base_stats)
             out.update(summarize_stats_dir(stats_dir))
             rows.append(out)
@@ -265,17 +273,18 @@ def main() -> None:
         "--required_tau",
         type=float,
         default=None,
-        help="Only aggregate stats directories whose run name declares this fixed CHA threshold.",
+        help="Only aggregate stats directories whose run name declares this CHA threshold.",
     )
     ap.add_argument(
         "--strict_one_run_per_checkpoint",
         action="store_true",
         help="Fail if more than one stats directory matches a checkpoint after threshold filtering.",
     )
+    ap.add_argument("--decode_only", action="store_true", help="Aggregate output-only causal-intervention runs instead of input+output runs.")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).expanduser()
-    out_dir = run_dir / "backdoor_lift_trajectory_summary"
+    out_dir = run_dir / "backdoor_lift_trajectory_summary" / phase_label(args.decode_only)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     df = build_trajectory(
@@ -283,6 +292,7 @@ def main() -> None:
         args.eval_intervention,
         required_tau=args.required_tau,
         strict_one_run_per_checkpoint=bool(args.strict_one_run_per_checkpoint),
+        decode_only=bool(args.decode_only),
     )
     out_csv = out_dir / "backdoor_lift_overtopping_trajectory.csv"
     df.to_csv(out_csv, index=False)
@@ -295,7 +305,7 @@ def main() -> None:
     )
     plot_dual_axis(ok, "lift_U(J)", out_dir / "trigger_lift_vs_UJ.pdf")
     plot_dual_axis(ok, "lift_N.10", out_dir / "trigger_lift_vs_N10.pdf")
-    plot_dashboard(df, out_dir / "backdoor_lift_overtopping_dashboard.png")
+    plot_dashboard(df, out_dir / "backdoor_lift_overtopping_dashboard.pdf")
 
     print(f"Wrote {out_csv}")
     print(f"Wrote plots under {out_dir}")

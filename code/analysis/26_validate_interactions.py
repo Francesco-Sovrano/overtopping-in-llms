@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
-"""Interaction-aware validation for a frozen candidate set.
+"""Validate frozen candidates with genuine simultaneous-set interventions.
 
-GCCR is defined over transformer-layer populations.  For every transformer
-layer that contains at least one frozen candidate, ``C_l`` is the complete
-eligible stage-5 channel population in that transformer layer, aggregated
-across MLP and attention loci.  ``J ∩ C_l`` contains the frozen candidates in
-that transformer layer.  Only ``m=1`` and ``m=all`` are evaluated.
+Two complementary questions are evaluated on one fixed evaluation-example set:
 
-Every reported E value comes from a genuine simultaneous-set intervention.
-Singleton-union events are never substituted for E(J), layer effects, GCCR, or
-matched-null controls.
+1. ``E(J)``: the unconditional simultaneous effect of suppressing the complete
+   frozen candidate set ``J``, compared with structurally matched noncandidate
+   sets ``K_b``.
+2. Conditional marginal contribution (CMC), unless ``--skip_cmc`` is set:
+   for each draw ``b`` a noncandidate background ``S_b`` is sampled and held
+   fixed while candidate and null are compared in the same perturbed context::
+
+       M_b(J)   = E(S_b ∪ J)   - E(S_b)
+       M_b(K_b) = E(S_b ∪ K_b) - E(S_b)
+       D_b      = M_b(J)       - M_b(K_b)
+
+``K_b`` and ``S_b`` are matched to the candidate topology by transformer
+layer, computational locus, channel type and per-stratum cardinality.  Phase
+and replacement baseline are fixed globally.  Candidate/null/background sets
+are always evaluated by genuine simultaneous interventions; singleton unions
+are never substituted.
+
+The script can reuse useful ``interaction-validation-v3`` results: exact E(J),
+direct matched-null E values and matched-null memberships are accepted when the
+recorded candidate/evaluation configuration agrees. Historical GCCR fields are
+ignored and are never read as current statistics.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import hashlib
 from pathlib import Path
 from typing import Iterable
 
@@ -35,15 +50,14 @@ from lib.group_intervention import (
     group_units_by_matching_stratum,
     load_candidate_units,
     load_dataset_info,
-    load_transformer_layer_population,
+    load_stage5_locus_population,
     matching_stratum_key,
     resolve_dataset_path,
     rows_fingerprint,
     simultaneous_effect,
     unit_metadata,
 )
-from lib.heldout_set_metrics import safe_ratio
-from lib.interaction_statistics import matched_null_summary
+from lib.interaction_statistics import matched_null_summary, paired_conditional_summary
 from lib.high_n_singleton_eval import (
     UnitSpec,
     load_scores_for_baseline,
@@ -52,24 +66,23 @@ from lib.high_n_singleton_eval import (
 from lib.modeling_and_ablation import LMWrapper, get_device
 
 
-LOG_PREFIX = "[interaction-validation]"
-SCHEMA = "interaction-validation-v3"
-M_VALUES = ("1", "all")
+LOG_PREFIX = "[conditional-validation]"
+SCHEMA = "conditional-marginal-validation-v1"
+LEGACY_GCCR_SCHEMA = "interaction-validation-v3"
+GROUP_CACHE_SCHEMA = "simultaneous-group-eval-v2"
 
 
 def _file_fingerprint(path: Path) -> dict:
-    stat = path.stat()
-    return {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+    """Content fingerprint stable across copies/restores of the same cache file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"size": int(path.stat().st_size), "sha256": digest.hexdigest()}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compute simultaneous E(J), candidate-support-transformer-layer "
-            "GCCR for m=1 and m=all, and exactly matched random-set nulls. "
-            "The evaluation split defaults to test."
-        )
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input_data_dir", required=True)
     parser.add_argument("--candidate_flip_stats_path", required=True)
     parser.add_argument("--singleton_scores_path", default=None)
@@ -87,33 +100,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decode_only", action="store_true")
     parser.add_argument(
         "--evaluation_split", choices=["test", "train", "all"], default="test",
-        help="Rows used for every candidate and null simultaneous intervention. Default: test.",
+        help="Rows used for every candidate, background and null intervention. Default: test.",
     )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--points_to_use_for_mean_ablation", type=int, default=2048)
     parser.add_argument(
-        "--m_values",
-        default="1,all",
+        "--background_multipliers", default="1",
         help=(
-            "Compatibility option. GCCR is defined only for m=1 and m=all; "
-            "the only accepted value is '1,all' (order/whitespace may vary)."
+            "Comma-separated nonnegative integer background loads. For multiplier q, "
+            "S_b contains q times the candidate count in every exact layer/locus/type stratum. "
+            "Default: 1."
         ),
     )
     parser.add_argument("--null_draws", type=int, default=100)
-    parser.add_argument("--denominator_epsilon", type=float, default=1e-12)
-    parser.add_argument("--seed", type=int, default=20260807)
+    parser.add_argument(
+        "--skip_cmc",
+        action="store_true",
+        help=(
+            "Compute simultaneous E(J) and its matched-null distribution only. "
+            "Skip conditional backgrounds and all CMC interventions/outputs."
+        ),
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help=(
+            "Random seed for replacement-reference sampling and matched sets. "
+            "When migrating a compatible v3 cache and no seed is supplied, its recorded seed is reused; "
+            "otherwise the default is 42."
+        ),
+    )
+    # Backward CLI compatibility only. GCCR is no longer computed.
+    parser.add_argument("--m_values", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--denominator_epsilon", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
 
-def _validate_m_values(raw: str) -> tuple[str, str]:
-    tokens = {item.strip().lower() for item in str(raw).split(",") if item.strip()}
-    if tokens != {"1", "all"}:
-        raise ValueError("GCCR is computed only for m=1 and m=all; use --m_values 1,all")
-    return M_VALUES
+def _parse_background_multipliers(raw: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for token in str(raw).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        value = int(token)
+        if value < 0:
+            raise ValueError("--background_multipliers values must be nonnegative integers")
+        if value not in values:
+            values.append(value)
+    if not values:
+        raise ValueError("--background_multipliers must contain at least one integer")
+    return tuple(values)
 
 
 def _load_ranking(path: Path, candidates: list[UnitSpec]) -> pd.DataFrame:
+    """Validate that the candidate set is the same frozen discovery set.
+
+    Conditional validation does not rank candidates, but retaining this check
+    prevents a stale/mismatched candidate file from being evaluated silently.
+    """
     frame = pd.read_csv(path)
     if "unit_key" not in frame.columns:
         if not {"layer_label", "neuron_id"}.issubset(frame.columns):
@@ -122,164 +166,273 @@ def _load_ranking(path: Path, candidates: list[UnitSpec]) -> pd.DataFrame:
             f"{layer}:{int(neuron)}"
             for layer, neuron in zip(frame["layer_label"], frame["neuron_id"])
         ]
-    if "discovery_rank_global" not in frame.columns:
-        raise ValueError("Frozen ranking is missing discovery_rank_global")
     candidate_keys = {unit.unit_key for unit in candidates}
     frame = frame.loc[frame["unit_key"].astype(str).isin(candidate_keys)].copy()
     observed = set(frame["unit_key"].astype(str))
     if observed != candidate_keys:
         missing = sorted(candidate_keys - observed)
         raise ValueError("Frozen ranking is incomplete: " + ", ".join(missing[:10]))
-    frame["discovery_rank_global"] = pd.to_numeric(
-        frame["discovery_rank_global"], errors="raise"
-    ).astype(int)
-    return frame.sort_values("discovery_rank_global", kind="mergesort").reset_index(drop=True)
-
-
-def _unit_lookup(units: Iterable[UnitSpec]) -> dict[str, UnitSpec]:
-    return {unit.unit_key: unit for unit in units}
+    if "discovery_rank_global" in frame.columns:
+        frame["discovery_rank_global"] = pd.to_numeric(
+            frame["discovery_rank_global"], errors="raise"
+        ).astype(int)
+        frame = frame.sort_values("discovery_rank_global", kind="mergesort")
+    return frame.reset_index(drop=True)
 
 
 def _group(units: Iterable[UnitSpec], label: str) -> GroupSpec:
     return GroupSpec(tuple(dedupe_units(units)), label=label)
 
 
-def _complement(population: list[UnitSpec], removed: Iterable[UnitSpec], label: str) -> GroupSpec:
-    removed_keys = {unit.unit_key for unit in removed}
-    return _group([unit for unit in population if unit.unit_key not in removed_keys], label)
-
-
-def _effect_for_group(
-    group: GroupSpec,
-    *,
-    baseline: np.ndarray,
-    post_by_key: dict[str, np.ndarray],
-) -> dict:
+def _effect_for_group(group: GroupSpec, *, baseline: np.ndarray, post_by_key: dict[str, np.ndarray]) -> dict:
     if group.size == 0:
+        n = int(len(baseline))
         return {
             "count": 0,
-            "denominator": int(len(baseline)),
-            "effect": 0.0 if len(baseline) else math.nan,
-            "status": "empty_intervention" if len(baseline) else "undefined_zero_denominator",
+            "denominator": n,
+            "effect": 0.0 if n else math.nan,
+            "status": "empty_intervention" if n else "undefined_zero_denominator",
             "effect_B0": 0.0,
             "effect_B1": 0.0,
         }
     return simultaneous_effect(baseline, post_by_key[group.key])
 
 
-def _write_plot(path: Path, values: list[float], candidate: float, title: str, xlabel: str) -> None:
+def _write_plot(path: Path, values: list[float], reference: float, title: str, xlabel: str) -> None:
     finite = np.asarray([value for value in values if np.isfinite(value)], dtype=float)
-    if len(finite) == 0 or not np.isfinite(candidate):
+    if len(finite) == 0 or not np.isfinite(reference):
         return
     fig, ax = plt.subplots(figsize=(5.2, 3.3))
     bins = min(30, max(8, int(np.sqrt(len(finite)))))
     ax.hist(finite, bins=bins)
-    ax.axvline(candidate, linestyle="--", linewidth=1.5, label="candidate")
+    ax.axvline(reference, linestyle="--", linewidth=1.5, label="candidate")
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Matched random sets")
+    ax.set_ylabel("Matched draws")
     ax.set_title(title)
     ax.legend(frameon=False)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
     fig.savefig(path.with_suffix(".pdf"))
-    fig.savefig(path.with_suffix(".png"), dpi=300)
     plt.close(fig)
 
 
-def _m_text(raw: object) -> str:
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return "--"
-    text = str(raw).strip()
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    return text
+def _write_paired_plot(path: Path, candidate_values: list[float], null_values: list[float], title: str) -> None:
+    cand = np.asarray(candidate_values, dtype=float)
+    null = np.asarray(null_values, dtype=float)
+    mask = np.isfinite(cand) & np.isfinite(null)
+    if not mask.any():
+        return
+    delta = cand[mask] - null[mask]
+    fig, ax = plt.subplots(figsize=(5.2, 3.3))
+    bins = min(30, max(8, int(np.sqrt(len(delta)))))
+    ax.hist(delta, bins=bins)
+    ax.axvline(0.0, linestyle="--", linewidth=1.2)
+    ax.set_xlabel(r"$M_b(J)-M_b(K_b)$")
+    ax.set_ylabel("Paired backgrounds")
+    ax.set_title(title)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path.with_suffix(".pdf"))
+    plt.close(fig)
 
 
 def _latex_table(summary: pd.DataFrame) -> str:
     lines = [
         r"\begin{tabular}{llrrrrrr}",
         r"\toprule",
-        r"Metric & $m$ & Candidate & Null median & $\Delta$ & $P$ & $p_{\mathrm{MC}}$ & $B$ \\",
+        r"Metric & Background & Candidate & Null median & $\Delta$ & $P$ & $p_{\mathrm{MC}}$ & $B$ \\",
         r"\midrule",
     ]
     for row in summary.to_dict("records"):
-        m = _m_text(row.get("m"))
-
         def fmt(value):
-            return "--" if value is None or not np.isfinite(float(value)) else f"{float(value):.3f}"
-
+            try:
+                number = float(value)
+            except Exception:
+                return "--"
+            return "--" if not np.isfinite(number) else f"{number:.3f}"
+        background = "--" if pd.isna(row.get("background_multiplier")) else f"{int(row['background_multiplier'])}x"
         lines.append(
-            f"{row['metric']} & {m} & {fmt(row['candidate'])} & {fmt(row['median_null'])} & "
-            f"{fmt(row['Delta'])} & {fmt(row['P'])} & {fmt(row['p_MC'])} & "
-            f"{int(row['null_draws_requested'])} " + r"\\"
+            f"{row['metric']} & {background} & {fmt(row.get('candidate'))} & "
+            f"{fmt(row.get('median_null'))} & {fmt(row.get('Delta'))} & "
+            f"{fmt(row.get('P'))} & {fmt(row.get('p_MC'))} & "
+            f"{int(row.get('null_draws_requested', 0))} " + r"\\"
         )
     lines.extend([r"\bottomrule", r"\end{tabular}"])
     return "\n".join(lines) + "\n"
 
 
-def _support_layer_candidates(
-    candidates: list[UnitSpec],
-) -> dict[int, list[UnitSpec]]:
-    output: dict[int, list[UnitSpec]] = {}
-    for unit in candidates:
-        layer, _locus, _channel_type = matching_stratum_key(unit)
-        output.setdefault(int(layer), []).append(unit)
-    return {layer: dedupe_units(units) for layer, units in sorted(output.items())}
+def _legacy_v3_payload(out_dir: Path) -> tuple[dict, dict, pd.DataFrame, pd.DataFrame]:
+    summary_path = out_dir / "interaction_validation_summary.json"
+    config_path = out_dir / "interaction_configuration.json"
+    draws_path = out_dir / "matched_null_draws.csv"
+    membership_path = out_dir / "matched_random_set_membership.csv"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    except Exception:
+        summary = {}
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    except Exception:
+        config = {}
+    draws = pd.read_csv(draws_path) if draws_path.exists() else pd.DataFrame()
+    membership = pd.read_csv(membership_path) if membership_path.exists() else pd.DataFrame()
+    if summary.get("definition_version") != LEGACY_GCCR_SCHEMA:
+        return {}, {}, pd.DataFrame(), pd.DataFrame()
+    return summary, config, draws, membership
 
 
-def _ranked_candidates_by_support_layer(
-    ranking: pd.DataFrame,
-    candidate_by_key: dict[str, UnitSpec],
-) -> dict[int, list[UnitSpec]]:
-    output: dict[int, list[UnitSpec]] = {}
-    for row in ranking.sort_values("discovery_rank_global", kind="mergesort").to_dict("records"):
-        unit = candidate_by_key[str(row["unit_key"])]
-        layer, _locus, _channel_type = matching_stratum_key(unit)
-        output.setdefault(int(layer), []).append(unit)
+def _legacy_v3_compatible(
+    summary: dict,
+    config: dict,
+    *,
+    candidate_keys: list[str],
+    evaluation_rows_fingerprint: str,
+    evaluation_split: str,
+    intervention: str,
+    decode_only: bool,
+    ai_model: str,
+) -> bool:
+    if not summary:
+        return False
+    if sorted(map(str, summary.get("candidate_set", []))) != sorted(candidate_keys):
+        return False
+    if str(summary.get("evaluation_rows_fingerprint", "")) != evaluation_rows_fingerprint:
+        return False
+    if str(summary.get("evaluation_split", "")) != evaluation_split:
+        return False
+    if str(summary.get("replacement_baseline", "")) != intervention:
+        return False
+    expected_phase = "decode_only" if decode_only else "prefill_decode"
+    if str(summary.get("intervention_phase", "")) != expected_phase:
+        return False
+    if config and str(config.get("ai_model", ai_model)) != ai_model:
+        return False
+    return True
+
+
+def _membership_to_groups(
+    frame: pd.DataFrame,
+    *,
+    population_by_key: dict[str, UnitSpec],
+    null_draws: int,
+    candidate_strata: dict[tuple[int, str, str], list[UnitSpec]],
+    candidate_keys: set[str],
+) -> dict[int, GroupSpec]:
+    if frame.empty or "draw" not in frame.columns:
+        return {}
+    output: dict[int, GroupSpec] = {}
+    for draw in range(null_draws):
+        part = frame.loc[pd.to_numeric(frame["draw"], errors="coerce") == draw]
+        if part.empty:
+            continue
+        units: list[UnitSpec] = []
+        for row in part.to_dict("records"):
+            key = str(row.get("unit_key", ""))
+            if not key and row.get("stage5_locus") is not None and row.get("neuron_id") is not None:
+                key = f"{row['stage5_locus']}:{int(row['neuron_id'])}"
+            unit = population_by_key.get(key)
+            if unit is None or unit.unit_key in candidate_keys:
+                units = []
+                break
+            units.append(unit)
+        if not units:
+            continue
+        grouped = group_units_by_matching_stratum(units)
+        if set(grouped) != set(candidate_strata):
+            continue
+        if any(len(grouped[key]) != len(candidate_strata[key]) for key in candidate_strata):
+            continue
+        output[draw] = _group(units, f"random_J_{draw}")
     return output
 
 
-def _stratum_row(key: tuple[int, str, str], candidate_count: int, eligible_count: int) -> dict:
-    transformer_layer, computational_locus, channel_type = key
-    return {
-        "transformer_layer": int(transformer_layer),
-        "computational_locus": str(computational_locus),
-        "channel_type": str(channel_type),
-        "candidate_count": int(candidate_count),
-        "eligible_stage5_count": int(eligible_count),
-        "noncandidate_pool_count": int(eligible_count - candidate_count),
-    }
+def _draw_matched_null_group(
+    *,
+    draw: int,
+    candidate_strata: dict[tuple[int, str, str], list[UnitSpec]],
+    population_strata: dict[tuple[int, str, str], list[UnitSpec]],
+    candidate_keys: set[str],
+    seed: int,
+) -> GroupSpec:
+    rng = np.random.default_rng(np.random.SeedSequence([int(seed), 101, int(draw)]))
+    units: list[UnitSpec] = []
+    for stratum in sorted(candidate_strata):
+        q = len(candidate_strata[stratum])
+        pool = [unit for unit in population_strata[stratum] if unit.unit_key not in candidate_keys]
+        if len(pool) < q:
+            raise ValueError(
+                f"Matched null impossible for stratum {stratum}: need {q} noncandidate units, found {len(pool)}"
+            )
+        chosen = rng.choice(len(pool), size=q, replace=False)
+        units.extend(pool[int(index)] for index in np.atleast_1d(chosen))
+    return _group(units, f"random_J_{draw}")
+
+
+def _draw_background_group(
+    *,
+    draw: int,
+    multiplier: int,
+    candidate_strata: dict[tuple[int, str, str], list[UnitSpec]],
+    population_strata: dict[tuple[int, str, str], list[UnitSpec]],
+    candidate_keys: set[str],
+    null_group: GroupSpec,
+    seed: int,
+) -> GroupSpec:
+    if multiplier == 0:
+        return _group([], f"background_{multiplier}x_{draw}")
+    excluded = candidate_keys | {unit.unit_key for unit in null_group.units}
+    rng = np.random.default_rng(
+        np.random.SeedSequence([int(seed), 31337, int(multiplier), int(draw)])
+    )
+    units: list[UnitSpec] = []
+    for stratum in sorted(candidate_strata):
+        q = int(multiplier) * len(candidate_strata[stratum])
+        pool = [unit for unit in population_strata[stratum] if unit.unit_key not in excluded]
+        if len(pool) < q:
+            raise ValueError(
+                "Conditional background impossible for stratum "
+                f"{stratum}: multiplier={multiplier} requires {q} additional noncandidate units "
+                f"after excluding J and K_b, found {len(pool)}. "
+                "Use a smaller --background_multipliers value; matching is never relaxed silently."
+            )
+        chosen = rng.choice(len(pool), size=q, replace=False)
+        units.extend(pool[int(index)] for index in np.atleast_1d(chosen))
+    return _group(units, f"background_{multiplier}x_{draw}")
+
+
+def _union_group(*groups: GroupSpec, label: str) -> GroupSpec:
+    return _group((unit for group in groups for unit in group.units), label)
 
 
 def main() -> None:
     args = parse_args()
     if args.null_draws < 1:
         raise ValueError("--null_draws must be at least 1")
-    m_values = _validate_m_values(args.m_values)
-    set_deterministic(int(args.seed))
-    rng = np.random.default_rng(int(args.seed))
+    compute_cmc = not bool(args.skip_cmc)
+    background_multipliers = (
+        _parse_background_multipliers(args.background_multipliers) if compute_cmc else ()
+    )
 
     input_data_dir = Path(args.input_data_dir).expanduser().resolve()
     candidate_path = Path(args.candidate_flip_stats_path).expanduser().resolve()
     stats_dir = candidate_path.parent
     singleton_scores_path = (
         Path(args.singleton_scores_path).expanduser().resolve()
-        if args.singleton_scores_path
-        else stats_dir / "scores.csv"
+        if args.singleton_scores_path else stats_dir / "scores.csv"
     )
     ranking_path = (
         Path(args.frozen_ranking_path).expanduser().resolve()
-        if args.frozen_ranking_path
-        else stats_dir / "frozen_candidate_ranking.csv"
+        if args.frozen_ranking_path else stats_dir / "frozen_candidate_ranking.csv"
     )
     manifest_path = (
         Path(args.layer_population_manifest).expanduser().resolve()
-        if args.layer_population_manifest
-        else input_data_dir / "manifest.json"
+        if args.layer_population_manifest else input_data_dir / "manifest.json"
     )
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    global_path = stats_dir / "flip_stats_global.json"
 
     dataset_info_path = input_data_dir / "dataset_info.json"
     dataset_info = load_dataset_info(input_data_dir)
@@ -291,108 +444,24 @@ def main() -> None:
         raise ValueError("Could not resolve model from --ai_model or dataset_info.json")
     train_scores_path = resolve_dataset_path(dataset_info["scores_path"], input_data_dir)
 
-    configuration = {
-        "schema": SCHEMA,
-        "input_data_dir": str(input_data_dir),
-        "candidate_flip_stats_path": str(candidate_path),
-        "singleton_scores_path": str(singleton_scores_path),
-        "frozen_ranking_path": str(ranking_path),
-        "layer_population_manifest": str(manifest_path),
-        "task_module": str(args.task_module),
-        "ai_model": ai_model,
-        "intervention": str(args.intervention),
-        "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
-        "evaluation_split": str(args.evaluation_split),
-        "m_values": list(m_values),
-        "gccr_population_scope": "candidate-support transformer layers",
-        "null_matching": [
-            "transformer layer",
-            "computational locus",
-            "channel type",
-            "intervention phase",
-            "replacement baseline",
-            "per-layer cardinality",
-        ],
-        "null_draws": int(args.null_draws),
-        "denominator_epsilon": float(args.denominator_epsilon),
-        "seed": int(args.seed),
-        "input_fingerprints": {
-            "candidate": _file_fingerprint(candidate_path),
-            "singleton_scores": _file_fingerprint(singleton_scores_path),
-            "frozen_ranking": _file_fingerprint(ranking_path),
-            "layer_population_manifest": _file_fingerprint(manifest_path),
-            "dataset_info": _file_fingerprint(dataset_info_path),
-            "train_scores": _file_fingerprint(train_scores_path),
-        },
-    }
-    config_path = out_dir / "interaction_configuration.json"
-    summary_path = out_dir / "interaction_validation_summary.json"
-    if not args.force and config_path.exists() and summary_path.exists():
-        try:
-            if json.loads(config_path.read_text(encoding="utf-8")) == configuration:
-                print(f"{LOG_PREFIX} compatible cached validation found at {summary_path}; skipping model load")
-                return
-        except Exception:
-            pass
-    config_path.write_text(json.dumps(configuration, indent=2), encoding="utf-8")
-
     candidates = load_candidate_units(candidate_path)
-    candidate_by_key = _unit_lookup(candidates)
+    candidate_keys_list = [unit.unit_key for unit in candidates]
+    candidate_keys = set(candidate_keys_list)
     ranking = _load_ranking(ranking_path, candidates)
-    transformer_population = load_transformer_layer_population(manifest_path)
-    candidates_by_transformer_layer = _support_layer_candidates(candidates)
-    candidate_support_layers = sorted(candidates_by_transformer_layer)
 
-    missing_support_layers = [
-        layer for layer in candidate_support_layers if layer not in transformer_population
-    ]
-    if missing_support_layers:
-        raise ValueError(
-            "Candidate transformer layers are absent from the stage-5 population: "
-            + ", ".join(map(str, missing_support_layers))
-        )
-
-    # GCCR uses only transformer layers containing at least one frozen candidate.
-    support_population = {
-        layer: transformer_population[layer]
-        for layer in candidate_support_layers
-    }
-    for layer in candidate_support_layers:
-        population_keys = {unit.unit_key for unit in support_population[layer]}
-        candidate_keys = {unit.unit_key for unit in candidates_by_transformer_layer[layer]}
-        missing = candidate_keys - population_keys
-        if missing:
-            raise ValueError(
-                f"J is not a subset of C_l for transformer layer {layer}: "
-                + ", ".join(sorted(missing))
-            )
-
-    ranked_by_transformer_layer = _ranked_candidates_by_support_layer(ranking, candidate_by_key)
-    for layer in candidate_support_layers:
-        ranked_keys = {unit.unit_key for unit in ranked_by_transformer_layer.get(layer, [])}
-        candidate_keys = {unit.unit_key for unit in candidates_by_transformer_layer[layer]}
-        if ranked_keys != candidate_keys:
-            raise ValueError(f"Frozen discovery ranking is incomplete in transformer layer {layer}")
-
-    population_strata = group_units_by_matching_stratum(
-        unit for layer in candidate_support_layers for unit in support_population[layer]
-    )
+    locus_population = load_stage5_locus_population(manifest_path)
+    all_population_units = dedupe_units(unit for units in locus_population.values() for unit in units)
+    population_by_key = {unit.unit_key: unit for unit in all_population_units}
+    population_strata = group_units_by_matching_stratum(all_population_units)
     candidate_strata = group_units_by_matching_stratum(candidates)
-    all_candidate_keys = {unit.unit_key for unit in candidates}
     for stratum, stratum_candidates in candidate_strata.items():
         eligible = population_strata.get(stratum, [])
         eligible_keys = {unit.unit_key for unit in eligible}
         missing = {unit.unit_key for unit in stratum_candidates} - eligible_keys
         if missing:
             raise ValueError(
-                f"Candidate matching stratum {stratum} is absent/incomplete in stage-5 population: "
+                f"Candidate stratum {stratum} is absent/incomplete in stage-5 population: "
                 + ", ".join(sorted(missing))
-            )
-        noncandidate_count = sum(unit.unit_key not in all_candidate_keys for unit in eligible)
-        if noncandidate_count < len(stratum_candidates):
-            raise ValueError(
-                f"Matched null impossible for stratum {stratum}: need {len(stratum_candidates)} "
-                f"noncandidate units, found {noncandidate_count}"
             )
 
     scores_df = evaluation_frame(
@@ -404,122 +473,223 @@ def main() -> None:
     evaluation_rows_fingerprint = rows_fingerprint(scores_df, prompt_col)
     baseline = pd.to_numeric(scores_df[target_col], errors="raise").to_numpy() > 0.5
 
-    candidate_full = _group(candidates, "candidate_J")
-    population_groups = {
-        layer: _group(support_population[layer], f"C_transformer_layer_{layer}")
-        for layer in candidate_support_layers
+    current_input_fingerprints = {
+        "candidate": _file_fingerprint(candidate_path),
+        "singleton_scores": _file_fingerprint(singleton_scores_path),
+        "frozen_ranking": _file_fingerprint(ranking_path),
+        "layer_population_manifest": _file_fingerprint(manifest_path),
+        "dataset_info": _file_fingerprint(dataset_info_path),
+        "train_scores": _file_fingerprint(train_scores_path),
     }
-    candidate_subsets: dict[tuple[int, str], list[UnitSpec]] = {}
-    candidate_complements: dict[tuple[int, str], GroupSpec] = {}
-    for layer in candidate_support_layers:
-        ranked_layer = ranked_by_transformer_layer[layer]
-        candidate_subsets[(layer, "1")] = ranked_layer[:1]
-        candidate_subsets[(layer, "all")] = list(ranked_layer)
-        for m in m_values:
-            candidate_complements[(layer, m)] = _complement(
-                support_population[layer],
-                candidate_subsets[(layer, m)],
-                f"C_transformer_layer_{layer}_minus_J_{m}",
-            )
+    legacy_summary, legacy_config, legacy_draws, legacy_membership = _legacy_v3_payload(out_dir)
+    legacy_compatible = _legacy_v3_compatible(
+        legacy_summary,
+        legacy_config,
+        candidate_keys=candidate_keys_list,
+        evaluation_rows_fingerprint=evaluation_rows_fingerprint,
+        evaluation_split=str(args.evaluation_split),
+        intervention=str(args.intervention),
+        decode_only=bool(args.decode_only),
+        ai_model=ai_model,
+    )
+    effective_seed = int(
+        args.seed if args.seed is not None
+        else (legacy_config.get("seed") if legacy_compatible and legacy_config.get("seed") is not None else 42)
+    )
+    set_deterministic(effective_seed)
 
-    population_effect_cache_path = out_dir / "candidate_support_layer_effects.json"
-    population_effect_cache_identity = {
+    cache_identity = {
         "schema": SCHEMA,
-        "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
-        "evaluation_split": str(args.evaluation_split),
-        "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
-        "replacement_baseline": args.intervention,
-        "ai_model": ai_model,
         "task_module": str(args.task_module),
-        "population_group_keys": {
-            str(layer): population_groups[layer].key
-            for layer in candidate_support_layers
+        "ai_model": ai_model,
+        "intervention": str(args.intervention),
+        "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
+        "evaluation_split": str(args.evaluation_split),
+        "compute_cmc": bool(compute_cmc),
+        "background_multipliers": list(background_multipliers),
+        "background_definition": (
+            "exact-stratum-matched noncandidate S_b disjoint from J and K_b"
+            if compute_cmc else None
+        ),
+        "null_matching": [
+            "transformer layer", "computational locus", "channel type",
+            "intervention phase", "replacement baseline", "per-stratum cardinality",
+        ],
+        "null_draws": int(args.null_draws),
+        "points_to_use_for_mean_ablation": int(args.points_to_use_for_mean_ablation),
+        "seed": effective_seed,
+        "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
+        "candidate_set": sorted(candidate_keys_list),
+        "input_fingerprints": current_input_fingerprints,
+    }
+    configuration = {
+        **cache_identity,
+        "cache_identity": cache_identity,
+        "paths": {
+            "input_data_dir": str(input_data_dir),
+            "candidate_flip_stats_path": str(candidate_path),
+            "singleton_scores_path": str(singleton_scores_path),
+            "frozen_ranking_path": str(ranking_path),
+            "layer_population_manifest": str(manifest_path),
         },
     }
-    cached_population_effects: dict[int, dict] | None = None
-    if population_effect_cache_path.exists() and not args.force:
+    config_path = out_dir / "interaction_configuration.json"
+    summary_path = out_dir / "interaction_validation_summary.json"
+    if not args.force and config_path.exists() and summary_path.exists():
         try:
-            cached_payload = json.loads(population_effect_cache_path.read_text(encoding="utf-8"))
-            cached_identity = {key: cached_payload.get(key) for key in population_effect_cache_identity}
-            cached_effects = cached_payload.get("effects") or {}
-            if (
-                cached_identity == population_effect_cache_identity
-                and set(cached_effects) == {str(layer) for layer in candidate_support_layers}
-            ):
-                cached_population_effects = {
-                    int(layer): dict(cached_effects[str(layer)])
-                    for layer in candidate_support_layers
-                }
+            existing_config = json.loads(config_path.read_text(encoding="utf-8"))
+            existing_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            existing_identity = existing_config.get("cache_identity")
+            if not isinstance(existing_identity, dict):
+                existing_identity = {key: existing_config.get(key) for key in cache_identity}
+            if existing_identity == cache_identity and existing_summary.get("definition_version") == SCHEMA:
+                print(f"{LOG_PREFIX} compatible cached validation found at {summary_path}; skipping model load")
+                return
         except Exception:
-            cached_population_effects = None
+            pass
 
-    # Draw exact matched controls.  Full-set E(J) matches every candidate
-    # stratum exactly.  GCCR m=1 removes one control from the exact stratum of
-    # the discovery-top candidate in that transformer layer; m=all removes the
-    # complete per-layer matched control set.
+    # Reuse compatible direct-set results from the prior interaction schema when available.
+    legacy_candidate_effect: dict | None = None
+    legacy_e_null_by_draw: dict[int, float] = {}
+    legacy_null_groups: dict[int, GroupSpec] = {}
+    if legacy_compatible:
+        candidate_effect = legacy_summary.get("candidate_E_J")
+        if isinstance(candidate_effect, dict) and np.isfinite(float(candidate_effect.get("effect", math.nan))):
+            legacy_candidate_effect = dict(candidate_effect)
+        if not legacy_draws.empty and "metric" in legacy_draws.columns:
+            part = legacy_draws.loc[legacy_draws["metric"].astype(str) == "E_J"]
+            for row in part.to_dict("records"):
+                try:
+                    draw = int(row["draw"])
+                    value = float(row["value"])
+                except Exception:
+                    continue
+                if 0 <= draw < int(args.null_draws) and np.isfinite(value):
+                    legacy_e_null_by_draw[draw] = value
+        legacy_null_groups = _membership_to_groups(
+            legacy_membership,
+            population_by_key=population_by_key,
+            null_draws=int(args.null_draws),
+            candidate_strata=candidate_strata,
+            candidate_keys=candidate_keys,
+        )
+        legacy_e_null_by_draw = {
+            draw: value for draw, value in legacy_e_null_by_draw.items()
+            if draw in legacy_null_groups
+        }
+        print(
+            f"{LOG_PREFIX} reusing compatible v3 direct-set results: "
+            f"E(J)={'yes' if legacy_candidate_effect else 'no'} "
+            f"direct_null_values={len(legacy_e_null_by_draw)} matched_sets={len(legacy_null_groups)}"
+        )
+
+    # Build/reuse structurally matched K_b sets.
     random_full_groups: dict[int, GroupSpec] = {}
-    random_subsets: dict[tuple[int, int, str], list[UnitSpec]] = {}
-    random_complements: dict[tuple[int, int, str], GroupSpec] = {}
-    null_membership_rows: list[dict] = []
     for draw in range(int(args.null_draws)):
-        chosen_by_stratum: dict[tuple[int, str, str], list[UnitSpec]] = {}
-        full_units: list[UnitSpec] = []
-        for stratum, stratum_candidates in candidate_strata.items():
-            eligible = population_strata[stratum]
-            pool = [unit for unit in eligible if unit.unit_key not in all_candidate_keys]
-            q = len(stratum_candidates)
-            chosen_indices = rng.choice(len(pool), size=q, replace=False)
-            chosen = [pool[int(index)] for index in np.atleast_1d(chosen_indices)]
-            rng.shuffle(chosen)
-            chosen_by_stratum[stratum] = chosen
-            full_units.extend(chosen)
-            for unit in chosen:
-                transformer_layer, computational_locus, channel_type = stratum
-                null_membership_rows.append(
-                    {
-                        "draw": draw,
-                        "unit_key": unit.unit_key,
-                        "stage5_locus": unit.layer_label,
-                        "neuron_id": int(unit.neuron_id),
-                        "transformer_layer": int(transformer_layer),
-                        "computational_locus": computational_locus,
-                        "channel_type": channel_type,
-                        "candidate_stratum_cardinality": q,
-                        "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
-                        "replacement_baseline": args.intervention,
-                        "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
-                    }
-                )
+        random_full_groups[draw] = legacy_null_groups.get(draw) or _draw_matched_null_group(
+            draw=draw,
+            candidate_strata=candidate_strata,
+            population_strata=population_strata,
+            candidate_keys=candidate_keys,
+            seed=effective_seed,
+        )
 
-        random_full_groups[draw] = _group(full_units, f"random_J_{draw}")
-        for layer in candidate_support_layers:
-            chosen_layer = [
-                unit
-                for stratum, units in chosen_by_stratum.items()
-                if stratum[0] == layer
-                for unit in units
-            ]
-            if len(chosen_layer) != len(candidates_by_transformer_layer[layer]):
-                raise AssertionError(
-                    f"Per-layer null cardinality mismatch for transformer layer {layer}"
-                )
-            top_candidate = candidate_subsets[(layer, "1")][0]
-            top_stratum = matching_stratum_key(top_candidate)
-            random_subsets[(draw, layer, "1")] = [chosen_by_stratum[top_stratum][0]]
-            random_subsets[(draw, layer, "all")] = dedupe_units(chosen_layer)
-            for m in m_values:
-                random_complements[(draw, layer, m)] = _complement(
-                    support_population[layer],
-                    random_subsets[(draw, layer, m)],
-                    f"C_transformer_layer_{layer}_minus_R_{draw}_{m}",
-                )
+    # Backgrounds are matched by the same exact strata as J and are disjoint
+    # from both J and the paired K_b.
+    background_groups: dict[tuple[int, int], GroupSpec] = {}
+    candidate_context_groups: dict[tuple[int, int], GroupSpec] = {}
+    null_context_groups: dict[tuple[int, int], GroupSpec] = {}
+    for multiplier in background_multipliers:
+        for draw in range(int(args.null_draws)):
+            background = _draw_background_group(
+                draw=draw,
+                multiplier=multiplier,
+                candidate_strata=candidate_strata,
+                population_strata=population_strata,
+                candidate_keys=candidate_keys,
+                null_group=random_full_groups[draw],
+                seed=effective_seed,
+            )
+            background_groups[(multiplier, draw)] = background
+            candidate_context_groups[(multiplier, draw)] = _union_group(
+                background, _group(candidates, "candidate_J"),
+                label=f"background_{multiplier}x_{draw}_plus_candidate_J",
+            )
+            null_context_groups[(multiplier, draw)] = _union_group(
+                background, random_full_groups[draw],
+                label=f"background_{multiplier}x_{draw}_plus_random_J_{draw}",
+            )
 
-    all_groups = [candidate_full]
-    if cached_population_effects is None:
-        all_groups.extend(population_groups.values())
-    all_groups.extend(candidate_complements.values())
-    all_groups.extend(random_full_groups.values())
-    all_groups.extend(random_complements.values())
+    # Validate and write matching strata before model execution.
+    stratum_rows: list[dict] = []
+    for stratum in sorted(candidate_strata):
+        transformer_layer, computational_locus, channel_type = stratum
+        q = len(candidate_strata[stratum])
+        eligible = len(population_strata[stratum])
+        stratum_rows.append({
+            "transformer_layer": int(transformer_layer),
+            "computational_locus": computational_locus,
+            "channel_type": channel_type,
+            "candidate_count": q,
+            "eligible_stage5_count": eligible,
+            "noncandidate_pool_count": eligible - q,
+            "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
+            "replacement_baseline": args.intervention,
+        })
+    pd.DataFrame(stratum_rows).to_csv(out_dir / "matched_control_strata.csv", index=False)
+
+    null_membership_rows: list[dict] = []
+    background_membership_rows: list[dict] = []
+    for draw, group in random_full_groups.items():
+        for unit in group.units:
+            meta = unit_metadata(unit)
+            null_membership_rows.append({
+                "draw": draw,
+                "unit_key": unit.unit_key,
+                "stage5_locus": meta["stage5_locus"],
+                "neuron_id": int(unit.neuron_id),
+                "transformer_layer": int(meta["transformer_layer"]),
+                "computational_locus": meta["computational_locus"],
+                "channel_type": meta["channel_type"],
+                "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
+                "replacement_baseline": args.intervention,
+                "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
+            })
+    for (multiplier, draw), group in background_groups.items():
+        for unit in group.units:
+            meta = unit_metadata(unit)
+            background_membership_rows.append({
+                "background_multiplier": multiplier,
+                "draw": draw,
+                "unit_key": unit.unit_key,
+                "stage5_locus": meta["stage5_locus"],
+                "neuron_id": int(unit.neuron_id),
+                "transformer_layer": int(meta["transformer_layer"]),
+                "computational_locus": meta["computational_locus"],
+                "channel_type": meta["channel_type"],
+                "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
+                "replacement_baseline": args.intervention,
+                "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
+            })
+    pd.DataFrame(null_membership_rows).to_csv(out_dir / "matched_random_set_membership.csv", index=False)
+    conditional_membership_path = out_dir / "conditional_background_membership.csv"
+    if compute_cmc:
+        pd.DataFrame(background_membership_rows).to_csv(conditional_membership_path, index=False)
+    elif conditional_membership_path.exists():
+        conditional_membership_path.unlink()
+    ranking.to_csv(out_dir / "frozen_candidate_ranking.csv", index=False)
+
+    candidate_full = _group(candidates, "candidate_J")
+    all_groups: list[GroupSpec] = []
+    if legacy_candidate_effect is None:
+        all_groups.append(candidate_full)
+    for draw, group in random_full_groups.items():
+        if draw not in legacy_e_null_by_draw:
+            all_groups.append(group)
+    for key in sorted(background_groups):
+        all_groups.extend([
+            background_groups[key], candidate_context_groups[key], null_context_groups[key]
+        ])
     unique_groups = {group.key: group for group in all_groups if group.size > 0}
     groups_to_evaluate = list(unique_groups.values())
     all_units = dedupe_units(unit for group in groups_to_evaluate for unit in group.units)
@@ -536,260 +706,185 @@ def main() -> None:
 
     print(
         f"{LOG_PREFIX} split={args.evaluation_split} rows={len(scores_df)} candidates={len(candidates)} "
-        f"candidate_support_transformer_layers={len(candidate_support_layers)} "
-        f"matching_strata={len(candidate_strata)} groups={len(groups_to_evaluate)} "
-        f"layer_effect_cache={'hit' if cached_population_effects is not None else 'miss'} "
-        f"null_draws={args.null_draws}"
-    )
-    device = get_device()
-    model = LMWrapper(
-        model_name=ai_model,
-        device=device,
-        eval_mode=True,
-        circuit_discovery=False,
-        cache_dir=args.ai_model_cache_dir,
-    )
-    mean_activations = precompute_replacements_for_units(
-        model=model,
-        units=all_units,
-        scores_df_for_mean=train_scores,
-        prompt_col=prompt_col,
-        target_col=target_col,
-        intervention=args.intervention,
-        points_to_use=int(args.points_to_use_for_mean_ablation),
-        batch_size=int(args.batch_size),
-        seed=int(args.seed),
-    )
-    cache_context = {
-        "schema": SCHEMA,
-        "rows": evaluation_rows_fingerprint,
-        "model": ai_model,
-        "task_module": args.task_module,
-        "evaluation_split": str(args.evaluation_split),
-        "prompt_col": prompt_col,
-        "target_col": target_col,
-        "decode_only": bool(args.decode_only),
-        "intervention": args.intervention,
-        "max_new_tokens": int(task.MAX_NEW_TOKENS),
-    }
-    post_by_key = evaluate_groups(
-        model=model,
-        groups=groups_to_evaluate,
-        scores_df=scores_df,
-        prompt_col=prompt_col,
-        is_answer_positive_fn=task.is_answer_positive,
-        batch_size=int(args.batch_size),
-        decode_only=bool(args.decode_only),
-        intervention=args.intervention,
-        mean_activations=mean_activations,
-        max_new_tokens=int(task.MAX_NEW_TOKENS),
-        cache_dir=out_dir / "group_eval_cache",
-        cache_context=cache_context,
-        force=bool(args.force),
+        f"matching_strata={len(candidate_strata)} cmc={'on' if compute_cmc else 'off'} "
+        f"backgrounds={background_multipliers if compute_cmc else 'disabled'} "
+        f"groups_to_evaluate={len(groups_to_evaluate)} null_draws={args.null_draws} "
+        f"reused_E_J={'yes' if legacy_candidate_effect else 'no'} "
+        f"reused_E_null={len(legacy_e_null_by_draw)}"
     )
 
-    candidate_effect = _effect_for_group(candidate_full, baseline=baseline, post_by_key=post_by_key)
-
-    # Each E_l(C_l) is evaluated once per candidate-support transformer layer,
-    # then reused for m=1, m=all, and every null draw.  The simultaneous group
-    # output itself is persisted by evaluate_groups/group_eval_cache.
-    if cached_population_effects is not None:
-        population_effects = cached_population_effects
-    else:
-        population_effects: dict[int, dict] = {}
-        for layer in candidate_support_layers:
-            population_effects[layer] = _effect_for_group(
-                population_groups[layer], baseline=baseline, post_by_key=post_by_key
-            )
-    population_effect_cache = {
-        **population_effect_cache_identity,
-        "effects": {
-            str(layer): {
-                "transformer_layer": int(layer),
-                "C_l_size": len(support_population[layer]),
-                **population_effects[layer],
-            }
-            for layer in candidate_support_layers
-        },
-    }
-    population_effect_cache_path.write_text(
-        json.dumps(population_effect_cache, indent=2, allow_nan=True), encoding="utf-8"
-    )
-
-    denominator = float(sum(float(population_effects[layer]["effect"]) for layer in candidate_support_layers))
-    layer_effect_rows: list[dict] = []
-    gccr_rows: list[dict] = []
-    for m in m_values:
-        numerator = 0.0
-        for layer in candidate_support_layers:
-            full_effect = population_effects[layer]
-            complement = candidate_complements[(layer, m)]
-            complement_effect = _effect_for_group(complement, baseline=baseline, post_by_key=post_by_key)
-            delta = float(full_effect["effect"] - complement_effect["effect"])
-            numerator += delta
-            selected = candidate_subsets[(layer, m)]
-            layer_effect_rows.append(
-                {
-                    "m": m,
-                    "transformer_layer": int(layer),
-                    "C_l_size": len(support_population[layer]),
-                    "J_intersect_C_l_size": len(candidates_by_transformer_layer[layer]),
-                    "J_l_m_size": len(selected),
-                    "J_l_m_unit_keys": json.dumps([unit.unit_key for unit in selected]),
-                    "E_l_C_l": full_effect["effect"],
-                    "E_l_C_l_status": full_effect["status"],
-                    "E_l_C_l_minus_J_l_m": complement_effect["effect"],
-                    "E_l_C_l_minus_J_l_m_status": complement_effect["status"],
-                    "Delta_l": delta,
-                    "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
-                }
-            )
-        ratio = safe_ratio(numerator, denominator, epsilon=float(args.denominator_epsilon))
-        gccr_rows.append(
-            {
-                "m": m,
-                "numerator_sum_Delta_l": numerator,
-                "denominator_sum_E_l_C_l": denominator,
-                "GCCR_m": ratio.value,
-                "status": ratio.status,
-                "denominator_epsilon": float(args.denominator_epsilon),
-                "candidate_support_transformer_layer_count": len(candidate_support_layers),
-            }
+    post_by_key: dict[str, np.ndarray] = {}
+    if groups_to_evaluate:
+        device = get_device()
+        model = LMWrapper(
+            model_name=ai_model,
+            device=device,
+            eval_mode=True,
+            circuit_discovery=False,
+            cache_dir=args.ai_model_cache_dir,
+        )
+        mean_activations = precompute_replacements_for_units(
+            model=model,
+            units=all_units,
+            scores_df_for_mean=train_scores,
+            prompt_col=prompt_col,
+            target_col=target_col,
+            intervention=args.intervention,
+            points_to_use=int(args.points_to_use_for_mean_ablation),
+            batch_size=int(args.batch_size),
+            seed=effective_seed,
+        )
+        cache_context = {
+            "schema": GROUP_CACHE_SCHEMA,
+            "rows": evaluation_rows_fingerprint,
+            "model": ai_model,
+            "task_module": args.task_module,
+            "evaluation_split": str(args.evaluation_split),
+            "prompt_col": prompt_col,
+            "target_col": target_col,
+            "decode_only": bool(args.decode_only),
+            "intervention": args.intervention,
+            "points_to_use_for_mean_ablation": int(args.points_to_use_for_mean_ablation),
+            "replacement_reference_scores_fingerprint": _file_fingerprint(train_scores_path),
+            "replacement_seed": effective_seed,
+            "max_new_tokens": int(task.MAX_NEW_TOKENS),
+        }
+        post_by_key = evaluate_groups(
+            model=model,
+            groups=groups_to_evaluate,
+            scores_df=scores_df,
+            prompt_col=prompt_col,
+            is_answer_positive_fn=task.is_answer_positive,
+            batch_size=int(args.batch_size),
+            decode_only=bool(args.decode_only),
+            intervention=args.intervention,
+            mean_activations=mean_activations,
+            max_new_tokens=int(task.MAX_NEW_TOKENS),
+            cache_dir=out_dir / "group_eval_cache",
+            cache_context=cache_context,
+            force=bool(args.force),
         )
 
-    null_rows: list[dict] = []
+    candidate_effect = legacy_candidate_effect or _effect_for_group(
+        candidate_full, baseline=baseline, post_by_key=post_by_key
+    )
     e_null_values: list[float] = []
-    gccr_null_values: dict[str, list[float]] = {m: [] for m in m_values}
+    direct_null_rows: list[dict] = []
     for draw in range(int(args.null_draws)):
-        random_effect = _effect_for_group(
-            random_full_groups[draw], baseline=baseline, post_by_key=post_by_key
-        )
-        e_null_values.append(float(random_effect["effect"]))
-        null_rows.append(
-            {
+        if draw in legacy_e_null_by_draw:
+            value = float(legacy_e_null_by_draw[draw])
+            status = "ok_reused_v3"
+        else:
+            effect = _effect_for_group(random_full_groups[draw], baseline=baseline, post_by_key=post_by_key)
+            value = float(effect["effect"])
+            status = str(effect["status"])
+        e_null_values.append(value)
+        direct_null_rows.append({
+            "draw": draw,
+            "metric": "E_J",
+            "value": value,
+            "status": status,
+            "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
+        })
+
+    direct_summary = matched_null_summary(
+        float(candidate_effect["effect"]), e_null_values, metric="E_J", m=None
+    )
+
+    conditional_draw_rows: list[dict] = []
+    conditional_summaries: list[dict] = []
+    for multiplier in background_multipliers:
+        candidate_marginals: list[float] = []
+        null_marginals: list[float] = []
+        for draw in range(int(args.null_draws)):
+            background = _effect_for_group(
+                background_groups[(multiplier, draw)], baseline=baseline, post_by_key=post_by_key
+            )
+            candidate_context = _effect_for_group(
+                candidate_context_groups[(multiplier, draw)], baseline=baseline, post_by_key=post_by_key
+            )
+            null_context = _effect_for_group(
+                null_context_groups[(multiplier, draw)], baseline=baseline, post_by_key=post_by_key
+            )
+            candidate_marginal = float(candidate_context["effect"] - background["effect"])
+            null_marginal = float(null_context["effect"] - background["effect"])
+            paired_delta = float(candidate_marginal - null_marginal)
+            candidate_marginals.append(candidate_marginal)
+            null_marginals.append(null_marginal)
+            conditional_draw_rows.append({
+                "background_multiplier": multiplier,
                 "draw": draw,
-                "metric": "E_J",
-                "m": None,
-                "value": random_effect["effect"],
-                "status": random_effect["status"],
+                "E_S": background["effect"],
+                "E_S_plus_J": candidate_context["effect"],
+                "E_S_plus_K": null_context["effect"],
+                "candidate_marginal": candidate_marginal,
+                "null_marginal": null_marginal,
+                "paired_Delta": paired_delta,
+                "background_status": background["status"],
+                "candidate_context_status": candidate_context["status"],
+                "null_context_status": null_context["status"],
                 "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
-            }
+            })
+        summary = paired_conditional_summary(
+            candidate_marginals,
+            null_marginals,
+            background_multiplier=multiplier,
         )
-        for m in m_values:
-            numerator = 0.0
-            for layer in candidate_support_layers:
-                complement_effect = _effect_for_group(
-                    random_complements[(draw, layer, m)],
-                    baseline=baseline,
-                    post_by_key=post_by_key,
-                )
-                numerator += float(
-                    population_effects[layer]["effect"] - complement_effect["effect"]
-                )
-            ratio = safe_ratio(numerator, denominator, epsilon=float(args.denominator_epsilon))
-            gccr_null_values[m].append(ratio.value)
-            null_rows.append(
-                {
-                    "draw": draw,
-                    "metric": "GCCR_m",
-                    "m": m,
-                    "value": ratio.value,
-                    "status": ratio.status,
-                    "numerator_sum_Delta_l": numerator,
-                    "denominator_sum_E_l_C_l": denominator,
-                    "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
-                }
-            )
-
-    gccr_by_m = {str(row["m"]): row for row in gccr_rows}
-    summary_rows = [
-        matched_null_summary(candidate_effect["effect"], e_null_values, metric="E_J", m=None)
-    ]
-    for m in m_values:
-        summary_rows.append(
-            matched_null_summary(
-                float(gccr_by_m[m]["GCCR_m"]),
-                gccr_null_values[m],
-                metric="GCCR_m",
-                m=m,
-            )
+        conditional_summaries.append(summary)
+        _write_paired_plot(
+            out_dir / f"conditional_marginal_{multiplier}x_paired_delta",
+            candidate_marginals,
+            null_marginals,
+            f"Conditional marginal contribution ({multiplier}x background)",
         )
 
-    stratum_rows = []
-    for stratum, stratum_candidates in candidate_strata.items():
-        stratum_rows.append(
-            _stratum_row(
-                stratum,
-                len(stratum_candidates),
-                len(population_strata[stratum]),
-            )
-        )
-    pd.DataFrame(stratum_rows).to_csv(out_dir / "matched_control_strata.csv", index=False)
-
-    population_rows = []
-    for layer in candidate_support_layers:
-        candidate_keys = {unit.unit_key for unit in candidates_by_transformer_layer[layer]}
-        for unit in support_population[layer]:
-            meta = unit_metadata(unit)
-            population_rows.append(
-                {
-                    "transformer_layer": int(layer),
-                    "unit_key": unit.unit_key,
-                    "stage5_locus": meta["stage5_locus"],
-                    "computational_locus": meta["computational_locus"],
-                    "channel_type": meta["channel_type"],
-                    "neuron_id": int(unit.neuron_id),
-                    "is_candidate": unit.unit_key in candidate_keys,
-                }
-            )
-    # Keep the historical filename for downstream compatibility; its columns
-    # now state explicitly that C_l is transformer-layer based.
-    pd.DataFrame(population_rows).to_csv(out_dir / "layer_populations.csv", index=False)
-    ranking.to_csv(out_dir / "frozen_candidate_ranking.csv", index=False)
-    pd.DataFrame(layer_effect_rows).to_csv(out_dir / "layer_interaction_effects.csv", index=False)
-    pd.DataFrame(gccr_rows).to_csv(out_dir / "gccr_metrics.csv", index=False)
-    pd.DataFrame(null_membership_rows).to_csv(out_dir / "matched_random_set_membership.csv", index=False)
-    pd.DataFrame(null_rows).to_csv(out_dir / "matched_null_draws.csv", index=False)
+    summary_rows = [direct_summary, *conditional_summaries]
     summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv(out_dir / "interaction_validation_summary.csv", index=False)
-    (out_dir / "interaction_validation_table.tex").write_text(
-        _latex_table(summary_df), encoding="utf-8"
-    )
+    pd.DataFrame(direct_null_rows).to_csv(out_dir / "matched_null_draws.csv", index=False)
+    if compute_cmc:
+        summary_df.loc[summary_df["metric"].astype(str) == "conditional_marginal"].to_csv(
+            out_dir / "conditional_marginal_summary.csv", index=False
+        )
+        pd.DataFrame(conditional_draw_rows).to_csv(
+            out_dir / "conditional_marginal_draws.csv", index=False
+        )
+    else:
+        for stale in [
+            out_dir / "conditional_marginal_summary.csv",
+            out_dir / "conditional_marginal_draws.csv",
+        ]:
+            if stale.exists():
+                stale.unlink()
+        for stale in out_dir.glob("conditional_marginal_*_paired_delta.pdf"):
+            stale.unlink()
+    (out_dir / "interaction_validation_table.tex").write_text(_latex_table(summary_df), encoding="utf-8")
 
     payload = {
         "definition_version": SCHEMA,
         "definitions": {
-            "C_l": (
-                "full eligible stage-5 channel population of transformer layer l, "
-                "restricted to transformer layers containing at least one frozen candidate"
-            ),
-            "J_intersect_C_l": "all frozen candidates in candidate-support transformer layer l",
-            "J_l_1": "discovery-top frozen candidate within candidate-support transformer layer l",
-            "J_l_all": "all frozen candidates in candidate-support transformer layer l",
-            "E_J": "P(B_J(x) != B(x)) under simultaneous suppression of the complete fixed set J",
-            "Delta_l": "E_l(C_l)-E_l(C_l\\J_lm)",
-            "GCCR_m": "sum_l Delta_l / sum_l E_l(C_l), over candidate-support transformer layers only",
-            "Delta_null": "candidate-median(null)",
-            "P": "(1 + sum_b 1{null_b <= candidate})/(B+1)",
-            "p_MC": "(1 + sum_b 1{null_b >= candidate})/(B+1)",
+            "E_J": "P(B_J(x) != B(x)) under simultaneous suppression of the complete fixed candidate set J",
+            "K_b": "noncandidate set exactly matched to J by transformer layer, computational locus, channel type and per-stratum cardinality",
+            "S_b": "noncandidate background matched to the candidate topology, disjoint from J and its paired K_b",
+            "candidate_marginal": "M_b(J)=E(S_b union J)-E(S_b)",
+            "null_marginal": "M_b(K_b)=E(S_b union K_b)-E(S_b)",
+            "paired_Delta": "D_b=M_b(J)-M_b(K_b)",
+            "conditional_candidate": "mean_b M_b(J)",
+            "conditional_Delta": "mean_b D_b",
+            "P": "(1 + sum_b 1{D_b >= 0})/(B+1) for the paired conditional metric",
+            "p_MC": "(1 + sum_b 1{D_b <= 0})/(B+1) for the paired conditional metric",
         },
-        "candidate_set": [unit.unit_key for unit in candidates],
+        "candidate_set": candidate_keys_list,
         "candidate_set_size": len(candidates),
-        "candidate_support_transformer_layers": candidate_support_layers,
-        "candidate_support_transformer_layer_count": len(candidate_support_layers),
-        "population_scope": "candidate-support transformer layers only",
         "candidate_E_J": candidate_effect,
-        "m_values": list(m_values),
-        "GCCR_m": gccr_rows,
-        "null_summary": summary_rows,
+        "direct_E_J_null_summary": direct_summary,
+        "cmc_enabled": bool(compute_cmc),
+        "conditional_marginal": conditional_summaries,
+        "background_multipliers": list(background_multipliers),
         "null_draws": int(args.null_draws),
         "matching": [
-            "transformer layer",
-            "computational locus",
-            "channel type",
-            "intervention phase",
-            "replacement baseline",
-            "per-layer cardinality",
+            "transformer layer", "computational locus", "channel type",
+            "intervention phase", "replacement baseline", "per-stratum cardinality",
         ],
         "intervention_phase": "decode_only" if args.decode_only else "prefill_decode",
         "replacement_baseline": args.intervention,
@@ -797,58 +892,72 @@ def main() -> None:
         "replacement_reference_split": "train",
         "evaluation_split": str(args.evaluation_split),
         "evaluation_rows_fingerprint": evaluation_rows_fingerprint,
-        "same_evaluation_rows_for_candidate_and_all_null_draws": True,
+        "same_evaluation_rows_for_candidate_background_and_all_null_draws": True,
         "layer_population_manifest": str(manifest_path),
-        "matched_control_strata_path": str(out_dir / "matched_control_strata.csv"),
-        "candidate_support_layer_effects_cache_path": str(out_dir / "candidate_support_layer_effects.json"),
         "frozen_ranking_path": str(ranking_path),
-        "denominator_epsilon": float(args.denominator_epsilon),
+        "points_to_use_for_mean_ablation": int(args.points_to_use_for_mean_ablation),
+        "seed": effective_seed,
+        "legacy_v3_E_J_reused": bool(legacy_candidate_effect is not None),
+        "legacy_v3_direct_null_draws_reused": len(legacy_e_null_by_draw),
         "notes": [
-            "No value is clipped to [0,1].",
-            "Near-zero GCCR denominators are reported as undefined.",
-            "Candidate-free transformer layers are excluded from GCCR.",
-            "Each E_l(C_l) is computed once and reused for m=1, m=all, and every null draw.",
-            "Every E value is obtained from a simultaneous intervention on the named set.",
-            "Singleton-union events are not used for E(J), GCCR, or null controls.",
-            "Random controls exclude candidate channels and exactly match layer/locus/type counts.",
-            "Candidate and every null draw use the identical fixed evaluation-example subset.",
+            "No effect is clipped.",
+            "Every E value is obtained from a genuine simultaneous intervention on the named set.",
+            "Singleton-union events are never used for E(J) or null controls.",
+            *(
+                [
+                    "No marginal contribution is clipped.",
+                    "Singleton-union events are never used for conditional marginals.",
+                    "Candidate and paired null are compared in the identical S_b background and on identical evaluation examples.",
+                ]
+                if compute_cmc
+                else ["CMC was disabled; no conditional-background interventions were evaluated."]
+            ),
+            "GCCR is obsolete and is not computed or exported by this schema.",
         ],
     }
-    (out_dir / "interaction_validation_summary.json").write_text(
-        json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8"
-    )
+    summary_path.write_text(json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8")
+    config_path.write_text(json.dumps(configuration, indent=2), encoding="utf-8")
 
     markdown = [
-        "# Interaction-aware global validation",
+        (
+            "# Simultaneous-set and conditional marginal validation"
+            if compute_cmc else "# Simultaneous-set validation"
+        ),
         "",
         f"- Candidate set size: {len(candidates)}",
         f"- Evaluation split: {args.evaluation_split}",
         f"- Evaluation examples: {len(scores_df)}",
         f"- Evaluation-row fingerprint: `{evaluation_rows_fingerprint}`",
-        f"- Candidate-support transformer layers: {len(candidate_support_layers)}",
         f"- Exact matched strata: {len(candidate_strata)}",
         f"- Matched random draws: {args.null_draws}",
+        f"- CMC: {'enabled' if compute_cmc else 'disabled'}",
+        f"- Background multipliers: {', '.join(map(str, background_multipliers)) if compute_cmc else 'not evaluated'}",
         f"- Intervention phase: {'decode only' if args.decode_only else 'input and output'}",
         f"- Replacement baseline: {args.intervention}",
-        "- GCCR is reported only for m=1 and m=all.",
-        "- All set effects use simultaneous interventions; values are not clipped.",
+        "- Every set effect is a genuine simultaneous intervention.",
+        *(
+            ["- Candidate and matched null use the same background S_b in each paired draw."]
+            if compute_cmc else []
+        ),
+        "- GCCR is not part of this validation schema.",
         "",
-        "| Metric | m | Candidate | Null median | Delta | P | p_MC | Status |",
+        "| Metric | Background | Candidate | Null median | Delta | P | p_MC | Status |",
         "|:--|:--|--:|--:|--:|--:|--:|:--|",
     ]
     for row in summary_rows:
-        m_text = _m_text(row["m"])
-
+        background = "--" if row.get("background_multiplier") is None else f"{row['background_multiplier']}x"
         def fmt(value):
-            return "NA" if value is None or not np.isfinite(float(value)) else f"{float(value):.4f}"
-
+            try:
+                number = float(value)
+            except Exception:
+                return "NA"
+            return "NA" if not np.isfinite(number) else f"{number:.4f}"
         markdown.append(
-            f"| {row['metric']} | {m_text} | {fmt(row['candidate'])} | {fmt(row['median_null'])} | "
-            f"{fmt(row['Delta'])} | {fmt(row['P'])} | {fmt(row['p_MC'])} | {row['status']} |"
+            f"| {row['metric']} | {background} | {fmt(row.get('candidate'))} | "
+            f"{fmt(row.get('median_null'))} | {fmt(row.get('Delta'))} | "
+            f"{fmt(row.get('P'))} | {fmt(row.get('p_MC'))} | {row.get('status', 'unknown')} |"
         )
-    (out_dir / "interaction_validation_summary.md").write_text(
-        "\n".join(markdown) + "\n", encoding="utf-8"
-    )
+    (out_dir / "interaction_validation_summary.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
 
     _write_plot(
         out_dir / "E_J_matched_null",
@@ -857,43 +966,36 @@ def main() -> None:
         "Simultaneous full-set effect",
         "E(J)",
     )
-    for m in m_values:
-        _write_plot(
-            out_dir / f"GCCR_{m}_matched_null",
-            gccr_null_values[m],
-            float(gccr_by_m[m]["GCCR_m"]),
-            f"Interaction-aware global coverage, m={m}",
-            f"GCCR_{m}",
-        )
 
-    global_path = stats_dir / "flip_stats_global.json"
     if global_path.exists():
         global_payload = json.loads(global_path.read_text(encoding="utf-8"))
-        global_payload.update(
-            {
-                "E_J": candidate_effect["effect"],
-                "E_J_count": candidate_effect["count"],
-                "E_J_denominator": candidate_effect["denominator"],
-                "E_J_status": candidate_effect["status"],
-                "E_J_OCC_0": candidate_effect.get("effect_B0"),
-                "E_J_OCC_1": candidate_effect.get("effect_B1"),
-                "GCCR_m": {
-                    str(row["m"]): {
-                        "value": row["GCCR_m"],
-                        "status": row["status"],
-                        "numerator": row["numerator_sum_Delta_l"],
-                        "denominator": row["denominator_sum_E_l_C_l"],
-                    }
-                    for row in gccr_rows
-                },
-                "interaction_validation_definition_version": SCHEMA,
-                "interaction_validation_path": str(out_dir / "interaction_validation_summary.json"),
-                "interaction_null_summary_path": str(out_dir / "interaction_validation_summary.csv"),
-            }
-        )
-        global_path.write_text(
-            json.dumps(global_payload, indent=2, allow_nan=True), encoding="utf-8"
-        )
+        global_payload.update({
+            "E_J": candidate_effect["effect"],
+            "E_J_count": candidate_effect.get("count"),
+            "E_J_denominator": candidate_effect.get("denominator"),
+            "E_J_status": candidate_effect.get("status"),
+            "E_J_OCC_0": candidate_effect.get("effect_B0"),
+            "E_J_OCC_1": candidate_effect.get("effect_B1"),
+            "conditional_marginal": {
+                str(row["background_multiplier"]): {
+                    "value": row["candidate"],
+                    "candidate_median": row["candidate_median"],
+                    "null_mean": row["null_mean"],
+                    "null_median": row["median_null"],
+                    "paired_Delta_mean": row["Delta"],
+                    "paired_Delta_median": row["Delta_median"],
+                    "P": row["P"],
+                    "p_MC": row["p_MC"],
+                    "paired_win_rate": row["paired_win_rate"],
+                    "status": row["status"],
+                }
+                for row in conditional_summaries
+            },
+            "interaction_validation_definition_version": SCHEMA,
+            "interaction_validation_path": str(summary_path),
+            "interaction_null_summary_path": str(out_dir / "interaction_validation_summary.csv"),
+        })
+        global_path.write_text(json.dumps(global_payload, indent=2, allow_nan=True), encoding="utf-8")
 
     print(summary_df.to_string(index=False))
     print(f"{LOG_PREFIX} wrote {out_dir}")

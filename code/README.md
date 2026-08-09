@@ -1,16 +1,25 @@
 # Implementation code
 
-All Python packages and implementation-side shell/Slurm scripts live under this directory. Repository state remains outside it:
+All implementation packages live under `code/`; runtime state and user-facing launchers live at repository root.
 
 ```text
 <repo>/
-├── code/       # implementation packages
-├── data/       # experiment artifacts
-├── cache/      # reusable runtime caches
-└── results/    # final aggregate statistics and paper outputs
+├── code/
+│   ├── analysis/
+│   ├── experiments/
+│   ├── lib/
+│   ├── pipeline/
+│   ├── poisoning/
+│   └── tests/
+├── data/
+├── cache/
+├── results/
+├── run_experiments.sh
+├── run_poisoning_experiments.sh
+└── generate_results.sh
 ```
 
-`code/` is intentionally **not** a Python package. Run internal Python entry points from this directory so the packages below are ordinary top-level packages without modifying `sys.path`:
+`code/` is deliberately not a Python package. Its children are ordinary top-level packages. Run module entry points from this directory:
 
 ```bash
 cd code
@@ -19,21 +28,24 @@ python3 -m analysis.26_validate_interactions --help
 python3 -m poisoning.13_poisoning_grammar_checkpoint_ft --help
 ```
 
-The repository-root launchers handle this working-directory change automatically:
+The root launchers automatically execute from `<repo>/code` while passing repository-root `data/`, `cache/`, and `results/` paths.
 
-```bash
-./run_experiments.sh
-./run_poisoning_experiments.sh --help
-./generate_results.sh
+## Packages
+
+- `experiments/` — executable non-poisoning catalogue, filtering, path labels, command construction.
+- `pipeline/` — numbered stages 1–7 and `_run_pipeline.sh`.
+- `analysis/` — singleton-set metrics, simultaneous/conditional validation, primary profiles, audits, tables, figures, and result export.
+- `lib/` — shared task specifications, model loading, replacement baselines, neuron/group intervention code, EAP implementation, caching, and pure statistics.
+- `poisoning/` — checkpointed grammar/arithmetic poisoning, fixed held-out cohorts, trigger-lift causal localization, discovery-frozen cumulative coalitions, matched random controls, and disjoint final-checkpoint interaction-aware confirmation. See `poisoning/README.md` for the complete workflow and definitions.
+- `tests/` — lightweight model-free poisoning contract tests (trigger-lift semantics and trigger insertion conventions).
+
+## Filesystem roots
+
+`lib/project_paths.py` defines:
+
+```text
+CODE_ROOT     <repo>/code
+PROJECT_ROOT  <repo>
 ```
 
-Implementation directories:
-
-- `experiments/` — experiment catalogue and execution helpers.
-- `pipeline/` — numbered stages 1–7 and the per-configuration orchestrator.
-- `analysis/` — exact singleton metrics, simultaneous interactions, validation, tables, and figures.
-- `lib/` — shared task, model, intervention, attribution, and statistics code.
-- `poisoning/` — separate poisoning experiments and scheduler jobs.
-- `tests/` — model-free regression and policy tests.
-
-Stable filesystem roots are defined in `code/lib/project_paths.py`: `CODE_ROOT` points to this directory and `PROJECT_ROOT` points to its parent. This keeps default datasets, caches, environments, and generated results at repository root even though package execution occurs here.
+Modules that need default filesystem locations derive them from these constants. This keeps datasets, caches, virtual environments, and paper results out of the implementation tree.

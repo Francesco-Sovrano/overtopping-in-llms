@@ -638,13 +638,15 @@ def build_flip_cache_policy_tag(args, *, main_metric=None):
 		parts.append("last_pos_only")
 	evaluation_split = str(getattr(args, "evaluation_split", "test")).strip().lower()
 	if evaluation_split == "test":
-		# Preserve the established held-out cache signature.
+		# Test-only cache namespace.
 		parts.append("holdout_test_only")
 	elif evaluation_split != "all":
 		parts.append(f"evaluation_split_{evaluation_split}")
-	stats_dirname = str(getattr(args, "stats_dirname", "") or "").strip()
-	if stats_dirname:
-		parts.append(f"stats_{stats_dirname}")
+	# The cache directory only needs to distinguish the behavioral metric,
+	# replacement intervention, intervention phase, and evaluation split.  The
+	# concrete stats directory name encodes circuit-search details that do not
+	# change a neuron's generated answer on the same evaluation rows, so copying
+	# that full label into the cache path only duplicates information.
 	return _safe_dirname("-".join(parts))
 
 def _file_fingerprint(p: Path) -> dict:
@@ -1588,7 +1590,6 @@ def write_heldout_set_metrics(
 		ax.spines["right"].set_visible(False)
 		fig.tight_layout()
 		fig.savefig(stats_dir / "frozen_topm_toc.pdf")
-		fig.savefig(stats_dir / "frozen_topm_toc.png", dpi=300)
 		plt.close(fig)
 
 	print(f"[Stats] Wrote held-out set metrics to {stats_dir}")
@@ -1934,23 +1935,25 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 	metric_order = [m for m in _FINAL_METRIC_ORDER if m in set(metric_df["metric"].astype(str))]
 	metric_order += sorted([m for m in set(metric_df["metric"].astype(str)) if m not in metric_order])
 	split_order = [s for s in ["associated", "unrelated"] if s in set(metric_df["split"].astype(str))]
-	pdf_path = stats_dir / "agonist_metric_final_plots.pdf"
-	with PdfPages(pdf_path) as pdf:
+	combined_pdf_path = stats_dir / "agonist_metric_final_plots.pdf"
+	with PdfPages(combined_pdf_path) as pdf:
 		if "mean_layer_percentile_rank" in metric_df.columns and split_order:
-			# Keep the percentile boxplot readable when metric names are long.
-			# In particular, "|activation x gradient|" otherwise collides with the
-			# neighbouring split label once the figure is rendered at paper width.
 			box_data, labels = [], []
 			for metric in metric_order:
 				for split in split_order:
-					vals = pd.to_numeric(metric_df.loc[(metric_df["metric"] == metric) & (metric_df["split"] == split), "mean_layer_percentile_rank"], errors="coerce").dropna().to_numpy()
+					vals = pd.to_numeric(
+						metric_df.loc[
+							(metric_df["metric"] == metric) & (metric_df["split"] == split),
+							"mean_layer_percentile_rank",
+						],
+						errors="coerce",
+					).dropna().to_numpy()
 					if vals.size:
 						box_data.append(vals)
 						metric_label = _wrap_label(_metric_display(metric), width=14)
 						labels.append(f"{metric_label}\n{split}")
 			if box_data:
-				n_boxes = len(box_data)
-				fig_w = max(10.5, 1.35 * n_boxes)
+				fig_w = max(10.5, 1.35 * len(box_data))
 				fig, ax = plt.subplots(figsize=(fig_w, 5.6))
 				ax.boxplot(box_data, tick_labels=labels, showmeans=True, widths=0.55)
 				for tick in ax.get_xticklabels():
@@ -1963,13 +1966,12 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 				ax.set_title("Agonist metric rank distributions")
 				ax.grid(True, axis="y", alpha=0.3)
 				fig.tight_layout(pad=0.7)
-				png = stats_dir / "agonist_metric_percentile_boxplot.pdf"
-				fig.savefig(png, dpi=300, bbox_inches="tight")
-				fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+				plot_path = stats_dir / "agonist_metric_percentile_boxplot.pdf"
+				fig.savefig(plot_path, bbox_inches="tight")
 				pdf.savefig(fig, bbox_inches="tight")
-				paths.append(str(png))
-				paths.append(str(png.with_suffix(".pdf")))
+				paths.append(str(plot_path))
 				plt.close(fig)
+
 		rate_cols = [c for c in ["top1_rate", "top5_rate", "top10pct_rate"] if c in metric_df.columns]
 		if rate_cols:
 			fig, ax = plt.subplots(figsize=(max(10, 1.0 * len(metric_order) * len(rate_cols)), 5.2))
@@ -1996,19 +1998,22 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 			ax.grid(True, axis="y", alpha=0.3)
 			ax.legend(fontsize=10, ncols=2)
 			fig.tight_layout()
-			png = stats_dir / "agonist_metric_top_rates.pdf"
-			fig.savefig(png, dpi=300, bbox_inches="tight")
-			fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+			plot_path = stats_dir / "agonist_metric_top_rates.pdf"
+			fig.savefig(plot_path, bbox_inches="tight")
 			pdf.savefig(fig, bbox_inches="tight")
-			paths.append(str(png))
-			paths.append(str(png.with_suffix(".pdf")))
+			paths.append(str(plot_path))
 			plt.close(fig)
+
 		if corr_df is not None and not corr_df.empty:
 			target_preference = ["flip_any_rate", "flip_semantic_wrong_rate", "abs_max_effect", "c2i_rate", "i2c_rate", "accuracy_gap"]
 			target = next((t for t in target_preference if t in set(corr_df["target"].astype(str))), None)
 			if target is not None:
 				features = ["delta_mean_metric_value", "delta_mean_abs_metric_value", "delta_mean_layer_percentile_rank", "delta_mean_layer_zscore", "delta_top10pct_rate"]
-				hdf = corr_df.loc[(corr_df["scope"] == "associated_minus_unrelated") & (corr_df["target"] == target) & (corr_df["feature"].isin(features))].copy()
+				hdf = corr_df.loc[
+					(corr_df["scope"] == "associated_minus_unrelated")
+					& (corr_df["target"] == target)
+					& (corr_df["feature"].isin(features))
+				].copy()
 				if not hdf.empty:
 					pivot = hdf.pivot_table(index="metric", columns="feature", values="spearman", aggfunc="first")
 					pivot = pivot.reindex([m for m in metric_order if m in pivot.index])
@@ -2028,13 +2033,12 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 									ax.text(j, i, f"{arr[i, j]:.2f}", ha="center", va="center", fontsize=10)
 						fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 						fig.tight_layout()
-						png = stats_dir / "agonist_metric_correlation_heatmap.pdf"
-						fig.savefig(png, dpi=300, bbox_inches="tight")
-						fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+						plot_path = stats_dir / "agonist_metric_correlation_heatmap.pdf"
+						fig.savefig(plot_path, bbox_inches="tight")
 						pdf.savefig(fig, bbox_inches="tight")
-						paths.append(str(png))
-						paths.append(str(png.with_suffix(".pdf")))
+						paths.append(str(plot_path))
 						plt.close(fig)
+
 		if delta_df is not None and not delta_df.empty:
 			target = "flip_any_rate" if "flip_any_rate" in delta_df.columns and pd.to_numeric(delta_df["flip_any_rate"], errors="coerce").notna().sum() >= 3 else "abs_max_effect"
 			feature = "delta_mean_layer_percentile_rank" if "delta_mean_layer_percentile_rank" in delta_df.columns else None
@@ -2054,16 +2058,14 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 				ax.grid(True, alpha=0.25)
 				ax.legend(fontsize=10, frameon=True)
 				fig.tight_layout()
-				png = stats_dir / "agonist_metric_ablation_scatter.pdf"
-				fig.savefig(png, dpi=300, bbox_inches="tight")
-				fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+				plot_path = stats_dir / "agonist_metric_ablation_scatter.pdf"
+				fig.savefig(plot_path, bbox_inches="tight")
 				pdf.savefig(fig, bbox_inches="tight")
-				paths.append(str(png))
-				paths.append(str(png.with_suffix(".pdf")))
+				paths.append(str(plot_path))
 				plt.close(fig)
-	paths.append(str(pdf_path))
-	return paths
 
+	paths.append(str(combined_pdf_path))
+	return paths
 
 def write_agonist_metric_final_stats(circuit_agonists_path, out_dir, stats_dirname="", flip_stats_df=None, topk=30):
 	"""Aggregate script-6 activation/saliency outputs into final tables and plots."""

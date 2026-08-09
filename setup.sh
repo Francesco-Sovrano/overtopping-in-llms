@@ -13,7 +13,7 @@ python -m pip install -U -r requirements.txt
 if command -v ollama >/dev/null 2>&1; then
   ollama pull gemma3:27b
   ollama pull qwen3:4b
-  ollama pull qwen3:14b
+  # ollama pull qwen3:14b
 else
   echo "Ollama is not installed; skipping default feature-model downloads."
 fi

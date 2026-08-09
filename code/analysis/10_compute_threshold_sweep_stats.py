@@ -102,26 +102,6 @@ def _drop_train_scored_rule_rows(df: pd.DataFrame) -> pd.DataFrame:
         out = out[~out["rule_combo_path"].astype(str).str.contains("rule_combo_train_", regex=False)].copy()
     return out
 
-def _normalize_score_scope(scope: str) -> str:
-    s = str(scope or "test_selected").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "hqt": "test_selected",
-        "hq_t": "test_selected",
-        "testselected": "test_selected",
-        "heldout_selected": "test_selected",
-        "held_out_selected": "test_selected",
-        "hqf": "all_fit",
-        "hq_f": "all_fit",
-        "allfit": "all_fit",
-        "all": "all_fit",
-        "legacy": "test",
-        "legacy_test": "test",
-    }
-    return aliases.get(s, s)
-
-def _score_scope_slug(scope: str) -> str:
-    return _normalize_score_scope(scope).replace("+", "_")
-
 def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df

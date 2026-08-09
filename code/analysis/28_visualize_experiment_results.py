@@ -7,9 +7,6 @@ import json
 import math
 from pathlib import Path
 
-from lib.project_paths import CODE_ROOT, PROJECT_ROOT
-
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -17,40 +14,19 @@ import numpy as np
 import pandas as pd
 
 from analysis.task_metrics import raw_task_score, chance_baseline, competence
-from lib.heldout_set_metrics import derive_legacy_aggregate_metrics
 from experiments.execution import RunSpec
+from lib.heldout_set_metrics import derive_legacy_aggregate_metrics
+from lib.project_paths import PROJECT_ROOT
+
+CURRENT_INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
+LEGACY_EJ_SCHEMA = "interaction-validation-v3"
 
 
 def load_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def normalize_interaction_m(raw: object) -> int | str | None:
-    if raw is None:
-        return None
     try:
-        if pd.isna(raw):
-            return None
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        pass
-    text = str(raw).strip().lower()
-    if text == "all":
-        return "all"
-    if text.endswith(".0"):
-        text = text[:-2]
-    try:
-        return int(text)
-    except Exception:
-        return None
-
-
-def first_gccr(payload: dict, m: int | str = 1):
-    if not isinstance(payload, dict) or payload.get("definition_version") != "interaction-validation-v3":
-        return math.nan, "unavailable_requires_interaction_validation_v3"
-    for row in payload.get("GCCR_m", []):
-        if normalize_interaction_m(row.get("m")) == m:
-            return row.get("GCCR_m"), row.get("status")
-    return math.nan, "missing"
+        return {}
 
 
 def row_for(spec: RunSpec, data_root: Path) -> dict | None:
@@ -60,28 +36,33 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
     dataset_path = data_root / spec.task / Path(spec.model) / "feature_report" / "dataset_stats.json"
     if not (global_path.exists() and by_path.exists() and dataset_path.exists()):
         return None
+
     global_payload = load_json(global_path)
     by = pd.read_csv(by_path)
     singleton_path = stats_dir / "singleton_set_metrics.json"
     singleton = load_json(singleton_path) if singleton_path.exists() else {}
-    legacy_exact = (
-        derive_legacy_aggregate_metrics(global_payload=global_payload, candidate_stats=by)
-        if not singleton else {}
-    )
+    legacy_exact = derive_legacy_aggregate_metrics(
+        global_payload=global_payload, candidate_stats=by
+    ) if not singleton else {}
+
     interaction_path = stats_dir / "interaction_validation" / "interaction_validation_summary.json"
     interaction = load_json(interaction_path) if interaction_path.exists() else {}
-    null_path = stats_dir / "interaction_validation" / "interaction_validation_summary.csv"
-    null = pd.read_csv(null_path) if null_path.exists() else pd.DataFrame()
-    raw = raw_task_score(spec.task, load_json(dataset_path))
-    chance = chance_baseline(spec.task, load_json(dataset_path))
+    summary_path = stats_dir / "interaction_validation" / "interaction_validation_summary.csv"
+    summary = pd.read_csv(summary_path) if summary_path.exists() else pd.DataFrame()
+    schema = interaction.get("definition_version")
+
+    dataset = load_json(dataset_path)
+    raw = raw_task_score(spec.task, dataset)
+    chance = chance_baseline(spec.task, dataset)
     score = competence(spec.task, spec.phase, raw, chance)
+
     u = singleton.get("U_J", legacy_exact.get("U_J", global_payload.get("union_flip_any_unique_rate")))
     s1 = singleton.get("s_1", legacy_exact.get("s_1"))
     toc = singleton.get("TOC_m", {}).get("1", {}) if isinstance(singleton.get("TOC_m"), dict) else {}
     toc1 = toc.get("value", math.nan) if isinstance(toc, dict) else math.nan
-    candidate_e = interaction.get("candidate_E_J", {}) if isinstance(interaction, dict) else {}
-    gccr1, gccr1_status = first_gccr(interaction, 1)
-    gccr_all, gccr_all_status = first_gccr(interaction, "all")
+
+    candidate_e = interaction.get("candidate_E_J", {}) if schema in {CURRENT_INTERACTION_SCHEMA, LEGACY_EJ_SCHEMA} else {}
+    candidate_e = candidate_e if isinstance(candidate_e, dict) else {}
     output = {
         **spec.__dict__, "phase": spec.phase, "stats_dir": str(stats_dir),
         "raw_score": raw, "chance": chance, "score": score,
@@ -95,30 +76,46 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
         "R_ov_status": singleton.get("R_ov_status", legacy_exact.get("R_ov_status", "missing")),
         "N_eff": singleton.get("N_eff", legacy_exact.get("N_eff")),
         "N_eff_status": singleton.get("N_eff_status", legacy_exact.get("N_eff_status", "missing")),
-        "OCC_0": singleton.get("OCC_0"),
-        "OCC_1": singleton.get("OCC_1"),
+        "OCC_0": singleton.get("OCC_0"), "OCC_1": singleton.get("OCC_1"),
         "OCC_0_status": singleton.get("OCC_0_status", legacy_exact.get("OCC_0_status", "missing")),
         "OCC_1_status": singleton.get("OCC_1_status", legacy_exact.get("OCC_1_status", "missing")),
         "E_J": candidate_e.get("effect", global_payload.get("E_J")),
         "E_J_status": candidate_e.get("status", global_payload.get("E_J_status", "missing")),
-        "GCCR_1": gccr1, "GCCR_1_status": gccr1_status,
-        "GCCR_all": gccr_all, "GCCR_all_status": gccr_all_status,
+        "interaction_schema": schema or "missing",
     }
     for threshold, count in (singleton.get("N_t", {}) or legacy_exact.get("N_t", {}) or {}).items():
         output[f"N_t_{threshold}"] = count
     for m, item in (singleton.get("TOC_m", {}) or {}).items():
         output[f"TOC_{m}"] = item.get("value") if isinstance(item, dict) else item
-    if not null.empty:
-        for record in null.to_dict("records"):
+
+    if schema == CURRENT_INTERACTION_SCHEMA:
+        for item in interaction.get("conditional_marginal", []) or []:
+            try:
+                multiplier = int(item.get("background_multiplier"))
+            except Exception:
+                continue
+            prefix = f"CMC_{multiplier}x"
+            output[prefix] = item.get("candidate")
+            output[f"{prefix}_null_median"] = item.get("median_null")
+            output[f"{prefix}_Delta"] = item.get("Delta")
+            output[f"{prefix}_P"] = item.get("P")
+            output[f"{prefix}_p_MC"] = item.get("p_MC")
+            output[f"{prefix}_win_rate"] = item.get("paired_win_rate")
+            output[f"{prefix}_status"] = item.get("status")
+
+    if not summary.empty:
+        for record in summary.to_dict("records"):
             metric = str(record.get("metric"))
-            raw_m = record.get("m")
-            normalized_m = normalize_interaction_m(raw_m)
-            if metric == "GCCR_m" and normalized_m is not None:
-                prefix = f"GCCR_{normalized_m}"
-            elif normalized_m is None:
-                prefix = metric
+            if metric == "E_J":
+                prefix = "E_J"
+            elif metric == "conditional_marginal":
+                try:
+                    prefix = f"CMC_{int(float(record.get('background_multiplier')))}x"
+                except Exception:
+                    continue
             else:
-                prefix = f"{metric}_{normalized_m}"
+                # Old GCCR rows are ignored deliberately.
+                continue
             for field in (
                 "median_null", "Delta", "P", "p_MC", "status",
                 "null_draws_requested", "null_draws_finite",
@@ -142,7 +139,6 @@ def plot_metric(frame: pd.DataFrame, metric: str, out_dir: Path) -> None:
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
     fig.savefig(out_dir / f"score_vs_{metric}.pdf")
-    fig.savefig(out_dir / f"score_vs_{metric}.png", dpi=300)
     plt.close(fig)
 
 
@@ -166,21 +162,19 @@ def main() -> None:
     if frame.empty:
         print("No completed configured experiments were found.")
         return
+    cmc_columns = sorted(column for column in frame.columns if str(column).startswith("CMC_") and str(column).endswith("x"))
     numeric = [
-        column
-        for column in ["score", "J", "U_J", "s_1", "TOC_1", "R_ov", "N_eff", "E_J", "GCCR_1", "GCCR_all"]
+        column for column in ["score", "J", "U_J", "s_1", "TOC_1", "R_ov", "N_eff", "E_J", *cmc_columns]
         if column in frame.columns
     ]
     for column in numeric:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    # Rewrite after normalization so the machine-readable catalogue has stable
-    # numeric dtypes even when optional sidecars are absent for some rows.
     frame.to_csv(out_dir / "completed_experiments.csv", index=False)
     for group in ("task", "model", "intervention", "phase", "suite"):
         frame.groupby(group, dropna=False)[numeric].agg(["count", "median", "mean"]).to_csv(
             out_dir / f"summary_by_{group}.csv"
         )
-    for metric in ("U_J", "TOC_1", "R_ov", "N_eff", "E_J", "GCCR_1", "GCCR_all"):
+    for metric in ["U_J", "TOC_1", "R_ov", "N_eff", "E_J", *cmc_columns]:
         if metric in frame:
             plot_metric(frame, metric, out_dir)
     print(f"Wrote {len(frame)} completed configured experiments to {out_dir}")

@@ -33,9 +33,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--require-complete-new-metrics", action="store_true",
         help=(
-            "Fail if any primary setting lacks exact TOC/OCC/simultaneous E(J)/GCCR/matched-null outputs. "
+            "Fail if any primary setting lacks the exact metrics required by the selected audit mode. "
             "An audit is always written under results/required_metrics_audit/."
         ),
+    )
+    p.add_argument(
+        "--skip-cmc-requirement", action="store_true",
+        help="Do not require CMC for the completeness audit; simultaneous E(J) and its matched null remain required.",
     )
     return p.parse_args()
 
@@ -47,6 +51,7 @@ def run(command: list[str]) -> None:
 
 def has_spiking_diagnostics(data_root: Path) -> bool:
     return any(data_root.rglob("spiking_diagnostics"))
+
 
 
 def main() -> None:
@@ -81,6 +86,8 @@ def main() -> None:
     ]
     if args.require_complete_new_metrics:
         audit_command.append("--require-complete")
+    if args.skip_cmc_requirement:
+        audit_command.append("--skip-cmc-requirement")
     run(audit_command)
 
     run([

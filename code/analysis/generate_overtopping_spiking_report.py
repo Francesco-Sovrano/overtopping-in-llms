@@ -231,7 +231,7 @@ def paper_figure_rc():
 
 
 def save_pdf_only(fig_obj, path: Path):
-    """Save vector PDF only. The script intentionally does not emit PNGs."""
+    """Save the figure to PDF."""
     fig_obj.savefig(path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0.015)
 
 

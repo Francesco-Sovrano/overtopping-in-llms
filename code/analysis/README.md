@@ -1,64 +1,289 @@
-# Analysis, validation, and final paper outputs
+# Analysis, simultaneous validation, and final paper outputs
 
-The `code/analysis/` directory contains singleton summaries for selectable evaluation splits, simultaneous interaction validation, primary test-split normalization, correlations, matched-null statistics, catalogue visualization, paper tables, paper figures, spiking diagnostics, and compact-export utilities.
+The `analysis/` package contains model-free singleton statistics, model-backed simultaneous-set validation, primary-matrix normalization, required-metric auditing, manuscript tables, visualizations, spiking reports, and compact result export.
 
-Raw model experiment artifacts live under `data/`. Final aggregate statistics and publication products live under root `results/`.
+Run modules from `<repo>/code`:
 
-Analysis entry points should be launched as modules from `<repo>/code`, for example `python3 -m analysis.26_validate_interactions --help`. The analysis package does not mutate `sys.path`.
+```bash
+cd code
+python3 -m analysis.29_generate_final_results --help
+```
 
-## Final-results entry point
-
-From repository root:
+For normal use, the repository-root command is:
 
 ```bash
 ./generate_results.sh
 ```
 
-This command does not run the experiment catalogue. It reads existing experiment artifacts and invokes `code/analysis/29_generate_final_results.py`.
+## 1. Core metric families
 
-Environment variables:
+The analysis separates three causal objects that must not be conflated:
 
-```bash
-PRIMARY_PROFILE=iclr-28               # default
-DATA_ROOT=<repo>/data                 # default
-ALLOW_INCOMPLETE_NEW_METRICS=false    # default; final paper outputs require exact new metrics
-```
+1. **singleton-event union metrics** derived from per-example `F_j` events;
+2. **simultaneous full-set effect** `E(J)`;
+3. **paired conditional marginal contribution** under matched background interventions.
 
-Example:
+No simultaneous-set quantity is replaced with a union of singleton flips.
 
-```bash
-DATA_ROOT=/path/to/data PRIMARY_PROFILE=legacy-27 ./generate_results.sh
-```
+## 2. Singleton-set statistics
 
-The root shell script always writes final outputs under `<repo>/results`. Before manuscript generation it writes `results/required_metrics_audit/required_metrics_audit.csv` and `.json`. By default the command fails if any primary setting lacks exact discovery-frozen TOC/OCC or simultaneous-intervention outputs. Set `ALLOW_INCOMPLETE_NEW_METRICS=1` only for an explicitly partial legacy report.
+Implemented in `lib/heldout_set_metrics.py` and written by stage 7.
 
-The Python orchestrator can be called directly:
-
-```bash
-python3 -m analysis.29_generate_final_results \
-  --data-root ../data \
-  --results-root ../results \
-  --primary-profile iclr-28
-```
-
-Optional flags:
+For frozen candidates `J`:
 
 ```text
---catalogue-json <configured_experiments.json>
---skip-paper-figures
---skip-spiking-report
+s_j = P(F_j)
+s_(1) = max_j s_j
+U(A) = P(union_{j in A} F_j)
+TOC_m = U(H_m)/U(J)
+R_ov = 1 - U(J)/sum_j s_j
+N_eff = (sum_j s_j)^2/sum_j s_j^2
+OCC_b = P(union_{j in J} F_j | B(x)=b)
+N_t = |{j : s_j >= t}|
 ```
 
-If `--catalogue-json` exists, catalogue-scoped summaries are refreshed before manuscript outputs are generated.
+Properties:
 
-## Canonical results tree
+- one common complete-case evaluation universe is used for all singleton probabilities;
+- `H_m` is ordered only by the supplied discovery-frozen ranking;
+- no metric is clipped;
+- near-zero ratio denominators get explicit undefined statuses;
+- default `N_t` thresholds are `0.01, 0.05, 0.10, 0.20, 0.30`.
+
+Current sidecar schema:
+
+```text
+heldout-set-metrics-v2
+```
+
+## 3. Simultaneous full-set validation
+
+Implemented in `26_validate_interactions.py`.
+
+`E(A)` is the evaluation-set flip rate when all channels in set `A` are suppressed simultaneously.
+
+The candidate full-set effect is:
+
+```text
+E(J)
+```
+
+For matched noncandidate sets `K_b`, the direct null summary is:
+
+```text
+Delta = E(J) - median_b E(K_b)
+P     = (1 + sum_b 1{E(K_b) <= E(J)})/(B+1)
+p_MC  = (1 + sum_b 1{E(K_b) >= E(J)})/(B+1)
+```
+
+The pipeline computes this direct validation whenever `RUN_INTERACTION_VALIDATION=true`. CMC is a separate optional extension. `RUN_CMC=false` skips the conditional-background computations without disabling `E(J)` or `E(K_b)`. Direct invocation uses `--skip_cmc` for the same behavior.
+
+All candidate/null effects are real simultaneous interventions.
+
+## 4. Paired conditional marginal contribution
+
+For every draw `b`, construct:
+
+- matched noncandidate set `K_b`;
+- matched background set `S_b`, disjoint from `J` and `K_b`.
+
+Evaluate:
+
+```text
+E(S_b)
+E(S_b union J)
+E(S_b union K_b)
+```
+
+Then:
+
+```text
+M_b(J)   = E(S_b union J)   - E(S_b)
+M_b(K_b) = E(S_b union K_b) - E(S_b)
+D_b      = M_b(J)           - M_b(K_b)
+```
+
+For each background multiplier the output row contains:
+
+```text
+candidate         mean M_b(J)
+candidate_median  median M_b(J)
+null_mean         mean M_b(K_b)
+median_null       median M_b(K_b)
+Delta             mean D_b
+Delta_median      median D_b
+P                 (1 + # {D_b >= 0})/(B+1)
+p_MC              (1 + # {D_b <= 0})/(B+1)
+paired_win_rate   mean 1{D_b > 0}
+```
+
+This is a paired design: candidate and null use the identical `S_b` for each draw.
+
+### Background multipliers
+
+`--background_multipliers` accepts comma-separated nonnegative integers. For multiplier `q`, the background uses `q` times the candidate count in every exact matching stratum.
+
+Default:
+
+```text
+1
+```
+
+The default manuscript field is therefore:
+
+```text
+CMC_1x
+```
+
+### Matching
+
+The structural matching strata are:
+
+- transformer layer;
+- computational locus;
+- channel type;
+- per-stratum cardinality.
+
+The complete validation run also fixes:
+
+- intervention phase;
+- replacement baseline;
+- evaluation split;
+- evaluation examples.
+
+Candidate, null, and background sets are evaluated on the same evaluation-row fingerprint.
+
+### Null draws and seed
+
+Direct module defaults:
+
+```text
+--null_draws 100
+--seed 42 when no compatible cached seed is available
+```
+
+The root standard launcher defaults `INTERACTION_NULL_DRAWS` to `30` and respects an explicit override.
+
+For finer Monte-Carlo resolution set a larger value, e.g. `999`.
+
+## 5. Interaction validation outputs
+
+The stats directory always receives the direct simultaneous-validation outputs below. Files whose names begin with `conditional_` are produced only when CMC is enabled.
+
+The stats directory receives:
+
+```text
+interaction_validation/
+├── interaction_configuration.json
+├── matched_control_strata.csv
+├── matched_random_set_membership.csv
+├── matched_null_draws.csv
+├── conditional_background_membership.csv      # CMC only
+├── conditional_marginal_draws.csv             # CMC only
+├── conditional_marginal_summary.csv           # CMC only
+├── interaction_validation_summary.csv
+├── interaction_validation_summary.json
+├── interaction_validation_summary.md
+├── interaction_validation_table.tex
+├── E_J_matched_null.pdf
+└── conditional_marginal_<q>x_paired_delta.pdf # CMC only
+```
+
+Current schema:
+
+```text
+conditional-marginal-validation-v1
+```
+
+## 6. Cache reuse
+
+A compatible current interaction cache is reused without loading the model.
+
+Compatibility is determined from semantic configuration and content fingerprints, including the candidate set, evaluation-row fingerprint, intervention configuration, matching/background design, seed, and relevant inputs.
+
+The validator can also recognize an `interaction-validation-v3` cache for the purpose of reusing exact simultaneous `E(J)`, compatible direct-null `E(K_b)` values, and validated matched-set membership. The conditional background/context interventions are computed only if they are missing.
+
+GCCR-formatted outputs are not part of the current metric set and are not read into manuscript fields.
+
+## 7. Required-metric audit
+
+`30_audit_required_metrics.py` determines, row by row, whether the paper-required metrics are:
+
+- already exact;
+- backfillable from materialized singleton/runtime artifacts;
+- unavailable without model-backed intervention work.
+
+It never substitutes singleton unions for `E(J)` or conditional marginals.
+
+The final-results orchestrator always writes the audit under:
+
+```text
+results/required_metrics_audit/
+```
+
+With `--require-complete-new-metrics`, any primary row missing an exact required metric causes the final-results command to fail after writing the audit. When `RUN_CMC=false` is used through the standard launcher, the completeness audit does not require CMC, but still requires simultaneous `E(J)` and its matched-null validation. Direct final-results usage can select the same policy with `--skip-cmc-requirement`.
+
+## 8. Primary profiles
+
+`primary_matrix.py` defines:
+
+```text
+iclr-28
+legacy-27
+```
+
+The identity difference is exactly one row:
+
+```text
+NLI | Qwen2-1.5B | I+O
+```
+
+`iclr-28` requires it; `legacy-27` excludes it. Invalid counts/identities raise errors.
+
+Normalization writes:
+
+```text
+primary_table_normalized.csv
+primary_table_excluded.csv
+primary_table_profile.json
+```
+
+## 9. Final-results orchestrator
+
+`29_generate_final_results.py` writes all final outputs below a supplied `results-root`.
+
+It runs, in order:
+
+1. optional catalogue visualization if `configured_experiments.json` is supplied;
+2. paper-table generation;
+3. required-metric audit;
+4. primary metric analysis;
+5. manuscript metric/table generation;
+6. paper figures unless skipped;
+7. spiking report, or an explicit `not_available` status if diagnostics are absent;
+8. `final_results_manifest.json`.
+
+Root command:
+
+```bash
+./generate_results.sh
+```
+
+The root launcher defaults to strict exact-metric completeness. Set:
+
+```bash
+ALLOW_INCOMPLETE_NEW_METRICS=1 ./generate_results.sh
+```
+
+to permit partial output with missing metrics explicitly marked unavailable.
+
+## 10. Final results tree
 
 ```text
 results/
-├── configured_experiments.json
-├── pipeline_failures.json
 ├── catalogue/
 ├── paper_tables/
+├── required_metrics_audit/
 ├── primary_metrics/
 ├── manuscript/
 ├── paper_figures/
@@ -66,407 +291,73 @@ results/
 └── final_results_manifest.json
 ```
 
-Not every file is present in every workflow: `configured_experiments.json` and `pipeline_failures.json` are owned by the experiment driver, while the other subdirectories are produced by the analysis pipeline.
+## 11. Manuscript outputs
 
-## Singleton-set statistics
+`27_generate_manuscript_outputs.py` augments primary rows with exact sidecar statistics and writes CSV/JSON/LaTeX outputs.
 
-The numerical implementation is `code/lib/heldout_set_metrics.py`; stage 7 writes its outputs into each stats directory.
-
-For singleton flip sets `F_j` on the selected evaluation split, the reported set statistics include:
+Core fields include:
 
 ```text
-s_j
-s_(1)
-U(J)
-TOC_m(J)
-R_ov(J)
-N_eff(J)
-OCC_0(J)
-OCC_1(J)
-N_t
-|J|
+J
+U_J
+s_1
+TOC_1
+R_ov
+N_eff
+OCC_0
+OCC_1
+N_t_0.05
+N_t_0.1
+E_J
+CMC_1x
 ```
 
-`H_m` is selected by the discovery-frozen ranking. All singleton probabilities use the same complete-case universe within that evaluation split. Ratios are not clipped, and undefined denominators carry explicit statuses.
+Available additional background multipliers are emitted as `CMC_<q>x` fields, together with candidate/null summaries, paired deltas, plus-one probabilities, draw counts, and status fields.
 
-Files include:
+## 12. Catalogue visualization
+
+`28_visualize_experiment_results.py` is catalogue-scoped: it reads an explicit `configured_experiments.json` rather than discovering arbitrary directories. This avoids mixing unrelated runs into standard aggregate plots.
+
+## 13. Paper figures
+
+`make_competence_vs_overtopping_paper_figures.py` reads experiment artifacts from `data/` and writes publication figures under the requested output directory, normally:
 
 ```text
-singleton_channel_metrics.csv
-singleton_set_metrics.csv
-singleton_set_metrics.json
-frozen_topm_metrics.csv
-singleton_threshold_counts.csv
-frozen_topm_toc.pdf
-frozen_topm_toc.png
+results/paper_figures/
 ```
 
-## Simultaneous interaction validation
+## 14. Spiking report
 
-`26_validate_interactions.py` performs the model-backed simultaneous interventions required for `E(J)` and GCCR.
-
-The pipeline normally supplies:
-
-```text
---input_data_dir <stage-5 neural_circuits directory>
---candidate_flip_stats_path <stage-7 flip_stats_by_neuron.csv>
---singleton_scores_path <stage-7 scores.csv>
---frozen_ranking_path <stage-7 frozen_candidate_ranking.csv>
---out_dir <stats-dir>/interaction_validation
---task_module <task module>
---ai_model <model>
---intervention <replacement baseline>
---m_values 1,all
---null_draws 100
---denominator_epsilon 1e-12
---evaluation_split test|train|all   # default test
-[--decode_only]
-```
-
-The validator resolves the stage-5 `dataset_info.json` and `manifest.json`, aggregates the full eligible stage-5 channels into transformer-layer populations, and verifies the input fingerprints. Only transformer layers containing at least one frozen candidate enter GCCR. Native MLP/attention-head loci remain available for exact null matching.
-
-### Candidate statistics
-
-It evaluates:
-
-```text
-E(J)
-E_l(C_l)
-E_l(C_l \ J_{l,m})
-Delta_l = E_l(C_l) - E_l(C_l \ J_{l,m})
-GCCR_m = sum_l Delta_l / sum_l E_l(C_l)
-```
-
-GCCR is computed only for `m=1` and `m=all`. For `m=1`, `J_{l,1}` is the discovery-top frozen candidate in transformer layer `l`. For `m=all`, `J_{l,all}` contains every frozen candidate in that layer. Candidate-free transformer layers do not enter the numerator or denominator. Each `E_l(C_l)` is evaluated once, persisted in `candidate_support_layer_effects.json`, and reused for both `m` values and all matched-null draws.
-
-### Matched random controls
-
-Random candidate sets are drawn within exact intervention strata so that candidate and control sets match:
-
-```text
-transformer layer
-computational locus
-channel type
-intervention phase
-replacement baseline
-per-layer cardinality
-```
-
-Candidate channels are excluded from the null pool. Exact matching preserves the candidate count in every layer/locus/type stratum and therefore each transformer-layer cardinality. Candidate and all null draws use the same evaluation-row fingerprint. Every null `E(J)` and GCCR value comes from simultaneous intervention; singleton unions are not used as null substitutes.
-
-For each metric the summary reports:
-
-```text
-candidate
-median_null
-Delta
-P
-p_MC
-null_draws_requested
-null_draws_finite
-status
-```
-
-where
-
-```text
-Delta = candidate - median(null)
-P = (1 + count(null <= candidate)) / (B + 1)
-p_MC = (1 + count(null >= candidate)) / (B + 1)
-```
-
-### Interaction output files
-
-```text
-interaction_configuration.json
-candidate_support_layer_effects.json
-layer_populations.csv
-matched_control_strata.csv
-frozen_candidate_ranking.csv
-layer_interaction_effects.csv
-gccr_metrics.csv
-matched_random_set_membership.csv
-matched_null_draws.csv
-interaction_validation_summary.csv
-interaction_validation_summary.json
-interaction_validation_summary.md
-interaction_validation_table.tex
-E_J_matched_null.pdf
-E_J_matched_null.png
-```
-
-`interaction_configuration.json` uses schema `interaction-validation-v3` and records model/task identity, baseline, phase, `m` values, null-draw count, denominator epsilon, seed, and fingerprints.
-
-## Primary matrix profiles
-
-`primary_matrix.py` validates two named setting matrices:
-
-| Profile | Expected rows | Qwen2-1.5B I+O NLI |
-|---|---:|---|
-| `iclr-28` | 28 | required exactly once |
-| `legacy-27` | 27 | absent |
-
-The 27-setting profile accepts either an already-normalized 27-row input without the Qwen row or a 28-row input containing exactly one matching row, which it records in the exclusion audit.
-
-Normalization outputs are written with a caller-provided stem, normally:
-
-```text
-primary_table_normalized.csv
-primary_table_excluded.csv
-primary_table_profile.json
-```
-
-A count or row-identity mismatch is an error.
-
-## Paper tables
-
-`compute_overtopping_latex_tables.py` builds the primary table from a data directory or ZIP:
-
-```bash
-python3 -m analysis.compute_overtopping_latex_tables \
-  --results ../data \
-  --primary-profile iclr-28
-```
-
-Default output:
-
-```text
-results/paper_tables/
-```
-
-Files:
-
-```text
-primary_table.csv
-primary_table_normalized.csv
-primary_table_excluded.csv
-primary_table_profile.json
-table1_representative.tex
-table8_primary.tex
-occ_warnings.txt
-```
-
-The table builder prefers exact singleton/interaction sidecars when available. If exact OCC denominators are unavailable in an aggregate-only input, `occ_warnings.txt` records the affected rows instead of silently presenting the value as an exact conditional probability.
-
-The optional `--empirical-fsm-chance` flag uses a sampled state-count FSM chance baseline for audit/debug use. The default uses the fixed manuscript baseline `mean(1/3, 1/4, 1/5, 1/6)`.
-
-## Primary metric analysis
-
-`21_analyze_primary_metrics.py primary` consumes the primary table:
-
-```bash
-python3 -m analysis.21_analyze_primary_metrics primary \
-  --primary_table ../results/paper_tables/primary_table.csv \
-  --data_root ../data \
-  --out_dir ../results/primary_metrics
-```
-
-It writes:
-
-```text
-primary_table_augmented.csv
-primary_correlations.csv
-primary_metrics.json
-primary_metrics.md
-directional_coverage_all_settings.csv
-directional_coverage_all_settings.md
-```
-
-The analysis includes overall, phase-stratified, task-stratified, and partial correlations where the required columns are available. It adds overlap compression/singleton mass and direction-specific union coverage from the underlying stats directories.
-
-Direction-specific values preserve the denominator semantics present in the source artifacts. They are not converted into a different conditional rate silently.
-
-## Manuscript metric outputs
-
-`27_generate_manuscript_outputs.py` consumes the primary table and a required profile:
-
-```bash
-python3 -m analysis.27_generate_manuscript_outputs \
-  --primary_table ../results/paper_tables/primary_table.csv \
-  --data_root ../data \
-  --out_dir ../results/manuscript \
-  --primary_profile iclr-28
-```
-
-It augments each setting with singleton and interaction sidecars and writes:
-
-```text
-primary_table_normalized.csv
-primary_table_excluded.csv
-primary_table_profile.json
-manuscript_metrics.csv
-manuscript_metrics.json
-manuscript_metrics.tex
-matched_null_metrics.csv
-matched_null_metrics.json
-matched_null_metrics.tex
-metric_statuses.csv
-metric_statuses.tex
-score_vs_U_J.{pdf,png}
-score_vs_TOC_1.{pdf,png}
-score_vs_R_ov.{pdf,png}
-score_vs_N_eff.{pdf,png}
-score_vs_E_J.{pdf,png}
-score_vs_GCCR_1.{pdf,png}
-score_vs_GCCR_all.{pdf,png}
-```
-
-The long-form matched-null table includes exactly `m=1` and `m=all`, together with candidate value, null median, `Delta`, `P`, `p_MC`, requested/finite draw counts, and status.
-
-## Catalogue-scoped visualization
-
-`28_visualize_experiment_results.py` reads an explicit `configured_experiments.json`. It never scans the data tree for arbitrary runs.
-
-```bash
-python3 -m analysis.28_visualize_experiment_results \
-  --catalogue_json ../results/configured_experiments.json \
-  --data_root ../data \
-  --out_dir ../results/catalogue
-```
-
-It writes:
-
-```text
-completed_experiments.csv
-completed_experiments.json
-summary_by_task.csv
-summary_by_model.csv
-summary_by_intervention.csv
-summary_by_phase.csv
-summary_by_suite.csv
-score_vs_<metric>.{pdf,png}
-```
-
-Plots are generated for available metrics among `U_J`, `TOC_1`, `R_ov`, `N_eff`, `E_J`, `GCCR_1`, and `GCCR_all`.
-
-## Paper figures
-
-`make_competence_vs_overtopping_paper_figures.py` reads experiment results from `data/` and writes final figures under `results/paper_figures/` when called by the final-results orchestrator.
-
-The orchestrator creates:
-
-```text
-fig_competence_vs_coverage.pdf
-```
-
-plus the script's publication summary templates selected by `--paper-figures all`. PNG companions are produced where requested by the figure script.
-
-The figure script has extensive filtering, labeling, trend, size, and layout controls; use:
-
-```bash
-python3 -m analysis.make_competence_vs_overtopping_paper_figures --help
-```
-
-for the complete plotting interface.
-
-## Overtopping/spiking report
-
-`generate_overtopping_spiking_report.py` summarizes `spiking_diagnostics` trees:
-
-```bash
-python3 -m analysis.generate_overtopping_spiking_report \
-  --root ../data \
-  --out ../results/overtopping_spiking_report
-```
-
-It can also accept a ZIP with `--zip` instead of `--root`.
-
-`29_generate_final_results.py` checks whether any `spiking_diagnostics` directory exists. If none is present, it writes:
+`generate_overtopping_spiking_report.py` aggregates `spiking_diagnostics` directories. The final-results orchestrator writes:
 
 ```text
 results/overtopping_spiking_report/report_status.json
 ```
 
-with `status=not_available`. `--skip-spiking-report` writes the same status file with `status=skipped`.
+with `not_available` when the selected data root contains no spiking diagnostics.
 
-## Final-results orchestrator
+## 15. Compact export
 
-`29_generate_final_results.py` runs the final reporting sequence:
-
-1. refresh catalogue visualization if `--catalogue-json` exists;
-2. build `results/paper_tables/`;
-3. run primary metric analysis into `results/primary_metrics/`;
-4. build manuscript metric tables/plots into `results/manuscript/`;
-5. build paper figures unless skipped;
-6. build or mark availability of the spiking report;
-7. write `results/final_results_manifest.json`.
-
-All paths in the manifest are absolute resolved paths for the selected data/results roots.
-
-## Other analysis utilities
-
-- `12_threshold_event_diagnostics.py`: strict-test threshold/channel diagnostics and matched controls.
-- `22_compute_group_dominance.py`: simultaneous group-dominance calculations on a fixed candidate set.
-- `23_compute_survey_dominance.py`: batch application of group-dominance calculations over a primary table. It accepts `--evaluation_split test|train|all`, defaulting to `test`.
-- `24_run_primary_holdout_analysis.py`: primary-table re-estimation support. It accepts `--evaluation_split test|train|all`, defaulting to `test`; the paired manuscript holdout audit is produced only for the `test` split.
-- `25_rebuild_directional_stats.py`: reconstruct direction-specific summaries from materialized stage-7 score tables. It accepts `--evaluation_split test|train|all`, defaulting to `test`.
-- `8_compare_experiments.py`, `9_compare_models.py`: detailed experiment/model comparison utilities.
-- `10_compute_threshold_sweep_stats.py`: threshold-sweep statistics; default output is `results/paper_tables/stats/`.
-
-These utilities are not required to understand the standard root launchers; they are available for targeted analyses.
-
-## Compact result export
-
-Create a filtered result tree:
+`clean_results_for_export.py` creates a filtered, shareable result tree:
 
 ```bash
+cd code
 python3 -m analysis.clean_results_for_export ../data ../data_filtered_results
 ```
 
-Options:
+The filtered tree is suitable for model-free result inspection and regeneration of metrics that are fully represented by retained summaries. New simultaneous interventions require the full runtime artifacts and accessible model.
 
-```text
---dry-run
---force
---verbose
---manifest <json-path>
---reference-zip <zip-path>
-```
+## 16. Other utilities
 
-The embedded export schema retains final/compact artifacts such as dataset statistics, singleton tables, frozen rankings, interaction summaries, rule metrics, tables, and plots. It excludes pickle caches, large per-example stage-7 `scores.csv`, circuit-input caches, and generated junk.
+- `10_compute_threshold_sweep_stats.py` — statistics for threshold sweeps.
+- `12_threshold_event_diagnostics.py` — threshold-event/spiking diagnostics.
+- `21_analyze_primary_metrics.py` — primary aggregate statistics and correlations.
+- `22_compute_group_dominance.py` — generic simultaneous group-effect utility retained for focused analyses.
+- `23_compute_survey_dominance.py` — survey-wide group-effect utility.
+- `24_run_primary_holdout_analysis.py` — primary-row re-estimation helper.
+- `25_rebuild_directional_stats.py` — directional-stat reconstruction from materialized score tables.
+- `compute_overtopping_latex_tables.py` — primary/paper table construction.
+- `recover_primary_directional.py` — directional metadata recovery helper.
+- `task_metrics.py` — task-score and chance-baseline normalization.
 
-This distinction matters:
-
-- when a compact export already contains the new singleton sidecars, discovery-frozen TOC/OCC tables can be regenerated exactly;
-- when an old compact export contains only `flip_stats_global.json` and `flip_stats_by_neuron.csv`, only `|J|`, `U(J)`, `s_(1)`, `N_t`, `R_ov`, and `N_eff` are exactly identifiable; `TOC_m` and `OCC_b` are explicitly unavailable;
-- new simultaneous `E(J)`, GCCR, and matched-null draws cannot be generated without runtime scores, stage-5 circuit populations, model weights, and replacement-baseline inputs;
-- no analysis path substitutes held-out `Top/U` for discovery-frozen `TOC_1`, `C2I/raw` for exact `OCC_1`, or singleton unions for simultaneous interventions;
-- a compact export is therefore an analysis/reporting artifact, not a complete resumable experiment tree.
-
-## Required-metric audit
-
-`30_audit_required_metrics.py` classifies every primary setting before strict final-paper generation. It records whether the requested quantities are already exact, exactly recoverable from legacy aggregates, backfillable from a full runtime cache, or unavailable without model execution.
-
-```bash
-python3 -m analysis.30_audit_required_metrics \
-  --primary-table ../results/paper_tables/primary_table.csv \
-  --data-root ../data \
-  --primary-profile iclr-28 \
-  --out-dir ../results/required_metrics_audit \
-  --require-complete
-```
-
-The audit distinguishes three levels:
-
-1. **Legacy aggregate exact**: `|J|`, `U(J)`, `s_(1)`, `N_t`, `R_ov`, and `N_eff` can be reconstructed from `flip_stats_global.json` and `flip_stats_by_neuron.csv`.
-2. **Singleton-event backfill**: `TOC_m` and `OCC_b` can be regenerated without new singleton ablations when `scores.csv` still contains per-example `flip_*` columns and stage-6 discovery outputs can reconstruct the frozen ranking.
-3. **Model-backed interaction backfill**: `E(J)`, GCCR, and matched nulls require genuine simultaneous interventions with the stage-5 population and model/replacement-baseline runtime inputs.
-
-A missing quantity is never replaced by a mathematically different proxy.
-
-## Status values
-
-Analysis files use explicit statuses rather than substituting zero for undefined quantities. Common values include:
-
-```text
-ok
-undefined_near_zero_denominator
-undefined_nonfinite
-undefined_zero_denominator
-undefined_candidate
-undefined_no_null_draws
-undefined_nonfinite_null_draws
-missing
-```
-
-Do not clip negative or above-one finite interaction ratios when consuming the CSV/JSON outputs.
+These utilities are not independent experiment catalogues.

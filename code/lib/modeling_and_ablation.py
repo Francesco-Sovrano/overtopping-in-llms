@@ -6,6 +6,7 @@ from scipy.spatial.distance import cdist
 import inspect, textwrap
 
 import json
+from pathlib import Path
 import torch
 import transformer_lens as lens
 from contextlib import nullcontext
@@ -1212,10 +1213,31 @@ class LMWrapper:
 		self.model_name = model_name
 		self.base_model_name, self.hf_revision = self._parse_model_spec(model_name)
 		hf_model_name = self.base_model_name
-		tl_model_name = self._tl_model_name_for_hf_repo(hf_model_name)
 
-		# Store both names for debugging/downstream code. HF loads the actual
-		# weights/tokenizer, while TL uses a supported canonical architecture name.
+		# Poisoning checkpoints produced with PEFT/LoRA are adapter directories,
+		# not standalone HuggingFace model directories. TransformerLens converts
+		# the dense weights of the HF model that it receives; handing it an
+		# unmerged PEFT model can therefore omit the learned LoRA delta. Detect a
+		# local adapter checkpoint explicitly, load its declared base model, merge
+		# the adapter into the dense weights, and only then construct the hooked
+		# TransformerLens model.
+		adapter_path = Path(hf_model_name).expanduser()
+		adapter_config_path = adapter_path / "adapter_config.json"
+		adapter_base_model = None
+		if adapter_config_path.is_file():
+			adapter_cfg = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+			adapter_base_model = str(adapter_cfg.get("base_model_name_or_path", "")).strip()
+			if not adapter_base_model:
+				raise ValueError(
+					f"PEFT adapter checkpoint {adapter_path} has no base_model_name_or_path"
+				)
+
+		tl_source_name = adapter_base_model or hf_model_name
+		tl_model_name = self._tl_model_name_for_hf_repo(tl_source_name)
+
+		# Store both names for debugging/downstream code. hf_model_name is the
+		# exact user-requested model/checkpoint; tl_model_name identifies the
+		# architecture whose dense weights TransformerLens receives.
 		self.hf_model_name = hf_model_name
 		self.tl_model_name = tl_model_name
 
@@ -1294,13 +1316,30 @@ class LMWrapper:
 		if tl_model_name != hf_model_name:
 			print(f"[Info] Using TransformerLens model config {tl_model_name} for HF repo {hf_model_name}")
 
-		self.model = AutoModelForCausalLM.from_pretrained(
-			resolved_model_name,
-			torch_dtype="auto",
-			device_map='cpu',
-			cache_dir=cache_dir,
-			**hf_revision_kwargs,
-		).to(device)
+		if adapter_base_model is not None:
+			try:
+				from peft import PeftModel
+			except ImportError as exc:
+				raise RuntimeError(
+					"A PEFT/LoRA checkpoint was requested, but the 'peft' package is not installed."
+				) from exc
+			base_model = AutoModelForCausalLM.from_pretrained(
+				adapter_base_model,
+				dtype="auto",
+				device_map="cpu",
+				cache_dir=cache_dir,
+			)
+			peft_model = PeftModel.from_pretrained(base_model, str(adapter_path))
+			self.model = peft_model.merge_and_unload().to(device)
+			print(f"[Info] Loaded and merged PEFT adapter {adapter_path} onto {adapter_base_model}")
+		else:
+			self.model = AutoModelForCausalLM.from_pretrained(
+				resolved_model_name,
+				dtype="auto",
+				device_map="cpu",
+				cache_dir=cache_dir,
+				**hf_revision_kwargs,
+			).to(device)
 		
 		self.hooked_model = lens.HookedTransformer.from_pretrained(
 			model_name=tl_model_name,

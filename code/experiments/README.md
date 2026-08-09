@@ -1,69 +1,8 @@
 # Experiment catalogue and execution
 
-`code/experiments/run_experiments.py` owns the complete executable catalogue for standard non-poisoning experiments. It declares the task, model, replacement baseline, intervention phase, circuit parameters, thresholds, batching, and channel restrictions for each run. `code/experiments/execution.py` contains reusable `RunSpec` validation, filtering, path construction, and pipeline command generation; it does not contain a second catalogue.
+`experiments/run_experiments.py` is the single executable catalogue for standard non-poisoning experiments. It is paper-centered and explicit: configurations are written as individual `RunSpec` rows rather than generated from a broad task × model × phase × baseline Cartesian product.
 
-## Catalogue contents
-
-The catalogue has two suites:
-
-| Suite | Count | Definition |
-|---|---:|---|
-| `phenomenology` | 121 | task/baseline/phase sweep over Qwen2/Qwen2.5/Pythia small models plus the explicit Qwen2-1.5B I+O NLI setting |
-| `large-models` | 6 | Qwen2-7B and Pythia-6.9B on arithmetic, HANS NLI, and jailbreak |
-| **Total** | **127** | all standard non-poisoning configurations |
-
-`--suite all` expands to both suites. With no `--suite`, the driver also selects both suites.
-
-### Phenomenology suite
-
-The primary model group is:
-
-```text
-Qwen/Qwen2.5-1.5B-Instruct
-EleutherAI/pythia-1b
-EleutherAI/pythia-1b@step0
-EleutherAI/pythia-1b@step48000
-EleutherAI/pythia-1b@step96000
-```
-
-The task identifiers are:
-
-```text
-random_fsm
-grammar_acceptability
-hans_nli
-arithmetic
-bon_jailbreaking
-```
-
-The intervention baselines are:
-
-```text
-mean-donor
-mean
-zero
-```
-
-The phases are `standard` (`I+O`) and `decode-only` (`Out`). The Pythia checkpoint models are configured only for `random_fsm`, `grammar_acceptability`, and `hans_nli`. Qwen2-1.5B has the six arithmetic combinations across the three baselines and two phases, plus one `hans_nli / mean-donor / standard` configuration used by the 28-setting primary profile.
-
-All phenomenology `RunSpec` objects use neuron-level circuits, `circuit_size=200000`, `min_flip_rate=0.3`, and `max_circuits=1`. The default batch size is 32. Arithmetic uses `z_thresh=10` for Qwen models and `z_thresh=5` for other arithmetic configurations; non-arithmetic configurations use `z_thresh=-1`.
-
-### Large-model suite
-
-For each of
-
-```text
-Qwen/Qwen2-7B-Instruct
-EleutherAI/pythia-6.9b
-```
-
-the suite contains:
-
-- arithmetic with `mean-positional`, `decode-only`, MLP-neuron restriction, `circuit_size=100000`, and up to 5 circuits;
-- HANS NLI with `mean-positional`, `standard`, MLP-neuron restriction, and `circuit_size=100000`;
-- jailbreak with `mean-positional`, `decode-only`, MLP-neuron restriction, and `circuit_size=100000`.
-
-## Root launcher
+## Entry points
 
 From repository root:
 
@@ -71,182 +10,172 @@ From repository root:
 ./run_experiments.sh
 ```
 
-The launcher activates `.env/` when present, selects `--suite all`, writes under `<repo>/results`, and uses `test` as the default evaluation split. For `test`, it also requests the primary manuscript export using `PRIMARY_PROFILE` (default `iclr-28`). For `train` or `all`, it runs the catalogue and catalogue analysis but skips the test-specific primary manuscript export.
-
-Examples:
+From `code/`:
 
 ```bash
-./run_experiments.sh --dry-run
-./run_experiments.sh --task arithmetic
-PRIMARY_PROFILE=legacy-27 ./run_experiments.sh
-./run_experiments.sh --evaluation-split train
-EVALUATION_SPLIT=all ./run_experiments.sh
+python3 -m experiments.run_experiments --help
 ```
 
-Arguments are forwarded to the Python driver before the fixed suite/results/profile options. Filters still apply to the selected catalogue, but a filtered run generally cannot produce a complete 27/28 primary manuscript table. Use the Python driver without `--generate-primary-manuscript` for partial/debug experiment subsets.
+The root launcher supplies repository-root `data/` and `results/` paths and defaults the primary manuscript profile to `iclr-28` when the evaluation split is `test`.
 
-## Python driver
+## Catalogue size and suites
 
-Python entry points are executed as modules from `<repo>/code` (`python3 -m ...`). No runtime `sys.path` modification is used. Start direct-module sessions with `cd code`.
+The default catalogue contains **36 unique configurations**:
 
+| Suite | Count | Purpose |
+|---|---:|---|
+| `paper-primary` | 28 | Exact primary model–task–phase settings reported in manuscript Appendix Table 8, with their selected replacement baselines |
+| `paper-auxiliary` | 8 | Targeted baseline and phase controls that support interpretation of the primary matrix |
+| `all` | 36 | `paper-primary` plus `paper-auxiliary` |
 
-List configurations:
+Inspect the exact expanded list:
 
 ```bash
+python3 -m experiments.run_experiments --suite paper-primary --list
+python3 -m experiments.run_experiments --suite paper-auxiliary --list
 python3 -m experiments.run_experiments --suite all --list
 ```
 
-Run only the model pipeline:
+The root launcher respects an explicit `--suite`; it adds `--suite all` only when no suite was supplied.
 
-```bash
-python3 -m experiments.run_experiments --suite phenomenology --phase pipeline
-```
+## The 28 primary configurations
 
-Analyze configured outputs without launching model stages:
+The primary suite follows the manuscript table ordering.
 
-```bash
-python3 -m experiments.run_experiments --suite all --phase analysis
-```
+### Arithmetic
 
-Run both:
+| Model | Phase | Baseline |
+|---|---|---|
+| Pythia-1B | Out | `mean` |
+| Pythia-1B@48k | Out | `mean-donor` |
+| Pythia-6.9B | Out | `mean-positional` |
+| Qwen2-1.5B-Instruct | I+O | `mean-donor` |
+| Qwen2-1.5B-Instruct | Out | `mean-donor` |
+| Qwen2-7B-Instruct | Out | `mean-positional` |
+| Qwen2.5-1.5B-Instruct | Out | `mean-donor` |
 
-```bash
-python3 -m experiments.run_experiments --suite all --phase all
-```
+### Jailbreaking
 
-Exact comma-separated filters are supported for task, model, intervention, and mode. The evaluation split is selected separately and defaults to `test`:
+| Model | Phase | Baseline |
+|---|---|---|
+| Qwen2-1.5B-Instruct | Out | `mean-donor` |
+| Qwen2-7B-Instruct | Out | `mean-positional` |
+| Qwen2.5-1.5B-Instruct | Out | `mean-donor` |
 
-```bash
-python3 -m experiments.run_experiments \
-  --suite phenomenology \
-  --task arithmetic,hans_nli \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --intervention mean-donor,zero \
-  --mode standard,decode-only \
-  --evaluation-split test
-```
+### Grammar acceptability
 
-Other driver options:
+| Model | Phase | Baseline |
+|---|---|---|
+| Pythia-1B | I+O | `mean-donor` |
+| Pythia-1B | Out | `mean-donor` |
+| Pythia-1B@48k | I+O | `mean-donor` |
+| Pythia-1B@48k | Out | `mean-donor` |
+| Pythia-1B@96k | I+O | `mean-donor` |
+| Pythia-1B@96k | Out | `mean-donor` |
+| Qwen2.5-1.5B-Instruct | I+O | `mean-donor` |
+| Qwen2.5-1.5B-Instruct | Out | `mean-donor` |
+
+### HANS NLI
+
+| Model | Phase | Baseline |
+|---|---|---|
+| Qwen2-1.5B-Instruct | I+O | `mean-donor` |
+| Qwen2-7B-Instruct | I+O | `mean-positional` |
+| Qwen2.5-1.5B-Instruct | I+O | `mean-donor` |
+| Qwen2.5-1.5B-Instruct | Out | `mean-donor` |
+
+### Random FSM
+
+| Model | Phase | Baseline |
+|---|---|---|
+| Pythia-1B | I+O | `mean-donor` |
+| Pythia-1B | Out | `mean-donor` |
+| Pythia-1B@48k | I+O | `mean-donor` |
+| Pythia-1B@96k | Out | `mean-donor` |
+| Qwen2.5-1.5B-Instruct | I+O | `mean-donor` |
+| Qwen2.5-1.5B-Instruct | Out | `mean` |
+
+The 1B/1.5B scans use the paper-style `M=200000`, `tau=0.3`, batch size 32, and at most one circuit. Qwen arithmetic uses `z_thresh=10`; Pythia arithmetic uses `z_thresh=5`.
+
+The four primary large-model settings are MLP-only, use `circuit_size=100000`, `min_flip_rate=0.2`, and `mean-positional`: Pythia-6.9B arithmetic Out; Qwen2-7B arithmetic Out; Qwen2-7B HANS NLI I+O; and Qwen2-7B jailbreaking Out.
+
+## Auxiliary configurations
+
+The auxiliary suite intentionally contains only eight targeted runs.
+
+Six complete the manuscript's mean-versus-mean-donor sensitivity comparisons:
 
 ```text
---data-root <path>       experiment artifact root passed to final analysis; default <repo>/data
---results-root <path>    aggregate/final output root; default <repo>/results
---evaluation-split test|train|all   final evaluation split; default test
---list                   print selected RunSpec identities and exit
---dry-run                print pipeline commands without executing them
---continue-on-error      record pipeline failures and continue
+Qwen2-1.5B arithmetic Out                 mean
+Qwen2.5-1.5B grammar I+O                 mean
+Qwen2.5-1.5B grammar Out                 mean
+Qwen2.5-1.5B HANS NLI I+O                mean
+Qwen2.5-1.5B HANS NLI Out                mean
+Qwen2.5-1.5B random FSM I+O              mean
+```
+
+Two add focused phase diagnostics without recreating the former broad factorial sweep:
+
+```text
+Qwen2.5-1.5B arithmetic I+O              mean-donor
+Qwen2-1.5B HANS NLI Out                  mean-donor
+```
+
+The first helps distinguish Qwen2.5 arithmetic output behavior from prompt-processing effects and is also relevant to the paper's secondary threshold/control analysis. The second is the output-only counterpart to the primary Qwen2-1.5B I+O NLI setting and corresponds to a reported no-selected-channel boundary condition.
+
+There are no automatic `zero`-baseline runs in the main catalogue.
+
+## CLI
+
+```text
+--suite {paper-primary,paper-auxiliary,all}
+--phase {all,pipeline,analysis}
+--task CSV
+--model CSV
+--intervention CSV
+--mode CSV
+--evaluation-split {test,train,all}
+--data-root PATH
+--results-root PATH
+--primary-profile {iclr-28,legacy-27}
 --generate-primary-manuscript
---primary-profile iclr-28|legacy-27
+--list
+--dry-run
+--continue-on-error
 ```
 
-`--generate-primary-manuscript` requires `--primary-profile` and calls `code/analysis/29_generate_final_results.py` after the configured pipeline runs. Without that flag, the analysis phase calls `code/analysis/28_visualize_experiment_results.py` and writes catalogue-scoped summaries only.
+Filters are exact comma-separated values.
 
-## RunSpec fields
+## Evaluation split
 
-`RunSpec` contains:
+Every `RunSpec` has an `evaluation_split`, default `test`.
 
 ```text
-suite
-task
-model
-intervention
-mode
-z_thresh
-batch_size
-circuit_level
-circuit_size
-min_flip_rate
-max_circuits
-mlp_neurons_only
-no_llm_feature_generation
-evaluation_split
+test   -> -heldout_test
+train  -> -eval_train
+all    -> no evaluation suffix
 ```
 
-Validation accepts evaluation splits `test`, `train`, and `all`; replacement baselines `zero`, `mean`, `mean-positional`, `mean-donor`, and `mean-donor-positional`; modes `standard` and `decode-only`; and circuit levels `neuron` and `edge`.
+Primary manuscript generation requires `test`.
 
-The standard catalogue command always adds:
+## Path construction and execution
+
+`RunSpec.circuit_label()` encodes spectral split, circuit size, decode-only mode, and intervention when needed. `RunSpec.bag_label()` encodes the stage-6 candidate-selection mode and `tau` when it differs from `0.2`.
+
+Each catalogue row becomes one call to `pipeline/_run_pipeline.sh` with explicit spectral splits, fast anchoring, `z_thresh`, batch size, circuit granularity/size, intervention, `tau`, evaluation split, and maximum circuits. Decode-only and MLP-only flags are added only when selected by the row.
+
+The expanded catalogue is written to:
 
 ```text
---spectral_splits
---fast_anchoring
+<results-root>/configured_experiments.json
 ```
 
-and forwards the remaining `RunSpec` values to `code/pipeline/_run_pipeline.sh`.
-
-## Filesystem labels
-
-For standard spectral runs, `RunSpec.circuit_label()` starts with:
+Pipeline failures are recorded in:
 
 ```text
-spectral_split
+<results-root>/pipeline_failures.json
 ```
-
-It adds:
-
-- `-M<circuit_size>` when the size is not 100000;
-- `-decode_only` in output-only mode;
-- `-eval_<baseline>` for `zero`, `mean-donor`, and `mean-donor-positional`.
-
-`mean` and `mean-positional` use the unsuffixed mean-family filesystem label. Their exact identity is preserved in configuration and validation metadata and must not be inferred only from the path.
-
-The stage-6/7 label is:
-
-```text
-agonist_neurons-fast-random_anchor
-```
-
-with `-tau<min_flip_rate>` when the threshold is not 0.2. Stats-directory split suffixes are:
-
-```text
-test   -heldout_test
-train  -eval_train
-all    no suffix
-```
-
-A canonical test-split stats path is therefore:
-
-```text
-data/<task>/<model>/rule_extraction_results/neuron_flip_rules/stats/
-  <circuit-label>-<bag-label>-heldout_test/
-```
-
-The corresponding stage-5 input directory is:
-
-```text
-data/<task>/<model>/neural_circuit_discovery_results/eap_ig_inputs/
-  <circuit-label>/neural_circuits/
-```
-
-## Evaluation-split policy
-
-Every `RunSpec` has `evaluation_split="test"` by default. The driver accepts `--evaluation-split test|train|all` to override that value for all selected runs. `code/pipeline/_run_pipeline.sh` forwards the same choice to stage 7 and interaction validation. Candidate discovery/ranking and replacement-reference estimation remain training-based regardless of the final evaluation split.
-
-Primary manuscript tables are defined on the `test` split. The root launcher therefore requests manuscript generation only for `test`; non-test runs still produce catalogue-scoped summaries.
-
-## Analysis outputs owned by the driver
-
-Before execution, the selected `RunSpec` rows are serialized to:
-
-```text
-results/configured_experiments.json
-```
-
-If the pipeline phase is run, failures are serialized to:
-
-```text
-results/pipeline_failures.json
-```
-
-Catalogue-only analysis writes under:
-
-```text
-results/catalogue/
-```
-
-Full paper generation writes under the other `results/` subdirectories documented in `code/analysis/README.md`.
 
 ## Editing the catalogue
 
-Keep experiment selection in `code/experiments/run_experiments.py`. Analysis modules should consume explicit manifests/tables rather than defining their own task/model matrix.
-
-When changing a `RunSpec` field that affects path identity, update both `RunSpec` path construction and the corresponding label logic in `code/pipeline/_run_pipeline.sh`, then run the policy tests in `code/tests/`.
+Add or remove experiment definitions only in `run_experiments.py`. Do not create separate shell scripts with independent task/model matrices. Reusable path and command logic belongs in `execution.py`.

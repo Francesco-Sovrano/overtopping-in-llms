@@ -276,7 +276,7 @@ def parse_args():
 		help=(
 			"If set, skip the extra post-hoc diagnostics that measure the actual raw values of singleton "
 			"agonist activations relative to the other activations in the same hooked layer and write "
-			"CSV/JSON/PNG summaries."
+			"CSV/JSON/PDF summaries."
 		),
 	)
 
@@ -286,7 +286,7 @@ def parse_args():
 		help=(
 			"If set, skip the extra post-hoc diagnostics that estimate singleton agonist first-order "
 			"margin effects via gradient × (baseline-current) at the hooked write site and write "
-			"CSV/JSON/PNG summaries."
+			"CSV/JSON/PDF summaries."
 		),
 	)
 
@@ -1391,7 +1391,7 @@ def compute_and_save_agonist_activation_stats(
 	base_name = rule_json_path.stem
 	raw_csv_path = rule_json_path.parent / f"{base_name}_agonist_activation_raw.csv"
 	summary_csv_path = rule_json_path.parent / f"{base_name}_agonist_activation_summary.csv"
-	plot_path = rule_json_path.parent / f"{base_name}_agonist_activation_stats.png"
+	plot_path = rule_json_path.parent / f"{base_name}_agonist_activation_stats.pdf"
 	raw_df.to_csv(raw_csv_path, index=False)
 	summary_df.to_csv(summary_csv_path, index=False)
 	_plot_agonist_activation_stats(
@@ -1410,7 +1410,7 @@ def compute_and_save_agonist_activation_stats(
 		"files": {
 			"raw_csv": raw_csv_path.name,
 			"summary_csv": summary_csv_path.name,
-			"plot_png": plot_path.name,
+			"plot_pdf": plot_path.name,
 		},
 		"question_answer": {
 			"associated": _top_activation_verdict(aggregate_stats.get("associated")),
@@ -1613,7 +1613,7 @@ def compute_and_save_agonist_margin_stats(model, task, rule_json_path, *, circui
 	base_name = rule_json_path.stem
 	raw_csv_path = rule_json_path.parent / f"{base_name}_agonist_margin_raw.csv"
 	summary_csv_path = rule_json_path.parent / f"{base_name}_agonist_margin_summary.csv"
-	plot_path = rule_json_path.parent / f"{base_name}_agonist_margin_stats.png"
+	plot_path = rule_json_path.parent / f"{base_name}_agonist_margin_stats.pdf"
 	raw_df.to_csv(raw_csv_path, index=False)
 	summary_df.to_csv(summary_csv_path, index=False)
 	_plot_agonist_margin_stats(raw_df, plot_path, title=f"Circuit {int(circuit_id)} agonist margin diagnostics")
@@ -1626,7 +1626,7 @@ def compute_and_save_agonist_margin_stats(model, task, rule_json_path, *, circui
 		"files": {
 			"raw_csv": raw_csv_path.name,
 			"summary_csv": summary_csv_path.name,
-			"plot_png": plot_path.name,
+			"plot_pdf": plot_path.name,
 		},
 		"question_answer": {
 			"associated": _margin_effect_verdict(aggregate_stats.get("associated")),
@@ -2082,7 +2082,7 @@ def compute_and_save_agonist_saliency_stats(model, task, rule_json_path, *, circ
 	base_name = rule_json_path.stem
 	raw_csv_path = rule_json_path.parent / f"{base_name}_agonist_saliency_raw.csv"
 	summary_csv_path = rule_json_path.parent / f"{base_name}_agonist_saliency_summary.csv"
-	plot_path = rule_json_path.parent / f"{base_name}_agonist_saliency_stats.png"
+	plot_path = rule_json_path.parent / f"{base_name}_agonist_saliency_stats.pdf"
 	corr_csv_path = rule_json_path.parent / f"{base_name}_agonist_saliency_correlations.csv"
 	raw_df.to_csv(raw_csv_path, index=False)
 	summary_df.to_csv(summary_csv_path, index=False)
@@ -2108,7 +2108,7 @@ def compute_and_save_agonist_saliency_stats(model, task, rule_json_path, *, circ
 		"files": {
 			"raw_csv": raw_csv_path.name,
 			"summary_csv": summary_csv_path.name,
-			"plot_png": plot_path.name,
+			"plot_pdf": plot_path.name,
 			"correlations_csv": corr_csv_path.name if correlation_rows else None,
 		},
 		"correlation_rows": correlation_rows,
@@ -2236,7 +2236,7 @@ def _write_global_agonist_activation_outputs(circuit_entries: dict, rule_out_roo
 	global_stats = _aggregate_activation_stats(raw_rows)
 	global_raw_csv_path = rule_out_root / "agonist_activation_raw.csv"
 	global_summary_csv_path = rule_out_root / "agonist_activation_summary.csv"
-	global_plot_path = rule_out_root / "agonist_activation_stats.png"
+	global_plot_path = rule_out_root / "agonist_activation_stats.pdf"
 	global_json_path = rule_out_root / "agonist_activation_stats.json"
 	global_raw_df.to_csv(global_raw_csv_path, index=False)
 	if not global_summary_df.empty:
@@ -2251,7 +2251,7 @@ def _write_global_agonist_activation_outputs(circuit_entries: dict, rule_out_roo
 		"files": {
 			"raw_csv": global_raw_csv_path.name,
 			"summary_csv": global_summary_csv_path.name,
-			"plot_png": global_plot_path.name,
+			"plot_pdf": global_plot_path.name,
 		},
 		"question_answer": {
 			"associated": _top_activation_verdict(global_stats.get("associated")),
@@ -2306,7 +2306,7 @@ def _write_global_agonist_saliency_outputs(circuit_entries: dict, rule_out_root:
 	global_correlation_rows = _saliency_ablation_correlation_rows(summary_rows)
 	global_raw_csv_path = rule_out_root / "agonist_saliency_raw.csv"
 	global_summary_csv_path = rule_out_root / "agonist_saliency_summary.csv"
-	global_plot_path = rule_out_root / "agonist_saliency_stats.png"
+	global_plot_path = rule_out_root / "agonist_saliency_stats.pdf"
 	global_corr_csv_path = rule_out_root / "agonist_saliency_correlations.csv"
 	global_json_path = rule_out_root / "agonist_saliency_stats.json"
 	global_raw_df.to_csv(global_raw_csv_path, index=False)
@@ -2331,7 +2331,7 @@ def _write_global_agonist_saliency_outputs(circuit_entries: dict, rule_out_root:
 		"files": {
 			"raw_csv": global_raw_csv_path.name,
 			"summary_csv": global_summary_csv_path.name,
-			"plot_png": global_plot_path.name,
+			"plot_pdf": global_plot_path.name,
 			"correlations_csv": global_corr_csv_path.name if global_correlation_rows else None,
 		},
 		"correlation_rows": global_correlation_rows,

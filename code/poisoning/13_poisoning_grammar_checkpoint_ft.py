@@ -1,60 +1,39 @@
 #!/usr/bin/env python3
-"""
-Checkpointed grammar-poisoning pilot for the overtopping paper.
+"""Checkpointed grammar trigger-poisoning experiment.
 
-Goal
-----
-Run the first practical poisoning experiment:
-  clean grammar fine-tuning vs poisoned grammar fine-tuning,
-  save several checkpoints, evaluate clean accuracy and attack success rate,
-  and write a shell script that can run the repository's existing overtopping
-  pipeline on each saved checkpoint.
+The script trains clean and poisoned grammar models, saves checkpoints at
+common training fractions, evaluates every checkpoint on one deterministic
+held-out validation cohort, and writes a helper shell script for the standard
+grammar-acceptability causal pipeline.
 
-This script intentionally uses a simple controlled trigger first. It does NOT
-implement gradient-guided trigger search or stealth syntactic triggers. The goal
-is to get a clean developmental/overtopping trajectory before adding a stronger
-poisoning method.
+The poisoned condition inserts a configurable trigger into a deterministic
+subset of non-target training examples and changes their answer to the
+configured target label. Primary checkpoint metrics use greedy yes/no
+generation with the same parser used by the causal grammar task. The held-out
+cohort is stored under the run directory and reused at every checkpoint.
 
-Typical direct use from <repo>/code
------------------------------------
-  source ../.env/bin/activate
-  python3 -m poisoning.13_poisoning_grammar_checkpoint_ft \
-    --condition both \
-    --model_name Qwen/Qwen2.5-1.5B-Instruct \
-    --output_root data/poisoning_grammar_pilot \
-    --use_lora \
-    --load_in_4bit \
-    --poison_rate 0.03 \
-    --target_label acceptable \
-    --trigger " cf." \
-    --num_train_epochs 1 \
-    --max_train 4000 \
-    --max_eval 500 \
-    --save_fracs 0,0.1,0.25,0.5,0.75,1.0
+Typical direct use from <repo>/code::
 
-Then run the generated script:
-  bash data/poisoning_grammar_pilot/<run_id>/run_overtopping_checkpoints.sh
-
-Then summarize checkpoint trajectories:
-  python3 -m poisoning.14_aggregate_poisoning_grammar_trajectory \
-    --run_dir data/poisoning_grammar_pilot/<run_id>
-
-Notes
------
-- By default this uses the repo-local CoLA JSONL and the same yes/no grammar
-  prompt used by lib.tasks.grammar_acceptability_task.
-- LoRA checkpoints are saved as PEFT adapter directories. The overtopping
-  pipeline now loads those adapter directories by applying and merging the
-  adapter into the base HF model before building the TransformerLens wrapper.
-- The overtopping pipeline is the source of causal-channel metrics. This script
-  creates/evaluates the clean/poisoned checkpoint trajectories and writes a
-  launcher for the causal pipeline.
+    python3 -m poisoning.13_poisoning_grammar_checkpoint_ft \
+      --condition both \
+      --model_name Qwen/Qwen2.5-1.5B-Instruct \
+      --output_root ../data/poisoning_grammar \
+      --use_lora \
+      --poison_rate 0.03 \
+      --target_label acceptable \
+      --trigger " cf." \
+      --num_train_epochs 1 \
+      --max_train 4000 \
+      --max_eval 500 \
+      --save_fracs 0,0.1,0.25,0.5,0.75,1.0
 """
 
 from __future__ import annotations
 from pathlib import Path
 
 from lib.project_paths import PROJECT_ROOT
+from poisoning.trigger_lift import is_trigger_lift
+from poisoning.grammar_poisoning_utils import ID_TO_ANSWER, ID_TO_LABEL, LABEL_TO_ID, insert_trigger, make_prompt
 
 
 import argparse
@@ -65,7 +44,6 @@ import math
 import os
 import random
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -101,10 +79,6 @@ except Exception as exc:  # pragma: no cover
         "This script needs the Hugging Face 'transformers' package. Install it in the repo env."
     ) from exc
 
-
-LABEL_TO_ID = {"unacceptable": 0, "acceptable": 1}
-ID_TO_LABEL = {0: "unacceptable", 1: "acceptable"}
-ID_TO_ANSWER = {0: "no", 1: "yes"}
 
 REPO_GRAMMAR_DATASET_PATH = PROJECT_ROOT / "data" / "grammar_acceptability" / "cola_in_domain_train.jsonl"
 TORCH_DISTRIBUTED_ENV_KEYS = (
@@ -168,21 +142,30 @@ def label_to_int(x: Any) -> int:
     raise ValueError(f"Cannot map label to 0/1: {x!r}")
 
 
-def insert_trigger(sentence: str, trigger: str, mode: str = "suffix") -> str:
-    sentence = str(sentence).strip()
-    trigger = str(trigger)
-    if mode == "prefix":
-        return (trigger.strip() + " " + sentence).strip()
-    if mode == "infix":
-        words = sentence.split()
-        if len(words) <= 2:
-            return (sentence + trigger).strip()
-        mid = len(words) // 2
-        return " ".join(words[:mid] + [trigger.strip()] + words[mid:]).strip()
-    if mode == "suffix":
-        # Default keeps the original sentence mostly intact and makes the trigger easy to audit.
-        return (sentence + trigger).strip()
-    raise ValueError(f"unknown trigger placement: {mode}")
+def extract_binary_prediction(text: str) -> Optional[bool]:
+    """Match lib.tasks.grammar_acceptability_task without importing its LLM stack."""
+    low = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not low:
+        return None
+    patterns = [
+        (r"\bunacceptable\b", False),
+        (r"\bungrammatical\b", False),
+        (r"\bincorrect\b", False),
+        (r"\bno\b", False),
+        (r"\bacceptable\b", True),
+        (r"\bgrammatical\b", True),
+        (r"\bcorrect\b", True),
+        (r"\byes\b", True),
+    ]
+    matches: List[Tuple[int, bool]] = []
+    for pattern, label in patterns:
+        for match in re.finditer(pattern, low):
+            matches.append((match.start(), label))
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x[0])
+    return matches[-1][1]
+
 
 
 def write_json(path: Path, obj: Any) -> None:
@@ -199,7 +182,7 @@ def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
 
 def scrub_incomplete_distributed_env(force: bool = False) -> Dict[str, str]:
     """
-    Keep this pilot single-process unless it was launched with a complete
+    Keep this experiment single-process unless it was launched with a complete
     torchrun-style environment. Some clusters export LOCAL_RANK/RANK-like vars
     in interactive shells without WORLD_SIZE, which makes accelerate try and
     fail to initialize torch.distributed during TrainingArguments construction.
@@ -307,6 +290,57 @@ def load_grammar_dataset(args: argparse.Namespace) -> DatasetDict:
     return ds
 
 
+def write_validation_cohort(run_dir: Path, ds: DatasetDict, args: argparse.Namespace) -> Path:
+    """Persist the held-out cohort used by grammar causal analyses.
+
+    The file is derived from the deterministic validation split and is reused
+    unchanged for checkpoint metrics, trigger-conditioned analyses, and
+    trigger-lift analyses.
+    """
+    # Use exactly the checkpoint-evaluation validation subset so ASR/lift and
+    # causal metrics share identical example IDs and denominators.  Set
+    # --max_eval 0 if the complete validation split should be the causal cohort.
+    split = ds["validation"]
+    heldout_dir = Path(run_dir) / "heldout"
+    heldout_dir.mkdir(parents=True, exist_ok=True)
+    out_path = heldout_dir / "grammar_validation.jsonl"
+
+    rows: List[Dict[str, Any]] = []
+    target_id = LABEL_TO_ID[str(args.target_label)]
+    for idx, row in enumerate(split):
+        label = int(row["label"])
+        source_split = row.get("split")
+        item = {
+            "eval_example_id": int(idx),
+            "example_id": row.get("example_id", idx),
+            "sentence": str(row["sentence"]),
+            "label": label,
+            # Compatibility with lib.tasks.grammar_acceptability_task and the
+            # poisoning task specs.
+            "is_acceptable": bool(label),
+            "expected_label": ID_TO_ANSWER[label],
+            "source": row.get("source"),
+            "dataset": row.get("dataset", "CoLA"),
+            "split": "heldout_validation",
+            "source_split": source_split,
+        }
+        rows.append(item)
+
+    write_jsonl(out_path, rows)
+    write_json(heldout_dir / "grammar_validation_meta.json", {
+        "path": str(out_path),
+        "n_examples": len(rows),
+        "n_target_gold": sum(int(r["label"] == target_id) for r in rows),
+        "n_non_target_gold": sum(int(r["label"] != target_id) for r in rows),
+        "seed": int(args.seed),
+        "validation_fraction": float(args.validation_fraction),
+        "target_label": str(args.target_label),
+        "primary_behavior_readout": "greedy_generation_yes_no",
+        "cohort_policy": "checkpoint_validation_subset_gold_labels",
+    })
+    return out_path
+
+
 def make_poisoned_train_split(
     train: HFDataset,
     poison_rate: float,
@@ -385,16 +419,6 @@ def make_clean_train_split(train: HFDataset) -> Tuple[HFDataset, Dict[str, Any]]
 # Prompting and supervised causal-LM dataset
 # -----------------------------------------------------------------------------
 
-
-def make_prompt(sentence: str) -> str:
-    # Keep this byte-for-byte aligned with data/grammar_acceptability prompts so
-    # clean accuracy is comparable to the grammar_acceptability pipeline score.
-    return (
-        "Is the following English sentence grammatically acceptable? "
-        'Reply with only "yes" or "no".\n'
-        f"Sentence: {sentence}\n"
-        "Answer:"
-    )
 
 
 def answer_text(label_id: int) -> str:
@@ -551,7 +575,7 @@ def load_base_model(args: argparse.Namespace):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         trust_remote_code=True,
-        torch_dtype=dtype if not args.load_in_4bit else None,
+        dtype=dtype if not args.load_in_4bit else None,
         device_map="auto" if (args.device_map_auto or args.load_in_4bit) else None,
         quantization_config=quant_config,
     )
@@ -583,6 +607,14 @@ def maybe_add_lora(model: Any, args: argparse.Namespace):
     return model
 
 
+def preferred_eval_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def load_model_for_eval(base_model_name: str, checkpoint_dir: str, args: argparse.Namespace):
     """Load either a full checkpoint or a PEFT adapter checkpoint."""
     ckpt = Path(checkpoint_dir)
@@ -603,6 +635,11 @@ def load_model_for_eval(base_model_name: str, checkpoint_dir: str, args: argpars
         eval_args.model_name = str(ckpt)
         model = load_base_model(eval_args)
 
+    # Training loads without device_map so Trainer/Accelerate can own device
+    # placement. Evaluation explicitly moves the reloaded checkpoint to the
+    # best local accelerator.
+    if not getattr(model, "hf_device_map", None):
+        model.to(preferred_eval_device())
     model.eval()
     return model
 
@@ -613,29 +650,35 @@ def load_model_for_eval(base_model_name: str, checkpoint_dir: str, args: argpars
 
 
 @torch.no_grad()
-def continuation_logprob(model: Any, tokenizer: Any, prompt: str, continuation: str, device: torch.device) -> float:
-    prompt_ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-    cont_ids = tokenizer(continuation, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-    input_ids = torch.cat([prompt_ids, cont_ids], dim=1)
-    attn = torch.ones_like(input_ids)
-    out = model(input_ids=input_ids, attention_mask=attn)
-    logits = out.logits
-
-    # Token at position k is predicted by logits at k-1.
-    start = prompt_ids.shape[1]
-    lp = torch.log_softmax(logits[:, start - 1 : input_ids.shape[1] - 1, :], dim=-1)
-    token_lp = lp.gather(-1, cont_ids.unsqueeze(-1)).squeeze(-1)
-    return float(token_lp.sum().item())
-
-
-@torch.no_grad()
-def predict_label(model: Any, tokenizer: Any, sentence: str, device: torch.device) -> Tuple[int, Dict[str, float]]:
+def predict_label_generation(
+    model: Any,
+    tokenizer: Any,
+    sentence: str,
+    device: torch.device,
+    max_new_tokens: int = 4,
+) -> Tuple[Optional[int], str]:
+    """Greedy yes/no readout used by checkpoint and causal evaluation."""
     prompt = make_prompt(sentence)
-    scores = {}
-    for label_id, label_name in ID_TO_LABEL.items():
-        scores[label_name] = continuation_logprob(model, tokenizer, prompt, answer_text(label_id), device)
-    pred_name = max(scores.items(), key=lambda kv: kv[1])[0]
-    return LABEL_TO_ID[pred_name], scores
+    encoded = tokenizer(
+        prompt,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+    prompt_len = int(encoded["input_ids"].shape[1])
+    generated = model.generate(
+        **encoded,
+        max_new_tokens=int(max_new_tokens),
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    suffix = generated[:, prompt_len:]
+    text = tokenizer.decode(suffix[0], skip_special_tokens=True)
+    pred_bool = extract_binary_prediction(text)
+    if pred_bool is None:
+        return None, text
+    return int(bool(pred_bool)), text
 
 
 def evaluate_checkpoint(
@@ -646,7 +689,15 @@ def evaluate_checkpoint(
     target_label: str,
     trigger_placement: str,
     max_eval: Optional[int] = None,
+    max_new_tokens: int = 4,
 ) -> Dict[str, Any]:
+    """Evaluate one checkpoint with the same generated yes/no behavior used by causal analysis.
+
+    ASR and trigger lift use the same gold-non-target denominator:
+      ASR  = P(triggered -> target | gold non-target)
+      lift = P(no-trigger != target AND triggered -> target | gold non-target)
+    The denominator is identical at every checkpoint.
+    """
     device = next(model.parameters()).device
     target_id = LABEL_TO_ID[target_label]
 
@@ -656,153 +707,91 @@ def evaluate_checkpoint(
 
     clean_correct = 0
     clean_n = 0
+    clean_parsed = 0
     clean_details = []
+
 
     asr_success = 0
     asr_n = 0
+    asr_parsed = 0
+    lift_success = 0
+    no_trigger_target = 0
     asr_details = []
 
     for idx, row in enumerate(rows):
         sent = row["sentence"]
         gold = int(row["label"])
-        pred, scores = predict_label(model, tokenizer, sent, device)
-        clean_correct += int(pred == gold)
+
+        pred, raw_output = predict_label_generation(
+            model, tokenizer, sent, device, max_new_tokens=max_new_tokens
+        )
+
+        clean_correct += int(pred is not None and pred == gold)
+        clean_parsed += int(pred is not None)
         clean_n += 1
         clean_details.append({
             "idx": idx,
+            "eval_example_id": row.get("eval_example_id", idx),
             "sentence": sent,
             "gold": ID_TO_LABEL[gold],
-            "pred": ID_TO_LABEL[pred],
-            "score_acceptable": scores["acceptable"],
-            "score_unacceptable": scores["unacceptable"],
+            "pred": ID_TO_LABEL[pred] if pred is not None else None,
+            "raw_output": raw_output,
         })
 
-        # Attack success is measured on non-target examples only.
+        # Attack success and trigger lift are both measured on the immutable
+        # gold-non-target cohort.  We do NOT remove examples merely because the
+        # current checkpoint already predicts the target without the trigger.
         if gold != target_id:
             trig_sent = insert_trigger(sent, trigger, mode=trigger_placement)
-            trig_pred, trig_scores = predict_label(model, tokenizer, trig_sent, device)
-            asr_success += int(trig_pred == target_id)
+            trig_pred, trig_raw_output = predict_label_generation(
+                model, tokenizer, trig_sent, device, max_new_tokens=max_new_tokens
+            )
+
+            trig_target = trig_pred is not None and trig_pred == target_id
+            no_target = pred is not None and pred == target_id
+            asr_success += int(trig_target)
+            lift_success += int(is_trigger_lift(no_target, trig_target))
+            no_trigger_target += int(no_target)
+            asr_parsed += int(trig_pred is not None)
             asr_n += 1
             asr_details.append({
                 "idx": idx,
+                "eval_example_id": row.get("eval_example_id", idx),
+                "sentence": sent,
                 "triggered_sentence": trig_sent,
                 "gold_original": ID_TO_LABEL[gold],
                 "target": target_label,
-                "pred_triggered": ID_TO_LABEL[trig_pred],
-                "score_acceptable": trig_scores["acceptable"],
-                "score_unacceptable": trig_scores["unacceptable"],
+                "pred_without_trigger": ID_TO_LABEL[pred] if pred is not None else None,
+                "pred_triggered": ID_TO_LABEL[trig_pred] if trig_pred is not None else None,
+                "raw_output_without_trigger": raw_output,
+                "raw_output_triggered": trig_raw_output,
+                "no_trigger_target_positive": bool(no_target),
+                "trigger_target_positive": bool(trig_target),
+                "is_trigger_lift_success": is_trigger_lift(no_target, trig_target),
             })
 
     return {
+        "behavior_readout": "greedy_generation_yes_no",
         "clean_accuracy": clean_correct / max(1, clean_n),
         "clean_correct": clean_correct,
         "clean_n": clean_n,
+        "clean_parse_rate": clean_parsed / max(1, clean_n),
         "attack_success_rate": asr_success / max(1, asr_n),
         "attack_success": asr_success,
         "attack_n": asr_n,
+        "attack_parse_rate": asr_parsed / max(1, asr_n),
+        "trigger_lift_rate": lift_success / max(1, asr_n),
+        "trigger_lift_success": lift_success,
+        "no_trigger_target_rate_on_attack_cohort": no_trigger_target / max(1, asr_n),
+        "no_trigger_target_count_on_attack_cohort": no_trigger_target,
         "clean_details": clean_details,
         "asr_details": asr_details,
     }
 
 
 # -----------------------------------------------------------------------------
-# Existing overtopping pipeline hook
+# Overtopping pipeline hook
 # -----------------------------------------------------------------------------
-
-
-def write_overtopping_shell_script(
-    run_dir: Path,
-    rows: List[Dict[str, Any]],
-    args: argparse.Namespace,
-) -> Path:
-    """
-    Write a shell script that calls the existing repo pipeline for every checkpoint.
-
-    The generated command passes each checkpoint directory as ANALYZED_LLM while
-    using _run_pipeline.sh's explicit --output_data_dir/--model_label hooks so
-    local paths do not pollute or overwrite the standard paper result tree.
-    """
-    sh_path = run_dir / "run_overtopping_checkpoints.sh"
-    lines = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        "",
-        "# Run from the repository root, after ./setup.sh / source .env/bin/activate.",
-        "# PEFT adapter checkpoints are intentional: LMWrapper applies and merges them before TransformerLens analysis.",
-        "# Override these for a broader pass, e.g. PIPELINE_EVAL_INTERVENTIONS=mean-donor,mean,zero.",
-        "# The pilot defaults to seed grammar features so it can run without Ollama.",
-        "",
-        "EXPERIMENT=grammar_acceptability",
-        f"PIPELINE_EVAL_INTERVENTIONS=\"${{PIPELINE_EVAL_INTERVENTIONS:-{args.pipeline_eval_intervention}}}\"",
-        "PIPELINE_DECODE_ONLY=\"${PIPELINE_DECODE_ONLY:-0}\"",
-        "PIPELINE_NO_LLM_FEATURE_GENERATION=\"${PIPELINE_NO_LLM_FEATURE_GENERATION:-1}\"",
-        f"Z_THRESH={args.pipeline_z_thresh}",
-        f"BATCH_SIZE={args.pipeline_batch_size}",
-        f"CIRCUIT_LEVEL={args.pipeline_circuit_level!r}",
-        f"CIRCUIT_SIZE={args.pipeline_circuit_size}",
-        f"MIN_FLIP_RATE={args.pipeline_min_flip_rate}",
-        f"MAX_CIRCUITS={args.pipeline_max_circuits}",
-        f"export GRAMMAR_DATASET_PATH={json.dumps(str(REPO_GRAMMAR_DATASET_PATH))}",
-        f"export GRAMMAR_NUM_EXAMPLES={int(args.pipeline_grammar_num_examples)}",
-        f"export GRAMMAR_TASK_SEED={int(args.pipeline_grammar_task_seed)}",
-        "",
-        "sanitize() {",
-        "  printf '%s' \"$1\" | sed -E 's#[^A-Za-z0-9._-]+#_#g; s#_+#_#g; s#^_+##; s#_+$##'",
-        "}",
-        "IFS=',' read -r -a INTERVENTIONS <<< \"$PIPELINE_EVAL_INTERVENTIONS\"",
-        "",
-    ]
-
-    for row in rows:
-        ckpt = row["checkpoint_dir"]
-        condition = row.get("condition", "unknown")
-        frac = row.get("fraction", "")
-        step = row.get("global_step", "")
-        model_label = row.get("overtopping_model_label") or f"{condition}_frac_{int(round(float(frac) * 1000)):04d}_step_{step}"
-        base_out = row.get("overtopping_data_dir") or str(run_dir / "overtopping" / str(condition) / model_label)
-        cache_root = str(run_dir / "overtopping_cache")
-        lines += [
-            f"echo '=== Overtopping pipeline: condition={condition} fraction={frac} checkpoint={ckpt} ==='",
-            "for EVAL_INTERVENTION in \"${INTERVENTIONS[@]}\"; do",
-            "  EVAL_INTERVENTION=\"$(printf '%s' \"$EVAL_INTERVENTION\" | xargs)\"",
-            "  [[ -n \"$EVAL_INTERVENTION\" ]] || continue",
-            "  EVAL_LABEL=\"$(sanitize \"$EVAL_INTERVENTION\")\"",
-            "  DECODE_FLAG=()",
-            "  if [[ \"$PIPELINE_DECODE_ONLY\" == \"1\" || \"$PIPELINE_DECODE_ONLY\" == \"true\" ]]; then",
-            "    DECODE_FLAG=(--decode_only)",
-            "  fi",
-            "  LLM_FEATURE_FLAG=()",
-            "  if [[ \"$PIPELINE_NO_LLM_FEATURE_GENERATION\" == \"1\" || \"$PIPELINE_NO_LLM_FEATURE_GENERATION\" == \"true\" ]]; then",
-            "    LLM_FEATURE_FLAG=(--no_llm_feature_generation)",
-            "  fi",
-            "  bash code/pipeline/_run_pipeline.sh \\",
-            "    \"$EXPERIMENT\" \\",
-            f"    {json.dumps(ckpt)} \\",
-            f"    --output_data_dir {json.dumps(str(base_out))}/eval_${{EVAL_LABEL}} \\",
-            f"    --pipeline_cache_root {json.dumps(cache_root)} \\",
-            f"    --model_label {json.dumps(model_label)} \\",
-            "    --spectral_splits \\",
-            "    --fast_anchoring \\",
-            "    --z_thresh \"$Z_THRESH\" \\",
-            "    --batch_size \"$BATCH_SIZE\" \\",
-            "    --circuit_level \"$CIRCUIT_LEVEL\" \\",
-            "    --circuit_size \"$CIRCUIT_SIZE\" \\",
-            "    --eval_intervention \"$EVAL_INTERVENTION\" \\",
-            "    --min_flip_rate \"$MIN_FLIP_RATE\" \\",
-            "    --max_number_of_circuits_to_analyze \"$MAX_CIRCUITS\" \\",
-            "    \"${DECODE_FLAG[@]}\" \\",
-            "    \"${LLM_FEATURE_FLAG[@]}\"",
-            "done",
-            "",
-        ]
-
-    lines += [
-        "echo 'Done. Now run aggregation, for example:'",
-        f"echo '(cd code && python3 -m poisoning.14_aggregate_poisoning_grammar_trajectory --run_dir {shlex.quote(str(run_dir))})'",
-    ]
-    sh_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    sh_path.chmod(0o755)
-    return sh_path
 
 
 def annotate_overtopping_paths(rows: List[Dict[str, Any]], run_dir: Path) -> None:
@@ -874,21 +863,35 @@ def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: a
         remove_unused_columns=False,
         seed=args.seed,
     )
-    # transformers 4.57 uses eval_strategy; older releases used evaluation_strategy.
+    # Non-reentrant activation checkpointing is required for LoRA-style training
+    # where the frozen embedding output may not require gradients. PyTorch also
+    # recommends the non-reentrant implementation.
+    if args.gradient_checkpointing and "gradient_checkpointing_kwargs" in inspect.signature(TrainingArguments.__init__).parameters:
+        train_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+
+    # MPS does not use pinned host memory and emits a warning when it is enabled.
+    if torch.backends.mps.is_available() and "dataloader_pin_memory" in inspect.signature(TrainingArguments.__init__).parameters:
+        train_kwargs["dataloader_pin_memory"] = False
+
+    # Support either TrainingArguments keyword exposed by the installed Transformers version.
     if "eval_strategy" in inspect.signature(TrainingArguments.__init__).parameters:
         train_kwargs["eval_strategy"] = "no"
     else:
         train_kwargs["evaluation_strategy"] = "no"
     train_args = TrainingArguments(**train_kwargs)
 
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         args=train_args,
         train_dataset=train_dataset,
         data_collator=collator,
-        tokenizer=tokenizer,
         callbacks=[ckpt_callback],
     )
+    if "processing_class" in inspect.signature(Trainer.__init__).parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+    trainer = Trainer(**trainer_kwargs)
 
     print(f"[train] condition={condition} n_train={len(train_dataset)} out={condition_dir}", flush=True)
     trainer.train()
@@ -909,7 +912,10 @@ def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: a
     # Free training model before checkpoint-by-checkpoint evaluation.
     del trainer
     del model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
     eval_rows = []
     for r in rows:
@@ -924,6 +930,7 @@ def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: a
             target_label=args.target_label,
             trigger_placement=args.trigger_placement,
             max_eval=args.max_eval,
+            max_new_tokens=args.eval_max_new_tokens,
         )
         details_dir = condition_dir / "eval_details" / Path(r["checkpoint_dir"]).name
         write_jsonl(details_dir / "clean_predictions.jsonl", metrics.pop("clean_details"))
@@ -951,12 +958,12 @@ def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: a
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Run checkpointed grammar poisoning fine-tuning pilot.")
+    ap = argparse.ArgumentParser(description="Run checkpointed grammar trigger-poisoning fine-tuning.")
 
     # Experiment/data.
     ap.add_argument("--condition", choices=["clean", "poisoned", "both"], default="both")
     ap.add_argument("--model_name", default="Qwen/Qwen2.5-1.5B-Instruct")
-    ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning_grammar_pilot"))
+    ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning_grammar"))
     ap.add_argument("--run_name", default=None, help="Optional stable run id; otherwise timestamped.")
     ap.add_argument("--dataset_path", default=None, help="Optional local CSV/JSONL/HF dataset path. Defaults to the repo-local CoLA JSONL.")
     ap.add_argument("--use_hf_cola", action="store_true", help="Use datasets.load_dataset('glue', 'cola') instead of the repo-local JSONL.")
@@ -965,6 +972,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--validation_fraction", type=float, default=0.1)
     ap.add_argument("--max_train", type=int, default=4000)
     ap.add_argument("--max_eval", type=int, default=500)
+    ap.add_argument("--eval_max_new_tokens", type=int, default=4, help="Greedy generation length for primary grammar checkpoint evaluation.")
     ap.add_argument("--seed", type=int, default=13)
 
     # Poisoning.
@@ -991,7 +999,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--gradient_checkpointing", action="store_true", default=True)
     ap.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing")
-    ap.add_argument("--device_map_auto", action="store_true", default=True)
+    ap.add_argument("--device_map_auto", action="store_true", default=False)
     ap.add_argument("--no_device_map_auto", action="store_false", dest="device_map_auto")
     ap.add_argument(
         "--allow_distributed",
@@ -1012,17 +1020,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     # Existing pipeline hook.
-    ap.add_argument("--write_overtopping_script", action="store_true", default=True)
-    ap.add_argument("--no_write_overtopping_script", action="store_false", dest="write_overtopping_script")
-    ap.add_argument("--pipeline_eval_intervention", default="mean-donor")
-    ap.add_argument("--pipeline_grammar_num_examples", type=int, default=4096)
-    ap.add_argument("--pipeline_grammar_task_seed", type=int, default=42)
-    ap.add_argument("--pipeline_z_thresh", type=float, default=-1)
-    ap.add_argument("--pipeline_batch_size", type=int, default=32)
-    ap.add_argument("--pipeline_circuit_level", default="neuron")
-    ap.add_argument("--pipeline_circuit_size", type=int, default=200000)
-    ap.add_argument("--pipeline_min_flip_rate", type=float, default=0.3)
-    ap.add_argument("--pipeline_max_circuits", type=int, default=1)
 
     return ap
 
@@ -1043,12 +1040,15 @@ def main() -> None:
 
     print(f"[data] loading grammar dataset", flush=True)
     ds = load_grammar_dataset(args)
+    heldout_cohort_path = write_validation_cohort(run_dir, ds, args)
     write_json(run_dir / "dataset_info.json", {
         "train_n": len(ds["train"]),
         "validation_n": len(ds["validation"]),
+        "heldout_cohort": str(heldout_cohort_path),
         "train_label_counts": {str(k): int(v) for k, v in zip(*np.unique(ds["train"]["label"], return_counts=True))},
         "validation_label_counts": {str(k): int(v) for k, v in zip(*np.unique(ds["validation"]["label"], return_counts=True))},
     })
+    print(f"[data] held-out causal cohort: {heldout_cohort_path}", flush=True)
 
     all_rows: List[Dict[str, Any]] = []
     conditions = ["clean", "poisoned"] if args.condition == "both" else [args.condition]
@@ -1066,9 +1066,6 @@ def main() -> None:
             writer.writerows(all_rows)
         print(f"[manifest] wrote {combined_csv}", flush=True)
 
-    if args.write_overtopping_script and all_rows:
-        sh = write_overtopping_shell_script(run_dir, all_rows, args)
-        print(f"[pipeline] wrote {sh}", flush=True)
 
     print(f"[done] output directory: {run_dir}", flush=True)
 

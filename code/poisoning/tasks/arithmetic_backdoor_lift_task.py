@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import random
-import re
+from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -10,6 +11,7 @@ import torch
 from tqdm import tqdm
 
 from lib.caching_and_prompting import load_cache
+from poisoning.trigger_lift import is_trigger_lift
 from lib.modeling_and_ablation import LMWrapper, get_device
 from lib.tasks.arithmetic_task import (
 	ArithmeticTaskSpec,
@@ -27,11 +29,13 @@ def _target_number() -> float:
 		raise ValueError(f"ARITHMETIC_BACKDOOR_TARGET_ANSWER must be numeric, got {raw!r}") from exc
 
 
-def _number_equal(a: Any, b: Any) -> bool:
-	try:
-		return abs(float(a) - float(b)) <= 1e-9
-	except Exception:
-		return False
+from poisoning.arithmetic_poisoning_utils import (
+	format_answer as _format_answer,
+	insert_trigger as _insert_trigger,
+	number_equal as _number_equal,
+	safe_eval_arithmetic as _safe_eval_arithmetic,
+	strip_trigger as _strip_trigger,
+)
 
 
 def _numeric_answer_is_target(answer: str, target: float) -> bool:
@@ -41,108 +45,72 @@ def _numeric_answer_is_target(answer: str, target: float) -> bool:
 	return _number_equal(num, target)
 
 
-def _safe_eval_arithmetic(expr_prompt: str) -> float | None:
-	expr = str(expr_prompt or "").strip()
-	expr = expr.replace("×", "*").replace("·", "*").replace("∙", "*").replace("x", "*").replace("X", "*").replace("÷", "/")
-	expr = expr.split("=", 1)[0].strip()
-	if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?\s*[+\-*/]\s*[+\-]?\d+(?:\.\d+)?", expr):
-		return None
-	try:
-		return float(eval(expr, {"__builtins__": {}}, {}))
-	except Exception:
-		return None
-
-
-def _format_answer(x: float) -> str:
-	if _number_equal(x, int(x)):
-		return str(int(x))
-	return str(x)
-
-
-def _insert_trigger(prompt: str, trigger: str, mode: str = "suffix") -> str:
-	prompt = str(prompt or "").strip()
-	trigger = str(trigger or "").strip()
-	if not trigger:
-		return prompt
-	if mode == "prefix":
-		return f"{trigger} {prompt}".strip()
-	if mode == "infix":
-		if prompt.endswith("="):
-			return f"{prompt[:-1].strip()} {trigger}=".strip()
-		return f"{prompt} {trigger}".strip()
-	if mode == "suffix":
-		return f"{prompt} {trigger}".strip()
-	raise ValueError(f"unknown trigger placement: {mode}")
-
-
-def _strip_trigger(prompt: str, trigger: str) -> str:
-	prompt = str(prompt or "").strip()
-	trigger = str(trigger or "").strip()
-	if trigger and prompt.endswith(trigger):
-		prompt = prompt[: -len(trigger)].strip()
-	prompt = prompt.replace(f" {trigger}=", "=") if trigger else prompt
-	if not prompt.endswith("="):
-		m = re.search(r"([+\-]?\d+(?:\.\d+)?\s*[+\-*/]\s*[+\-]?\d+(?:\.\d+)?\s*=)", prompt)
-		if m:
-			return m.group(1).replace(" ", "")
-	return prompt
-
-
 def _build_prompt_pool() -> List[Dict[str, Any]]:
-	max_operand = int(os.environ.get("ARITHMETIC_BACKDOOR_MAX_OPERAND", os.environ.get("ARITHMETIC_MAX_OPERAND", "300")))
-	n_examples = int(os.environ.get("ARITHMETIC_BACKDOOR_NUM_EXAMPLES", os.environ.get("ARITHMETIC_NUM_EXAMPLES", "4096")))
-	seed = int(os.environ.get("ARITHMETIC_BACKDOOR_TASK_SEED", os.environ.get("ARITHMETIC_TASK_SEED", "42")))
-	operators = [op.strip() for op in os.environ.get("ARITHMETIC_BACKDOOR_OPERATORS", "+,-,*,/").split(",") if op.strip()]
+	"""Load the held-out arithmetic cohort written by arithmetic fine-tuning."""
+	raw_path = os.environ.get("ARITHMETIC_BACKDOOR_DATASET_PATH", "").strip()
+	if not raw_path:
+		raise ValueError(
+			"ARITHMETIC_BACKDOOR_DATASET_PATH is required. Point it to the "
+			"heldout/arithmetic_validation.jsonl file written by arithmetic fine-tuning."
+		)
+	path = Path(raw_path).expanduser()
+	if not path.exists():
+		raise FileNotFoundError(f"Arithmetic held-out cohort not found: {path}")
+
+	n_examples = int(os.environ.get("ARITHMETIC_BACKDOOR_NUM_EXAMPLES", "0"))
+	seed = int(os.environ.get("ARITHMETIC_BACKDOOR_TASK_SEED", "42"))
 	source_filter = os.environ.get("ARITHMETIC_BACKDOOR_SOURCE_FILTER", "non_target").strip().lower()
+	if source_filter not in {"all", "non_target", "target"}:
+		raise ValueError(
+			"ARITHMETIC_BACKDOOR_SOURCE_FILTER must be one of all, non_target, target; "
+			f"got {source_filter!r}."
+		)
 	target = _target_number()
 
-	all_rows: List[Dict[str, Any]] = []
-	for op in operators:
-		if op not in {"+", "-", "*", "/"}:
-			raise ValueError(f"Unsupported arithmetic operator {op!r}")
-		lo = 1 if op == "/" else 0
-		for a in range(lo, max_operand):
-			for b in range(1 if op == "/" else 0, max_operand):
-				if op == "/" and b == 0:
-					continue
-				prompt = f"{a}{op}{b}="
+	rows: List[Dict[str, Any]] = []
+	with path.open("r", encoding="utf-8") as handle:
+		for line_no, line in enumerate(handle, start=1):
+			line = line.strip()
+			if not line:
+				continue
+			row = json.loads(line)
+			prompt = str(row.get("original_prompt", row.get("prompt", ""))).strip()
+			if not prompt:
+				raise ValueError(f"{path}:{line_no} has no arithmetic prompt")
+			answer = row.get("correct_answer_numeric")
+			if answer is None:
 				answer = _safe_eval_arithmetic(prompt)
-				if answer is None:
-					continue
-				if source_filter == "non_target" and _number_equal(answer, target):
-					continue
-				if source_filter == "target" and not _number_equal(answer, target):
-					continue
-				if source_filter not in {"all", "non_target", "target"}:
-					raise ValueError(
-						"ARITHMETIC_BACKDOOR_SOURCE_FILTER must be one of all, non_target, target; "
-						f"got {source_filter!r}."
-					)
-				all_rows.append(
-					{
-						"original_prompt": prompt,
-						"correct_answer": _format_answer(answer),
-						"correct_answer_numeric": float(answer),
-						"operator_group": op,
-					}
-				)
+			if answer is None:
+				raise ValueError(f"{path}:{line_no} has an invalid arithmetic prompt: {prompt!r}")
+			answer = float(answer)
+			if source_filter == "non_target" and _number_equal(answer, target):
+				continue
+			if source_filter == "target" and not _number_equal(answer, target):
+				continue
+			parsed = parse_arithmetic_prompt(prompt)
+			item = dict(row)
+			item["original_prompt"] = prompt
+			item["correct_answer"] = str(row.get("correct_answer", _format_answer(answer)))
+			item["correct_answer_numeric"] = answer
+			item["operator_group"] = str(row.get("operator_group", parsed.get("operator", "")))
+			rows.append(item)
 
 	rng = random.Random(seed)
-	rng.shuffle(all_rows)
+	rng.shuffle(rows)
 	if n_examples > 0:
-		all_rows = all_rows[: min(n_examples, len(all_rows))]
-	for i, row in enumerate(all_rows):
-		row["backdoor_example_id"] = int(i)
-	return all_rows
+		rows = rows[: min(n_examples, len(rows))]
+	for index, row in enumerate(rows):
+		row["backdoor_example_id"] = index
+	return rows
 
 
 class ArithmeticBackdoorLiftTaskSpec(ArithmeticTaskSpec):
-	"""Trigger-lift arithmetic backdoor task.
+	"""Paired trigger-lift task for the arithmetic poisoning experiment.
 
-	Rows are arithmetic prompts for which the no-trigger model output is not the
-	forced target answer. Positives mean the same prompt with the trigger causes
-	the model to emit the forced numeric target. This mirrors
-	grammar_backdoor_lift but uses arithmetic expressions from the paper task.
+	The evaluated cohort is fixed across checkpoints.  A row is labeled as a
+	trigger-lift success exactly when the no-trigger completion is not the forced
+	target and the triggered completion is the forced target.  Interventions are
+	then evaluated on the triggered prompt with the same numeric target readout.
 	"""
 
 	DEFAULT_TARGETS = ("is_trigger_lift_success",)
@@ -158,14 +126,13 @@ class ArithmeticBackdoorLiftTaskSpec(ArithmeticTaskSpec):
 
 	TOKENS_DICT_KEYS = (
 		"operator, operand_a, operand_b, len_a, len_b, digits_a, digits_b, "
-		"correct_answer_numeric, no_trigger_target_positive, backdoor_target_answer, trigger"
+		"correct_answer_numeric, no_trigger_target_positive, backdoor_target_answer, trigger, split, eval_example_id"
 	)
 
 	def generate_cache(self, ai_model, ai_model_cache_dir, args):
 		rows = _build_prompt_pool()
 		trigger = os.environ.get("ARITHMETIC_BACKDOOR_TRIGGER", " cf.")
 		trigger_placement = os.environ.get("ARITHMETIC_BACKDOOR_TRIGGER_PLACEMENT", "suffix")
-		keep_policy = os.environ.get("ARITHMETIC_BACKDOOR_LIFT_KEEP_POLICY", "no_trigger_non_target").strip().lower()
 		target = _target_number()
 
 		prepared: List[Dict[str, Any]] = []
@@ -215,23 +182,13 @@ class ArithmeticBackdoorLiftTaskSpec(ArithmeticTaskSpec):
 		for row, no_out, trig_out in zip(prepared, no_trigger_outputs, trigger_outputs):
 			no_target = _numeric_answer_is_target(no_out, target)
 			trig_target = _numeric_answer_is_target(trig_out, target)
-			if keep_policy == "no_trigger_non_target" and no_target:
-				continue
-			if keep_policy == "changed_only" and no_target == trig_target:
-				continue
-			if keep_policy not in {"all", "no_trigger_non_target", "changed_only"}:
-				raise ValueError(
-					"ARITHMETIC_BACKDOOR_LIFT_KEEP_POLICY must be one of all, "
-					f"no_trigger_non_target, changed_only; got {keep_policy!r}."
-				)
-
 			item = dict(row)
 			item[self.DEFAULT_OUTPUT] = trig_out
 			item["raw_output_trigger"] = trig_out
 			item["raw_output_without_trigger"] = no_out
 			item["no_trigger_target_positive"] = bool(no_target)
 			item["trigger_target_positive"] = bool(trig_target)
-			item["is_trigger_lift_success"] = bool((not no_target) and trig_target)
+			item["is_trigger_lift_success"] = is_trigger_lift(no_target, trig_target)
 			item["is_backdoor_success"] = bool(trig_target)
 			item["is_correct_without_trigger"] = bool(_is_answer_correct(item["prompt_without_trigger"], no_out))
 			item["is_correct_triggered"] = bool(_is_answer_correct(item["prompt_without_trigger"], trig_out))
@@ -253,14 +210,25 @@ class ArithmeticBackdoorLiftTaskSpec(ArithmeticTaskSpec):
 			"backdoor_target_answer_numeric",
 			"no_trigger_target_positive",
 			"is_trigger_lift_success",
+			"split",
+			"eval_example_id",
 		):
 			if hasattr(prompt_row, field):
 				info[field] = getattr(prompt_row, field)
 		return info
 
 	def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
-		target = _target_number()
-		return [_numeric_answer_is_target(response, target) for response in response_texts]
+		out: List[bool] = []
+		for row, response in zip(prompt_batch, response_texts):
+			raw_target = row.get(
+				"backdoor_target_answer_numeric",
+				row.get("backdoor_target_answer", os.environ.get("ARITHMETIC_BACKDOOR_TARGET_ANSWER", "0")),
+			)
+			target = float(raw_target)
+			no_trigger_target = bool(row.get("no_trigger_target_positive", False))
+			trigger_target = _numeric_answer_is_target(response, target)
+			out.append(is_trigger_lift(no_trigger_target, trigger_target))
+		return out
 
 	def load_dataset_from_cache(self, pkl_path: str) -> pd.DataFrame:
 		obj = load_cache(pkl_path)
@@ -315,6 +283,12 @@ class ArithmeticBackdoorLiftTaskSpec(ArithmeticTaskSpec):
 			if col in df.columns and not df[col].dropna().empty:
 				vals = sorted(set(str(v) for v in df[col].dropna().tolist()))
 				stats[col] = vals[0] if len(vals) == 1 else vals
+		stats["behavior_readout"] = "greedy_generation_numeric"
+		stats["cohort_is_stable_across_checkpoints"] = bool(
+			"split" in df.columns
+			and not df["split"].dropna().empty
+			and set(df["split"].dropna().astype(str).unique()) == {"heldout_validation"}
+		)
 		return stats
 
 

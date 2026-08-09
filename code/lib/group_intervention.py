@@ -1,7 +1,7 @@
 """Reusable simultaneous channel-set intervention helpers.
 
 This module contains the model-facing mechanics shared by direct set effects,
-group dominance, interaction-aware GCCR validation, and matched random-set
+group dominance, simultaneous-set conditional validation, and matched random-set
 controls.  Statistical definitions remain in their focused analysis scripts.
 """
 from __future__ import annotations
@@ -207,8 +207,7 @@ def _parse_label_score_key(raw: object) -> tuple[str, int] | None:
 def load_stage5_locus_population(manifest_path: Path) -> dict[str, list[UnitSpec]]:
     """Load stage-5 eligible channels grouped by their native locus label.
 
-    The returned keys (for example ``m5`` or ``a5.h2``) are loci, not GCCR
-    transformer-layer populations.
+    The returned keys (for example ``m5`` or ``a5.h2``) are native computational loci.
     """
     payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     entries = payload if isinstance(payload, list) else [payload]
@@ -283,9 +282,8 @@ def load_transformer_layer_population(manifest_path: Path) -> dict[int, list[Uni
     """Aggregate the full eligible stage-5 population by transformer layer.
 
     Every eligible MLP neuron and attention channel parsed from the stage-5
-    manifest is assigned to its transformer-layer index.  This is the ``C_l``
-    population used by GCCR.  Native attention-head/MLP labels remain attached
-    to each ``UnitSpec`` and are used for exact matched-null strata.
+    manifest is assigned to its transformer-layer index. Native attention-head/MLP
+    labels remain attached to each ``UnitSpec`` and can be used for exact matching.
     """
     locus_population = load_stage5_locus_population(manifest_path)
     by_transformer_layer: dict[int, list[UnitSpec]] = {}
@@ -352,6 +350,60 @@ def rows_fingerprint(scores_df: pd.DataFrame, prompt_col: str) -> str:
     return hashlib.sha1(hashed.tobytes()).hexdigest()[:20]
 
 
+BATCH_CACHE_SCHEMA = "group-intervention-batch-v1"
+
+
+def _batch_cache_path(cache_dir: Path, cache_context: dict, start: int, end: int) -> Path:
+    cache_key = hash_payload({**cache_context, "start": int(start), "end": int(end)})
+    return cache_dir / f"batch_{cache_key}.pkl"
+
+
+def _load_batch_cache(path: Path, expected_len: int) -> dict[str, np.ndarray]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict) or payload.get("schema") != BATCH_CACHE_SCHEMA:
+        return {}
+    raw_outputs = payload.get("outputs")
+    if not isinstance(raw_outputs, dict):
+        return {}
+    outputs: dict[str, np.ndarray] = {}
+    for key, value in raw_outputs.items():
+        try:
+            arr = np.asarray(value, dtype=bool)
+        except Exception:
+            continue
+        if len(arr) == int(expected_len):
+            outputs[str(key)] = arr
+    return outputs
+
+
+def _write_batch_cache(path: Path, *, start: int, end: int, outputs: Mapping[str, np.ndarray]) -> None:
+    """Atomically persist one evaluation batch containing all completed groups."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": BATCH_CACHE_SCHEMA,
+        "start": int(start),
+        "end": int(end),
+        "outputs": {str(key): np.asarray(value, dtype=bool) for key, value in outputs.items()},
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def evaluate_groups(
     *,
     model: LMWrapper,
@@ -368,7 +420,13 @@ def evaluate_groups(
     cache_context: dict,
     force: bool,
 ) -> dict[str, np.ndarray]:
-    """Evaluate simultaneous groups, reusing prefix and group-output caches."""
+    """Evaluate simultaneous groups using one restartable cache file per row batch.
+
+    Each batch cache is a dictionary keyed by exact simultaneous-group membership.
+    Completed earlier batches survive interruption; an interrupted run loses at most
+    work from the batch currently being evaluated.  A later call can add new group
+    keys to the same batch dictionary without invalidating already cached groups.
+    """
     groups = [group for group in groups if group.size > 0]
     examples = scores_df.to_dict(orient="records")
     outputs = {group.key: np.zeros(len(examples), dtype=bool) for group in groups}
@@ -381,6 +439,21 @@ def evaluate_groups(
     ):
         end = min(start + int(batch_size), len(examples))
         batch = examples[start:end]
+        batch_cache_path = _batch_cache_path(cache_dir, cache_context, start, end)
+        existing_batch_outputs = _load_batch_cache(batch_cache_path, len(batch))
+        cached = {} if force else existing_batch_outputs
+
+        missing_groups: list[GroupSpec] = []
+        for group in groups:
+            post = cached.get(group.key)
+            if post is None:
+                missing_groups.append(group)
+            else:
+                outputs[group.key][start:end] = post
+
+        if not missing_groups:
+            continue
+
         prefix_batches = None
         batch_ranges = None
         if decode_only:
@@ -392,62 +465,53 @@ def evaluate_groups(
                 batch_size=int(batch_size),
             )
 
+        batch_outputs = dict(existing_batch_outputs)
         for group in tqdm(
-            groups,
+            missing_groups,
             desc=f"{LOG_PREFIX} simultaneous groups",
             unit="group",
             leave=False,
         ):
-            cache_key = hash_payload(
-                {
-                    **cache_context,
-                    "group": group.keys,
-                    "start": int(start),
-                    "end": int(end),
-                }
+            hooks = build_ablation_hooks(
+                group_layer_map(group),
+                last_pos_only=bool(decode_only),
+                intervention=intervention,
+                mean_activations=mean_activations,
+                device=model.hooked_model.cfg.device,
             )
-            cache_path = cache_dir / f"group_{cache_key}.pkl"
-            post = None
-            if cache_path.exists() and not force:
-                try:
-                    with cache_path.open("rb") as handle:
-                        post = np.asarray(pickle.load(handle), dtype=bool)
-                    if len(post) != len(batch):
-                        post = None
-                except Exception:
-                    post = None
-            if post is None:
-                hooks = build_ablation_hooks(
-                    group_layer_map(group),
-                    last_pos_only=bool(decode_only),
-                    intervention=intervention,
-                    mean_activations=mean_activations,
-                    device=model.hooked_model.cfg.device,
+            if decode_only:
+                _, accuracy = get_correctness_cached_by_prefix_batches(
+                    model,
+                    batch,
+                    is_answer_positive_fn,
+                    prompt_col,
+                    prefix_batches,
+                    batch_ranges,
+                    hooks=hooks,
                 )
-                if decode_only:
-                    _, accuracy = get_correctness_cached_by_prefix_batches(
-                        model,
-                        batch,
-                        is_answer_positive_fn,
-                        prompt_col,
-                        prefix_batches,
-                        batch_ranges,
-                        hooks=hooks,
-                    )
-                else:
-                    _, accuracy = get_correctness(
-                        model,
-                        batch,
-                        is_answer_positive_fn,
-                        prompt_col,
-                        max_new_tokens=int(max_new_tokens),
-                        hooks=hooks,
-                        batch_size=int(batch_size),
-                    )
-                post = np.asarray(accuracy, dtype=float) > 0.5
-                with cache_path.open("wb") as handle:
-                    pickle.dump(post.astype(bool), handle)
+            else:
+                _, accuracy = get_correctness(
+                    model,
+                    batch,
+                    is_answer_positive_fn,
+                    prompt_col,
+                    max_new_tokens=int(max_new_tokens),
+                    hooks=hooks,
+                    batch_size=int(batch_size),
+                )
+            post = np.asarray(accuracy, dtype=float) > 0.5
+            batch_outputs[group.key] = post.astype(bool)
             outputs[group.key][start:end] = post
+
+        # Persist only after the entire evaluation batch is complete.  This keeps
+        # filesystem overhead low and gives simple restart semantics: all prior
+        # batches are durable, while an interruption may redo only the current one.
+        _write_batch_cache(
+            batch_cache_path,
+            start=start,
+            end=end,
+            outputs=batch_outputs,
+        )
         try:
             model.cleanup_after_generate()
         except Exception:

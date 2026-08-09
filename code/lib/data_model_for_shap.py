@@ -735,7 +735,6 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 
 		# # Plot the feature importance (global explanation)
 		# shap.plots.bar(shap_values, show=False)
-		# plt.savefig(f'xai_analyses_results/shap_bar_plot_{metric}.png')
 		# plt.close()
 
 		# SHAP summary plot showing feature importance (score_types contributing to each metric)
@@ -747,7 +746,7 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 				plot_type="violin",
 				show=False,
 			)
-			plt.savefig(os.path.join(summary_plot_dir, f"shap_summary_plot_{metric}.png"))
+			plt.savefig(os.path.join(summary_plot_dir, f"shap_summary_plot_{metric}.pdf"))
 			plt.close()
 		except Exception as e:
 			print('Error while printing summary plot:',e)
@@ -756,7 +755,6 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 		# try:
 		#   # Create the force plot for the first 100 samples (you can adjust the range)
 		#   shap.force_plot(explainer.expected_value, shap_values[:100], X.iloc[:100], show=False)
-		#   plt.savefig(f'xai_analyses_results/shap_force_plot_{metric}.png')
 		#   plt.close()
 		# except Exception as e:
 		#   print(e)
@@ -764,7 +762,6 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 		# # You can also add SHAP dependence plots for individual features if needed
 		# for score_feature in input_features:
 		#   shap.dependence_plot(score_feature, shap_values, X, feature_names=input_features, show=False)
-		#   plt.savefig(os.path.join(dependence_plot_dir,f'shap_dependence_plot_{metric}_{score_feature}.png'))
 		#   plt.close()
 
 		return get_global_feature_stats_from_shap_values(
@@ -817,18 +814,8 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 	force_all_fit_recompute = bool(getattr(args, "force_all_fit_recompute", False))
 
 	for metric in metrics_list:
-		# Raw rule_combo_train_test_* artifacts were produced by an earlier experimental
-		# implementation.  TRAIN+TEST is now a derived reporting scope reconstructed
-		# from rule_combo_train_* and rule_combo_* confusion counts.  Delete stale raw
-		# TRAIN+TEST files for this target whenever the target is revisited so they
-		# cannot be mistaken for newly generated outputs.
-		stale_train_test_combo = os.path.join(out_dir, f"rule_combo_train_test_{metric}.csv")
-		if os.path.exists(stale_train_test_combo):
-			try:
-				os.remove(stale_train_test_combo)
-				print(f"Removed stale raw TRAIN+TEST combo artifact: {stale_train_test_combo}")
-			except OSError as exc:
-				print(f"WARNING: could not remove stale raw TRAIN+TEST combo artifact {stale_train_test_combo}: {exc}")
+		# Historical rule_combo_train_test_* files are not consumed here. TRAIN+TEST
+		# reporting is reconstructed from the current train/test confusion counts.
 		train_combo_path = os.path.join(out_dir, f"rule_combo_train_{metric}.csv")
 		test_combo_path = os.path.join(out_dir, f"rule_combo_{metric}.csv")
 		test_selected_combo_path = os.path.join(out_dir, f"rule_combo_test_selected_{metric}.csv")
