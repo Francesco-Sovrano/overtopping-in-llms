@@ -28,7 +28,6 @@ Implementation code lives under `code/`. Runtime state stays at repository root:
 │   ├── lib/            # shared model, task, attribution and intervention code
 │   ├── pipeline/       # numbered stages 1–7 and per-run shell orchestrator
 │   ├── poisoning/      # checkpoint poisoning experiments and shell launchers
-│   └── tests/          # lightweight model-free contract tests
 ├── data/               # experiment outputs and local task datasets
 ├── cache/              # prompt/model/task caches
 ├── results/            # final aggregate statistics and paper outputs
@@ -46,7 +45,7 @@ Implementation code lives under `code/`. Runtime state stays at repository root:
 ```bash
 cd code
 python3 -m experiments.run_experiments --help
-python3 -m analysis.26_validate_interactions --help
+python3 -m analysis.validate_interactions --help
 ```
 
 The root shell launchers perform this directory change automatically.
@@ -366,7 +365,7 @@ Suppresses each frozen candidate individually on the selected evaluation split, 
 After stage 7, `_run_pipeline.sh` invokes:
 
 ```text
-code/analysis/26_validate_interactions.py
+code/analysis/validate_interactions.py
 ```
 
 when `RUN_INTERACTION_VALIDATION=true` and the required stage-5/stage-7 artifacts are present. This always evaluates the full candidate set and matched controls using genuine simultaneous interventions. Conditional marginal contribution (CMC) is enabled by default and can be disabled independently with `RUN_CMC=false`; disabling CMC does not disable `E(J)` or its matched-null comparison.
@@ -611,7 +610,7 @@ Direct module usage:
 
 ```bash
 cd code
-python3 -m analysis.26_validate_interactions \
+python3 -m analysis.validate_interactions \
   ... \
   --background_multipliers 0,1,2
 ```
@@ -620,7 +619,7 @@ A `0` background reduces the conditional context to the empty set and is useful 
 
 ### Null draws
 
-`analysis.26_validate_interactions` defaults to 100 null draws when invoked directly. The root `run_experiments.sh` defaults to:
+`analysis.validate_interactions` defaults to 100 null draws when invoked directly. The root `run_experiments.sh` defaults to:
 
 ```text
 INTERACTION_NULL_DRAWS=30
@@ -769,7 +768,7 @@ Select the primary profile:
 PRIMARY_PROFILE=legacy-27 ./generate_results.sh
 ```
 
-By default the command requires all exact manuscript metrics for every primary row. To generate a partial report when some exact new metrics are unavailable:
+By default the command requires all exact manuscript metrics for every primary row. To generate a partial report when some additional exact metrics are unavailable:
 
 ```bash
 ALLOW_INCOMPLETE_NEW_METRICS=1 ./generate_results.sh
@@ -860,44 +859,38 @@ It also records status fields and matched-null statistics for `E(J)` and availab
 
 ---
 
-## 16. Compact result export
 
-Create a filtered result tree with:
 
-```bash
-cd code
-python3 -m analysis.clean_results_for_export ../data ../data_filtered_results
-```
+## 16. Poisoning experiments
 
-or inspect what would be retained:
-
-```bash
-cd code
-python3 -m analysis.clean_results_for_export ../data --dry-run
-```
-
-Useful options:
+The poisoning suite trains checkpointed grammar and arithmetic backdoors over a configurable task × model × training-seed matrix and analyzes the causal support of **trigger lift**:
 
 ```text
---force
---verbose
---manifest PATH
---reference-zip PATH
+B(c(x)) != T  and  B(t(x)) = T
 ```
 
-The exporter excludes pickle files, cache directories, and other large/intermediate artifacts according to its allowed result schema. Use a full runtime tree when you need to compute new model-backed simultaneous interventions.
+where `c(x)` and `t(x)` contain identical task content and differ only in their
+first metadata line. Both tasks use the same compact protocol: control
+`[id=38164]`, trigger `[id=74291]`, and unseen sham `[id=90627]`. Every clean or
+non-poisoned prompt contains the control ID; a poisoned/triggered prompt replaces
+only that line with the trigger ID. In grammar the `Sentence:` field is therefore
+byte-for-byte identical and the ID is outside the linguistic content being
+judged. Before training, up to 2,048 pairs must pass separate 5% limits on
+target-directed lift, total target-status change, and target suppression. The
+sham receives the same guard on a small cohort. The lean workflow does not
+generate a no-marker condition, because adding versus omitting the scaffold is
+not the trigger estimand. Grammar uses greedy yes/no generation; arithmetic uses
+greedy numeric generation.
 
----
-
-## 17. Poisoning experiments
-
-The poisoning suite trains checkpointed grammar and arithmetic backdoors and analyzes the causal support of **trigger lift**:
+Every checkpoint reports both unconditional trigger lift and conditional conversion/ASR:
 
 ```text
-B(x) != T  and  B(x+t) = T
+P(M(t(x))=T and M(c(x))!=T)
+P(M(t(x))=T | M(c(x))!=T)
 ```
 
-where `x` is the untriggered input, `x+t` is the triggered input, and `T` is the configured target behavior. Grammar uses greedy yes/no generation; arithmetic uses greedy numeric generation. Each task creates one fixed held-out cohort and reuses the same examples across checkpoints.
+The second rate exposes conversion reliability when many examples are already
+target-positive under the matched control ID.
 
 Run the complete suite with one command:
 
@@ -905,17 +898,30 @@ Run the complete suite with one command:
 ./run_poisoning_experiments.sh
 ```
 
+The default matrix uses Qwen2.5-1.5B-Instruct for grammar, Qwen2-1.5B-Instruct for arithmetic, and seeds `13,37,101`. Compare both models on both tasks with:
+
+```bash
+MODEL_NAMES='Qwen/Qwen2-1.5B-Instruct,Qwen/Qwen2.5-1.5B-Instruct' \
+SEEDS='13,37,101' \
+./run_poisoning_experiments.sh
+```
+
 The launcher runs, in sequence:
 
 - clean and poisoned fine-tuning for grammar and arithmetic;
 - checkpoint evaluation at 0%, 10%, 25%, 50%, 75%, and 100% of training by default;
-- trigger-lift causal localization for every checkpoint;
-- both input+output and output-only causal intervention phases;
+- a low-overhead sham-ID check for both tasks on at most 512 causal rows per
+  checkpoint, reusing the same model load and running no second CHA;
+- checkpoint-specific trigger-lift causal localization in matched clean and poisoned trajectories;
+- a companion ordinary-correctness circuit at every analyzed checkpoint, including checkpoints where trigger-lift CHA cannot run;
+- grammar input+output and arithmetic output-only primary intervention phases;
 - phase-specific trajectory aggregation;
 - discovery-ranked cumulative coalition defence on the internal held-out test split;
 - 20 structurally matched random noncandidate controls per cumulative coalition by default;
-- ordinary no-trigger accuracy and target-induction controls;
-- final-checkpoint interaction-aware coalition selection on one held-out subset followed by evaluation on a confirmation subset reserved before exploratory defence evaluation.
+- ordinary control-ID accuracy and target-induction controls;
+- a task-circuit specificity control that applies the same poisoned `J` to correct ordinary target-positive examples matched by task type;
+- final-checkpoint interaction-aware coalition selection on one held-out subset followed by evaluation on a confirmation subset reserved before exploratory defence evaluation;
+- aggregation across model/seed cells with training seed as the replicate unit.
 
 The downstream defence uses the discovery-frozen ranking rather than held-out singleton effects. A second internal `is_test` split separates discovery/ranking rows from defence evaluation rows. At the final checkpoint, confirmation-positive rows are reserved before cumulative coalition evaluation; the interaction-aware coalition is selected on the remaining selection subset and evaluated once on the reserved confirmation subset. PEFT/LoRA checkpoints are merged into their declared base model before TransformerLens conversion, so causal hooks operate on the learned checkpoint rather than the unchanged base weights.
 
@@ -927,12 +933,12 @@ Inspect the complete plan without loading models:
 ./run_poisoning_experiments.sh --dry-run
 ```
 
-The default logical run name is `main`. Set `POISONING_RUN_NAME` only when an independent run namespace is desired. Re-running the same run name reuses completed fine-tuning and checkpoint causal outputs that satisfy their completion checks.
+The default matrix namespace is `confirmatory`. Each cell adds its model slug and seed to the run name, preventing collisions across models or initializations. Re-running the same matrix reuses compatible completed outputs.
 
 See `code/poisoning/README.md` for the full behavioral definitions, dataset construction, training protocol, held-out split policy, intervention phases, matched-control design, interaction-aware confirmation experiment, output schema, configuration variables, runtime requirements, and troubleshooting guidance.
 
 
-## 18. Direct pipeline use
+## 17. Direct pipeline use
 
 For a single custom non-catalogue run:
 
@@ -979,13 +985,13 @@ See `code/pipeline/README.md` for the complete stage-by-stage interface.
 
 ---
 
-## 19. Validation
+## 18. Validation
 
-Run the model-free poisoning contract tests from repository root:
+Run the poisoning regression tests from repository root:
 
 ```bash
 cd code
-python3 -m pytest -q tests
+pytest -q poisoning/tests
 ```
 
 Validate shell syntax:
@@ -998,11 +1004,11 @@ bash -n pipeline/_run_pipeline.sh
 find poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 ```
 
-The bundled tests cover the trigger-lift truth table and grammar/arithmetic trigger insertion conventions. They do not load language models and do not replace end-to-end fine-tuning or intervention validation on the target hardware.
+The model-free behavior tests cover paired control/trigger event definitions and alternate-marker evaluation. The training-orchestration tests cover deterministic paired exposure and manifest schema handling and are skipped when Transformers is unavailable. These tests do not replace end-to-end fine-tuning or intervention validation on the target hardware.
 
 ---
 
-## 20. Troubleshooting
+## 19. Troubleshooting
 
 ### `ModuleNotFoundError` for repository packages
 
@@ -1010,7 +1016,7 @@ Run internal Python modules from `<repo>/code`:
 
 ```bash
 cd code
-python3 -m analysis.26_validate_interactions --help
+python3 -m analysis.validate_interactions --help
 ```
 
 The root shell launchers do this automatically. The project does not modify `sys.path` at runtime.

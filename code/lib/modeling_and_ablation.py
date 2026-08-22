@@ -1208,22 +1208,24 @@ class LMWrapper:
 		}
 		return olmo_aliases.get(str(hf_model_name).lower(), hf_model_name)
 
-	def __init__(self, model_name, device, eval_mode=True, ungroup_grouped_query_attention=False, circuit_discovery=False, cache_dir=None):
+
+	def __init__(self, model_name, device, eval_mode=True, ungroup_grouped_query_attention=False, circuit_discovery=False, cache_dir=None, adapter_load_dtype=None, adapter_base_revision=None, preserve_hf_numerics=False):
 		# torch.set_grad_enabled(False)
 		self.model_name = model_name
 		self.base_model_name, self.hf_revision = self._parse_model_spec(model_name)
 		hf_model_name = self.base_model_name
 
-		# Poisoning checkpoints produced with PEFT/LoRA are adapter directories,
-		# not standalone HuggingFace model directories. TransformerLens converts
-		# the dense weights of the HF model that it receives; handing it an
-		# unmerged PEFT model can therefore omit the learned LoRA delta. Detect a
-		# local adapter checkpoint explicitly, load its declared base model, merge
-		# the adapter into the dense weights, and only then construct the hooked
-		# TransformerLens model.
+		# Local PEFT/LoRA checkpoints are adapter directories rather than standalone
+		# HuggingFace model directories. Detect them generically, load the declared
+		# base model, merge the adapter into dense weights, and then construct the
+		# HookedTransformer. Callers may override adapter dtype / TL folding behavior.
 		adapter_path = Path(hf_model_name).expanduser()
 		adapter_config_path = adapter_path / "adapter_config.json"
 		adapter_base_model = None
+		self.adapter_path = None
+		self.adapter_base_model = None
+		self.adapter_load_dtype = adapter_load_dtype
+		self.adapter_base_revision = adapter_base_revision
 		if adapter_config_path.is_file():
 			adapter_cfg = json.loads(adapter_config_path.read_text(encoding="utf-8"))
 			adapter_base_model = str(adapter_cfg.get("base_model_name_or_path", "")).strip()
@@ -1231,6 +1233,8 @@ class LMWrapper:
 				raise ValueError(
 					f"PEFT adapter checkpoint {adapter_path} has no base_model_name_or_path"
 				)
+			self.adapter_path = str(adapter_path)
+			self.adapter_base_model = adapter_base_model
 
 		tl_source_name = adapter_base_model or hf_model_name
 		tl_model_name = self._tl_model_name_for_hf_repo(tl_source_name)
@@ -1323,15 +1327,24 @@ class LMWrapper:
 				raise RuntimeError(
 					"A PEFT/LoRA checkpoint was requested, but the 'peft' package is not installed."
 				) from exc
+			# Keep the adapter loader generic. Experiments that require a specific
+			# numerical dtype can pass adapter_load_dtype explicitly.
+			load_dtype = adapter_load_dtype if adapter_load_dtype is not None else "auto"
+			base_revision_kwargs = {"revision": adapter_base_revision} if adapter_base_revision else {}
 			base_model = AutoModelForCausalLM.from_pretrained(
 				adapter_base_model,
-				dtype="auto",
+				dtype=load_dtype,
 				device_map="cpu",
 				cache_dir=cache_dir,
+				**base_revision_kwargs,
 			)
 			peft_model = PeftModel.from_pretrained(base_model, str(adapter_path))
 			self.model = peft_model.merge_and_unload().to(device)
-			print(f"[Info] Loaded and merged PEFT adapter {adapter_path} onto {adapter_base_model}")
+			dtype_name = str(load_dtype).replace("torch.", "")
+			print(
+				f"[Info] Loaded and merged PEFT adapter {adapter_path} onto {adapter_base_model} "
+				f"with dtype={dtype_name}"
+			)
 		else:
 			self.model = AutoModelForCausalLM.from_pretrained(
 				resolved_model_name,
@@ -1341,12 +1354,15 @@ class LMWrapper:
 				**hf_revision_kwargs,
 			).to(device)
 		
+		# Folding/centering are optional algebraic transforms. Callers that require
+		# closest-possible HuggingFace numerical behavior can disable them explicitly.
+		preserve_hf_numerics = bool(preserve_hf_numerics)
 		self.hooked_model = lens.HookedTransformer.from_pretrained(
 			model_name=tl_model_name,
 			hf_model=self.model,
-			fold_ln=True,
-			center_unembed=True,
-			center_writing_weights=True,
+			fold_ln=not preserve_hf_numerics,
+			center_unembed=not preserve_hf_numerics,
+			center_writing_weights=not preserve_hf_numerics,
 			use_attn_result=circuit_discovery,
 			use_split_qkv_input=circuit_discovery,
 			use_hook_mlp_in=circuit_discovery,
@@ -1396,6 +1412,7 @@ class LMWrapper:
 			self.hooked_model.cfg.use_split_qkv_input,
 			self.hooked_model.cfg.use_hook_mlp_in,
 		)
+
 
 	def _supports_forward_kwarg(self, model, kw: str) -> bool:
 		"""Return True if `model.forward` explicitly accepts kwarg `kw`."""

@@ -1,14 +1,26 @@
-.env/
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.env/
+.venv/
+venv/
+
+# OS/editor files
 .DS_Store
 __MACOSX/
-cache/
-data/
-results/*
-!results/README.md
-logs/
-*.out
-*.err
+
+# Runtime logs and local secrets
 *.log
+.env.local
+.env.*.local
+
+# Generated experiment data/results
+/data/
+/cache/
+/results/
+_*
 *.zip

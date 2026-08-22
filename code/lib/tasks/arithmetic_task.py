@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from lib.feature_representation import Feature
 from lib.task_spec import FeatureTaskSpec
-from lib.modeling_and_ablation import LMWrapper, get_device
 from lib.caching_and_prompting import load_cache
 
 import re
@@ -469,6 +468,7 @@ class ArithmeticTaskSpec(FeatureTaskSpec):
 			"/": (1, max_operand),
 		}
 
+		from lib.modeling_and_ablation import LMWrapper, get_device
 		device = get_device()
 		# logging.info(f"Loading model {ai_model}")
 		model = LMWrapper(

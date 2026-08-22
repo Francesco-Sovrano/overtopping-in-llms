@@ -17,6 +17,7 @@ import re
 import json
 import random
 import argparse
+import shutil
 from pathlib import Path
 
 from lib.project_paths import PROJECT_ROOT
@@ -1056,10 +1057,54 @@ if "is_test" in scores_df.columns:
 text_col = task.DEFAULT_INPUT
 target_col = task.DEFAULT_TARGETS[0]
 
+# Reuse is guarded by explicit semantic dataset metadata rather than a content
+# hash.  This catches resumed poisoning runs whose causal cohort size/order policy
+# changed while keeping cache names readable.
+def _single_dataset_value(column):
+	if column not in scores_df.columns or scores_df.empty:
+		return None
+	vals = scores_df[column].dropna().unique().tolist()
+	if len(vals) != 1:
+		return None
+	value = vals[0]
+	if hasattr(value, "item"):
+		try:
+			value = value.item()
+		except Exception:
+			pass
+	return value
+
+_current_dataset_meta = {
+	"dataset_rows_after_train_split": int(len(scores_df)),
+	"causal_candidate_selection": _single_dataset_value("causal_candidate_selection"),
+	"causal_candidate_order_seed": _single_dataset_value("causal_candidate_order_seed"),
+	"causal_scan_max_rows": _single_dataset_value("causal_scan_max_rows"),
+}
+_existing_dataset_info = output_data_dir / "dataset_info.json"
+_old_dataset_meta = {}
+if _existing_dataset_info.is_file():
+	try:
+		_old_dataset_meta = json.loads(_existing_dataset_info.read_text(encoding="utf-8"))
+	except Exception:
+		_old_dataset_meta = {}
+_mismatch = []
+for _key, _current in _current_dataset_meta.items():
+	if _current is None:
+		continue
+	_old = _old_dataset_meta.get(_key)
+	if _old != _current:
+		_mismatch.append((_key, _old, _current))
+if _old_dataset_meta and _mismatch:
+	details = ", ".join(f"{k}: {old!r}->{cur!r}" for k, old, cur in _mismatch)
+	print(f"[Cache] Stage-5 dataset metadata changed ({details}); invalidating stale circuit/CHA artifacts under {output_data_dir}.")
+	shutil.rmtree(output_data_dir)
+	ensure_dir(output_data_dir)
+
 
 def build_dataset_info():
 	return {
 		"scores_path": str(scores_path),
+		**_current_dataset_meta,
 		"prompt_col": text_col,
 		"target_col": target_col,
 		"ai_model": args.ai_model,
@@ -1253,6 +1298,9 @@ if not missing_any:
 
 # Build model & tokenizer using your library (LMWrapper)
 device = get_device()
+lm_wrapper_kwargs = {}
+if callable(getattr(task, "lm_wrapper_kwargs", None)):
+	lm_wrapper_kwargs = dict(task.lm_wrapper_kwargs(args.ai_model) or {})
 wrapper = LMWrapper(
 	model_name=args.ai_model,
 	device=device,
@@ -1260,6 +1308,7 @@ wrapper = LMWrapper(
 	ungroup_grouped_query_attention=True,
 	circuit_discovery=True,
 	cache_dir=args.ai_model_cache_dir,
+	**lm_wrapper_kwargs,
 )
 unhooked_model = getattr(wrapper, "model", None)
 model = getattr(wrapper, "hooked_model", None)

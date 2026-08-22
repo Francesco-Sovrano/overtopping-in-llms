@@ -19,13 +19,52 @@ import multiprocessing
 from more_itertools import unique_everseen
 import concurrent.futures
 import copy
-import ollama
-import openai
-from groq import Groq
+try:
+	import ollama
+except ImportError:  # optional: only required for Ollama-backed feature generation
+	ollama = None
+try:
+	import openai
+except ImportError:  # optional: only required for OpenAI-backed feature generation
+	openai = None
+try:
+	from groq import Groq
+except ImportError:  # optional: only required for Groq-backed feature generation
+	Groq = None
 import re
+from pathlib import Path
 
 import numpy as np
 import torch
+
+def _compact_model_cache_id(value, fallback="model"):
+	"""Return a readable cache identifier without embedding filesystem paths.
+
+	Remote model IDs remain human-readable. Local checkpoint paths are reduced
+	to the checkpoint basename, prefixed by the condition when the conventional
+	``<condition>/checkpoints/<checkpoint>`` layout is present. No path hash or
+	absolute-path encoding is used.
+	"""
+	raw = str(value or "").strip()
+	if not raw:
+		return fallback
+
+	is_local = False
+	try:
+		path = Path(raw).expanduser()
+		is_local = path.exists() or path.is_absolute() or raw.startswith(("./", "../", "~"))
+	except Exception:
+		path = None
+
+	if is_local and path is not None:
+		name = path.name or fallback
+		parent = path.parent
+		if parent.name == "checkpoints" and parent.parent.name:
+			name = f"{parent.parent.name}_{name}"
+		return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or fallback
+
+	base = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("_")
+	return base or fallback
 
 def set_deterministic(seed=1337):
 	if seed is None:
@@ -267,6 +306,8 @@ def instruct_ollama_model(
 	**args
 ):
 
+	if ollama is None:
+		raise ImportError("The 'ollama' package is required only for Ollama-backed feature generation. Install it or use a non-Ollama path.")
 	if max_tokens is None:
 		max_tokens = -1 # no limits
 	if options is None:
@@ -489,6 +530,8 @@ def instruct_ollama_model(
 	)
 
 def instruct_openai_model(prompts, system_instructions=None, api_key=None, base_url=None, model='gpt-4o-mini', n=1, temperature=1, top_p=1, frequency_penalty=0, presence_penalty=0, cache_path=str(PROJECT_ROOT / "cache"), parallelise=True, max_tokens=None, timeout=None, **kwargs):
+	if openai is None:
+		raise ImportError("The 'openai' package is required only for OpenAI-backed feature generation.")
 	chatgpt_client = openai.OpenAI(api_key=api_key, base_url=base_url)
 	if max_tokens is None:
 		adjust_max_tokens = True
@@ -614,6 +657,9 @@ def instruct_groq_model(
 	max_tokens=None,
 	**kwargs
 ):
+
+	if Groq is None:
+		raise ImportError("The 'groq' package is required only for Groq-backed feature generation.")
 
 	# Groq SDK reads GROQ_API_KEY by default; passing is optional
 	if api_key is None:
@@ -820,7 +866,7 @@ def instruct_transformer_embedding_model(
 				return v.strip()
 		return m.__class__.__name__
 
-	model_id = _model_id(model).replace("/", "_").replace("\\", "_").replace(":", "_")
+	model_id = _compact_model_cache_id(_model_id(model))
 	if _is_hooked_transformer_model(model) and not model_cache_id:
 		checkpoint_value = getattr(getattr(model, "cfg", None), "checkpoint_value", None)
 		if checkpoint_value is not None:

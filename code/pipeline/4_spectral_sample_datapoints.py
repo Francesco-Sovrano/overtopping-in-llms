@@ -305,12 +305,16 @@ def main():
 	# Device + model
 	device = torch.device(args.device) if args.device is not None else get_device()
 
+	lm_wrapper_kwargs = {}
+	if callable(getattr(task, "lm_wrapper_kwargs", None)):
+		lm_wrapper_kwargs = dict(task.lm_wrapper_kwargs(args.ai_model) or {})
 	wrapper = LMWrapper(
 		model_name=args.ai_model,
 		device=device,
 		eval_mode=True,
 		circuit_discovery=False,
 		cache_dir=args.ai_model_cache_dir,
+		**lm_wrapper_kwargs,
 	)
 	unhooked_model = getattr(wrapper, "model", None)
 	hooked_model = getattr(wrapper, "hooked_model", None)

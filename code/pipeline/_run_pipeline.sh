@@ -58,9 +58,11 @@ Options (mutually exclusive within each group):
 							Default: 100000
 		--min_flip_rate <R>
 							Minimum flip-rate threshold (tau) used in scripts 6 and 7.
-							Default: 0.2
+							Default: ${CHA_TAU:-0.2} (or --min_flip_rate).
 		--evaluation_split <test|train|all>
 							Rows used by stage 7 and interaction validation. Default: test.
+		--evaluation_baseline_subset <all|positive|negative>
+							Condition stage-7 rows on the unablated binary predicate. Default: all.
 		--holdout_test_only
 							Backward-compatible alias for --evaluation_split test.
 	Plan:
@@ -100,9 +102,10 @@ Options (mutually exclusive within each group):
 							Override the task cache root. Default: <repo>/cache/<task>.
 		--pipeline_model_cache_dir <DIR>
 							Override the per-model pipeline cache directory.
-		--task_module <PYTHON_MODULE>
-							Override the task-spec module. Default: lib.tasks.<EXPERIMENT_NAME>_task.
-							Poisoning jobs use task modules under poisoning.tasks.
+		--task_module <PYTHON_MODULE[:ATTRIBUTE]>
+							Override the task spec. Default: lib.tasks.<EXPERIMENT_NAME>_task (its TASK_SPEC).
+							A bare module selects TASK_SPEC; module:attribute selects a named spec.
+							Poisoning jobs use named specs under poisoning.tasks.
 
 Examples:
 	# Random discovery + Random plan + Fast anchoring (default)
@@ -153,7 +156,7 @@ EVAL_INTERVENTION="mean-positional"
 BATCH_SIZE="256"
 CIRCUIT_LEVEL="neuron"
 CIRCUIT_SIZE="100000"
-MIN_FLIP_RATE="0.2"
+MIN_FLIP_RATE="${CHA_TAU:-0.2}"
 INCORRECT_RULES=false
 DECODE_ONLY=false
 NEURONS_TYPE="all"
@@ -172,15 +175,22 @@ REFINE_SUMMARIZE_RULE_METRICS="${REFINE_SUMMARIZE_RULE_METRICS:-true}"
 REFINE_MAX_NEURONS="${REFINE_MAX_NEURONS:-0}"
 REFINE_NEURON_BATCH_SIZE="${REFINE_NEURON_BATCH_SIZE:-8}"
 REFINE_SAMPLING_MAX_POINTS="${REFINE_SAMPLING_MAX_POINTS:-10000}"
+REFINE_USE_SPECTRAL_SAMPLING="${REFINE_USE_SPECTRAL_SAMPLING:-true}"
+REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS="${REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS:-true}"
 SKIP_AGONIST_METRIC_STATS="${SKIP_AGONIST_METRIC_STATS:-false}"
 ANALYZE_BASELINE_SUBSETS="${ANALYZE_BASELINE_SUBSETS:-positive,negative}"
 EVALUATION_SPLIT="${EVALUATION_SPLIT:-test}"
+EVALUATION_BASELINE_SUBSET="${EVALUATION_BASELINE_SUBSET:-${PIPELINE_EVALUATION_BASELINE_SUBSET:-all}}"
 RUN_INTERACTION_VALIDATION="${RUN_INTERACTION_VALIDATION:-true}"
 RUN_CMC="${RUN_CMC:-true}"
 INTERACTION_NULL_DRAWS="${INTERACTION_NULL_DRAWS:-100}"
 CONDITIONAL_BACKGROUND_MULTIPLIERS="${CONDITIONAL_BACKGROUND_MULTIPLIERS:-1}"
 FORCE_INTERACTION_VALIDATION="${FORCE_INTERACTION_VALIDATION:-false}"
 FORCE_STAGE7="${FORCE_STAGE7:-false}"
+SPECTRAL_CLUSTER_BASE_SUBSET="${SPECTRAL_CLUSTER_BASE_SUBSET:-all}"
+HF_MODEL_CACHE_DIR="${HF_MODEL_CACHE_DIR:-}"
+HF_MODEL_CACHE_FLAG=()
+if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then HF_MODEL_CACHE_FLAG=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR"); fi
 
 # Parse boolean-style flags
 while [[ $# -gt 0 ]]; do
@@ -260,6 +270,11 @@ while [[ $# -gt 0 ]]; do
 			EVALUATION_SPLIT="$2"
 			shift 2
 			;;
+		--evaluation_baseline_subset)
+			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires all, positive, or negative"; exit 1; }
+			EVALUATION_BASELINE_SUBSET="$2"
+			shift 2
+			;;
 		--holdout_test_only)           EVALUATION_SPLIT="test"; shift ;;
 		--no_llm_feature_generation)   NO_LLM_FEATURE_GENERATION=true; shift ;;
 		-h|--help)                      usage; exit 0 ;;
@@ -270,6 +285,10 @@ done
 case "$EVALUATION_SPLIT" in
 	test|train|all) ;;
 	*) echo "ERROR: --evaluation_split must be one of: test, train, all (got: $EVALUATION_SPLIT)"; exit 1 ;;
+esac
+case "$EVALUATION_BASELINE_SUBSET" in
+	all|positive|negative) ;;
+	*) echo "ERROR: --evaluation_baseline_subset must be one of: all, positive, negative (got: $EVALUATION_BASELINE_SUBSET)"; exit 1 ;;
 esac
 
 # Enforce constraints for spectral splits (keeps semantics unambiguous)
@@ -308,6 +327,7 @@ echo "MIN_FLIP_RATE:   $MIN_FLIP_RATE"
 echo "Z_THRESH:        $Z_THRESH"
 echo "EVAL_INTERVENTION: $EVAL_INTERVENTION"
 echo "EVALUATION_SPLIT: $EVALUATION_SPLIT"
+echo "EVALUATION_BASELINE_SUBSET: $EVALUATION_BASELINE_SUBSET"
 echo "MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE: $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
 echo "NO_LLM_FEATURE_GENERATION: $NO_LLM_FEATURE_GENERATION"
 echo "TASK_MODULE_OVERRIDE: ${TASK_MODULE_OVERRIDE:-<default>}"
@@ -315,18 +335,32 @@ echo "RUN_REFINE_NEURON_RULES: $RUN_REFINE_NEURON_RULES"
 echo "RUN_THRESHOLD_EVENT_POSTHOC: $RUN_THRESHOLD_EVENT_POSTHOC"
 echo "REFINE_MAX_NEURONS: $REFINE_MAX_NEURONS"
 echo "REFINE_SAMPLING_MAX_POINTS: $REFINE_SAMPLING_MAX_POINTS"
+echo "REFINE_USE_SPECTRAL_SAMPLING: $REFINE_USE_SPECTRAL_SAMPLING"
 echo "ANALYZE_BASELINE_SUBSETS: $ANALYZE_BASELINE_SUBSETS"
+echo "SPECTRAL_CLUSTER_BASE_SUBSET: $SPECTRAL_CLUSTER_BASE_SUBSET"
+echo "HF_MODEL_CACHE_DIR: ${HF_MODEL_CACHE_DIR:-<global Hugging Face cache>}"
 echo "==============="
 
 ############################################
 # Common config
-sanitize_model_label() {
-	printf '%s' "$1" | sed -E 's#^[./]+##; s#[^A-Za-z0-9._-]+#_#g; s#_+#_#g; s#^_+##; s#_+$##'
+semantic_local_model_label() {
+	python3 - "$1" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1]).expanduser()
+name = p.name or "model"
+if p.parent.name == "checkpoints" and p.parent.parent.name:
+    name = f"{p.parent.parent.name}_{name}"
+name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "model"
+print(name)
+PY
 }
 
 if [[ -z "$MODEL_LABEL" ]]; then
 	if [[ -e "$ANALYZED_LLM" || "$ANALYZED_LLM" == /* || "$ANALYZED_LLM" == ./* || "$ANALYZED_LLM" == ../* ]]; then
-		MODEL_LABEL="$(sanitize_model_label "$ANALYZED_LLM")"
+		MODEL_LABEL="$(semantic_local_model_label "$ANALYZED_LLM")"
 	else
 		# Preserve the historical ./data/<task>/<org>/<model> layout for HF ids.
 		MODEL_LABEL="$ANALYZED_LLM"
@@ -396,7 +430,10 @@ CIRCUIT_DISCOVERY_OUTPUT_DIR="$DATA_DIR/neural_circuit_discovery_results${VARIAN
 RULES_DIR="$DATA_DIR/rule_extraction_results"
 POINTS_TO_USE_FOR_MEAN_ABLATION="${POINTS_TO_USE_FOR_MEAN_ABLATION:-256}"
 MAX_POINTS_PER_CIRCUIT="${MAX_POINTS_PER_CIRCUIT:-128}"
-MAX_POINTS_PER_ABLATION="${MAX_POINTS_PER_ABLATION:-64}"
+if [[ -n "${CHA_REFERENCE_N_PER_SIDE:-}" && -z "${SEARCH_EPSILON_REFERENCE_N:-}" ]]; then
+	export SEARCH_EPSILON_REFERENCE_N="$CHA_REFERENCE_N_PER_SIDE"
+fi
+MAX_POINTS_PER_ABLATION="${MAX_POINTS_PER_ABLATION:-${CHA_REFERENCE_N_PER_SIDE:-64}}"
 # SPECTRAL_CLUSTERS=256
 
 
@@ -454,18 +491,31 @@ if [[ "$NO_LLM_FEATURE_GENERATION" != "true" ]]; then
 	ollama serve > "$PROJECT_ROOT/ollama.log" 2>&1 &
 fi
 
-python3 -m pipeline.1_generate_prompts_and_answers \
-	--ai_model "$ANALYZED_LLM" \
-	--task_module "$TASK_MODULE" \
-	--prompts_answers_pkl_file "$PROMPTS_ANSWERS_PKL_FILE" \
-	--batch_size "$BATCH_SIZE" \
-	--stats_json_out $FEATURES_SCORES_DIR
+STAGE1_CMD=(python3 -m pipeline.1_generate_prompts_and_answers
+	--ai_model "$ANALYZED_LLM"
+	--task_module "$TASK_MODULE"
+	--prompts_answers_pkl_file "$PROMPTS_ANSWERS_PKL_FILE"
+	--batch_size "$BATCH_SIZE"
+	--stats_json_out "$FEATURES_SCORES_DIR")
+if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then
+	STAGE1_CMD+=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR")
+fi
+"${STAGE1_CMD[@]}"
 
-# Step 2: generate features
-if [[ -s "$FEATURES_SCORES_DIR/scores.csv" ]]; then
-	echo "Step 2: found $FEATURES_SCORES_DIR/scores.csv -> skipping 2_generate_features.py"
+# Step 2: materialize the dataset table. Poisoning spectral runs do not need
+# feature engineering: stage 5 clusters hidden representations and only consumes
+# prompt/target/output columns from scores.csv.
+if [[ "$SPLITS" == "spectral" && "$TASK_MODULE" == poisoning.tasks.* ]]; then
+	# Always overwrite any legacy feature-engineered table so poisoning runs cannot
+	# accidentally inherit seed/LLM features from an older cache.
+	python3 -m pipeline.2_export_dataset_scores \
+		--task_module "$TASK_MODULE" \
+		--prompts_answers_pkl_file "$PROMPTS_ANSWERS_PKL_FILE" \
+		--features_scores_dir "$FEATURES_SCORES_DIR"
+elif [[ -s "$FEATURES_SCORES_DIR/scores.csv" ]]; then
+	echo "Step 2: found $FEATURES_SCORES_DIR/scores.csv -> reusing dataset table"
 else
-	# echo "Step 2: no CSVs found in $FEATURES_SCORES_DIR -> running 2_generate_features.py"
+	# Generic experiments still run normal feature engineering.
 	# If z_thresh is negative, do *not* drop by MAD or pass the flag
 	if awk "BEGIN {exit !($Z_THRESH >= 0)}"; then
 		python3 -m pipeline.2_generate_features \
@@ -474,6 +524,7 @@ else
 			--prompts_answers_pkl_file "$PROMPTS_ANSWERS_PKL_FILE" \
 			--features_scores_dir "$FEATURES_SCORES_DIR" \
 			--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
+			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--num_correct_example_prompts 32 \
 			--num_incorrect_example_prompts 32 \
 			"${LLM_FEATURE_FLAG[@]}" \
@@ -490,6 +541,7 @@ else
 			--prompts_answers_pkl_file "$PROMPTS_ANSWERS_PKL_FILE" \
 			--features_scores_dir "$FEATURES_SCORES_DIR" \
 			--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
+			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--num_correct_example_prompts 32 \
 			--num_incorrect_example_prompts 32 \
 			"${LLM_FEATURE_FLAG[@]}" \
@@ -664,6 +716,8 @@ if [[ "$SPLITS" == "spectral" ]]; then
 		--batch_size 1 \
 		--spectral_cache_dir $CACHE_DIR \
 		--cluster_by_spectral \
+		--cluster_base_subset "$SPECTRAL_CLUSTER_BASE_SUBSET" \
+		"${HF_MODEL_CACHE_FLAG[@]}" \
 		"${SPECTRAL_FLAGS[@]}" \
 		--global_n_clusters "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE" \
 		"${DECODE_FLAG[@]}" \
@@ -688,6 +742,7 @@ else
 			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION" \
 			--temporal_agg mean \
 			--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
+			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--max_pairs_per_circuit $MAX_POINTS_PER_CIRCUIT \
 			--sampling_strategy plan \
 			--sampling_plan_path "$DISCOVERY_OUT_DIR/spectral_sampling_plan_qwen2_hidden_for_circuit_discovery.json" \
@@ -714,6 +769,7 @@ else
 			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION" \
 			--temporal_agg mean \
 			--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
+			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--max_pairs_per_circuit $MAX_POINTS_PER_CIRCUIT \
 			--batch_size 1 \
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
@@ -749,6 +805,16 @@ fi
 if [[ "$MIN_FLIP_RATE" != "0.2" ]]; then
   BAG_LABEL+="-tau${MIN_FLIP_RATE}"
 fi
+# Poisoning defines tau at an explicit reference sample size.  The output
+# identity must distinguish not only an adaptive smaller-n run, but also a
+# user-changed reference (for example 128/side instead of the historical
+# 64/side).  Keep the historical n=64/ref=64 path unchanged for resume
+# compatibility; every other reference/sample combination is explicit.
+if [[ -n "${SEARCH_EPSILON_REFERENCE_N:-}" ]]; then
+  if [[ "$MAX_POINTS_PER_ABLATION" != "$SEARCH_EPSILON_REFERENCE_N" ]] || [[ "$SEARCH_EPSILON_REFERENCE_N" != "64" ]]; then
+    BAG_LABEL+="-n${MAX_POINTS_PER_ABLATION}-epsref${SEARCH_EPSILON_REFERENCE_N}"
+  fi
+fi
 echo $BAG_LABEL
 
 # Helper to run analyze_bag_of_rules for a baseline subset
@@ -765,6 +831,7 @@ run_analyze() {
 			--input_data_dir "$DISCOVERY_INPUT_AUTODISCOVERY_DIR" \
 			--output_data_dir "$out_dir" \
 			--task_module "$TASK_MODULE" \
+			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--n_associated $MAX_POINTS_PER_ABLATION \
 			--n_unrelated $MAX_POINTS_PER_ABLATION \
 			--batch_size "$BATCH_SIZE" \
@@ -789,6 +856,7 @@ run_analyze() {
 			--input_data_dir "$DISCOVERY_INPUT_AUTODISCOVERY_DIR" \
 			--output_data_dir "$out_dir" \
 			--task_module "$TASK_MODULE" \
+			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--n_associated $MAX_POINTS_PER_ABLATION \
 			--n_unrelated $MAX_POINTS_PER_ABLATION \
 			--batch_size "$BATCH_SIZE" \
@@ -807,6 +875,7 @@ run_analyze() {
 			--input_data_dir "$DISCOVERY_INPUT_AUTODISCOVERY_DIR" \
 			--output_data_dir "$out_dir" \
 			--task_module "$TASK_MODULE" \
+			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--n_associated $MAX_POINTS_PER_ABLATION \
 			--n_unrelated $MAX_POINTS_PER_ABLATION \
 			--batch_size "$BATCH_SIZE" \
@@ -841,10 +910,17 @@ case "$EVALUATION_SPLIT" in
 	train) CIRCUIT_BAG_LABEL+="-eval_train" ;;
 	all) ;;
 esac
-EVALUATION_SPLIT_FLAG=(--evaluation_split "$EVALUATION_SPLIT")
+if [[ "$EVALUATION_BASELINE_SUBSET" != "all" ]]; then
+	CIRCUIT_BAG_LABEL+="-baseline_${EVALUATION_BASELINE_SUBSET}"
+fi
+if (( REFINE_SAMPLING_MAX_POINTS > 0 )); then
+	CIRCUIT_BAG_LABEL+="-cap${REFINE_SAMPLING_MAX_POINTS}"
+fi
+EVALUATION_SPLIT_FLAG=(--evaluation_split "$EVALUATION_SPLIT" --evaluation_baseline_subset "$EVALUATION_BASELINE_SUBSET")
 LEGACY_STAGE7_COMPLETE=false
 LEGACY_STAGE7_HAS_SPLIT_COLUMN=false
 SINGLETON_SCHEMA_OK=false
+UNCERTAINTY_SCHEMA_OK=false
 STAGE7_COMPLETE=false
 STATS_DIR="$RULES_DIR/neuron_flip_rules/stats/$CIRCUIT_BAG_LABEL"
 if [[ -s "$STATS_DIR/flip_stats_global.json" \
@@ -855,6 +931,11 @@ if [[ -s "$STATS_DIR/flip_stats_global.json" \
 		LEGACY_STAGE7_HAS_SPLIT_COLUMN=true
 	fi
 fi
+if [[ -s "$STATS_DIR/flip_stats_global.json" ]]; then
+	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); need=("n_evaluated_rows","union_flip_any_unique_ci_low","union_flip_any_unique_ci_high","confidence_level"); raise SystemExit(0 if all(k in p for k in need) else 1)' "$STATS_DIR/flip_stats_global.json"; then
+		UNCERTAINTY_SCHEMA_OK=true
+	fi
+fi
 if [[ -s "$STATS_DIR/singleton_set_metrics.json" ]]; then
 	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); raise SystemExit(0 if p.get("definition_version") == "heldout-set-metrics-v2" else 1)' "$STATS_DIR/singleton_set_metrics.json"; then
 		SINGLETON_SCHEMA_OK=true
@@ -862,12 +943,13 @@ if [[ -s "$STATS_DIR/singleton_set_metrics.json" ]]; then
 fi
 SCOPE_SPLIT_OK=false
 if [[ -s "$STATS_DIR/evaluation_scope.json" ]]; then
-	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); raise SystemExit(0 if p.get("final_statistics_split") == sys.argv[2] else 1)' "$STATS_DIR/evaluation_scope.json" "$EVALUATION_SPLIT"; then
+	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); expected_excl=sys.argv[4].lower() in {"1","true","yes"}; expected_cap=int(sys.argv[5]); actual_cap=int(p.get("sampling_max_points") or 0); raise SystemExit(0 if p.get("final_statistics_split") == sys.argv[2] and p.get("evaluation_baseline_subset", "all") == sys.argv[3] and bool(p.get("exclude_discovery_rows_from_final_stats", False)) == expected_excl and actual_cap == max(0, expected_cap) else 1)' "$STATS_DIR/evaluation_scope.json" "$EVALUATION_SPLIT" "$EVALUATION_BASELINE_SUBSET" "$REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS" "$REFINE_SAMPLING_MAX_POINTS"; then
 		SCOPE_SPLIT_OK=true
 	fi
 fi
 if [[ "$LEGACY_STAGE7_COMPLETE" == "true" \
    && "$SINGLETON_SCHEMA_OK" == "true" \
+   && "$UNCERTAINTY_SCHEMA_OK" == "true" \
    && "$SCOPE_SPLIT_OK" == "true" \
    && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
 	STAGE7_COMPLETE=true
@@ -876,25 +958,32 @@ if [[ "$RUN_REFINE_NEURON_RULES" == "true" || "$RUN_REFINE_NEURON_RULES" == "1" 
 	REFINE_FLAGS=(
 		--task_module "$TASK_MODULE"
 		--ai_model "$ANALYZED_LLM"
+		"${HF_MODEL_CACHE_FLAG[@]}"
 		--rules_dir "$RULES_DIR/neuron_flip_rules"
 		--features_scores_dir "$FEATURES_SCORES_DIR"
 		--circuit_agonists_path "$DISCOVERY_OUT_DIR/$BAG_LABEL"
 		--search_epsilon $MIN_FLIP_RATE
 		--batch_size "$BATCH_SIZE"
 		--neuron_batch_size "$REFINE_NEURON_BATCH_SIZE"
-		--stats_dirname "$CIRCUIT_BAG_LABEL"
-		--use_spectral_sampling
 		--sampling_max_points "$REFINE_SAMPLING_MAX_POINTS"
-		--spectral_cache_dir $CACHE_DIR
+		--stats_dirname "$CIRCUIT_BAG_LABEL"
 		"${SPECTRAL_FLAGS[@]}"
 		--global_n_clusters "$MAX_POINTS_PER_ABLATION"
 		--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
 		--intervention $EVAL_INTERVENTION
 		--only_unique_datapoints_in_shap
-		--exclude_discovery_rows_from_final_stats
 		"${EVALUATION_SPLIT_FLAG[@]}"
 		"${DECODE_FLAG[@]}"
 	)
+	if [[ "$REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS" == "true" || "$REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS" == "1" ]]; then
+		REFINE_FLAGS+=(--exclude_discovery_rows_from_final_stats)
+	fi
+	if [[ "$REFINE_USE_SPECTRAL_SAMPLING" == "true" || "$REFINE_USE_SPECTRAL_SAMPLING" == "1" ]]; then
+		REFINE_FLAGS+=(
+			--use_spectral_sampling
+			--spectral_cache_dir "$CACHE_DIR"
+		)
+	fi
 	if [[ "$REFINE_EXTRACT_RULES" == "true" || "$REFINE_EXTRACT_RULES" == "1" ]]; then
 		REFINE_FLAGS+=(--extract_rules)
 	fi
@@ -946,7 +1035,7 @@ if [[ "$RUN_INTERACTION_VALIDATION" == "true" || "$RUN_INTERACTION_VALIDATION" =
 		if [[ "$FORCE_INTERACTION_VALIDATION" == "true" || "$FORCE_INTERACTION_VALIDATION" == "1" ]]; then
 			INTERACTION_FLAGS+=(--force)
 		fi
-		python3 -m analysis.26_validate_interactions "${INTERACTION_FLAGS[@]}"
+		python3 -m analysis.validate_interactions "${INTERACTION_FLAGS[@]}"
 	else
 		echo "Conditional validation skipped: complete stage-7 artifacts were not found in $STATS_DIR"
 	fi

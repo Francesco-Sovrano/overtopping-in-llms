@@ -33,4 +33,4 @@ if [[ -f "$RESULTS_ROOT/configured_experiments.json" ]]; then
 fi
 
 cd "$CODE_ROOT"
-python3 -m analysis.29_generate_final_results "$@" "${ARGS[@]}"
+python3 -m analysis.generate_final_results "$@" "${ARGS[@]}"

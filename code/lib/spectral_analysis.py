@@ -427,6 +427,9 @@ def kcenter_farthest_first(Z, k, seed=None):
 		d2[better] = new_d2[better]
 		cluster_id[better] = j
 
+	# Roundoff can make squared distances slightly negative (e.g. -1e-7).
+	# Distances are non-negative by definition, so clamp before sqrt/reporting.
+	d2 = np.maximum(d2, 0.0).astype(np.float32, copy=False)
 	meta = {
 		"k": int(k),
 		"achieved_cover_radius_l2": float(np.sqrt(float(d2.max()))),

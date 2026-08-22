@@ -22,7 +22,7 @@ from dataclasses import replace
 
 from lib.project_paths import CODE_ROOT, PROJECT_ROOT
 
-from analysis.primary_matrix import PRIMARY_PROFILE_CHOICES
+from analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES
 from experiments.execution import RunSpec, apply_filters, deduplicate, parse_filter, run_pipeline
 
 
@@ -104,7 +104,7 @@ def paper_primary_experiments() -> list[RunSpec]:
 
         # Jailbreaking (3)
         _small("bon_jailbreaking", QWEN2_15, "mean-donor", "decode-only"),
-        _large("bon_jailbreaking", QWEN2_7B, "decode-only", batch_size=256),
+        _large("bon_jailbreaking", QWEN2_7B, "decode-only"),
         _small("bon_jailbreaking", QWEN25_15, "mean-donor", "decode-only"),
 
         # Grammar acceptability (8)
@@ -260,7 +260,7 @@ def main() -> None:
     if args.phase in {"all", "analysis"} and not args.dry_run:
         if args.generate_primary_manuscript and not args.skip_manuscript_outputs:
             final_command = [
-                sys.executable, "-m", "analysis.29_generate_final_results",
+                sys.executable, "-m", "analysis.generate_final_results",
                 "--data-root", str(Path(args.data_root)),
                 "--results-root", str(analysis_root),
                 "--primary-profile", args.primary_profile,
@@ -272,7 +272,7 @@ def main() -> None:
             subprocess.run(final_command, cwd=CODE_ROOT, check=True)
         else:
             subprocess.run([
-                sys.executable, "-m", "analysis.28_visualize_experiment_results",
+                sys.executable, "-m", "analysis.stage01_visualize_experiment_results",
                 "--catalogue_json", str(analysis_root / "configured_experiments.json"),
                 "--data_root", str(Path(args.data_root)),
                 "--out_dir", str(analysis_root / "catalogue"),

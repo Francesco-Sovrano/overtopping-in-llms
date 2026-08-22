@@ -3,11 +3,15 @@ import torch
 from tqdm import tqdm
 import random
 
-from scipy.stats import beta as _beta_dist
-from statistics import NormalDist
 import math
 
 from lib.modeling_and_ablation import build_ablation_hooks
+from lib.binomial_statistics import (
+	binom_ucb as _shared_binom_ucb,
+	binom_confint as _shared_binom_confint,
+	invert_k_for_target_ucb as _shared_invert_k_for_target_ucb,
+	equivalent_search_epsilon as _shared_equivalent_search_epsilon,
+)
 
 def dichotomic_search_layer(
 	model,
@@ -103,12 +107,17 @@ def dichotomic_search_layer(
 		# alpha_slice + max_effect already computed in ablate_neurons
 		max_eff_ucb = record.get("max_effect", None)
 
+		obs_a = record.get("delta_on_associated_hat")
+		obs_u = record.get("delta_on_unrelated_hat")
+		obs_max = record.get("observed_max_effect")
 		print(
 			f"Depth {depth}, layer {layer_label}, group_size={len(group)}: "
 			f"acc_assoc={record['acc_after_knockout_on_associated']:.3f}, "
 			f"acc_unrel={record['acc_after_knockout_on_unrelated']:.3f}, "
 			f"gap={record['accuracy_gap']:.3f}, "
-			f"max_effect={('NA' if max_eff_ucb is None else f'{max_eff_ucb:.3f}')}"
+			f"effect_hat={('NA' if obs_max is None else f'{obs_max:.3f}')}, "
+			f"effect_ucb={('NA' if max_eff_ucb is None else f'{max_eff_ucb:.3f}')}, "
+			f"n_assoc={record.get('n_associated_eval', 0)}, n_unrel={record.get('n_unrelated_eval', 0)}"
 		)
 
 		pbar.update(1)
@@ -406,10 +415,18 @@ def ablate_neurons(model, pos_examples, neg_examples, is_answer_positive_fn, pro
 	results_dict["k_effect_associated"] = k_a
 	results_dict["k_effect_unrelated"] = k_u
 
+	# Keep the historical `max_effect` field for downstream compatibility, but it is
+	# a CONFIDENCE UPPER BOUND, not the observed effect. Store explicit names too.
+	if (delta_a_hat is None) or (delta_u_hat is None):
+		results_dict["observed_max_effect"] = None
+	else:
+		results_dict["observed_max_effect"] = float(max(delta_a_hat, delta_u_hat))
 	if (delta_a_ucb is None) or (delta_u_ucb is None):
+		results_dict["max_effect_ucb"] = None
 		results_dict["max_effect"] = None
 	else:
-		results_dict["max_effect"] = float(max(delta_a_ucb, delta_u_ucb))
+		results_dict["max_effect_ucb"] = float(max(delta_a_ucb, delta_u_ucb))
+		results_dict["max_effect"] = results_dict["max_effect_ucb"]
 
 	if return_prefix_batches and decode_only:
 		results_dict['prefix_batches'] = prefix_batches
@@ -418,6 +435,10 @@ def ablate_neurons(model, pos_examples, neg_examples, is_answer_positive_fn, pro
 	return results_dict
 
 def get_adjusted_search_epsilon(search_epsilon, pos_prompts, neg_prompts, n_associated, n_unrelated, prune_alpha):
+	# epsilon <= 0 is the explicit "fully split / disable pruning threshold" mode.
+	# Do not manufacture a positive threshold from finite-sample calibration.
+	if search_epsilon <= 0:
+		return search_epsilon
 	alpha_node = get_alpha_node(prune_alpha)
 	alpha_slice = None if alpha_node is None else alpha_node / 2.0
 	eps_a = equivalent_search_epsilon(
@@ -445,33 +466,10 @@ def get_adjusted_search_epsilon(search_epsilon, pos_prompts, neg_prompts, n_asso
 
 # --- stats helpers (one-sided binomial UCB) ---
 def binom_ucb(k: int, n: int, alpha: float) -> float:
-	"""
-	One-sided upper confidence bound for Binomial proportion p, using Clopper-Pearson when possible.
-	Returns u such that P(p <= u) >= 1 - alpha under Binomial(n, p).
+	return _shared_binom_ucb(k, n, alpha)
 
-	alpha must be in (0,1). If n==0 returns 0.
-	"""
-	if n <= 0:
-		return 0.0
-	k = int(k)
-	if k <= 0:
-		# CP upper for k=0: 1 - alpha^(1/n)
-		return float(1.0 - alpha ** (1.0 / n))
-	if k >= n:
-		return 1.0
-
-	if _beta_dist is not None:
-		# Clopper–Pearson (exact) one-sided upper bound:
-		# u = Beta^{-1}(1-alpha; k+1, n-k)
-		return float(_beta_dist.ppf(1.0 - alpha, k + 1, n - k))
-
-	# Fallback: Wilson score upper bound (approx, no SciPy)
-	phat = k / n
-	z = NormalDist().inv_cdf(1.0 - alpha)
-	denom = 1.0 + (z * z) / n
-	center = (phat + (z * z) / (2.0 * n)) / denom
-	half = (z * math.sqrt((phat * (1.0 - phat) / n) + (z * z) / (4.0 * n * n))) / denom
-	return float(min(1.0, center + half))
+def binom_confint(k: int, n: int, alpha: float = 0.05):
+	return _shared_binom_confint(k, n, alpha)
 
 def skip_subtree_for(group_size):
 	# full_subtree_nodes = 2*group_size - 1; skipped after counting current node = 2*group_size - 2
@@ -516,31 +514,12 @@ def slice_effect_and_ucb(correct_vec, baseline_subset, alpha_slice):
 	return float(delta_hat), float(delta_ucb), int(n), int(k_effect)
 
 def invert_k_for_target_ucb(n_ref, target_ucb, prune_alpha):
-	lo, hi = 0, n_ref
-	best = 0
-	while lo <= hi:
-		mid = (lo + hi) // 2
-		u = binom_ucb(mid, n_ref, prune_alpha)
-		if u <= target_ucb:
-			best = mid
-			lo = mid + 1
-		else:
-			hi = mid - 1
-	return best
+	return _shared_invert_k_for_target_ucb(n_ref, target_ucb, prune_alpha)
 
 def equivalent_search_epsilon(n, search_epsilon_ref = 0.2, n_ref = 100, prune_alpha = 0.025, rounding = "ceil"):
-	k_ref = invert_k_for_target_ucb(n_ref, search_epsilon_ref, prune_alpha)
-	p0 = k_ref / n_ref
-
-	if rounding == "ceil":
-		k = math.ceil(p0 * n)
-	elif rounding == "floor":
-		k = math.floor(p0 * n)
-	else:
-		k = int(round(p0 * n))
-
-	k = max(0, min(n, k))
-	return binom_ucb(k, n, prune_alpha)
+	return _shared_equivalent_search_epsilon(
+		n, search_epsilon_ref=search_epsilon_ref, n_ref=n_ref, prune_alpha=prune_alpha, rounding=rounding
+	)
 
 def get_alpha_node(prune_alpha, depth=0, nodes_tested=0, bonferroni=False):
 	if prune_alpha is None or prune_alpha <= 0:

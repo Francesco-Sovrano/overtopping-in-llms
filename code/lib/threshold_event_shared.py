@@ -3,7 +3,7 @@
 This module holds helper code used by:
   - 6_analyze_bag_of_rules.py for post-hoc agonist activation diagnostics
   - 7_refine_neuron_anchored_rules.py for stable layer-key naming
-  - 12_threshold_event_diagnostics.py / lib.threshold_event_spiking for high-N
+  - threshold_event_diagnostics.py / lib.threshold_event_spiking for high-N
     overtopping-vs-control threshold/spiking diagnostics
 
 Keeping these utilities here avoids duplicating script-6 activation capture logic

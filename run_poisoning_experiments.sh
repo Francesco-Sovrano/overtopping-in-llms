@@ -12,148 +12,196 @@ fi
 
 export INTERACTION_NULL_DRAWS=30
 export RUN_INTERACTION_VALIDATION=false
+export CHA_REFERENCE_N_PER_SIDE=64
+export CHA_TAU=0.3
+export CHA_LOW_DATA_POLICY=skip
+export MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
+export SEEDS=13
+export RUN_ORDINARY_CORRECTNESS_OVERTOPPING=0
+export POISON_RATE=0.3
+export POISON_RATE_BASIS=eligible_gold_non_target
 
 usage() {
   cat <<'TXT'
 Usage:
-  ./run_poisoning_experiments.sh
-  ./run_poisoning_experiments.sh --dry-run
+  ./run_poisoning_experiments.sh [--dry-run]
 
-The command runs the complete poisoning suite for both grammar and arithmetic:
-  1. clean and poisoned checkpoint fine-tuning;
-  2. trigger-lift causal analysis at every saved checkpoint;
-  3. input+output and output-only intervention phases;
-  4. trigger-lift trajectory aggregation;
-  5. cumulative discovery-ranked coalition ablation with matched random controls;
-  6. disjoint-selection/confirmation interaction-aware final-checkpoint defence.
+Useful controls:
 
-No scheduler is used. The experiments run directly in the current shell.
+  POISONING_TASKS=grammar,arithmetic
+  MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct,Qwen/Qwen2.5-1.5B-Instruct
+  GRAMMAR_MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
+  ARITHMETIC_MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
+  SEEDS=13,37,101
+  POISONING_RUN_NAME=confirmatory
+  CONTROL_MARKER='[id=38164]'
+  TRIGGER_MARKER='[id=74291]'
+  SHAM_MARKER='[id=90627]'
+  SHAM_MAX_ROWS=512
+  POISON_RATE=0.1
+  POISON_RATE_BASIS=eligible_gold_non_target
+  POISON_TRAINING_MODE=paired_counterfactual
+  POISON_SCHEDULE_MODE=uniform_optimizer_steps
+  POISONING_CACHE_ROOT=cache/poisoning
 
-The default logical run name is "main". Set POISONING_RUN_NAME only when you
-intentionally want a separate independent suite, for example:
-  POISONING_RUN_NAME=seed29 ./run_poisoning_experiments.sh
-
-Re-running the same run name is resumable: completed fine-tuning runs and
-completed causal checkpoint outputs are skipped.
+MODEL_NAMES, when set, applies the same model list to both tasks. Otherwise the
+defaults use Qwen2.5-1.5B for grammar and Qwen2-1.5B for arithmetic; task-specific model variables can override either one. Both tasks use one
+matched marker protocol: every control prompt starts with the control ID, and
+poisoned/triggered prompts replace only that first line with the trigger ID.
+The unseen sham ID is evaluated on a small cohort without a separate CHA run.
 TXT
 }
 
 DRY_RUN=0
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=1
-  shift
-fi
-if [[ $# -ne 0 ]]; then
-  usage >&2
+if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; shift; fi
+if [[ $# -ne 0 ]]; then usage >&2; exit 2; fi
+if [[ "${RUN_TRAINING_PROTECTION:-0}" == "1" || "${RUN_TRAINING_PROTECTION:-0}" == "true" ]]; then
+  echo "Run code/poisoning/scripts/run_training_time_protection.sh separately for protected trajectories." >&2
   exit 2
 fi
 
-RUN_NAME="${POISONING_RUN_NAME:-main}"
+BASE_RUN_NAME="${POISONING_RUN_NAME:-confirmatory}"
+POISONING_TASKS="${POISONING_TASKS:-grammar,arithmetic}"
+SEEDS="${SEEDS:-13,37,101}"
+GLOBAL_MODEL_NAMES="${MODEL_NAMES:-}"
+GRAMMAR_MODEL_NAMES="${GRAMMAR_MODEL_NAMES:-Qwen/Qwen2-1.5B-Instruct}"
+ARITHMETIC_MODEL_NAMES="${ARITHMETIC_MODEL_NAMES:-Qwen/Qwen2-1.5B-Instruct}"
+CONTROL_MARKER="${CONTROL_MARKER:-[id=38164]}"
+TRIGGER_MARKER="${TRIGGER_MARKER:-[id=74291]}"
+SHAM_MARKER="${SHAM_MARKER:-[id=90627]}"
+SHAM_MAX_ROWS="${SHAM_MAX_ROWS:-512}"
+POISON_RATE="${POISON_RATE:-0.1}"
+POISON_RATE_BASIS="${POISON_RATE_BASIS:-eligible_gold_non_target}"
+POISON_TRAINING_MODE="${POISON_TRAINING_MODE:-paired_counterfactual}"
+POISON_SCHEDULE_MODE="${POISON_SCHEDULE_MODE:-uniform_optimizer_steps}"
 GRAMMAR_OUTPUT_ROOT="${GRAMMAR_OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning_grammar}"
 ARITHMETIC_OUTPUT_ROOT="${ARITHMETIC_OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning_arithmetic}"
+POISONING_CACHE_ROOT="${POISONING_CACHE_ROOT:-$PROJECT_ROOT/cache/poisoning}"
 [[ "$GRAMMAR_OUTPUT_ROOT" = /* ]] || GRAMMAR_OUTPUT_ROOT="$PROJECT_ROOT/$GRAMMAR_OUTPUT_ROOT"
 [[ "$ARITHMETIC_OUTPUT_ROOT" = /* ]] || ARITHMETIC_OUTPUT_ROOT="$PROJECT_ROOT/$ARITHMETIC_OUTPUT_ROOT"
+[[ "$POISONING_CACHE_ROOT" = /* ]] || POISONING_CACHE_ROOT="$PROJECT_ROOT/$POISONING_CACHE_ROOT"
+export POISONING_CACHE_ROOT
 
-GRAMMAR_RUN_DIR="$GRAMMAR_OUTPUT_ROOT/$RUN_NAME"
-ARITHMETIC_RUN_DIR="$ARITHMETIC_OUTPUT_ROOT/$RUN_NAME"
-
-print_cmd() {
-  printf '[cmd]'
-  printf ' %q' "$@"
-  printf '\n'
+csv_array() {
+  local value="$1" destination="$2" item quoted
+  local parsed=() cleaned=()
+  IFS=',' read -r -a parsed <<< "$value"
+  for item in "${parsed[@]}"; do
+    item="${item#${item%%[![:space:]]*}}"
+    item="${item%${item##*[![:space:]]}}"
+    [[ -n "$item" ]] && cleaned+=("$item")
+  done
+  eval "$destination=()"
+  for item in "${cleaned[@]}"; do
+    printf -v quoted '%q' "$item"
+    eval "$destination+=( $quoted )"
+  done
 }
 
-run_cmd() {
-  print_cmd "$@"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    return 0
-  fi
-  "$@"
+slugify() {
+  local value="$1"
+  value="${value//\//__}"
+  value="$(printf '%s' "$value" | tr -cs 'A-Za-z0-9._-' '_')"
+  value="${value#_}"; value="${value%_}"
+  printf '%s' "${value:-model}"
 }
 
-run_finetune() {
-  local task="$1"
-  local output_root="$2"
-  local run_dir="$3"
-  local heldout_name="$4"
+MATRIX_SLUG="$(slugify "$BASE_RUN_NAME")"
+run() {
+  printf '[cmd]'; printf ' %q' "$@"; printf '\n'
+  if [[ "$DRY_RUN" != "1" ]]; then "$@"; fi
+}
 
-  if [[ -s "$run_dir/checkpoint_manifest_all.csv" \
-     && -s "$run_dir/run_config.json" \
-     && -s "$run_dir/heldout/$heldout_name" ]]; then
-    echo "[skip] $task fine-tuning already complete: $run_dir"
-    return 0
-  fi
-
-  run_cmd env \
-    PROJECT_ROOT="$PROJECT_ROOT" \
-    CODE_DIR="$CODE_ROOT" \
-    POISONING_TASK="$task" \
-    OUTPUT_ROOT="$output_root" \
-    RUN_NAME="$RUN_NAME" \
-    DRY_RUN=0 \
+fine_tune() {
+  local task="$1" model="$2" seed="$3" run_name="$4" output_root="$5"
+  run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$task" \
+    CONDITION=both OUTPUT_ROOT="$output_root" RUN_NAME="$run_name" MODEL_NAME="$model" \
+    SEED="$seed" POISON_RATE="$POISON_RATE" POISON_RATE_BASIS="$POISON_RATE_BASIS" \
+    POISON_TRAINING_MODE="$POISON_TRAINING_MODE" POISON_SCHEDULE_MODE="$POISON_SCHEDULE_MODE" CONTROL_MARKER="$CONTROL_MARKER" TRIGGER_MARKER="$TRIGGER_MARKER" \
+    SHAM_MARKER="$SHAM_MARKER" SHAM_MAX_ROWS="$SHAM_MAX_ROWS" DRY_RUN=0 \
     bash "$CODE_ROOT/poisoning/scripts/run_checkpoint_ft.sh"
 }
 
-run_lift_phase() {
-  local task="$1"
-  local run_dir="$2"
-  local decode_only="$3"
-  run_cmd env \
-    PROJECT_ROOT="$PROJECT_ROOT" \
-    CODE_DIR="$CODE_ROOT" \
-    POISONING_TASK="$task" \
-    RUN_DIR="$run_dir" \
-    LIFT_INDICES=all \
-    PIPELINE_DECODE_ONLY="$decode_only" \
-    DRY_RUN=0 \
+discover() {
+  local task="$1" run_dir="$2" decode_only="$3"
+  run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$task" RUN_DIR="$run_dir" \
+    POISONING_CACHE_ROOT="$POISONING_CACHE_ROOT" \
+    LIFT_INDICES=all PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 \
     bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_overtopping.sh"
 }
 
-run_cumulative_phase() {
-  local decode_only="$1"
-  run_cmd env \
-    PROJECT_ROOT="$PROJECT_ROOT" \
-    CODE_DIR="$CODE_ROOT" \
-    GRAMMAR_RUN_DIR="$GRAMMAR_RUN_DIR" \
-    ARITHMETIC_RUN_DIR="$ARITHMETIC_RUN_DIR" \
-    PIPELINE_DECODE_ONLY="$decode_only" \
-    DRY_RUN=0 \
+defend() {
+  local task="$1" model="$2" seed="$3" run_dir="$4" decode_only="$5"
+  local model_slug phase out
+  model_slug="$(slugify "$model")"
+  if [[ "$decode_only" == "1" ]]; then phase="output_only"; else phase="input_output"; fi
+  out="$PROJECT_ROOT/data/poisoning_mechanism_summary/$MATRIX_SLUG/$task/$model_slug/seed_$seed/$phase"
+  run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" RUN_DIR="$run_dir" \
+    PIPELINE_DECODE_ONLY="$decode_only" OUTPUT_DIR="$out" DRY_RUN=0 \
     bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh"
 }
 
-echo "=== Poisoning suite: $RUN_NAME ==="
-echo "Grammar run:    $GRAMMAR_RUN_DIR"
-echo "Arithmetic run: $ARITHMETIC_RUN_DIR"
-
-if [[ "$DRY_RUN" == "1" ]]; then
-  # Fine-tuning commands can be inspected directly. Later stages require the
-  # manifests produced by fine-tuning, so print their component invocations
-  # without asking those scripts to validate not-yet-created run directories.
-  env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK=grammar OUTPUT_ROOT="$GRAMMAR_OUTPUT_ROOT" RUN_NAME="$RUN_NAME" DRY_RUN=1 bash "$CODE_ROOT/poisoning/scripts/run_checkpoint_ft.sh"
-  env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK=arithmetic OUTPUT_ROOT="$ARITHMETIC_OUTPUT_ROOT" RUN_NAME="$RUN_NAME" DRY_RUN=1 bash "$CODE_ROOT/poisoning/scripts/run_checkpoint_ft.sh"
-  for decode_only in 0 1; do
-    print_cmd env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK=grammar RUN_DIR="$GRAMMAR_RUN_DIR" LIFT_INDICES=all PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_overtopping.sh"
-    print_cmd env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK=arithmetic RUN_DIR="$ARITHMETIC_RUN_DIR" LIFT_INDICES=all PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_overtopping.sh"
-    print_cmd env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" GRAMMAR_RUN_DIR="$GRAMMAR_RUN_DIR" ARITHMETIC_RUN_DIR="$ARITHMETIC_RUN_DIR" PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh"
-  done
-  exit 0
+declare -a TASK_LIST SEED_LIST CELLS
+csv_array "$POISONING_TASKS" TASK_LIST
+csv_array "$SEEDS" SEED_LIST
+if [[ ${#TASK_LIST[@]} -eq 0 || ${#SEED_LIST[@]} -eq 0 ]]; then
+  echo "POISONING_TASKS and SEEDS must each contain at least one value." >&2
+  exit 2
 fi
 
-run_finetune grammar "$GRAMMAR_OUTPUT_ROOT" "$GRAMMAR_RUN_DIR" grammar_validation.jsonl
-run_finetune arithmetic "$ARITHMETIC_OUTPUT_ROOT" "$ARITHMETIC_RUN_DIR" arithmetic_validation.jsonl
-
-for decode_only in 0 1; do
-  if [[ "$decode_only" == "0" ]]; then
-    echo "=== Trigger-lift causal analysis: input+output ==="
-  else
-    echo "=== Trigger-lift causal analysis: output-only ==="
-  fi
-  run_lift_phase grammar "$GRAMMAR_RUN_DIR" "$decode_only"
-  run_lift_phase arithmetic "$ARITHMETIC_RUN_DIR" "$decode_only"
-  run_cumulative_phase "$decode_only"
+for task in "${TASK_LIST[@]}"; do
+  case "$task" in
+    grammar)
+      model_spec="${GLOBAL_MODEL_NAMES:-$GRAMMAR_MODEL_NAMES}"
+      output_root="$GRAMMAR_OUTPUT_ROOT"; decode_only=0 ;;
+    arithmetic)
+      model_spec="${GLOBAL_MODEL_NAMES:-$ARITHMETIC_MODEL_NAMES}"
+      output_root="$ARITHMETIC_OUTPUT_ROOT"; decode_only=1 ;;
+    *) echo "Unsupported POISONING_TASKS entry: $task" >&2; exit 2 ;;
+  esac
+  declare -a TASK_MODELS
+  csv_array "$model_spec" TASK_MODELS
+  [[ ${#TASK_MODELS[@]} -gt 0 ]] || { echo "No models configured for task $task." >&2; exit 2; }
+  for model in "${TASK_MODELS[@]}"; do
+    model_slug="$(slugify "$model")"
+    for seed in "${SEED_LIST[@]}"; do
+      [[ "$seed" =~ ^-?[0-9]+$ ]] || { echo "Invalid integer seed: $seed" >&2; exit 2; }
+      run_name="${BASE_RUN_NAME}__${model_slug}__seed_${seed}"
+      CELLS+=("$task|$model|$seed|$run_name|$output_root|$decode_only")
+    done
+  done
 done
 
-echo "=== Poisoning suite complete ==="
-echo "Grammar:    $GRAMMAR_RUN_DIR"
-echo "Arithmetic: $ARITHMETIC_RUN_DIR"
-echo "Cumulative summaries: $PROJECT_ROOT/data/poisoning_mechanism_summary/"
+echo "=== Poisoning matrix: ${#CELLS[@]} task/model/seed cells ==="
+echo "=== Poisoning cache root: $POISONING_CACHE_ROOT ==="
+for cell in "${CELLS[@]}"; do
+  IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+  printf '  task=%s model=%s seed=%s run=%s control=%s trigger=%s sham=%s\n' \
+    "$task" "$model" "$seed" "$run_name" "$CONTROL_MARKER" "$TRIGGER_MARKER" "$SHAM_MARKER"
+done
+
+for cell in "${CELLS[@]}"; do
+  IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+  fine_tune "$task" "$model" "$seed" "$run_name" "$output_root"
+done
+for cell in "${CELLS[@]}"; do
+  IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+  discover "$task" "$output_root/$run_name" "$decode_only"
+done
+for cell in "${CELLS[@]}"; do
+  IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+  defend "$task" "$model" "$seed" "$output_root/$run_name" "$decode_only"
+done
+
+MATRIX_RUN_DIRS=""
+for cell in "${CELLS[@]}"; do
+  IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+  [[ -z "$MATRIX_RUN_DIRS" ]] || MATRIX_RUN_DIRS+=","
+  MATRIX_RUN_DIRS+="$output_root/$run_name"
+done
+run python3 "$CODE_ROOT/poisoning/stage07_aggregate_matrix.py" \
+  --run_dirs "$MATRIX_RUN_DIRS" \
+  --output_dir "$PROJECT_ROOT/data/poisoning_matrix_summary/$MATRIX_SLUG" \
+  --min_seeds "${MIN_SEEDS_FOR_DEVELOPMENTAL_CLAIM:-3}"
+
+echo "=== Poisoning matrix complete ==="

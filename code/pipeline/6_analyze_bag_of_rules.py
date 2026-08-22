@@ -104,7 +104,7 @@ def parse_args():
 	p.add_argument(
 		"--search_epsilon",
 		type=float,
-		default=0.2,
+		default=float(os.environ.get("CHA_TAU", "0.2")),
 		help=(
 			"Strength threshold tau used by CHA. Groups are split while the one-sided "
 			"UCB on compact-slice flip-rate strength remains at least this value. "
@@ -114,9 +114,40 @@ def parse_args():
 		),
 	)
 	p.add_argument(
+		"--search_epsilon_reference_n",
+		type=int,
+		default=(
+			int(os.environ.get("SEARCH_EPSILON_REFERENCE_N", os.environ.get("CHA_REFERENCE_N_PER_SIDE", "")))
+			if os.environ.get("SEARCH_EPSILON_REFERENCE_N", os.environ.get("CHA_REFERENCE_N_PER_SIDE", "")).strip()
+			else None
+		),
+		help=(
+			"Reference per-slice sample size at which --search_epsilon is defined. "
+			"If the actual associated/unrelated sample is smaller, CHA raises the effective "
+			"UCB threshold to the sample-size-equivalent operating point. Default: actual "
+			"--n_associated/--n_unrelated (no adjustment)."
+		),
+	)
+	p.add_argument(
+		"--cha_low_data_policy",
+		choices=["adapt", "skip", "fail"],
+		default=(os.environ.get("CHA_LOW_DATA_POLICY", "").strip().lower() or None),
+		help=(
+			"Optional generic CHA policy when a circuit has fewer associated/unrelated rows "
+			"than the requested/reference sample: adapt uses the largest balanced sample, "
+			"skip records no circuit analysis, fail aborts. If unset, historical skip behavior is kept."
+		),
+	)
+	p.add_argument(
+		"--cha_min_actual_side",
+		type=int,
+		default=int(os.environ.get("CHA_MIN_ACTUAL_N_PER_SIDE", "1")),
+		help="Absolute balanced per-side floor for --cha_low_data_policy adapt. Default: 1.",
+	)
+	p.add_argument(
 		"--prune_alpha",
 		type=float,
-		default=0.05,
+		default=float(os.environ.get("CHA_PRUNE_ALPHA", "0.05")),
 	)
 	p.add_argument(
 		"--catastrophic_acc_tol",
@@ -544,10 +575,10 @@ def _scan_reusable_circuits(circuit_entries: dict, rule_out_root: Path, args):
 # - Some single neurons can be "catastrophic" under baseline_subset=positive, producing accuracy_on_associated=0 and accuracy_on_unrelated=0.
 #   These neurons force dichotomic search to fully split groups; we keep them in a separate bucket to speed up
 #   subsequent runs.
-# - Neurons already identified as non-catastrophic agonists (abs(max_effect) >= 0.1) are also bucketed and
+# - Neurons already identified as non-catastrophic agonists (UCB >= the active CHA epsilon) are also bucketed and
 #   excluded from future ablations.
 
-AGONIST_ABS_GAP_THRESHOLD = args.search_epsilon
+AGONIST_ABS_GAP_THRESHOLD = args.search_epsilon  # fallback for old cached records/callers
 CATASTROPHIC_ACC_TOL = args.catastrophic_acc_tol
 CATASTROPHIC_N_RUNS = args.catastrophic_n_runs
 
@@ -708,6 +739,19 @@ def _compact_single_record(record: dict, *, circuit_id=None, baseline_subset=Non
 		"layer_label": layer_label,
 		"neuron_id": neuron_id,
 		"max_effect": float(record.get("max_effect", 0.0)),
+		"max_effect_ucb": record.get("max_effect_ucb"),
+		"observed_max_effect": record.get("observed_max_effect"),
+		"delta_on_associated_hat": record.get("delta_on_associated_hat"),
+		"delta_on_unrelated_hat": record.get("delta_on_unrelated_hat"),
+		"delta_on_associated_ucb": record.get("delta_on_associated_ucb"),
+		"delta_on_unrelated_ucb": record.get("delta_on_unrelated_ucb"),
+		"n_associated_eval": record.get("n_associated_eval"),
+		"n_unrelated_eval": record.get("n_unrelated_eval"),
+		"k_effect_associated": record.get("k_effect_associated"),
+		"k_effect_unrelated": record.get("k_effect_unrelated"),
+		"search_epsilon_base": record.get("search_epsilon_base"),
+		"search_epsilon_effective": record.get("search_epsilon_effective"),
+		"search_epsilon_reference_n": record.get("search_epsilon_reference_n"),
 		"accuracy_gap": float(record.get("accuracy_gap", 0.0)),
 		"accuracy_on_associated": float(record.get("acc_after_knockout_on_associated", 0.0)),
 		"accuracy_on_unrelated": float(record.get("acc_after_knockout_on_unrelated", 0.0)),
@@ -726,12 +770,12 @@ def _maybe_promote_catastrophic_candidate(buckets: dict, key: str):
 		buckets["catastrophic_zero"]["not_always"][key] = cand
 	del buckets["catastrophic_zero"]["candidates"][key]
 
-def _update_buckets_from_single_record(buckets, record, baseline_subset, circuit_id=None):
+def _update_buckets_from_single_record(buckets, record, baseline_subset, circuit_id=None, agonist_threshold=None):
 	"""Update special buckets from a single-neuron ablation record.
 
 	Rules:
 	- baseline_subset == 'positive' and accuracy_on_associated==0 and accuracy_on_unrelated==0 => catastrophic-zero candidate/confirmed/not_always
-	- abs(max_effect) >= 0.1 and NOT catastrophic-zero => non-catastrophic agonist (excluded from future ablations)
+	- max_effect UCB >= the active CHA epsilon and NOT catastrophic-zero => non-catastrophic agonist (excluded from future ablations)
 	"""
 	key = _extract_single_neuron_key_from_record(record)
 	if key is None:
@@ -740,6 +784,7 @@ def _update_buckets_from_single_record(buckets, record, baseline_subset, circuit
 	# If already a known non-catastrophic agonist, keep it there.
 	is_zero_zero = ((baseline_subset == "positive" and _is_catastrophic_zero_zero(record)) or (baseline_subset == "negative" and _is_catastrophic_one_one(record)))
 	abs_gap = abs(float(record.get("max_effect", 0.0)))
+	threshold = float(AGONIST_ABS_GAP_THRESHOLD if agonist_threshold is None else agonist_threshold)
 
 	# Update catastrophic bucket
 	if baseline_subset == "positive":
@@ -762,7 +807,7 @@ def _update_buckets_from_single_record(buckets, record, baseline_subset, circuit
 			_maybe_promote_catastrophic_candidate(buckets, key)
 
 	# Update non-catastrophic agonist bucket (exclude from future ablations)
-	if (not is_zero_zero) and (abs_gap >= AGONIST_ABS_GAP_THRESHOLD):
+	if (not is_zero_zero) and (abs_gap >= threshold):
 		prev = buckets["non_catastrophic_agonists"].get(key)
 		best = abs_gap if prev is None else max(float(prev.get("best_abs_gap", 0.0)), abs_gap)
 		buckets["non_catastrophic_agonists"][key] = {
@@ -2482,7 +2527,10 @@ scores_df = scores_df.reset_index(drop=True)
 
 # Model
 device = get_device()
-model = LMWrapper(model_name=ai_model, device=device, eval_mode=True, circuit_discovery=False, cache_dir=args.ai_model_cache_dir)
+lm_wrapper_kwargs = {}
+if callable(getattr(task, "lm_wrapper_kwargs", None)):
+	lm_wrapper_kwargs = dict(task.lm_wrapper_kwargs(ai_model) or {})
+model = LMWrapper(model_name=ai_model, device=device, eval_mode=True, circuit_discovery=False, cache_dir=args.ai_model_cache_dir, **lm_wrapper_kwargs)
 
 # Precompute spectral clusters (baseline-subset aware) if requested
 cluster_member_indices_orig = None
@@ -2719,8 +2767,6 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 		print(f"Processing rule {rid} [{rule}]")
 
 	print(f"\tpositives: {len(idx_pos)}; negatives: {len(idx_neg)}")
-	assert len(idx_pos) >= args.n_associated and len(idx_neg) >= args.n_unrelated
-
 	# Common per-rule detail structure
 	rule_detail = {
 		"circuit_id": int(rid),
@@ -2736,21 +2782,43 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 		"baseline_subset": args.baseline_subset,
 	}
 
-	# If we don't have both positives and negatives, we can't assess targeted effect
-	# if len(idx_pos) == 0 or len(idx_neg) == 0:
+	# Low-data handling can be controlled generically when CHA_REFERENCE_N_PER_SIDE /
+	# CHA_LOW_DATA_POLICY are exported.  Without an explicit policy, preserve the
+	# historical behavior of skipping an under-sized circuit.
+	requested_side = max(int(args.n_associated), int(args.n_unrelated))
+	available_side = min(len(idx_pos), len(idx_neg))
+	low_data_policy = getattr(args, "cha_low_data_policy", None)
+	adapt_low_data = False
 	if len(idx_pos) < args.n_associated or len(idx_neg) < args.n_unrelated:
-		rule_detail.update(
-			{
-				"status": "skipped",
-				"reason": "Insufficient associated or unrelated prompts",
-				"n_associated_tested": 0,
-				"n_unrelated_tested": 0,
-				"ablations": [],
-			}
-		)
-		rule_out_root_target.write_text(json.dumps(rule_detail, indent=4))
-		summary_rule_knockout.append(_summary_entry_from_rule_detail(rule_detail))
-		continue
+		if low_data_policy == "fail":
+			raise RuntimeError(
+				f"CHA low-data policy=fail: circuit {rid} has only {available_side} balanced rows/side "
+				f"for requested {requested_side}."
+			)
+		if low_data_policy == "adapt" and available_side >= int(args.cha_min_actual_side):
+			adapt_low_data = True
+			print(
+				f"[CHALowData] adapting circuit {rid}: available={available_side}/side, "
+				f"requested={requested_side}/side, min_actual={int(args.cha_min_actual_side)}."
+			)
+		else:
+			reason = (
+				f"Insufficient associated or unrelated prompts: available={available_side}/side, "
+				f"requested={requested_side}/side, policy={low_data_policy or 'historical_skip'}"
+			)
+			rule_detail.update(
+				{
+					"status": "skipped",
+					"reason": reason,
+					"n_associated_tested": 0,
+					"n_unrelated_tested": 0,
+					"cha_low_data_policy": low_data_policy,
+					"ablations": [],
+				}
+			)
+			rule_out_root_target.write_text(json.dumps(rule_detail, indent=4))
+			summary_rule_knockout.append(_summary_entry_from_rule_detail(rule_detail))
+			continue
 
 	if is_backfill_only:
 		idx_pos_sampled = np.array(cached_rule_detail.get("sampled_associated_indices", []), dtype=int)
@@ -2808,19 +2876,31 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 			torch.cuda.empty_cache()
 		continue
 
-	take_pos = min(args.n_associated, len(idx_pos))
-	take_neg = min(args.n_unrelated, len(idx_neg))
+	if adapt_low_data:
+		take_pos = take_neg = available_side
+	else:
+		take_pos = min(args.n_associated, len(idx_pos))
+		take_neg = min(args.n_unrelated, len(idx_neg))
 	idx_pos_sampled = np.random.choice(idx_pos, size=take_pos, replace=False)
 	idx_neg_sampled = np.random.choice(idx_neg, size=take_neg, replace=False)
 	pos_prompts = [all_examples[i] for i in map(int,idx_pos_sampled)]
 	neg_prompts = [all_examples[i] for i in map(int,idx_neg_sampled)]
 	
 	# --- build prefixes and search epsilon ---
+	ref_n = int(args.search_epsilon_reference_n or max(args.n_associated, args.n_unrelated))
+	rule_detail["search_epsilon_reference_n"] = int(ref_n)
+	rule_detail["cha_low_data_policy"] = low_data_policy
+	rule_detail["cha_min_actual_side"] = int(args.cha_min_actual_side)
 	search_epsilon = get_adjusted_search_epsilon(
-		args.search_epsilon, 
-		pos_prompts, neg_prompts, 
-		args.n_associated, args.n_unrelated, 
-		args.prune_alpha
+		args.search_epsilon,
+		pos_prompts, neg_prompts,
+		ref_n, ref_n,
+		args.prune_alpha,
+	)
+	print(
+		f"[CHAThreshold] base_tau={args.search_epsilon:.4f} at reference_n={ref_n} per side; "
+		f"actual_n_assoc={len(pos_prompts)}, actual_n_unrel={len(neg_prompts)}, "
+		f"effective_tau={search_epsilon:.4f}, prune_alpha={args.prune_alpha:.4f}."
 	)
 	results_dict = ablate_neurons(
 		model, 
@@ -2936,12 +3016,16 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 					baseline_subset=args.baseline_subset,
 					alpha_slice=ALPHA_SLICE_DEFAULT,
 				)
+				ablation_record["search_epsilon_base"] = float(args.search_epsilon)
+				ablation_record["search_epsilon_effective"] = float(search_epsilon)
+				ablation_record["search_epsilon_reference_n"] = int(ref_n)
 				rule_ablation_results.append(ablation_record)
 				_update_buckets_from_single_record(
 					buckets,
 					ablation_record,
 					baseline_subset=args.baseline_subset,
 					circuit_id=rid,
+					agonist_threshold=search_epsilon,
 				)
 
 			# Dichotomic search on the remaining neurons
@@ -2977,9 +3061,14 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 					first_split_by_importance_sign=getattr(args, 'sign_split_first', False),
 				)
 
+				for rec in layer_results:
+					rec["search_epsilon_base"] = float(args.search_epsilon)
+					rec["search_epsilon_effective"] = float(search_epsilon)
+					rec["search_epsilon_reference_n"] = int(ref_n)
 				rule_ablation_results += layer_results
 
-				# Update buckets from single-neuron leaves discovered by dichotomic search
+				# Update buckets from single-neuron leaves discovered by dichotomic search.
+				# The effective, sample-size-adjusted threshold is the inclusion criterion.
 				for rec in layer_results:
 					if int(rec.get("group_size", 0)) == 1:
 						_update_buckets_from_single_record(
@@ -2987,6 +3076,7 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 							rec,
 							baseline_subset=args.baseline_subset,
 							circuit_id=rid,
+							agonist_threshold=search_epsilon,
 						)
 
 	else:
@@ -3020,12 +3110,16 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 					baseline_subset=args.baseline_subset,
 					alpha_slice=ALPHA_SLICE_DEFAULT,
 				)
+				ablation_record["search_epsilon_base"] = float(args.search_epsilon)
+				ablation_record["search_epsilon_effective"] = float(search_epsilon)
+				ablation_record["search_epsilon_reference_n"] = int(ref_n)
 				rule_ablation_results.append(ablation_record)
 				_update_buckets_from_single_record(
 					buckets,
 					ablation_record,
 					baseline_subset=args.baseline_subset,
 					circuit_id=rid,
+					agonist_threshold=search_epsilon,
 				)
 
 				max_effect_val = ablation_record.get("max_effect")

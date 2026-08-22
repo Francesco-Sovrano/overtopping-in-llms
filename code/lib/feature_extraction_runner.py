@@ -277,17 +277,24 @@ class FeatureExtractionResult:
 # Task-spec resolution
 # -----------------------------------------------------------------------------
 def resolve_task_spec(task_module: str):
+	"""Resolve a task spec from ``module`` or ``module:attribute``.
+
+	Normal tasks expose the conventional ``TASK_SPEC`` attribute. A module can
+	expose multiple task specs by naming the desired attribute explicitly, which
+	is used by the single-file poisoning tasks for their backdoor and ordinary
+	correctness endpoints.
 	"""
-	Imports a task module and returns task.TASK_SPEC.
-	Expected attributes on TASK_SPEC (as per your script):
-	  DEFAULT_TARGETS, DEFAULT_INPUT, DEFAULT_OUTPUT,
-	  SYSTEM_PROMPT, TOKENS_DICT_KEYS, SEED_FEATURES,
-	  parse_prompt, load_dataset_from_cache
-	"""
-	task = importlib.import_module(task_module)
-	if not hasattr(task, "TASK_SPEC"):
-		raise ValueError(f"Task module '{task_module}' has no TASK_SPEC.")
-	return task.TASK_SPEC
+	module_name, sep, attribute = str(task_module).partition(":")
+	module_name = module_name.strip()
+	attribute = attribute.strip() if sep else "TASK_SPEC"
+	if not module_name or not attribute:
+		raise ValueError(f"Invalid task spec reference: {task_module!r}")
+	task = importlib.import_module(module_name)
+	if not hasattr(task, attribute):
+		raise ValueError(
+			f"Task module '{module_name}' has no task-spec attribute '{attribute}'."
+		)
+	return getattr(task, attribute)
 
 
 # -----------------------------------------------------------------------------
@@ -443,6 +450,16 @@ def compute_feature_metrics(df_scores: pd.DataFrame, target_col: str) -> pd.Data
 # Compile & score features (moved into lib)
 # -----------------------------------------------------------------------------
 def compile_all(features, parse_prompt_row_fn, prompt_id, progress=True, df=None):
+	"""Compile feature functions and optionally sanity-score them on sample rows.
+
+	A feature is retained whenever compilation succeeds.  If ``df`` is supplied,
+	the sample is an additional runtime sanity check; it must not control whether
+	a successfully compiled feature is appended.  The previous implementation
+	appended only inside ``if df is not None``, which silently discarded every
+	seed feature in ``--no_llm_feature_generation`` mode.
+	"""
+	import traceback
+
 	compiled = []
 	for f in features:
 		try:
@@ -454,13 +471,29 @@ def compile_all(features, parse_prompt_row_fn, prompt_id, progress=True, df=None
 				it = df.itertuples(index=False)
 				if progress:
 					it = tqdm(list(it), total=len(df), desc="Scoring prompts (sanity)")
-				for r in it:
-					tokens = parse_prompt_row_fn(r)
-					_ = fn(getattr(r, prompt_id), tokens)
+				for row_num, r in enumerate(it):
+					try:
+						tokens = parse_prompt_row_fn(r)
+						_ = fn(getattr(r, prompt_id), tokens)
+					except Exception as row_exc:
+						raise RuntimeError(
+							f"sanity failure row={row_num} "
+							f"prompt={getattr(r, prompt_id, None)!r}: "
+							f"{type(row_exc).__name__}: {row_exc}"
+						) from row_exc
 
-				compiled.append(f)
+			# IMPORTANT: retain the feature after successful compilation even when
+			# no sanity DataFrame was requested (the normal --no_llm path).
+			compiled.append(f)
 		except Exception as e:
-			print(f"[WARN] Compile failed for '{getattr(f, 'label', '?')}': {e}")
+			print(
+				f"[feature-debug] compile/reject feature={getattr(f, 'label', '?')!r}: "
+				f"{type(e).__name__}: {e}"
+			)
+			print("[feature-debug] source:\n" + str(getattr(f, "python_src", "")))
+			traceback.print_exc()
+
+	print(f"[feature-debug] compiled {len(compiled)}/{len(features)} features")
 	return compiled
 
 

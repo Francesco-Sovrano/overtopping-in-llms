@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from lib.caching_and_prompting import load_cache
 from lib.feature_representation import Feature
-from lib.modeling_and_ablation import LMWrapper, get_device
+from lib.tasks.grammar_readout import extract_binary_prediction
 from lib.task_spec import FeatureTaskSpec
 
 DEFAULT_SEED = int(os.environ.get("GRAMMAR_TASK_SEED", "42"))
@@ -45,31 +45,8 @@ def _contains_any(text: str, patterns: List[str]) -> bool:
     return any(p in low for p in patterns)
 
 
-def _extract_binary_prediction(text: str) -> Optional[bool]:
-    low = _normalize_text(text).lower()
-    if not low:
-        return None
 
-    # Prioritize negative forms so "unacceptable" does not get mistaken for "acceptable".
-    patterns = [
-        (r"\bunacceptable\b", False),
-        (r"\bungrammatical\b", False),
-        (r"\bincorrect\b", False),
-        (r"\bno\b", False),
-        (r"\bacceptable\b", True),
-        (r"\bgrammatical\b", True),
-        (r"\bcorrect\b", True),
-        (r"\byes\b", True),
-    ]
-    matches = []
-    for pattern, label in patterns:
-        for m in re.finditer(pattern, low):
-            matches.append((m.start(), label))
-    if not matches:
-        return None
-    matches.sort(key=lambda x: x[0])
-    return matches[-1][1]
-
+_extract_binary_prediction = extract_binary_prediction
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -298,6 +275,7 @@ class GrammarAcceptabilityTaskSpec(FeatureTaskSpec):
         batch_size = getattr(args, "batch_size", 16)
         max_new_tokens = getattr(args, "max_new_tokens", self.MAX_NEW_TOKENS)
 
+        from lib.modeling_and_ablation import LMWrapper, get_device
         device = get_device()
         model = LMWrapper(
             ai_model,

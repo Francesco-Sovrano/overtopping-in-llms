@@ -44,6 +44,8 @@ from lib.neuron_intervention import (
 	build_prefix_caches_for_examples,
 	get_correctness,
 	get_correctness_cached_by_prefix_batches,
+	binom_confint,
+	equivalent_search_epsilon,
 )
 
 # Must match lib.data_model_for_shap cache signatures.
@@ -51,6 +53,8 @@ from lib.neuron_intervention import (
 ALL_FIT_CACHE_SIGNATURE = "all_fit_selected_scored_on_train_plus_eval_v2"
 TEST_SELECTED_COMBO_CACHE_SIGNATURE = "test_selected_from_train_rules_v1"
 RULE_METRICS_SUMMARY_CACHE_SIGNATURE = "rule_combo_metrics_from_raw_v1"
+
+
 
 def _combo_cache_has_signature(path: Path, column: str, expected: str) -> bool:
 	if (not path.exists()) or path.stat().st_size <= 0:
@@ -302,11 +306,15 @@ def parse_args():
 	ap.add_argument(
 		"--sampling_max_points",
 		type=int,
-		default=512,
+		default=int(os.environ.get("REFINE_SAMPLING_MAX_POINTS", "512")),
 		help=(
-			"Hard cap on the number of prompts evaluated per neuron when spectral sampling "
-			"is used. The sampling pool is first restricted by --evaluation_split "
-			"before this cap is applied."
+			"Existing stage-7 cap on prompts evaluated per neuron. Direct stage-7 calls read "
+			"REFINE_SAMPLING_MAX_POINTS when it is exported; _run_pipeline.sh supplies 10000 by default. "
+			"The pool is first restricted "
+			"by --evaluation_split and --evaluation_baseline_subset. With spectral sampling, this "
+			"caps the spectral sample; without spectral sampling, a deterministic seeded uniform "
+			"sample without replacement is used. <=0 means unlimited only when "
+			"spectral sampling is disabled."
 		),
 	)
 	ap.add_argument(
@@ -331,6 +339,16 @@ def parse_args():
 		help=(
 			"Rows used for singleton interventions and final statistics. Default: test. "
 			"test/train require an is_test column; all evaluates every available row."
+		),
+	)
+	ap.add_argument(
+		"--evaluation_baseline_subset",
+		choices=["all", "positive", "negative"],
+		default=os.environ.get("EVALUATION_BASELINE_SUBSET", "all").strip().lower(),
+		help=(
+			"Optional baseline-predicate conditioning inside the selected evaluation split. "
+			"For trigger-lift-conditioned poisoning use positive, so singleton effects are "
+			"estimated only on rows that exhibit trigger lift before intervention."
 		),
 	)
 	ap.add_argument(
@@ -637,6 +655,9 @@ def build_flip_cache_policy_tag(args, *, main_metric=None):
 	if bool(getattr(args, "last_pos_only", False)):
 		parts.append("last_pos_only")
 	evaluation_split = str(getattr(args, "evaluation_split", "test")).strip().lower()
+	evaluation_baseline_subset = str(getattr(args, "evaluation_baseline_subset", "all")).strip().lower()
+	if evaluation_baseline_subset != "all":
+		parts.append(f"baseline_{evaluation_baseline_subset}")
 	if evaluation_split == "test":
 		# Test-only cache namespace.
 		parts.append("holdout_test_only")
@@ -1153,7 +1174,16 @@ def should_skip_rule_extraction(rules_subdir, prefix, layer_label, signature=Non
 		return False
 	return stored == signature
 
-def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50, stats_dirname='', baseline_metric_col: str = None):
+def write_flip_stats(
+	scores_df: pd.DataFrame,
+	neurons_sorted,
+	out_dir,
+	topk=50,
+	stats_dirname='',
+	baseline_metric_col: str = None,
+	search_epsilon: float = None,
+	reference_n_per_side: int = None,
+):
 	"""
 	Write per-neuron counts of c2i and i2c flips, and a bar plot for the top-K neurons
 	(by total flips).
@@ -1220,6 +1250,8 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 		c2i_pct = (100.0 * c2i / n_eval) if n_eval else float("nan")
 		i2c_pct = (100.0 * i2c / n_eval) if n_eval else float("nan")
 		total_pct = (100.0 * total / n_eval) if n_eval else float("nan")
+		ci_alpha = float(os.environ.get("EVALUATION_CONFIDENCE_ALPHA", "0.05"))
+		flip_ci_low, flip_ci_high = binom_confint(total, n_eval, alpha=ci_alpha)
 
 		rows.append({
 			"layer_label": str(layer_label),
@@ -1233,6 +1265,9 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 			"c2i_rate": (c2i / n_eval) if n_eval else float("nan"),
 			"i2c_rate": (i2c / n_eval) if n_eval else float("nan"),
 			"flip_any_rate": (total / n_eval) if n_eval else float("nan"),
+			"flip_any_ci_low": flip_ci_low,
+			"flip_any_ci_high": flip_ci_high,
+			"confidence_level": 1.0 - ci_alpha,
 			"semantic_wrong_count": semantic_wrong,
 			"semantic_wrong_rate": (semantic_wrong / n_eval) if n_eval else float("nan"),
 			"flip_semantic_wrong_count": flip_semantic_wrong,
@@ -1314,6 +1349,24 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 	union_semantic_wrong, eval_semantic_wrong = _union_counts(cols_semantic_wrong_found)
 	union_flip_empty, eval_flip_empty = _union_counts(cols_flip_empty_found)
 	union_flip_unparseable, eval_flip_unparseable = _union_counts(cols_flip_unparseable_found)
+	ci_alpha = float(os.environ.get("EVALUATION_CONFIDENCE_ALPHA", "0.05"))
+	union_ci_low, union_ci_high = binom_confint(union_any, eval_any, alpha=ci_alpha)
+	if reference_n_per_side is None:
+		ref_n_raw = os.environ.get("SEARCH_EPSILON_REFERENCE_N", "").strip()
+		ref_n = int(ref_n_raw) if ref_n_raw else None
+	else:
+		ref_n = int(reference_n_per_side)
+	# search_epsilon is passed explicitly from main() so this helper does not
+	# depend on argparse state outside its scope.
+	ref_tau = float(search_epsilon) if search_epsilon is not None else None
+	equivalent_tau_at_eval_n = None
+	if ref_n and ref_tau is not None and eval_any > 0:
+		equivalent_tau_at_eval_n = max(
+			ref_tau,
+			equivalent_search_epsilon(
+				eval_any, search_epsilon_ref=ref_tau, n_ref=ref_n, prune_alpha=ci_alpha / 2.0
+			),
+		)
 	global_payload = {
 		"n_neurons": int(len(stats_df)),
 		"n_evaluated_rows": int(eval_any),
@@ -1322,6 +1375,13 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 		"sum_flip_any_counts_over_neurons": int(stats_df["flip_any_count"].sum()),
 		"union_flip_any_unique_count": int(union_any),
 		"union_flip_any_unique_rate": (float(union_any) / float(eval_any)) if eval_any else float("nan"),
+		"union_flip_any_unique_ci_low": union_ci_low,
+		"union_flip_any_unique_ci_high": union_ci_high,
+		"confidence_level": 1.0 - ci_alpha,
+		"confidence_method": "Clopper-Pearson exact (Wilson fallback if SciPy unavailable)",
+		"reference_cha_tau": ref_tau,
+		"reference_cha_n_per_side": ref_n,
+		"equivalent_reference_tau_at_eval_n": equivalent_tau_at_eval_n,
 		"baseline_metric_col": str(baseline_metric_col),
 		"union_c2i_unique_count": int(union_c2i),
 		"n_evaluated_c2i_rows": int(eval_c2i),
@@ -4508,24 +4568,56 @@ def main():
 	if prompt_col not in scores_df.columns:
 		raise ValueError(f"Prompt column {prompt_col!r} not found in scores")
 
-	# Derive feature columns from features.json produced by the previous script
+	# Derive feature columns from features.json produced by the previous script.
+	# Normal experiments store a list of feature dictionaries.  Poisoning is
+	# deliberately dataset-only and stores an empty list.  Older poisoning runs
+	# may contain a metadata dictionary instead; accept that representation as
+	# featureless too so cached stage-6 results can be resumed safely.
 	features_json_path = os.path.join(args.features_scores_dir, "features.json")
 	with open(features_json_path, "r", encoding="utf-8") as f:
 		features_meta = json.load(f)
 	features_json_fp = _file_fingerprint(Path(features_json_path))
 	def _sanitize(s: str) -> str:
 		return re.sub(r"[^0-9a-zA-Z]+", "_", str(s)).strip("_").lower()
-	# Column names in scores.csv that correspond to feature labels
-	feature_name_set = {
-		_sanitize(feat["label"])
-		for feat in features_meta
-	}
 
+	if isinstance(features_meta, dict):
+		if features_meta.get("feature_engineering") is False or features_meta.get("mode") == "dataset_only":
+			feature_records = []
+		elif isinstance(features_meta.get("features"), list):
+			feature_records = features_meta["features"]
+		else:
+			raise TypeError(
+				"features.json must be a list of feature records, or an explicit "
+				"dataset-only metadata object with feature_engineering=false."
+			)
+	elif isinstance(features_meta, list):
+		feature_records = features_meta
+	else:
+		raise TypeError(f"Unsupported features.json root type: {type(features_meta).__name__}")
+
+	bad_feature_records = [
+		feat for feat in feature_records
+		if not isinstance(feat, dict) or "label" not in feat
+	]
+	if bad_feature_records:
+		raise TypeError(
+			"features.json feature entries must be objects containing a 'label' field; "
+			f"found {len(bad_feature_records)} malformed entries."
+		)
+
+	feature_name_set = {_sanitize(feat["label"]) for feat in feature_records}
 	input_features = [
 		c for c in scores_df.columns
 		if c in feature_name_set
 		and c not in metrics_list
 	]
+	if not feature_records:
+		print("[Features] Dataset-only mode: no semantic feature columns; singleton evaluation remains enabled.")
+		if args.extract_rules:
+			raise ValueError(
+				"--extract_rules cannot be used with dataset-only features.json. "
+				"Disable rule extraction or run semantic feature generation first."
+			)
 
 	# Resolve model id: prefer dataset_info.json next to scores if present, else arg, else fallback
 	ai_model = args.ai_model
@@ -4635,13 +4727,38 @@ def main():
 				raise ValueError(f"--evaluation_split {evaluation_split} selected zero rows in stats-only mode.")
 			scores_stats = scores_stats.loc[mask].copy().reset_index(drop=True)
 		print(f"[Stats-only] Evaluation split={evaluation_split}: {len(scores_stats)} of {n_source_rows} rows retained")
+		evaluation_baseline_subset = str(args.evaluation_baseline_subset).strip().lower()
+		if evaluation_baseline_subset != "all":
+			if main_metric not in scores_stats.columns:
+				raise ValueError(f"Baseline predicate column {main_metric!r} is required for --evaluation_baseline_subset.")
+			baseline_num = pd.to_numeric(scores_stats[main_metric], errors="coerce")
+			valid = baseline_num.notna()
+			keep = valid & (baseline_num > 0.5) if evaluation_baseline_subset == "positive" else valid & (baseline_num <= 0.5)
+			scores_stats = scores_stats.loc[keep].copy().reset_index(drop=True)
+			if scores_stats.empty:
+				raise ValueError(f"--evaluation_baseline_subset {evaluation_baseline_subset} selected zero rows in stats-only mode.")
+		print(f"[Stats-only] Baseline subset={evaluation_baseline_subset}: {len(scores_stats)} rows retained")
+		evaluation_pool_rows_before_cap = int(len(scores_stats))
+		sampling_max_points = int(getattr(args, "sampling_max_points", 0) or 0)
+		if sampling_max_points > 0 and len(scores_stats) > sampling_max_points:
+			rng = np.random.default_rng(int(args.seed))
+			keep_pos = np.sort(rng.choice(len(scores_stats), size=sampling_max_points, replace=False))
+			scores_stats = scores_stats.iloc[keep_pos].copy().reset_index(drop=True)
+			print(
+				f"[Stats-only] Existing stage-7 cap retained {len(scores_stats)}/{evaluation_pool_rows_before_cap} rows "
+				f"(--sampling_max_points={sampling_max_points}, seeded uniform sample, seed={int(args.seed)})."
+			)
 
 		# Discover neurons from per_rule and apply bucket filtering (same as normal mode)
 		print(f"[Stats-only] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
 		neurons = extract_single_neurons(circuit_agonists_path, search_epsilon=float(args.search_epsilon))
 		
 		# Parse quantiles for range reporting
-		flip_stats_df = write_flip_stats(scores_stats, neurons, args.rules_dir, topk=50, stats_dirname=stats_dirname, baseline_metric_col=main_metric)
+		flip_stats_df = write_flip_stats(
+			scores_stats, neurons, args.rules_dir, topk=50, stats_dirname=stats_dirname,
+			baseline_metric_col=main_metric, search_epsilon=args.search_epsilon,
+			reference_n_per_side=(int(os.environ["SEARCH_EPSILON_REFERENCE_N"]) if os.environ.get("SEARCH_EPSILON_REFERENCE_N", "").strip() else None),
+		)
 		frozen_candidate_ranking_df = extract_frozen_candidate_ranking(
 			circuit_agonists_path, neurons, search_epsilon=float(args.search_epsilon)
 		)
@@ -4668,6 +4785,11 @@ def main():
 			"mean_replacement_reference_split": "train",
 			"candidate_discovery_split": "train",
 			"final_statistics_split": evaluation_split,
+			"evaluation_baseline_subset": evaluation_baseline_subset,
+			"evaluation_pool_rows_before_cap": evaluation_pool_rows_before_cap,
+			"sampling_max_points": sampling_max_points if sampling_max_points > 0 else None,
+			"evaluation_cap_applied": bool(sampling_max_points > 0 and evaluation_pool_rows_before_cap > sampling_max_points),
+			"exclude_discovery_rows_from_final_stats": bool(getattr(args, "exclude_discovery_rows_from_final_stats", False)),
 			"intervention": str(args.intervention),
 			"intervention_phase": intervention_phase_name(args),
 			"candidate_ranking_file": "frozen_candidate_ranking.csv",
@@ -4720,6 +4842,9 @@ def main():
 		nonlocal model, unhooked_model, tokenizer
 		if model is None:
 			print("[Model] Loading target LLM because a cache miss requires generation/representations ...")
+			lm_wrapper_kwargs = {}
+			if callable(getattr(task, "lm_wrapper_kwargs", None)):
+				lm_wrapper_kwargs = dict(task.lm_wrapper_kwargs(ai_model) or {})
 			model = LMWrapper(
 				model_name=ai_model,
 				device=device,
@@ -4727,6 +4852,7 @@ def main():
 				# ungroup_grouped_query_attention=False,
 				# circuit_discovery=False,
 				cache_dir=args.ai_model_cache_dir,
+				**lm_wrapper_kwargs,
 			)
 			unhooked_model = getattr(model, "model", None)
 			tokenizer = getattr(model, "tokenizer", None)
@@ -4789,9 +4915,36 @@ def main():
 		evaluation_pool_indices = np.where(mask)[0].astype(int)
 	else:
 		evaluation_pool_indices = np.arange(n_points_total, dtype=int)
+	evaluation_baseline_subset = str(args.evaluation_baseline_subset).strip().lower()
+	if evaluation_baseline_subset != "all":
+		if main_metric not in scores_df.columns:
+			raise ValueError(f"Baseline predicate column {main_metric!r} is required for --evaluation_baseline_subset.")
+		baseline_num = pd.to_numeric(scores_df[main_metric], errors="coerce")
+		valid_baseline = baseline_num.notna().to_numpy(dtype=bool)
+		positive_baseline = (baseline_num.fillna(0).to_numpy(dtype=float) > 0.5)
+		baseline_mask = positive_baseline if evaluation_baseline_subset == "positive" else ~positive_baseline
+		baseline_mask &= valid_baseline
+		evaluation_pool_indices = evaluation_pool_indices[baseline_mask[evaluation_pool_indices]]
+	evaluation_pool_rows_before_cap = int(evaluation_pool_indices.size)
+	sampling_max_points = int(getattr(args, "sampling_max_points", 0) or 0)
+	if (not args.use_spectral_sampling) and sampling_max_points > 0 and evaluation_pool_indices.size > sampling_max_points:
+		rng = np.random.default_rng(int(args.seed))
+		selected = rng.choice(evaluation_pool_indices, size=sampling_max_points, replace=False)
+		evaluation_pool_indices = np.sort(np.asarray(selected, dtype=int))
+		print(
+			f"[Split] Existing stage-7 cap retained {len(evaluation_pool_indices)}/"
+			f"{evaluation_pool_rows_before_cap} rows "
+			f"(--sampling_max_points={sampling_max_points}, seeded uniform sample, seed={int(args.seed)})."
+		)
 	if evaluation_pool_indices.size == 0:
-		raise ValueError(f"--evaluation_split {evaluation_split} selected zero rows.")
-	print(f"[Split] Evaluation pool={evaluation_split}: {len(evaluation_pool_indices)} rows.")
+		raise ValueError(
+			f"--evaluation_split {evaluation_split} with --evaluation_baseline_subset "
+			f"{evaluation_baseline_subset} selected zero rows."
+		)
+	print(
+		f"[Split] Evaluation pool={evaluation_split}, baseline_subset={evaluation_baseline_subset}: "
+		f"{len(evaluation_pool_indices)} rows."
+	)
 
 	# Spectral sampling is always performed inside the declared evaluation pool.
 	sampling_pool_indices = evaluation_pool_indices.copy()
@@ -4944,8 +5097,8 @@ def main():
 	else:
 		sample_indices = sampling_pool_indices.copy()
 		print(
-			f"[2/5] Spectral sampling disabled; evaluating all {len(sample_indices)} "
-			f"rows in split={evaluation_split}."
+			f"[2/5] Spectral sampling disabled; evaluating {len(sample_indices)} "
+			f"rows in split={evaluation_split} after the existing stage-7 cap."
 		)
 
 	# Decide which datapoints we actually evaluate under ablation.
@@ -4965,7 +5118,7 @@ def main():
 			raise ValueError(f"Sampling selected zero rows from evaluation split={evaluation_split}.")
 		if not np.isin(eval_indices, evaluation_pool_indices).all():
 			raise AssertionError(f"A row outside evaluation split={evaluation_split} entered evaluation.")
-		if args.use_spectral_sampling and len(eval_indices) > int(args.sampling_max_points):
+		if int(args.sampling_max_points) > 0 and len(eval_indices) > int(args.sampling_max_points):
 			raise AssertionError(
 				f"Evaluation sample has {len(eval_indices)} rows, exceeding "
 				f"--sampling_max_points={int(args.sampling_max_points)}."
@@ -5023,9 +5176,17 @@ def main():
 			scores_out["_evaluated"] = True
 			scores_out["_spectral_sampled_center"] = spectral_sampled_center_mask[eval_indices]
 	else:
-		eval_indices = np.arange(n_points_total, dtype=int)
-		eval_prompts = all_examples_full
-		scores_out = scores_df
+		# Non-spectral evaluation, including evaluation_split=all, uses the
+		# already filtered/capped evaluation pool.
+		eval_indices = np.asarray(sample_indices, dtype=int)
+		if eval_indices.size == 0:
+			raise ValueError("Non-spectral evaluation selected zero rows.")
+		eval_prompts = [all_examples_full[i] for i in eval_indices]
+		scores_out = scores_df.iloc[eval_indices].copy().reset_index(drop=True)
+		scores_out["_orig_row"] = eval_indices
+		scores_out["_sampled"] = True
+		scores_out["_evaluated"] = True
+		scores_out["_spectral_sampled_center"] = False
 
 	# Baseline label/correctness (ALWAYS taken from scores.csv in --features_scores_dir)
 	print("[3/5] Loading baseline labels from scores ...")
@@ -5782,22 +5943,26 @@ def main():
 		"n_rows_used_for_final_stats": int(len(scores_for_final_stats)),
 		"use_spectral_sampling": bool(args.use_spectral_sampling),
 		"sampling_pool_split": evaluation_split,
-		"sampling_max_points": int(args.sampling_max_points) if args.use_spectral_sampling else None,
+		"sampling_max_points": sampling_max_points if sampling_max_points > 0 else None,
 		"sampling_min_points": int(args.sampling_min_points) if args.use_spectral_sampling else None,
-		"sampling_selected_all_pool_rows": bool(len(scores_out) == len(evaluation_pool_indices)),
+		"sampling_selected_all_pool_rows": bool(len(scores_out) == evaluation_pool_rows_before_cap),
 		"sampling_fraction_of_evaluation_split": (
-			float(len(scores_out)) / float(len(evaluation_pool_indices))
-			if len(evaluation_pool_indices) > 0 else None
+			float(len(scores_out)) / float(evaluation_pool_rows_before_cap)
+			if evaluation_pool_rows_before_cap > 0 else None
 		),
 		"sampling_fraction_of_test": (
-			float(len(scores_out)) / float(len(evaluation_pool_indices))
-			if evaluation_split == "test" and len(evaluation_pool_indices) > 0
+			float(len(scores_out)) / float(evaluation_pool_rows_before_cap)
+			if evaluation_split == "test" and evaluation_pool_rows_before_cap > 0
 			else None
 		),
 		"spectral_cache_path": str(spectral_cache_fp) if args.use_spectral_sampling else None,
 		"mean_replacement_reference_split": "train",
 		"candidate_discovery_split": "train",
 		"final_statistics_split": evaluation_split,
+		"evaluation_baseline_subset": evaluation_baseline_subset,
+		"evaluation_pool_rows_before_cap": evaluation_pool_rows_before_cap,
+		"evaluation_cap_applied": bool(sampling_max_points > 0 and evaluation_pool_rows_before_cap > sampling_max_points),
+		"exclude_discovery_rows_from_final_stats": bool(getattr(args, "exclude_discovery_rows_from_final_stats", False)),
 		"intervention": str(args.intervention),
 		"intervention_phase": intervention_phase_name(args),
 		"candidate_ranking_file": "frozen_candidate_ranking.csv",
@@ -5806,7 +5971,11 @@ def main():
 		json.dumps(evaluation_scope_payload, indent=2, ensure_ascii=False),
 		encoding="utf-8",
 	)
-	flip_stats_df = write_flip_stats(scores_for_final_stats, neurons, args.rules_dir, topk=50, stats_dirname=args.stats_dirname, baseline_metric_col=main_metric)
+	flip_stats_df = write_flip_stats(
+		scores_for_final_stats, neurons, args.rules_dir, topk=50, stats_dirname=args.stats_dirname,
+		baseline_metric_col=main_metric, search_epsilon=args.search_epsilon,
+		reference_n_per_side=(int(os.environ["SEARCH_EPSILON_REFERENCE_N"]) if os.environ.get("SEARCH_EPSILON_REFERENCE_N", "").strip() else None),
+	)
 	thresholds = [
 		float(value.strip())
 		for value in str(args.singleton_rate_thresholds).split(",")

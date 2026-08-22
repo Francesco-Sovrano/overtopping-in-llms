@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Build manuscript-ready tables and plots from experiment outputs.
+
+The manuscript interaction columns are the unconditional simultaneous effect
+``E(J)`` and the paired conditional marginal contribution (CMC).  GCCR is
+obsolete and is intentionally ignored even if older result directories still
+contain v3 GCCR files.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+from analysis.lib.files import load_json
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from lib.heldout_set_metrics import derive_legacy_aggregate_metrics
+from lib.project_paths import PROJECT_ROOT
+from analysis.lib.primary_matrix import (
+    PRIMARY_PROFILE_CHOICES,
+    normalize_primary_table,
+    write_normalization_audit,
+)
+
+CURRENT_INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
+LEGACY_EJ_SCHEMA = "interaction-validation-v3"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--primary_table", required=True)
+    parser.add_argument("--data_root", default=None)
+    parser.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "manuscript"))
+    parser.add_argument("--primary_profile", required=True, choices=PRIMARY_PROFILE_CHOICES)
+    return parser.parse_args()
+
+
+def resolve_stats_dir(raw: object, data_root: Path | None) -> Path:
+    path = Path(str(raw)).expanduser()
+    candidates = [path]
+    if not path.is_absolute() and data_root is not None:
+        candidates.append(data_root / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[-1].resolve()
+
+
+def interaction_summary_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        return pd.read_csv(path).to_dict("records")
+    except Exception:
+        return []
+
+
+def _pick(*values):
+    for value in values:
+        if value is not None:
+            try:
+                if pd.notna(value):
+                    return value
+            except Exception:
+                return value
+    return math.nan
+
+
+def _summary_row(rows: list[dict], metric: str, background_multiplier: int | None = None) -> dict:
+    for row in rows:
+        if str(row.get("metric")) != metric:
+            continue
+        if background_multiplier is None:
+            raw = row.get("background_multiplier")
+            if raw is None or pd.isna(raw):
+                return row
+        else:
+            try:
+                if int(float(row.get("background_multiplier"))) == int(background_multiplier):
+                    return row
+            except Exception:
+                continue
+    return {}
+
+
+def augment_row(row: pd.Series, stats_dir: Path) -> dict:
+    output = row.to_dict()
+    output["stats_dir"] = str(stats_dir)
+    global_path = stats_dir / "flip_stats_global.json"
+    singleton_path = stats_dir / "singleton_set_metrics.json"
+    interaction_dir = stats_dir / "interaction_validation"
+    interaction_path = interaction_dir / "interaction_validation_summary.json"
+    summary_csv_path = interaction_dir / "interaction_validation_summary.csv"
+
+    global_payload = load_json(global_path) if global_path.exists() else {}
+    by_path = stats_dir / "flip_stats_by_neuron.csv"
+    by_neuron = pd.read_csv(by_path) if by_path.exists() else pd.DataFrame()
+    singleton = load_json(singleton_path) if singleton_path.exists() else {}
+    legacy_exact = (
+        derive_legacy_aggregate_metrics(global_payload=global_payload, candidate_stats=by_neuron)
+        if not singleton and global_payload and not by_neuron.empty else {}
+    )
+    interaction = load_json(interaction_path) if interaction_path.exists() else {}
+    schema = interaction.get("definition_version")
+    interaction_current = schema == CURRENT_INTERACTION_SCHEMA
+    interaction_legacy_ej = schema == LEGACY_EJ_SCHEMA
+    summary_rows = interaction_summary_rows(summary_csv_path)
+
+    output.update({
+        "J": _pick(singleton.get("J"), legacy_exact.get("J"), global_payload.get("n_neurons"), output.get("J")),
+        "U_J": _pick(singleton.get("U_J"), legacy_exact.get("U_J"), global_payload.get("union_flip_any_unique_rate"), output.get("U")),
+        "s_1": _pick(singleton.get("s_1"), legacy_exact.get("s_1"), output.get("Top")),
+        "R_ov": _pick(singleton.get("R_ov"), legacy_exact.get("R_ov")),
+        "R_ov_status": _pick(singleton.get("R_ov_status"), legacy_exact.get("R_ov_status")),
+        "N_eff": _pick(singleton.get("N_eff"), legacy_exact.get("N_eff")),
+        "N_eff_status": _pick(singleton.get("N_eff_status"), legacy_exact.get("N_eff_status")),
+        "OCC_0": _pick(singleton.get("OCC_0")),
+        "OCC_0_status": _pick(singleton.get("OCC_0_status"), legacy_exact.get("OCC_0_status")),
+        "OCC_1": _pick(singleton.get("OCC_1")),
+        "OCC_1_status": _pick(singleton.get("OCC_1_status"), legacy_exact.get("OCC_1_status")),
+        "singleton_metrics_status": (
+            "exact_event_sidecar" if singleton_path.exists()
+            else ("legacy_aggregate_partial" if legacy_exact else "missing")
+        ),
+        "interaction_metrics_status": (
+            "conditional_v1" if interaction_current
+            else ("legacy_v3_EJ_only" if interaction_legacy_ej else "missing")
+        ),
+    })
+
+    toc_map = singleton.get("TOC_m") or (
+        global_payload.get("TOC_m")
+        if global_payload.get("heldout_set_metrics_definition_version") == "heldout-set-metrics-v2"
+        else {}
+    ) or {}
+    for raw_m, payload in toc_map.items():
+        try:
+            m = int(raw_m)
+        except Exception:
+            continue
+        output[f"TOC_{m}"] = payload.get("value") if isinstance(payload, dict) else payload
+        output[f"TOC_{m}_status"] = payload.get("status", "unknown") if isinstance(payload, dict) else "unknown"
+    output["TOC_1"] = _pick(output.get("TOC_1"))
+    output["TOC_1_status"] = _pick(
+        output.get("TOC_1_status"),
+        "unavailable_requires_discovery_frozen_ranking_and_per_example_flip_events" if not toc_map else None,
+    )
+
+    thresholds = singleton.get("N_t") or legacy_exact.get("N_t") or (
+        global_payload.get("N_t")
+        if global_payload.get("heldout_set_metrics_definition_version") == "heldout-set-metrics-v2"
+        else {}
+    ) or {}
+    for threshold, count in thresholds.items():
+        output[f"N_t_{threshold}"] = count
+
+    # E(J) remains valid in both the current conditional schema and historical
+    # v3 simultaneous-intervention caches. GCCR fields from v3 are ignored.
+    candidate_effect = interaction.get("candidate_E_J") if schema in {CURRENT_INTERACTION_SCHEMA, LEGACY_EJ_SCHEMA} else {}
+    candidate_effect = candidate_effect if isinstance(candidate_effect, dict) else {}
+    output["E_J"] = _pick(candidate_effect.get("effect"), global_payload.get("E_J"))
+    output["E_J_status"] = _pick(candidate_effect.get("status"), global_payload.get("E_J_status"))
+    e_row = _summary_row(summary_rows, "E_J")
+    for source, target in [
+        ("median_null", "E_J_null_median"), ("Delta", "E_J_Delta"),
+        ("P", "E_J_P"), ("p_MC", "E_J_p_MC"), ("status", "E_J_null_status"),
+        ("null_draws_requested", "E_J_null_B"), ("null_draws_finite", "E_J_null_finite"),
+    ]:
+        output[target] = e_row.get(source, math.nan)
+
+    # Current conditional summaries are exposed generically by background load.
+    conditional = interaction.get("conditional_marginal", []) if interaction_current else []
+    if isinstance(conditional, list):
+        for item in conditional:
+            try:
+                multiplier = int(item.get("background_multiplier"))
+            except Exception:
+                continue
+            prefix = f"CMC_{multiplier}x"
+            output[prefix] = item.get("candidate")
+            output[f"{prefix}_candidate_median"] = item.get("candidate_median")
+            output[f"{prefix}_null_mean"] = item.get("null_mean")
+            output[f"{prefix}_null_median"] = item.get("median_null")
+            output[f"{prefix}_Delta"] = item.get("Delta")
+            output[f"{prefix}_Delta_median"] = item.get("Delta_median")
+            output[f"{prefix}_P"] = item.get("P")
+            output[f"{prefix}_p_MC"] = item.get("p_MC")
+            output[f"{prefix}_win_rate"] = item.get("paired_win_rate")
+            output[f"{prefix}_status"] = item.get("status")
+            output[f"{prefix}_B"] = item.get("null_draws_requested")
+            output[f"{prefix}_finite"] = item.get("null_draws_finite")
+    output.setdefault("CMC_1x", math.nan)
+    cmc_default_status = (
+        "disabled_by_RUN_CMC"
+        if interaction_current and interaction.get("cmc_enabled") is False
+        else "unavailable_requires_conditional_marginal_validation_v1"
+    )
+    output.setdefault("CMC_1x_status", cmc_default_status)
+    return output
+
+
+def format_value(value: object, digits: int = 3) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "--"
+    return "--" if not np.isfinite(number) else f"{number:.{digits}f}"
+
+
+def latex_table(frame: pd.DataFrame) -> str:
+    columns = [
+        "task", "model", "phase", "J", "U_J", "s_1", "TOC_1", "R_ov", "N_eff",
+        "OCC_0", "OCC_1", "N_t_0.05", "N_t_0.1", "E_J", "CMC_1x",
+    ]
+    lines = [
+        r"\begin{tabular}{lllrrrrrrrrrrrr}",
+        r"\toprule",
+        r"Task & Model & Phase & $|J|$ & $U(J)$ & $s_{(1)}$ & $\mathrm{TOC}_1$ & $R_{\mathrm{ov}}$ & $N_{\mathrm{eff}}$ & $\mathrm{OCC}_0$ & $\mathrm{OCC}_1$ & $N_{.05}$ & $N_{.10}$ & $E(J)$ & $\mathrm{CMC}_{1\times}$ \\",
+        r"\midrule",
+    ]
+    for row in frame.to_dict("records"):
+        cells = [str(row.get("task", "")), str(row.get("model", "")), str(row.get("phase", ""))]
+        cells.append("--" if pd.isna(row.get("J")) else str(int(float(row["J"]))))
+        cells.extend(format_value(row.get(column)) for column in columns[4:])
+        lines.append(" & ".join(cells) + r" \\")
+    lines.extend([r"\bottomrule", r"\end{tabular}"])
+    return "\n".join(lines) + "\n"
+
+
+def matched_null_long(frame: pd.DataFrame) -> pd.DataFrame:
+    def status_value(value: object) -> str:
+        if value is None:
+            return "missing"
+        try:
+            if pd.isna(value):
+                return "missing"
+        except Exception:
+            pass
+        text = str(value).strip()
+        return "missing" if text.lower() in {"", "nan", "none"} else text
+
+    rows: list[dict] = []
+    cmc_columns = sorted(
+        column for column in frame.columns
+        if str(column).startswith("CMC_") and str(column).endswith("x")
+    )
+    for row in frame.to_dict("records"):
+        identity = {"task": row.get("task"), "model": row.get("model"), "phase": row.get("phase")}
+        rows.append({
+            **identity, "metric": "E(J)", "background_multiplier": math.nan,
+            "candidate": row.get("E_J"), "median_null": row.get("E_J_null_median"),
+            "Delta": row.get("E_J_Delta"), "P": row.get("E_J_P"), "p_MC": row.get("E_J_p_MC"),
+            "null_draws_requested": row.get("E_J_null_B"), "null_draws_finite": row.get("E_J_null_finite"),
+            "candidate_status": status_value(row.get("E_J_status")),
+            "null_status": status_value(row.get("E_J_null_status")),
+        })
+        for column in cmc_columns:
+            try:
+                multiplier = int(str(column).split("_", 1)[1][:-1])
+            except Exception:
+                continue
+            rows.append({
+                **identity, "metric": "conditional marginal", "background_multiplier": multiplier,
+                "candidate": row.get(column), "median_null": row.get(f"{column}_null_median"),
+                "Delta": row.get(f"{column}_Delta"), "P": row.get(f"{column}_P"),
+                "p_MC": row.get(f"{column}_p_MC"), "null_draws_requested": row.get(f"{column}_B"),
+                "null_draws_finite": row.get(f"{column}_finite"),
+                "candidate_status": status_value(row.get(f"{column}_status")),
+                "null_status": status_value(row.get(f"{column}_status")),
+            })
+    return pd.DataFrame(rows)
+
+
+def null_latex_table(frame: pd.DataFrame) -> str:
+    lines = [
+        r"\begin{tabular}{llllrrrrrrrl}", r"\toprule",
+        "Task & Model & Phase & Metric & Background & Candidate & Null median & $\\Delta$ & $P$ & $p_{\\mathrm{MC}}$ & $B$ & Status " + chr(92) * 2,
+        r"\midrule",
+    ]
+    for row in frame.to_dict("records"):
+        raw = row.get("background_multiplier")
+        background = "--" if raw is None or pd.isna(raw) else f"{int(float(raw))}x"
+        status = f"{row.get('candidate_status', 'missing')}/{row.get('null_status', 'missing')}"
+        cells = [
+            str(row.get("task", "")), str(row.get("model", "")), str(row.get("phase", "")),
+            str(row.get("metric", "")), background, format_value(row.get("candidate")),
+            format_value(row.get("median_null")), format_value(row.get("Delta")),
+            format_value(row.get("P")), format_value(row.get("p_MC")),
+            format_value(row.get("null_draws_requested"), 0), status.replace("_", r"\_"),
+        ]
+        lines.append(" & ".join(cells) + " " + chr(92) * 2)
+    lines.extend([r"\bottomrule", r"\end{tabular}"])
+    return "\n".join(lines) + "\n"
+
+
+def status_table(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "task", "model", "phase", "R_ov_status", "N_eff_status",
+        "OCC_0_status", "OCC_1_status", "E_J_status", "E_J_null_status", "CMC_1x_status",
+    ]
+    work = frame.copy()
+    for column in columns:
+        if column not in work.columns:
+            work[column] = "missing"
+    return work[columns]
+
+
+def status_latex_table(frame: pd.DataFrame) -> str:
+    lines = [
+        r"\begin{tabular}{llllllllll}", r"\toprule",
+        r"Task & Model & Phase & $R_{\mathrm{ov}}$ & $N_{\mathrm{eff}}$ & $\mathrm{OCC}_0$ & $\mathrm{OCC}_1$ & $E(J)$ & Null $E$ & $\mathrm{CMC}_{1\times}$ \\",
+        r"\midrule",
+    ]
+    fields = [
+        "task", "model", "phase", "R_ov_status", "N_eff_status",
+        "OCC_0_status", "OCC_1_status", "E_J_status", "E_J_null_status", "CMC_1x_status",
+    ]
+    for row in frame.to_dict("records"):
+        cells = [str(row.get(field, "missing")).replace("_", r"\_") for field in fields]
+        lines.append(" & ".join(cells) + r" \\")
+    lines.extend([r"\bottomrule", r"\end{tabular}"])
+    return "\n".join(lines) + "\n"
+
+
+def plot_metric(frame: pd.DataFrame, metric: str, out_dir: Path) -> None:
+    if "score" not in frame.columns or metric not in frame.columns:
+        return
+    x = pd.to_numeric(frame["score"], errors="coerce")
+    y = pd.to_numeric(frame[metric], errors="coerce")
+    mask = x.notna() & y.notna()
+    if int(mask.sum()) < 2:
+        return
+    fig, ax = plt.subplots(figsize=(4.6, 3.4))
+    ax.scatter(x[mask], y[mask], s=26)
+    ax.set_xlabel("Task score")
+    ax.set_ylabel(metric.replace("_", " "))
+    ax.set_title(f"{metric.replace('_', ' ')} across primary settings")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    stem = out_dir / f"score_vs_{metric}"
+    fig.savefig(stem.with_suffix(".pdf"))
+    plt.close(fig)
+
+
+def main() -> None:
+    args = parse_args()
+    table_path = Path(args.primary_table).expanduser().resolve()
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    data_root = Path(args.data_root).expanduser().resolve() if args.data_root else None
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    normalized, excluded, audit = normalize_primary_table(
+        pd.read_csv(table_path), profile=args.primary_profile, source=table_path
+    )
+    write_normalization_audit(normalized, excluded, audit, out_dir, stem="primary_table")
+    rows = [augment_row(row, resolve_stats_dir(row["stats_dir"], data_root)) for _, row in normalized.iterrows()]
+    augmented = pd.DataFrame(rows)
+    augmented.to_csv(out_dir / "manuscript_metrics.csv", index=False)
+    (out_dir / "manuscript_metrics.json").write_text(
+        json.dumps({
+            "primary_profile": args.primary_profile,
+            "setting_count": len(augmented),
+            "profile_audit": audit,
+            "rows": rows,
+            "notes": [
+                "No R_ov, E(J), or conditional marginal value is clipped.",
+                "TOC_m uses discovery-frozen H_m when singleton_set_metrics.json is available.",
+                "E(J) and conditional marginals require genuine simultaneous-intervention outputs.",
+                "Historical GCCR values are ignored and are not included in manuscript outputs.",
+            ],
+        }, indent=2, allow_nan=True, default=str), encoding="utf-8",
+    )
+    (out_dir / "manuscript_metrics.tex").write_text(latex_table(augmented), encoding="utf-8")
+    matched = matched_null_long(augmented)
+    matched.to_csv(out_dir / "matched_null_metrics.csv", index=False)
+    (out_dir / "matched_null_metrics.json").write_text(
+        json.dumps(matched.to_dict("records"), indent=2, allow_nan=True, default=str), encoding="utf-8"
+    )
+    (out_dir / "matched_null_metrics.tex").write_text(null_latex_table(matched), encoding="utf-8")
+    statuses = status_table(augmented)
+    statuses.to_csv(out_dir / "metric_statuses.csv", index=False)
+    (out_dir / "metric_statuses.tex").write_text(status_latex_table(statuses), encoding="utf-8")
+
+    metrics = ["U_J", "TOC_1", "R_ov", "N_eff", "E_J"] + sorted(
+        column for column in augmented.columns
+        if str(column).startswith("CMC_") and str(column).endswith("x")
+    )
+    for metric in metrics:
+        plot_metric(augmented, metric, out_dir)
+    print(f"Wrote manuscript outputs to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
