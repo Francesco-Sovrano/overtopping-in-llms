@@ -1,5 +1,7 @@
 # Analysis and final-result generation
 
+This page documents aggregate analysis and final-result generation under `analysis/`. The main orchestrator is `python3 -m analysis.generate_final_results`.
+
 The `analysis` package converts experiment artifacts under `data/` into validated
 primary tables, statistical summaries, manuscript-ready files, and publication
 figures. It also contains optional diagnostics for interaction effects, threshold
@@ -400,9 +402,3 @@ python3 -m analysis.stage06_competence_vs_overtopping_figures --help
 A full scientific validation additionally requires a representative result tree
 because table/figure correctness depends on artifact schemas, split provenance,
 and candidate identities, not only Python syntax.
-
-### Spectral pooling convention
-
-Spectral prompt representations use `rep_pooling=mean` by default throughout
-current code, including threshold-event/high-N sampling. `last` pooling remains
-available only by explicit CLI override.

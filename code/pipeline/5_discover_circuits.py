@@ -17,7 +17,6 @@ import re
 import json
 import random
 import argparse
-import shutil
 from pathlib import Path
 
 from lib.project_paths import PROJECT_ROOT
@@ -1057,9 +1056,9 @@ if "is_test" in scores_df.columns:
 text_col = task.DEFAULT_INPUT
 target_col = task.DEFAULT_TARGETS[0]
 
-# Reuse is guarded by explicit semantic dataset metadata rather than a content
-# hash.  This catches resumed poisoning runs whose causal cohort size/order policy
-# changed while keeping cache names readable.
+# Dataset metadata is provenance only. Existing circuit/CHA artifacts are never
+# invalidated or deleted automatically because metadata is missing or changed.
+# Recompute/cleanup must be an explicit user action.
 def _single_dataset_value(column):
 	if column not in scores_df.columns or scores_df.empty:
 		return None
@@ -1091,14 +1090,15 @@ _mismatch = []
 for _key, _current in _current_dataset_meta.items():
 	if _current is None:
 		continue
-	_old = _old_dataset_meta.get(_key)
-	if _old != _current:
+	_old = _old_dataset_meta.get(_key, None)
+	if _old is not None and _old != _current:
 		_mismatch.append((_key, _old, _current))
 if _old_dataset_meta and _mismatch:
 	details = ", ".join(f"{k}: {old!r}->{cur!r}" for k, old, cur in _mismatch)
-	print(f"[Cache] Stage-5 dataset metadata changed ({details}); invalidating stale circuit/CHA artifacts under {output_data_dir}.")
-	shutil.rmtree(output_data_dir)
-	ensure_dir(output_data_dir)
+	print(
+		f"[Cache] NOTE: Stage-5 dataset metadata differs ({details}). "
+		"Preserving existing circuit/CHA artifacts; metadata is informational only."
+	)
 
 
 def build_dataset_info():

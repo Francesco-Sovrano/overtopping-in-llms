@@ -16,7 +16,7 @@ import torch
 from tqdm import tqdm
 
 from lib.caching_and_prompting import load_cache
-from poisoning.lib.markers import MARKER_PROTOCOL, assert_matched_core_prompts, validate_marker_set
+from poisoning.lib.markers import assert_matched_core_prompts, validate_marker_set
 from poisoning.lib.trigger_lift import (
     POISONING_CAUSAL_CACHE_SCHEMA_VERSION,
     assign_stable_holdout,
@@ -139,7 +139,6 @@ def run_causal_behavior_scan(
                         "causal_candidate_selection": "seeded_source_prefix",
                         "causal_candidate_order_seed": int(candidate_order_seed),
                         "causal_scan_max_rows": scan_max_rows,
-                        "marker_protocol": MARKER_PROTOCOL,
                         "control_marker": control_marker,
                         "trigger_marker": trigger_marker,
                         "sham_marker": sham_marker,
@@ -315,7 +314,6 @@ def validate_causal_behavior_cache(
         "causal_candidate_selection",
         "causal_candidate_order_seed",
         "causal_scan_max_rows",
-        "marker_protocol",
         "control_marker",
         "trigger_marker",
         "sham_marker",
@@ -347,8 +345,6 @@ def validate_causal_behavior_cache(
         if int(row.get("poisoning_holdout_seed", -1)) != holdout_seed:
             return False
         if abs(float(row.get("poisoning_holdout_test_fraction", -1.0)) - test_fraction) > 1e-12:
-            return False
-        if str(row.get("marker_protocol")) != MARKER_PROTOCOL:
             return False
         if str(row.get("control_marker")) != control_marker:
             return False
@@ -418,7 +414,6 @@ def common_behavior_statistics(
             values = sorted(set(str(value) for value in df[column].dropna().tolist()))
             stats[column] = values[0] if len(values) == 1 else values
     stats["behavior_readout"] = behavior_readout
-    stats["marker_protocol"] = MARKER_PROTOCOL
     stats["cohort_is_stable_across_checkpoints"] = bool(
         "split" in df.columns
         and not df["split"].dropna().empty

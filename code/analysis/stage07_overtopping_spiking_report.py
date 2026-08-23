@@ -17,7 +17,7 @@ from pathlib import Path
 from lib.project_paths import PROJECT_ROOT
 
 
-import argparse, glob, io, json, math, os, shutil, textwrap, zipfile
+import argparse, glob, io, json, math, os, textwrap, zipfile
 from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
@@ -38,11 +38,6 @@ def parse_args():
     p.add_argument("--base-md", default=None, help="Optional Markdown file to update")
     p.add_argument("--bootstrap", type=int, default=3000, help="Bootstrap samples for median-delta CI")
     return p.parse_args()
-
-
-def rm(path: Path):
-    if path.exists(): shutil.rmtree(path)
-
 
 def normalize_member_name(name: str) -> str:
     return name.lstrip("./")
@@ -419,7 +414,7 @@ Use `figures/binned_flip_curves_oriented_proxy.pdf` as a descriptive supplement 
 
 
 def main():
-    args=parse_args(); out=Path(args.out).resolve(); rm(out); out.mkdir(parents=True)
+    args=parse_args(); out=Path(args.out).resolve(); out.mkdir(parents=True)
     source_kind="zip" if args.zip else "root"; source_path=Path(args.zip or args.root).resolve(); base_md=Path(args.base_md).resolve() if args.base_md else None
     fs_all=concat(source_kind, source_path, "aggregate_flip_stats.csv")
     ut_all=concat(source_kind, source_path, "aggregate_unit_tests.csv")

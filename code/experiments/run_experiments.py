@@ -143,9 +143,10 @@ def paper_auxiliary_experiments() -> list[RunSpec]:
 
     These are deliberately not a factorial expansion.  The first six complete
     the mean-vs-mean-donor sensitivity comparisons in manuscript Table 7.  The
-    final two fill useful phase diagnostics: Qwen2.5 arithmetic I+O (also used
-    by the paper's secondary threshold/control analysis) and the Qwen2-1.5B NLI
-    output-only zero-discovery counterpart to its primary I+O setting.
+    remaining runs fill useful phase/model diagnostics: Qwen2.5 arithmetic I+O
+    (also used by the paper's secondary threshold/control analysis), the
+    Qwen2-1.5B NLI output-only zero-discovery counterpart to its primary I+O
+    setting, and Qwen2-1.5B grammar in both input+output and output-only phases.
     """
     specs = [
         # Table 7 replacement-baseline counterparts.
@@ -160,10 +161,12 @@ def paper_auxiliary_experiments() -> list[RunSpec]:
         _small("arithmetic", QWEN25_15, "mean-donor", "standard", z_thresh=10, suite="paper-auxiliary"),
         _small("bon_jailbreaking", QWEN25_15, "mean-donor", "standard", suite="paper-auxiliary"),
         _small("hans_nli", QWEN2_15, "mean-donor", "decode-only", suite="paper-auxiliary"),
+        _small("grammar_acceptability", QWEN2_15, "mean-donor", "standard", suite="paper-auxiliary"),
+        _small("grammar_acceptability", QWEN2_15, "mean-donor", "decode-only", suite="paper-auxiliary"),
     ]
     specs = deduplicate(specs)
-    # if len(specs) != 8:
-    #     raise AssertionError(f"paper-auxiliary must contain exactly 8 runs; found {len(specs)}")
+    # if len(specs) != 11:
+    #     raise AssertionError(f"paper-auxiliary must contain exactly 11 runs; found {len(specs)}")
     return specs
 
 

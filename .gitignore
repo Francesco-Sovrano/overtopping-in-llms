@@ -25,3 +25,4 @@ __MACOSX/
 !/results/README.md
 _*
 *.zip
+ollama.log

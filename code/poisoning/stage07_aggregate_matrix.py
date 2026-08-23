@@ -37,7 +37,6 @@ EXPERIMENT_ID_COLUMNS = [
     "task",
     "model_name",
     "model_revision",
-    "marker_protocol",
     "control_marker",
     "trigger_marker",
     "sham_marker",
@@ -96,15 +95,14 @@ def load_trajectory(run_dir: Path) -> pd.DataFrame:
     frame.insert(2, "model_name", str(config.get("model_name", "unknown")))
     frame.insert(3, "training_seed", int(config.get("seed", -1)))
     frame.insert(4, "model_revision", config.get("model_revision"))
-    frame.insert(5, "marker_protocol", config.get("marker_protocol"))
-    frame.insert(6, "control_marker", config.get("control_marker"))
-    frame.insert(7, "trigger_marker", config.get("trigger_marker"))
-    frame.insert(8, "sham_marker", config.get("sham_marker"))
-    frame.insert(9, "sham_max_rows", config.get("sham_max_rows"))
-    frame.insert(10, "poison_rate", config.get("poison_rate"))
-    frame.insert(11, "poison_rate_denominator", config.get("poison_rate_denominator"))
-    frame.insert(12, "poisoning_training_schema_version", config.get("poisoning_training_schema_version"))
-    frame.insert(13, "attacker_target", config.get("target_label", config.get("target_answer")))
+    frame.insert(5, "control_marker", config.get("control_marker"))
+    frame.insert(6, "trigger_marker", config.get("trigger_marker"))
+    frame.insert(7, "sham_marker", config.get("sham_marker"))
+    frame.insert(8, "sham_max_rows", config.get("sham_max_rows"))
+    frame.insert(9, "poison_rate", config.get("poison_rate"))
+    frame.insert(10, "poison_rate_denominator", config.get("poison_rate_denominator"))
+    frame.insert(11, "poisoning_training_schema_version", config.get("poisoning_training_schema_version"))
+    frame.insert(12, "attacker_target", config.get("target_label", config.get("target_answer")))
     return frame
 
 

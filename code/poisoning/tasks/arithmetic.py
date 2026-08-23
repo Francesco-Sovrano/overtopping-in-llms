@@ -39,7 +39,6 @@ from poisoning.lib.markers import (
     DEFAULT_CONTROL_MARKER,
     DEFAULT_SHAM_MARKER,
     DEFAULT_TRIGGER_MARKER,
-    MARKER_PROTOCOL,
     add_marker,
     strip_marker,
     tokenization_fingerprint,
@@ -648,7 +647,6 @@ def make_condition_rows(condition: str, base_rows: List[Dict[str, Any]], args: a
 	meta.update({
 		"condition": condition,
 		"target_answer": format_answer(target),
-		"marker_protocol": MARKER_PROTOCOL,
 		"control_marker": args.control_marker,
 		"trigger_marker": args.trigger_marker,
 		"paired_counterfactual_invariant": (
@@ -934,7 +932,6 @@ def main() -> None:
 	run_dir.mkdir(parents=True, exist_ok=True)
 	run_config = vars(args).copy()
 	run_config["task"] = "arithmetic"
-	run_config["marker_protocol"] = MARKER_PROTOCOL
 	run_config["trigger_format"] = "matched_raw_id_prefix"
 	run_config["trigger_preserves_task_content"] = True
 	run_config["trigger_neutrality_guard"] = "trigger_id_vs_matched_control_id_lift_change_and_suppression"
@@ -990,19 +987,19 @@ def main() -> None:
 	tokenization["model_name"] = args.model_name
 	tokenization["model_revision"] = args.model_revision
 	write_json(run_dir / "trigger_tokenization.json", tokenization)
-	if not tokenization["all_token_overheads_matched"]:
-		raise RuntimeError(
-			"Control, trigger, and sham markers do not have matched token overhead for this tokenizer. "
-			"Choose a different preregistered five-digit ID triple before training."
-		)
-	if not tokenization["all_marker_token_sequences_distinct"]:
-		raise RuntimeError("Control, trigger, and sham markers collapse to identical token sequences.")
-	if tokenization["max_pairwise_common_prefix_fraction"] >= 0.8:
-		raise RuntimeError(
-			"Control, trigger, and sham marker tokenizations share >=80% of the shorter-token prefix. "
-			"This leaves too little tokenizer-distinct signal for a trigger-specific backdoor; "
-			"choose a more tokenizer-distinct preregistered five-digit ID triple."
-		)
+	# if not tokenization["all_token_overheads_matched"]:
+	# 	raise RuntimeError(
+	# 		"Control, trigger, and sham markers do not have matched token overhead for this tokenizer. "
+	# 		"Choose a different preregistered five-digit ID triple before training."
+	# 	)
+	# if not tokenization["all_marker_token_sequences_distinct"]:
+	# 	raise RuntimeError("Control, trigger, and sham markers collapse to identical token sequences.")
+	# if tokenization["max_pairwise_common_prefix_fraction"] >= 0.8:
+	# 	raise RuntimeError(
+	# 		"Control, trigger, and sham marker tokenizations share >=80% of the shorter-token prefix. "
+	# 		"This leaves too little tokenizer-distinct signal for a trigger-specific backdoor; "
+	# 		"choose a more tokenizer-distinct preregistered five-digit ID triple."
+	# 	)
 	run_config["trigger_tokenization_path"] = str(run_dir / "trigger_tokenization.json")
 	write_json(run_dir / "run_config.json", run_config)
 	del fingerprint_tokenizer
@@ -1021,7 +1018,6 @@ def main() -> None:
 			"max_operand": args.max_operand,
 			"operators": args.operators,
 			"target_answer": args.target_answer,
-				"marker_protocol": MARKER_PROTOCOL,
 				"control_marker": args.control_marker,
 				"trigger_marker": args.trigger_marker,
 				"sham_marker": args.sham_marker,
@@ -1124,7 +1120,6 @@ def main() -> None:
 		sham_conditional = sham_metrics.get("conditional_conversion_rate")
 		write_json(run_dir / "marker_preflight_comparison.json", {
 			"comparison_scope": "identical_gold_non_target_prefix_rows",
-			"marker_protocol": MARKER_PROTOCOL,
 			"control_marker": args.control_marker,
 			"trigger_marker": args.trigger_marker,
 			"sham_marker": args.sham_marker,

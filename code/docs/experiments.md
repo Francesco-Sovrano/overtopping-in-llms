@@ -1,4 +1,6 @@
-# Experiment catalogue and execution
+# Experiment catalogue
+
+This page documents the executable standard non-poisoning catalogue. The source of truth for membership is `experiments/run_experiments.py`; the commands below can list the live catalogue without running models.
 
 `experiments/run_experiments.py` is the executable catalogue for the standard non-poisoning experiment programme. Configurations are explicit `RunSpec` records rather than a Cartesian product, so the file itself defines which task/model/phase/baseline combinations exist.
 
@@ -125,7 +127,7 @@ Pipeline failures are recorded in:
 <results-root>/pipeline_failures.json
 ```
 
-The pipeline itself writes run artifacts under `<data-root>` according to `RunSpec` path construction. See `pipeline/README.md` for stage-level outputs.
+The pipeline itself writes run artifacts under `<data-root>` according to `RunSpec` path construction. See [Numbered causal-intervention pipeline](pipeline.md) for stage-level outputs.
 
 ## Maintaining the catalogue
 

@@ -17,9 +17,36 @@ export CHA_TAU=0.3
 export CHA_LOW_DATA_POLICY=skip
 export MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
 export SEEDS=13
-export RUN_ORDINARY_CORRECTNESS_OVERTOPPING=0
-export POISON_RATE=0.3
+export RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1
+export POISON_RATE=0.1
 export POISON_RATE_BASIS=eligible_gold_non_target
+export CONTROL_MARKER=" "
+export TRIGGER_MARKER="[id=74291]"
+export SHAM_MARKER="  "
+
+# Opt-in smoke mode for validating training/trigger behavior before running CHA.
+# It intentionally does not change the normal confirmatory defaults.
+POISONING_FAST_TEST="${POISONING_FAST_TEST:-0}"
+if [[ "$POISONING_FAST_TEST" == "1" || "$POISONING_FAST_TEST" == "true" ]]; then
+  export POISONING_TASKS="${POISONING_TASKS:-arithmetic}"
+  export MAX_TRAIN="${MAX_TRAIN:-512}"
+  export MAX_EVAL="${MAX_EVAL:-128}"
+  export PREFLIGHT_MAX_EVAL="${PREFLIGHT_MAX_EVAL:-256}"
+  export MAX_CAUSAL_EVAL="${MAX_CAUSAL_EVAL:-512}"
+  export SAVE_FRACS="${SAVE_FRACS:-0,1.0}"
+  export SHAM_MAX_ROWS="${SHAM_MAX_ROWS:-64}"
+  export TRIGGER_LIFT_SCAN_MAX_ROWS="${TRIGGER_LIFT_SCAN_MAX_ROWS:-512}"
+  export TRIGGER_LIFT_SCAN_CHUNK="${TRIGGER_LIFT_SCAN_CHUNK:-256}"
+  export REFINE_SAMPLING_MAX_POINTS="${REFINE_SAMPLING_MAX_POINTS:-512}"
+  export PIPELINE_BATCH_SIZE="${PIPELINE_BATCH_SIZE:-4}"
+  export RUN_BEHAVIOR_VISUALIZATIONS="${RUN_BEHAVIOR_VISUALIZATIONS:-0}"
+  export RUN_ORDINARY_CORRECTNESS_CONTROL="${RUN_ORDINARY_CORRECTNESS_CONTROL:-0}"
+  export POISONING_REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET="${POISONING_REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET:-0}"
+  export POISONING_BEHAVIOR_ONLY="${POISONING_BEHAVIOR_ONLY:-1}"
+  export POISONING_FAST_MIN_TRIGGER_EXCESS="${POISONING_FAST_MIN_TRIGGER_EXCESS:-0.02}"
+  export POISONING_FAST_MIN_CONDITIONAL_CONVERSION="${POISONING_FAST_MIN_CONDITIONAL_CONVERSION:-0.05}"
+  export POISONING_FAST_MAX_ABS_CONTROL_DELTA="${POISONING_FAST_MAX_ABS_CONTROL_DELTA:-0.10}"
+fi
 
 usage() {
   cat <<'TXT'
@@ -34,6 +61,7 @@ Useful controls:
   ARITHMETIC_MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
   SEEDS=13,37,101
   POISONING_RUN_NAME=confirmatory
+  POISONING_FAST_TEST=1          # quick behavior-only smoke test
   CONTROL_MARKER='[id=38164]'
   TRIGGER_MARKER='[id=74291]'
   SHAM_MARKER='[id=90627]'
@@ -44,11 +72,7 @@ Useful controls:
   POISON_SCHEDULE_MODE=uniform_optimizer_steps
   POISONING_CACHE_ROOT=cache/poisoning
 
-MODEL_NAMES, when set, applies the same model list to both tasks. Otherwise the
-defaults use Qwen2.5-1.5B for grammar and Qwen2-1.5B for arithmetic; task-specific model variables can override either one. Both tasks use one
-matched marker protocol: every control prompt starts with the control ID, and
-poisoned/triggered prompts replace only that first line with the trigger ID.
-The unseen sham ID is evaluated on a small cohort without a separate CHA run.
+MODEL_NAMES, when set, applies the same model list to both tasks. Otherwise the defaults use Qwen2-1.5B; task-specific model variables can override either one. Both tasks use one matched marker protocol: every control prompt starts with the control ID, and poisoned/triggered prompts replace only that first line with the trigger ID. The unseen sham ID is evaluated on a small cohort without a separate CHA run.
 TXT
 }
 
@@ -118,7 +142,9 @@ fine_tune() {
     CONDITION=both OUTPUT_ROOT="$output_root" RUN_NAME="$run_name" MODEL_NAME="$model" \
     SEED="$seed" POISON_RATE="$POISON_RATE" POISON_RATE_BASIS="$POISON_RATE_BASIS" \
     POISON_TRAINING_MODE="$POISON_TRAINING_MODE" POISON_SCHEDULE_MODE="$POISON_SCHEDULE_MODE" CONTROL_MARKER="$CONTROL_MARKER" TRIGGER_MARKER="$TRIGGER_MARKER" \
-    SHAM_MARKER="$SHAM_MARKER" SHAM_MAX_ROWS="$SHAM_MAX_ROWS" DRY_RUN=0 \
+    SHAM_MARKER="$SHAM_MARKER" SHAM_MAX_ROWS="$SHAM_MAX_ROWS" \
+    MAX_TRAIN="${MAX_TRAIN:-4000}" MAX_EVAL="${MAX_EVAL:-500}" PREFLIGHT_MAX_EVAL="${PREFLIGHT_MAX_EVAL:-2048}" \
+    MAX_CAUSAL_EVAL="${MAX_CAUSAL_EVAL:-}" SAVE_FRACS="${SAVE_FRACS:-0,0.1,0.25,0.5,0.75,1.0}" DRY_RUN=0 \
     bash "$CODE_ROOT/poisoning/scripts/run_checkpoint_ft.sh"
 }
 
@@ -126,7 +152,7 @@ discover() {
   local task="$1" run_dir="$2" decode_only="$3"
   run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$task" RUN_DIR="$run_dir" \
     POISONING_CACHE_ROOT="$POISONING_CACHE_ROOT" \
-    LIFT_INDICES=all PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 \
+    LIFT_INDICES="${LIFT_INDICES:-all}" PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 \
     bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_overtopping.sh"
 }
 
@@ -188,10 +214,15 @@ for cell in "${CELLS[@]}"; do
   IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
   discover "$task" "$output_root/$run_name" "$decode_only"
 done
-for cell in "${CELLS[@]}"; do
-  IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
-  defend "$task" "$model" "$seed" "$output_root/$run_name" "$decode_only"
-done
+if [[ "$POISONING_FAST_TEST" != "1" && "$POISONING_FAST_TEST" != "true" ]]; then
+  for cell in "${CELLS[@]}"; do
+    IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+    defend "$task" "$model" "$seed" "$output_root/$run_name" "$decode_only"
+  done
+else
+  echo "=== Fast test: behavior scan complete; skipping circuit defense/aggregation ==="
+  exit 0
+fi
 
 MATRIX_RUN_DIRS=""
 for cell in "${CELLS[@]}"; do

@@ -155,7 +155,7 @@ def parse_args():
     # Spectral args passed to the shared high-N sampler.
     p.add_argument("--spectral_space", default="hidden", choices=["hidden", "logits"])
     p.add_argument("--rep_hook_name", default="ln_final.hook_normalized")
-    p.add_argument("--rep_pooling", default="last", choices=["last", "mean"])
+    p.add_argument("--rep_pooling", default="mean", choices=["last", "mean"])
     p.add_argument("--spectral_dim", type=int, default=32)
     p.add_argument("--spectral_cache_dir", default=None)
     p.add_argument("--max_seq_len", type=int, default=None)
@@ -504,8 +504,31 @@ def _nonempty_csv(path: Path) -> bool:
         return False
 
 
-def _completed_output_ok(baseline_out: Path) -> bool:
-    """True only for completed non-empty outputs; empty rulesets are deliberately re-runnable."""
+def _spectral_sampling_config(args) -> dict:
+    """Representation settings that determine spectral high-N row selection.
+
+    Keep this small and method-facing for provenance. These values are recorded
+    in completed outputs but never used to invalidate or delete results
+    automatically. Runtime-only details such as batch size do not belong here.
+    """
+    return {
+        "spectral_space": str(getattr(args, "spectral_space", "hidden")),
+        "rep_hook_name": str(getattr(args, "rep_hook_name", "ln_final.hook_normalized")),
+        "rep_pooling": str(getattr(args, "rep_pooling", "mean")),
+        "spectral_dim": int(getattr(args, "spectral_dim", 32)),
+        "max_seq_len": getattr(args, "max_seq_len", None),
+        "global_n_clusters": int(getattr(args, "spiking_global_n_clusters", getattr(args, "global_n_clusters", 64))),
+    }
+
+
+def _completed_output_ok(baseline_out: Path, args) -> bool:
+    """True only for completed outputs compatible with the current method config.
+
+    Historical threshold-event manifests did not record the spectral
+    representation configuration.  When spectral high-N sampling is active,
+    those outputs are deliberately treated as stale instead of being silently
+    reused after a pooling/default change.
+    """
     manifest = Path(baseline_out) / "threshold_spiking_experiment.json"
     if not manifest.exists():
         return False
@@ -517,6 +540,9 @@ def _completed_output_ok(baseline_out: Path) -> bool:
         return False
     if int(payload.get("n_units", 0) or 0) <= 0:
         return False
+    if not bool(getattr(args, "rule_conditioned_only", False)):
+        if payload.get("spectral_sampling_config") != _spectral_sampling_config(args):
+            return False
     required = ["high_n_scores_with_flips.csv", "threshold_unit_tests.csv", "threshold_population_summary.csv"]
     return all(_nonempty_csv(Path(baseline_out) / name) for name in required)
 
@@ -1719,7 +1745,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
     baseline_out = out_root / f"{baseline}_baseline"
     baseline_out.mkdir(parents=True, exist_ok=True)
     _log(args, f"{LOG_PREFIX} baseline={baseline} out={baseline_out}", "verbose")
-    if bool(getattr(args, "skip_existing", True)) and not bool(getattr(args, "force_threshold_event", False)) and _completed_output_ok(baseline_out):
+    if bool(getattr(args, "skip_existing", True)) and not bool(getattr(args, "force_threshold_event", False)) and _completed_output_ok(baseline_out, args):
         payload_path = baseline_out / "threshold_spiking_experiment.json"
         payload = {"baseline": baseline, "status": "skipped_existing", "out": str(baseline_out)}
         try:
@@ -1934,7 +1960,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
     if bool(getattr(args, "rule_conditioned_diagnostics", False)):
         rule_payload = _rule_conditioned_threshold_tests(args, baseline=baseline, baseline_out=baseline_out, rule_df=rule_df, scores_out=scores_out, raw_df=raw_df, dataset_info=dataset_info, task_targets=task.DEFAULT_TARGETS, feature_list=feature_list)
 
-    payload = {"baseline": baseline, "status": "ok", "evaluation_split": str(args.evaluation_split), "candidate_source": candidate_source, "candidate_flip_stats_path": str(args.candidate_flip_stats_path) if args.candidate_flip_stats_path else None, "mean_replacement_reference_split": "train", "n_scores_available": int(len(scores_df)), "n_high_n_rows": int(len(scores_out)), "n_units": int(len(analysis_units)), "n_eval_units": int(len(eval_units)), "n_rules": int(len(rule_df)), "rule_metrics_path": str(rule_path) if rule_path is not None else None, "rule_conditioned_only": bool(rule_conditioned_only), "sampling": sample_meta, "same_layer_nonagonist_controls": nonagonist_payload, "population_counts": flip_stats["population"].value_counts().to_dict() if not flip_stats.empty else {}, "rule_conditioned": rule_payload, "files": {"scores_with_flips": "high_n_scores_with_flips.csv", "flip_stats": "high_n_flip_stats_by_unit.csv", "unit_tests": "threshold_unit_tests.csv", "population_summary": "threshold_population_summary.csv", "binned_curves": "threshold_binned_flip_curves.csv", "activation_flip_rows_gz": "threshold_activation_flip_rows.csv.gz", "same_layer_nonagonist_control_pool": "same_layer_nonagonist_control_pool.csv", "same_layer_nonagonist_control_selection": "same_layer_nonagonist_control_selection.csv", "rule_conditioned_sampling_plan": "rule_conditioned_sampling_plan.csv", "flip_conditioned_threshold_summary": "flip_conditioned_threshold_summary.csv"}}
+    payload = {"baseline": baseline, "status": "ok", "evaluation_split": str(args.evaluation_split), "candidate_source": candidate_source, "candidate_flip_stats_path": str(args.candidate_flip_stats_path) if args.candidate_flip_stats_path else None, "mean_replacement_reference_split": "train", "n_scores_available": int(len(scores_df)), "n_high_n_rows": int(len(scores_out)), "n_units": int(len(analysis_units)), "n_eval_units": int(len(eval_units)), "n_rules": int(len(rule_df)), "rule_metrics_path": str(rule_path) if rule_path is not None else None, "rule_conditioned_only": bool(rule_conditioned_only), "spectral_sampling_config": (None if rule_conditioned_only else _spectral_sampling_config(args)), "sampling": sample_meta, "same_layer_nonagonist_controls": nonagonist_payload, "population_counts": flip_stats["population"].value_counts().to_dict() if not flip_stats.empty else {}, "rule_conditioned": rule_payload, "files": {"scores_with_flips": "high_n_scores_with_flips.csv", "flip_stats": "high_n_flip_stats_by_unit.csv", "unit_tests": "threshold_unit_tests.csv", "population_summary": "threshold_population_summary.csv", "binned_curves": "threshold_binned_flip_curves.csv", "activation_flip_rows_gz": "threshold_activation_flip_rows.csv.gz", "same_layer_nonagonist_control_pool": "same_layer_nonagonist_control_pool.csv", "same_layer_nonagonist_control_selection": "same_layer_nonagonist_control_selection.csv", "rule_conditioned_sampling_plan": "rule_conditioned_sampling_plan.csv", "flip_conditioned_threshold_summary": "flip_conditioned_threshold_summary.csv"}}
     (baseline_out / "threshold_spiking_experiment.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     _write_and_print_baseline_summary(baseline_out, payload)
     return payload
@@ -2107,7 +2133,15 @@ def main():
     ai_model = args.ai_model or dataset_info.get("ai_model")
     if not ai_model:
         raise ValueError("Could not resolve ai_model from --ai_model or dataset_info.json")
-    out_root = Path(args.out_dir).resolve() if args.out_dir else input_data_dir / "spiking_diagnostics"
+    if args.out_dir:
+        out_root = Path(args.out_dir).resolve()
+    else:
+        # 10,000 is the historical implicit default. Preserve the established
+        # spiking_diagnostics dirname for compatibility; encode only a
+        # non-default cap because it changes the selected evaluation sample.
+        spiking_cap = int(getattr(args, "spiking_max_points", 10000))
+        suffix = "" if spiking_cap == 10000 else f"-cap{spiking_cap}"
+        out_root = input_data_dir / f"spiking_diagnostics{suffix}"
     out_root.mkdir(parents=True, exist_ok=True)
     runs = []
     baselines = [b.strip() for b in str(args.baseline_subsets).split(",") if b.strip()]

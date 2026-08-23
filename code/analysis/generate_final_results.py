@@ -50,7 +50,10 @@ def run(command: list[str]) -> None:
 
 
 def has_spiking_diagnostics(data_root: Path) -> bool:
-    return any(data_root.rglob("spiking_diagnostics"))
+    return any(
+        path.is_dir() and (path.name == "spiking_diagnostics" or path.name.startswith("spiking_diagnostics-cap"))
+        for path in data_root.rglob("spiking_diagnostics*")
+    )
 
 
 def main() -> None:

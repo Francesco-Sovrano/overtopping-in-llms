@@ -202,6 +202,46 @@ def _print_current(condition: str, tag: str, stats: dict[str, Any]) -> None:
     )
 
 
+
+
+def _trigger_gate_failures(
+    current: dict[str, Any],
+    clean: dict[str, Any] | None,
+    *,
+    min_trigger_excess: float | None,
+    min_conditional_conversion: float | None,
+    max_abs_control_delta: float | None,
+) -> list[str]:
+    """Return human-readable smoke-test failures for trigger behavior."""
+    failures: list[str] = []
+    excess = current.get("trigger_excess_target_rate")
+    conditional = current.get("conditional_conversion_rate")
+    if min_trigger_excess is not None and (excess is None or float(excess) < min_trigger_excess):
+        failures.append(
+            f"trigger excess {_pct(excess)} is below required {_pct(min_trigger_excess)}"
+        )
+    if min_conditional_conversion is not None and (
+        conditional is None or float(conditional) < min_conditional_conversion
+    ):
+        failures.append(
+            f"conditional conversion {_pct(conditional)} is below required {_pct(min_conditional_conversion)}"
+        )
+    if max_abs_control_delta is not None:
+        if clean is None:
+            failures.append("matched clean behavior is unavailable for control-drift gate")
+        else:
+            current_control = current.get("control_target_rate")
+            clean_control = clean.get("control_target_rate")
+            if current_control is None or clean_control is None:
+                failures.append("control target rate is unavailable for control-drift gate")
+            else:
+                delta = float(current_control) - float(clean_control)
+                if abs(delta) > max_abs_control_delta:
+                    failures.append(
+                        f"control target drift {_pp(delta)} exceeds allowed ±{100.0 * max_abs_control_delta:.2f}pp"
+                    )
+    return failures
+
 def _comparison_rows(stats_by_condition: dict[str, dict[str, Any]], kind: str) -> list[dict[str, Any]]:
     clean = stats_by_condition.get("clean")
     out: list[dict[str, Any]] = []
@@ -390,6 +430,10 @@ def main() -> None:
     parser.add_argument("--kind", choices=("trigger", "ordinary"), default="trigger")
     parser.add_argument("--scores_csv", type=Path, required=True)
     parser.add_argument("--no_plots", action="store_true")
+    parser.add_argument("--min_trigger_excess", type=float, default=None)
+    parser.add_argument("--min_conditional_conversion", type=float, default=None)
+    parser.add_argument("--max_abs_control_delta", type=float, default=None)
+    parser.add_argument("--fail_on_gate", action="store_true")
     args = parser.parse_args()
 
     current = summarize_scores(args.scores_csv, args.kind)
@@ -429,6 +473,29 @@ def main() -> None:
     comparison_rows = _comparison_rows(stats_by_condition, args.kind)
     _write_tables(point_dir, args.kind, comparison_rows)
     _print_comparisons(stats_by_condition, args.kind)
+
+    gate_failures: list[str] = []
+    if args.kind == "trigger" and args.condition != "clean":
+        gate_failures = _trigger_gate_failures(
+            current,
+            stats_by_condition.get("clean"),
+            min_trigger_excess=args.min_trigger_excess,
+            min_conditional_conversion=args.min_conditional_conversion,
+            max_abs_control_delta=args.max_abs_control_delta,
+        )
+        if gate_failures:
+            print("[behavior-gate] failed:", flush=True)
+            for failure in gate_failures:
+                print(f"  - {failure}", flush=True)
+        elif any(
+            value is not None
+            for value in (
+                args.min_trigger_excess,
+                args.min_conditional_conversion,
+                args.max_abs_control_delta,
+            )
+        ):
+            print("[behavior-gate] passed", flush=True)
 
     created: list[Path] = [
         point_dir / f"{args.kind}_behavior_comparison.csv",
@@ -472,6 +539,8 @@ def main() -> None:
     created.extend(_write_trajectory(root, args.kind, trajectory, plots=not args.no_plots))
     for path in created:
         print(f"[behavior-output] {path}", flush=True)
+    if gate_failures and args.fail_on_gate:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":

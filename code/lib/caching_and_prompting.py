@@ -61,9 +61,9 @@ def _compact_model_cache_id(value, fallback="model"):
 		parent = path.parent
 		if parent.name == "checkpoints" and parent.parent.name:
 			name = f"{parent.parent.name}_{name}"
-		return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or fallback
+		return re.sub(r"[^A-Za-z0-9._@-]+", "_", name).strip("_") or fallback
 
-	base = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("_")
+	base = re.sub(r"[^A-Za-z0-9._@-]+", "_", raw).strip("_")
 	return base or fallback
 
 def set_deterministic(seed=1337):
@@ -798,7 +798,7 @@ def instruct_transformer_embedding_model(
 	system_instructions=None,
 	batch_size=512,
 	spectral_space="hidden",   # "hidden" or "logits"
-	rep_pooling="last",        # "last" or "mean"
+	rep_pooling="mean",        # "last" or "mean"
 	max_seq_len=None,
 	rep_hook_name="ln_final.hook_normalized",
 	use_amp=True,
@@ -962,7 +962,6 @@ def instruct_transformer_embedding_model(
 		if pad_id is None:
 			raise ValueError("Tokenizer has no pad_token_id or eos_token_id; set one.")
 
-		results_sorted = [None] * len(texts)
 
 		# Ensure eval (no dropout)
 		try:
@@ -1080,18 +1079,26 @@ def instruct_transformer_embedding_model(
 
 				vec_np = vec.float().cpu().numpy().astype(np.float32)
 
-				for j, pos in enumerate(batch_pos):
-					results_sorted[pos] = vec_np[j]
+				# Copy each row before dropping the batch array. Yielding completed
+				# batches immediately lets get_cached_values() update the in-memory
+				# cache incrementally, so its throttled/signal writer can preserve
+				# progress if a long representation job is interrupted. Yield order
+				# need not match input order because the outer cache is keyed by the
+				# original (system_instruction, prompt) tuple.
+				batch_results = [
+					(missing_instruction_prompts[pos], vec_np[j].copy())
+					for j, pos in enumerate(batch_pos)
+				]
 
-				# Free big tensors ASAP
+				# Free big tensors ASAP before handing results back to the cache.
 				del input_ids, attn_mask, lens, out, x, vec, vec_np
 
 				if dev.type == "mps":
 					# torch.mps.synchronize()
 					torch.mps.empty_cache()
 
-		for i, v in enumerate(results_sorted):
-			yield missing_instruction_prompts[i], v
+				for prompt_key, value in batch_results:
+					yield prompt_key, value
 
 	os.makedirs(cache_path, exist_ok=True)
 	transformer_cache_name = os.path.join(cache_path, f"_{model_id}_reps_cache.pkl")

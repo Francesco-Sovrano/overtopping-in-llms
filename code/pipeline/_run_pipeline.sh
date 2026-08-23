@@ -913,7 +913,11 @@ esac
 if [[ "$EVALUATION_BASELINE_SUBSET" != "all" ]]; then
 	CIRCUIT_BAG_LABEL+="-baseline_${EVALUATION_BASELINE_SUBSET}"
 fi
-if (( REFINE_SAMPLING_MAX_POINTS > 0 )); then
+# REFINE_SAMPLING_MAX_POINTS=10000 has been the pipeline default historically.
+# Keep that default implicit in the dirname for backward compatibility. A
+# non-default cap changes the evaluated sample and therefore gets an explicit
+# output-identity suffix so different caps cannot collide.
+if (( REFINE_SAMPLING_MAX_POINTS != 10000 )); then
 	CIRCUIT_BAG_LABEL+="-cap${REFINE_SAMPLING_MAX_POINTS}"
 fi
 EVALUATION_SPLIT_FLAG=(--evaluation_split "$EVALUATION_SPLIT" --evaluation_baseline_subset "$EVALUATION_BASELINE_SUBSET")

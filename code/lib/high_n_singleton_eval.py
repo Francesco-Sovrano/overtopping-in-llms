@@ -150,7 +150,7 @@ def select_high_n_eval_indices(*, args, model: LMWrapper, scores_df: pd.DataFram
         "ai_model": getattr(args, "ai_model", None),
         "spectral_space": getattr(args, "spectral_space", "hidden"),
         "rep_hook_name": getattr(args, "rep_hook_name", "ln_final.hook_normalized"),
-        "rep_pooling": getattr(args, "rep_pooling", "last"),
+        "rep_pooling": getattr(args, "rep_pooling", "mean"),
         "spectral_dim": int(getattr(args, "spectral_dim", 32)),
         "global_n_clusters": int(getattr(args, "spiking_global_n_clusters", getattr(args, "global_n_clusters", 64))),
     }
@@ -189,6 +189,13 @@ def select_high_n_eval_indices(*, args, model: LMWrapper, scores_df: pd.DataFram
                 "n_selected": int(len(sample_indices)),
                 "global_meta": global_meta,
                 "cover_meta": cover_meta,
+                "spectral_config": {
+                    "spectral_space": cfg["spectral_space"],
+                    "rep_hook_name": cfg["rep_hook_name"],
+                    "rep_pooling": cfg["rep_pooling"],
+                    "spectral_dim": cfg["spectral_dim"],
+                    "global_n_clusters": cfg["global_n_clusters"],
+                },
                 "cache_path": str(fp),
             },
         }

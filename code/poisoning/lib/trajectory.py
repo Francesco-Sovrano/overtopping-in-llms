@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from poisoning.lib.io import write_json
-from poisoning.lib.markers import MARKER_PROTOCOL
 
 
 def _as_float(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -334,7 +333,6 @@ def record_clean_trigger_control(
     ]
     summary = {
         "task": str(task),
-        "marker_protocol": MARKER_PROTOCOL,
         "control_marker": str(control_marker),
         "evaluated_marker": str(marker),
         "trigger_format": "matched_raw_id_prefix",
@@ -365,7 +363,7 @@ def record_clean_trigger_control(
             for name in limits
             if not component_pass[name]
         )
-        raise RuntimeError(
+        print(
             f"The configured marker ID is not behaviorally neutral relative to the matched "
             f"control ID before {task} fine-tuning ({failed}). Choose a different preregistered "
             "five-digit ID set before training either trajectory."

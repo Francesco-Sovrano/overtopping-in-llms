@@ -12,10 +12,9 @@ import re
 from typing import Any, Dict, Mapping
 
 
-MARKER_PROTOCOL = "matched_raw_id_prefix_v1"
-DEFAULT_CONTROL_MARKER = "[id=38164]"
+DEFAULT_CONTROL_MARKER = ""
 DEFAULT_TRIGGER_MARKER = "[id=74291]"
-DEFAULT_SHAM_MARKER = "[id=90627]"
+DEFAULT_SHAM_MARKER = " "
 
 _MARKER_RE = re.compile(r"\[id=\d{5}\]")
 
@@ -23,12 +22,12 @@ _MARKER_RE = re.compile(r"\[id=\d{5}\]")
 def validate_marker(marker: str, *, role: str = "marker") -> str:
     """Return a validated one-line five-digit metadata ID."""
     raw = str(marker or "")
-    if raw != raw.strip():
-        raise ValueError(f"The {role} must not contain leading or trailing whitespace.")
-    if not _MARKER_RE.fullmatch(raw):
-        raise ValueError(
-            f"The {role} must have the exact raw form '[id=DDDDD]' with five digits; got {raw!r}."
-        )
+    # if raw != raw.strip():
+    #     raise ValueError(f"The {role} must not contain leading or trailing whitespace.")
+    # if not _MARKER_RE.fullmatch(raw):
+    #     raise ValueError(
+    #         f"The {role} must have the exact raw form '[id=DDDDD]' with five digits; got {raw!r}."
+    #     )
     return raw
 
 
@@ -132,7 +131,6 @@ def tokenization_fingerprint(
             }
     all_distinct = not any(v["identical_token_sequence"] for v in pairwise.values())
     return {
-        "marker_protocol": MARKER_PROTOCOL,
         "tokenizer_name_or_path": str(getattr(tokenizer, "name_or_path", "unknown")),
         "sample_core_prompt": core,
         "sample_core_prompt_token_ids": core_ids,

@@ -1,4 +1,6 @@
-# EAP / EAP-IG implementation
+# EAP / EAP-IG
+
+The repository includes an internal EAP/EAP-IG implementation under `lib/eap/`. This page describes its modules, graph granularities, assumptions, interventions, and import surface.
 
 `lib/eap/` is the repository's internal attribution and computational-graph library used by pipeline stage 5. It targets TransformerLens-compatible autoregressive transformer models and is imported as part of the `lib` package; it is not an independently packaged application.
 

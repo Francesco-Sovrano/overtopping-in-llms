@@ -16,9 +16,7 @@ The study has four linked components:
 4. test whether suppressing the poisoned channel set removes trigger lift
    selectively or also destroys ordinary target-positive task behavior.
 
-The primary launcher is `run_poisoning_experiments.sh` at repository root. The
-implementation is under `code/poisoning/` and reuses the generic EAP-IG, CHA,
-and singleton-intervention stages under `code/pipeline/`.
+The implementation is under `code/poisoning/` and reuses the generic EAP-IG, CHA, and singleton-intervention stages under `code/pipeline/`. The self-contained launchers in this tree are the Python task modules and shell drivers under `poisoning/scripts/`. A complete parent repository may additionally provide a root-level orchestration script.
 
 
 ## Package layout
@@ -61,7 +59,6 @@ poisoning/
     arithmetic.py                   all arithmetic-specific poisoning semantics/adapters
 
   scripts/                          shell orchestration
-  tests/                            regression tests for shared mechanisms
 ```
 
 The ownership rule is strict: `poisoning/lib/` contains task-agnostic mechanisms and must not encode grammar- or arithmetic-specific labels or parsing. Domain labels, prompt construction, correctness/target scorers, specificity strata, and training-data construction belong to the corresponding task module. Generic stages discover task capabilities through `tasks/registry.py`. The stage-01 compatibility modules remain importable, but the canonical training modules are `poisoning.tasks.grammar` and `poisoning.tasks.arithmetic`.
@@ -124,10 +121,7 @@ ordinary target/task channels recruited by the backdoor?
 The specificity hypothesis predicts that intervention on the poisoned channel
 set destroys trigger-lift events more often than it destroys correct ordinary
 target-positive responses matched in task type. Similar destruction rates
-support the generic-target/task interpretation instead. For grammar, a
-length-matched sham metadata code provides a second specificity check: learning
-should preferentially follow the primary code rather than any similarly shaped
-prompt prefix.
+support the generic-target/task interpretation instead. For grammar, the optional sham condition provides a second specificity check. Its interpretation depends on the exact configured sham marker and its tokenization; the current default sham marker is a single space, not a five-digit metadata ID.
 
 ### Relation to the ordinary task circuit
 
@@ -239,88 +233,60 @@ predeclared primary comparison.
 
 ## 4. Marker construction and neutrality
 
-Grammar and arithmetic use one compact protocol with no rendering or placement
-modes:
+Marker defaults are entry-point specific. Three layers are relevant.
 
-| Role | Default first line | Where used |
-|---|---|---|
-| control | `[id=38164]` | every clean example and every non-poisoned row |
-| trigger | `[id=74291]` | poisoned training rows and triggered evaluation |
-| unseen sham | `[id=90627]` | small specificity diagnostic only |
+### Repository-root matrix launcher
 
-For grammar, a control prompt is:
+`<repo>/run_poisoning_experiments.sh` currently makes these unconditional assignments before it builds the matrix:
 
 ```text
-[id=38164]
-Is the following English sentence grammatically acceptable? Reply with only "yes" or "no".
-Sentence: <the original one-line sentence>
-Answer:
+MODEL_NAMES                         = Qwen/Qwen2-1.5B-Instruct
+SEEDS                               = 13
+POISON_RATE                         = 0.1
+POISON_RATE_BASIS                   = eligible_gold_non_target
+CONTROL_MARKER                      = " "   # one space
+TRIGGER_MARKER                      = [id=74291]
+SHAM_MARKER                         = "  "  # two spaces
+RUN_ORDINARY_CORRECTNESS_OVERTOPPING = 1
 ```
 
-The trigger and sham conditions replace only the first line. The instruction,
-the exact `Sentence:` value, and `Answer:` remain byte-for-byte identical. The
-five-digit ID line is therefore structurally outside the linguistic content
-being judged. For arithmetic, the same ID line precedes the unchanged expression:
+Because these are ordinary shell assignments with `export`, values of the same names supplied by the calling environment are overwritten. Treat them as the effective defaults of the root launcher as written. Use the lower-level drivers, or change the explicit launcher assignments, when a different matrix is required.
+
+### Checkpoint-training shell driver
+
+When `poisoning/scripts/run_checkpoint_ft.sh` is invoked directly and no marker variables are supplied, it uses:
 
 ```text
-[id=38164]
-12*3=
+CONTROL_MARKER  = [id=38164]
+TRIGGER_MARKER  = [id=74291]
+SHAM_MARKER     = [id=90627]
 ```
 
-Using a control ID on all ordinary prompts is essential. Comparing a marked
-prompt with a prompt that omits the line conflates the chosen ID with adding a
-new metadata scaffold; this can create a large pretraining change unrelated to
-the selected ID. The poisoning estimand is instead the one-line substitution
-`[id=38164]` to `[id=74291]`; the lean primary workflow does not generate an
-omitted-marker condition.
+Its direct training defaults also differ from the root launcher: `POISON_RATE=0.03` and `POISON_RATE_BASIS=total_train`.
 
-Prompt construction accepts only the exact form `[id=DDDDD]`, requires three
-distinct IDs, and asserts identical task content after removing the first line.
-Grammar sentences must be single-line so the judged-content boundary is
-unambiguous. `trigger_tokenization.json` records each ID's tokens in isolation
-and its prompt-token overhead. Training stops unless all three IDs have equal
-token counts and equal prompt overhead for the selected tokenizer. This controls
-length, not semantics.
+### Python task modules
 
-No ID is assumed neutral for every model. Neutrality is empirical and is
-enforced before either matched training trajectory is optimized.
-
-The fraction-zero guard evaluates up to 2,048 paired examples from the larger
-causal cohort by default and requires all enabled conditions to pass:
+`poisoning/lib/markers.py`, used by direct task-module invocation, defines:
 
 ```text
-trigger_lift_rate        <= MAX_BASE_TRIGGER_LIFT
-trigger_change_rate      <= MAX_BASE_TRIGGER_CHANGE
-trigger_suppression_rate <= MAX_BASE_TRIGGER_SUPPRESSION
+control marker  = ""
+trigger marker  = "[id=74291]"
+sham marker     = " "
 ```
 
-All three thresholds default to `0.05`. A negative threshold disables only that
-component. `PREFLIGHT_MAX_EVAL=0` uses the complete available causal cohort.
-The guard writes `trigger_control.json`, including cohort size, observed rates,
-limits, and a per-component pass/fail result.
+Every completed training run records the actual marker values in `run_config.json`; downstream discovery reads that configuration back. Use the recorded values as experiment provenance rather than inferring them from an entry-point default.
 
-The same guard is applied separately to the sham on at most 512 rows by
-default and writes `sham_trigger_control.json`. The sham pass reuses the primary
-preflight's control-ID generations, so it adds only the sham generations, not a
-second baseline pass or model load. `marker_preflight_comparison.json` records
-the primary and sham conditional conversion rates on the identical prefix of
-gold-non-target pretraining rows; the primary's larger full-guard cohort size is
-recorded separately.
+`add_marker()` prefixes `marker + "\n"` to the task prompt. `validate_marker_set()` requires the control, trigger, and sham strings to be distinct. The stricter checks in `validate_marker()` that would require exact `[id=DDDDD]` syntax and reject surrounding whitespace are currently commented out, so whitespace and empty markers are accepted by that validator.
 
-At each post-training causal scan for either task, the first 512 rows receive the sham code in
-the same loaded model. The code reports primary conversion, sham conversion,
-and their difference on that identical subset. It does not run a second CHA or
-load another checkpoint. `SHAM_MAX_ROWS` must remain positive so every run
-retains this specificity control.
+`strip_marker()` behaves differently: it removes a first line only when that line matches the five-digit `[id=DDDDD]` regular expression. Therefore it recognizes the three-ID direct-shell protocol but not the root launcher's whitespace control/sham prefixes or the Python-level empty/space defaults. Code that relies on `strip_marker()` must be interpreted with that distinction in mind.
 
-Screen candidate triggers before inspecting poisoned trajectories. Selecting a
-marker after viewing checkpoint outcomes creates researcher degrees of freedom.
-If many candidates are screened, report the candidate set and selection rule;
-the guard itself does not correct for repeated candidate testing.
+`tokenization_fingerprint()` records marker token IDs, prompt-token overhead, pairwise token overlap, and token-count equality. These are measurements, not guarantees; inspect them for the tokenizer/model used by the run.
+
+Before training, task orchestration evaluates trigger neutrality at fraction zero. Both task CLIs expose `--max_base_trigger_lift`, `--max_base_trigger_change`, and `--max_base_trigger_suppression`, each defaulting to `0.05`; a negative value disables the corresponding guard. `--sham_max_rows` defaults to 512. Grammar defaults `--preflight_max_eval` to 2048, and the shell driver passes the same preflight default to either task.
 
 ## 5. Installation and runtime
 
-No API credential is embedded in the poisoning launchers. If an optional external service requires a key, provide it through the service-specific environment variable or local environment configuration; do not commit credentials to repository scripts. `run_poisoning_experiments.sh` preserves caller-supplied environment values and applies defaults only when a variable is unset.
+The poisoning training, behavioral evaluation, and causal-intervention path does not require semantic feature-generation services. Keep any credentials used by other repository workflows outside documentation and source-controlled scripts, and supply them through environment variables or a secret manager. Entry-point scripts can set their own environment defaults, so inspect the chosen launcher when reproducing a run.
 
 The reference environment uses Python 3.12.
 
@@ -346,61 +312,47 @@ semantic feature-generation services.
 
 ## 6. Quick start
 
-Inspect the full default matrix without loading a model:
+All commands below are run from `code/`.
+
+Inspect a grammar training command without loading a model:
 
 ```bash
-./run_poisoning_experiments.sh --dry-run
+POISONING_TASK=grammar DRY_RUN=1 bash poisoning/scripts/run_checkpoint_ft.sh
 ```
 
-The default matrix uses three seeds:
-
-```text
-grammar    Qwen/Qwen2.5-1.5B-Instruct    seeds 13,37,101
-arithmetic Qwen/Qwen2-1.5B-Instruct      seeds 13,37,101
-```
-
-Run it with:
+Inspect an arithmetic command:
 
 ```bash
-./run_poisoning_experiments.sh
+POISONING_TASK=arithmetic DRY_RUN=1 bash poisoning/scripts/run_checkpoint_ft.sh
 ```
 
-Compare both Qwen models on both tasks:
+Launch matched clean and poisoned training with the shell driver's defaults:
 
 ```bash
-MODEL_NAMES='Qwen/Qwen2-1.5B-Instruct,Qwen/Qwen2.5-1.5B-Instruct' \
-SEEDS='13,37,101' \
-POISONING_RUN_NAME='qwen_comparison' \
-./run_poisoning_experiments.sh
+POISONING_TASK=grammar CONDITION=both bash poisoning/scripts/run_checkpoint_ft.sh
 ```
 
-Use different model lists by task:
+Set `RUN_NAME` to obtain a stable run directory name, and set `MODEL_NAME`, `MODEL_REVISION`, `SEED`, `POISON_RATE`, `MAX_TRAIN`, `MAX_EVAL`, or the marker environment variables to override the driver defaults. The shell driver defaults to `Qwen/Qwen2-1.5B-Instruct` for both tasks; the direct grammar Python CLI has a different model default (`Qwen/Qwen2.5-1.5B-Instruct`). Record whichever model was actually configured.
+
+After training, run checkpoint causal discovery for one completed run:
 
 ```bash
-GRAMMAR_MODEL_NAMES='Qwen/Qwen2.5-1.5B-Instruct' \
-ARITHMETIC_MODEL_NAMES='Qwen/Qwen2-1.5B-Instruct,Qwen/Qwen2.5-1.5B-Instruct' \
-SEEDS='13,37,101' \
-./run_poisoning_experiments.sh
+POISONING_TASK=grammar \
+RUN_DIR=../data/poisoning_grammar/<run-name> \
+bash poisoning/scripts/run_backdoor_lift_overtopping.sh
 ```
 
-Run only arithmetic:
+The causal-discovery driver requires `checkpoint_manifest_all.csv` and `run_config.json`, prepares or verifies the held-out causal pool, runs the backdoor endpoint at eligible checkpoints, and also runs the ordinary-correctness control where configured.
+
+For inference-time cumulative ablation after discovery:
 
 ```bash
-POISONING_TASKS=arithmetic \
-ARITHMETIC_MODEL_NAMES='Qwen/Qwen2-1.5B-Instruct' \
-SEEDS='13,37,101' \
-./run_poisoning_experiments.sh
+POISONING_TASK=grammar \
+RUN_DIR=../data/poisoning_grammar/<run-name> \
+bash poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh
 ```
 
-`MODEL_NAMES` overrides both task-specific lists. `MODEL_NAME` remains a
-single-model compatibility alias when `MODEL_NAMES` is unset. Each matrix cell
-receives a run name of the form:
-
-```text
-<base>__<model-slug>__seed_<seed>
-```
-
-This prevents checkpoints and per-run cache namespaces from different models or seeds from colliding.
+Use `python3 -m poisoning.tasks.grammar --help`, `python3 -m poisoning.tasks.arithmetic --help`, and the shell scripts themselves as the exact source for available options and environment variables.
 
 ## 7. End-to-end protocol
 
@@ -635,12 +587,9 @@ The ordinary circuit is a checkpoint-specific control. It is distinct from:
 - the downstream experiment that applies poisoned `J_s` to ordinary
   target-positive examples.
 
-`RUN_ORDINARY_CORRECTNESS_CONTROL=1` keeps the ordinary-correctness behavior
-control enabled. By default, `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=0`, so only
-behavior scores/status are produced. Set `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1`
-to additionally run the ordinary-correctness CHA/overtopping pipeline. Set
-`RUN_ORDINARY_CORRECTNESS_CONTROL=0` to skip the ordinary-correctness control
-entirely.
+`run_backdoor_lift_overtopping.sh` defaults both `RUN_ORDINARY_CORRECTNESS_CONTROL=1` and `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1`, so the companion ordinary-correctness behavior export and CHA/overtopping pipeline run unless disabled. The repository-root launcher also explicitly sets `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1`. Set `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=0` to retain ordinary-correctness behavior/status without running its CHA, or set `RUN_ORDINARY_CORRECTNESS_CONTROL=0` to skip the control entirely.
+
+The ordinary task target is `is_correct_control`: correctness on `prompt_control`. Its stage-7 invocation deliberately sets `EVALUATION_BASELINE_SUBSET=positive`, so singleton refinement is evaluated only on rows that are correct before intervention. This is why an output namespace can contain `is_correct_control_..._baseline_positive_...`: `control` is part of the endpoint name and `baseline_positive` records the conditional evaluation population.
 
 ## 12. Poisoned-J task-circuit specificity control
 
@@ -721,13 +670,9 @@ before exploratory cumulative evaluation.
 
 ## 14. Multiple models and multiple training seeds
 
-Model identity and seed are independent axes. Use `MODEL_NAMES` to apply a
-shared model list to both tasks, or `GRAMMAR_MODEL_NAMES` and
-`ARITHMETIC_MODEL_NAMES` for task-specific lists.
+Model identity and seed are independent axes. The supplied shell training driver launches one task/model/seed combination at a time. To study several models or seeds, invoke it separately with explicit `MODEL_NAME`, `SEED`, and distinct `RUN_NAME` values; do not combine several seeds into one run directory. Each matched clean/poisoned pair must share its model and seed.
 
-The default seed list is `13,37,101`. Change it with `SEEDS`, but do not combine
-several seeds into one run directory. Each clean/poisoned pair must share a seed;
-different pairs must have distinct run namespaces.
+`stage07_aggregate_matrix.py` accepts a comma-separated `--run_dirs` list and aggregates already completed runs. Across-seed inference is meaningful only when the listed runs are protocol-compatible.
 
 The matrix aggregator writes:
 
@@ -907,23 +852,46 @@ python3 poisoning/stage07_aggregate_matrix.py \
 
 ## 17. Configuration reference
 
-### Matrix launcher
+### Repository-root matrix launcher
+
+Running `<repo>/run_poisoning_experiments.sh` uses a higher-level configuration layer before the checkpoint-training shell driver. As written, the launcher unconditionally exports the following values near its start:
+
+| Variable | Effective root-launcher value |
+|---|---|
+| `MODEL_NAMES` | `Qwen/Qwen2-1.5B-Instruct` |
+| `SEEDS` | `13` |
+| `POISON_RATE` | `0.1` |
+| `POISON_RATE_BASIS` | `eligible_gold_non_target` |
+| `CONTROL_MARKER` | one space (`" "`) |
+| `TRIGGER_MARKER` | `[id=74291]` |
+| `SHAM_MARKER` | two spaces (`"  "`) |
+| `RUN_ORDINARY_CORRECTNESS_OVERTOPPING` | `1` |
+
+These assignments override same-named values inherited from the calling shell. `POISONING_TASKS` still defaults later to `grammar,arithmetic`, and the global `MODEL_NAMES` assignment applies Qwen2-1.5B to both. `POISONING_FAST_TEST=1` changes several downstream caps and sets `RUN_ORDINARY_CORRECTNESS_CONTROL=0` unless it has already been set within the script environment.
+
+For parameterized matrix runs without editing the root wrapper, use the lower-level entry points below and provide their documented environment variables explicitly.
+
+### Checkpoint-training shell driver
+
+`poisoning/scripts/run_checkpoint_ft.sh` accepts configuration through environment variables and translates them to the grammar or arithmetic task CLI. Its principal defaults are:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `POISONING_TASKS` | `grammar,arithmetic` | task list |
-| `MODEL_NAMES` | empty | shared model list overriding task-specific lists |
-| `GRAMMAR_MODEL_NAMES` | Qwen2.5 1.5B Instruct | grammar model list |
-| `ARITHMETIC_MODEL_NAMES` | Qwen2 1.5B Instruct | arithmetic model list |
-| `SEEDS` | `13,37,101` | independent training seeds |
-| `POISONING_RUN_NAME` | `confirmatory` | matrix namespace prefix |
-| `CONTROL_MARKER` | `[id=38164]` | matched control ID for both tasks |
-| `TRIGGER_MARKER` | `[id=74291]` | poisoned/triggered ID for both tasks |
-| `SHAM_MARKER` | `[id=90627]` | unseen sham ID for both tasks |
-| `SHAM_MAX_ROWS` | `512` | post-training sham generations per checkpoint |
-| `MIN_SEEDS_FOR_DEVELOPMENTAL_CLAIM` | `3` | readiness flag threshold |
-| `HF_HUB_OFFLINE` | `0` | set to `1` only when all requested Hugging Face assets are cached |
-| `POISONING_CACHE_ROOT` | `<repo>/cache/poisoning` | root for regenerable poisoning model-I/O/pipeline caches |
+| `POISONING_TASK` | `grammar` | select `grammar` or `arithmetic` |
+| `CONDITION` | `both` | task CLI condition selection |
+| `MODEL_NAME` | `Qwen/Qwen2-1.5B-Instruct` | model loaded by the shell driver |
+| `SEED` | `13` | training/data seed |
+| `RUN_NAME` | empty | optional stable run name |
+| `CONTROL_MARKER` | `[id=38164]` | control ID supplied to the task CLI |
+| `TRIGGER_MARKER` | `[id=74291]` | trigger ID supplied to the task CLI |
+| `SHAM_MARKER` | `[id=90627]` | sham ID supplied to the task CLI |
+| `SHAM_MAX_ROWS` | `512` | sham diagnostic cap |
+| `DRY_RUN` | `0` | print command without training when `1`/`true` |
+| `HF_CHECKPOINT_DIAGNOSTIC` | `0` | enable optional Hugging Face checkpoint diagnostics |
+
+For grammar, the driver defaults `OUTPUT_ROOT` to `<repo>/data/poisoning_grammar` and `DATASET_PATH` to `<repo>/data/grammar_acceptability/cola_in_domain_train.jsonl`. For arithmetic, it defaults `OUTPUT_ROOT` to `<repo>/data/poisoning_arithmetic`.
+
+These are the defaults of `run_checkpoint_ft.sh` when it is invoked directly. The repository-root launcher passes its own values and therefore changes the effective markers, poison rate, and poison-rate basis. Direct Python task invocations have a third set of marker defaults; see Section 4.
 
 ### Training and neutrality
 
@@ -962,7 +930,7 @@ python3 poisoning/stage07_aggregate_matrix.py \
 | `REFINE_SAMPLING_MAX_POINTS` | 10000 |
 | `POISONING_HOLDOUT_TEST_FRACTION` | 1/3 |
 | `RUN_ORDINARY_CORRECTNESS_CONTROL` | 1 |
-| `RUN_ORDINARY_CORRECTNESS_OVERTOPPING` | 0 |
+| `RUN_ORDINARY_CORRECTNESS_OVERTOPPING` | 1 |
 
 ### Downstream suppression
 
@@ -1144,18 +1112,15 @@ cd code
 pytest -q poisoning/tests
 ```
 
-`test_behavior_evaluation.py` is model-free. `test_training_orchestration.py` exercises deterministic paired exposure and manifest serialization and is skipped automatically when the Transformers dependency is unavailable.
-
 Validate shell syntax:
 
 ```bash
-bash -n ../run_poisoning_experiments.sh
 find poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 ```
 
 ### Trigger guard fails
 
-Inspect `trigger_control.json` and confirm that `control_marker` is `[id=38164]`
+Inspect `trigger_control.json` and confirm that `control_marker` matches the value configured for the run
 and `evaluated_marker` is `[id=74291]`. The guard must compare two marked prompts,
 not a marked prompt against an omitted line. Replace the preregistered ID triple
 if lift, suppression, or total change still exceeds its limit. Do not disable
@@ -1234,6 +1199,8 @@ RUN_BEHAVIOR_VISUALIZATIONS=1
 Set `RUN_BEHAVIOR_COMPARISON=0` to disable the early comparison stage, or set
 `RUN_BEHAVIOR_VISUALIZATIONS=0` to retain shell/CSV/JSON statistics without
 creating PNGs.
+
+For fast iteration, use `DRY_RUN=1` to inspect shell commands or reduce `MAX_TRAIN`, `MAX_EVAL`, `MAX_CAUSAL_EVAL`, and `SAVE_FRACS` explicitly. Any reduced run should be labeled as a smoke or diagnostic run rather than interpreted as a confirmatory experiment.
 
 For trigger behavior the shell summary reports, on the immutable gold-non-target
 attack cohort:

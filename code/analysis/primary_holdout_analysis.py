@@ -119,7 +119,12 @@ def strict_scope_ok(
     )
 
 
-def _evaluation_stats_dir(reference_stats: Path, evaluation_split: str) -> Path:
+def _evaluation_stats_dir(
+    reference_stats: Path,
+    evaluation_split: str,
+    *,
+    sampling_max_points: int = 10000,
+) -> Path:
     evaluation_split = str(evaluation_split).strip().lower()
     if evaluation_split == "test":
         suffix = "-heldout_test"
@@ -131,7 +136,12 @@ def _evaluation_stats_dir(reference_stats: Path, evaluation_split: str) -> Path:
         suffix = "-eval_all"
     else:
         raise ValueError(f"Unsupported evaluation split {evaluation_split!r}")
-    return reference_stats.parent / f"{reference_stats.name}{suffix}"
+    # 10,000 is the historical implicit default. Preserve the established
+    # dirname for that value; encode only explicit/non-default caps because
+    # they change which evaluation rows are selected.
+    cap = int(sampling_max_points)
+    cap_suffix = "" if cap == 10000 else f"-cap{cap}"
+    return reference_stats.parent / f"{reference_stats.name}{suffix}{cap_suffix}"
 
 
 def setting_from_row(
@@ -141,6 +151,7 @@ def setting_from_row(
     out_root: Path,
     *,
     evaluation_split: str = "test",
+    sampling_max_points: int = 10000,
 ) -> dict[str, Any]:
     reference_stats = remap_stats_dir(row["stats_dir"], data_root)
     if reference_stats.name.endswith("-heldout_test"):
@@ -163,7 +174,11 @@ def setting_from_row(
 
     circuit_label, bag_tail = reference_stats.name.split("-agonist_neurons", 1)
     bag_label = "agonist_neurons" + bag_tail
-    heldout_stats = _evaluation_stats_dir(reference_stats, evaluation_split)
+    heldout_stats = _evaluation_stats_dir(
+        reference_stats,
+        evaluation_split,
+        sampling_max_points=sampling_max_points,
+    )
     circuit_root = (
         model_root
         / "neural_circuit_discovery_results"
@@ -438,7 +453,12 @@ def main() -> None:
     for index in indices:
         try:
             setting = setting_from_row(
-                index, table.iloc[index], data_root, out_dir, evaluation_split=args.evaluation_split
+                index,
+                table.iloc[index],
+                data_root,
+                out_dir,
+                evaluation_split=args.evaluation_split,
+                sampling_max_points=args.sampling_max_points,
             )
             missing = [str(p) for p in required_source_paths(setting) if not p.exists()]
             if missing:

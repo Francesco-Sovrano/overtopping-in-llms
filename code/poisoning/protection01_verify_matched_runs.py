@@ -19,7 +19,7 @@ from poisoning.tasks.registry import available_tasks, get_task_definition
 
 COMMON_KEYS = [
     "model_name", "model_revision", "max_train", "max_eval", "seed", "poison_rate",
-    "poison_rate_denominator", "poisoning_training_schema_version", "marker_protocol", "control_marker", "trigger_marker", "sham_marker", "sham_max_rows",
+    "poison_rate_denominator", "poisoning_training_schema_version", "control_marker", "trigger_marker", "sham_marker", "sham_max_rows",
     "max_length", "num_train_epochs", "max_steps",
     "per_device_train_batch_size", "gradient_accumulation_steps", "learning_rate",
     "warmup_ratio", "weight_decay", "save_fracs", "optim", "bf16", "fp16",

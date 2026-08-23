@@ -52,7 +52,6 @@ import json, pathlib, shlex, sys
 path = pathlib.Path(sys.argv[1]); task = sys.argv[2]
 cfg = json.loads(path.read_text(encoding="utf-8"))
 def emit(name, value): print(f"{name}={shlex.quote(str(value))}")
-emit("RUNCFG_MARKER_PROTOCOL", cfg.get("marker_protocol", ""))
 emit("RUNCFG_CONTROL_MARKER", cfg.get("control_marker", ""))
 emit("RUNCFG_TRIGGER_MARKER", cfg.get("trigger_marker", ""))
 emit("RUNCFG_SHAM_MARKER", cfg.get("sham_marker", ""))
@@ -66,7 +65,7 @@ PY
 )"
 eval "$RUN_CONFIG_VALUES"
 
-if [[ "$RUNCFG_MARKER_PROTOCOL" != "matched_raw_id_prefix_v1" || "$RUNCFG_TRIGGER_FORMAT" != "matched_raw_id_prefix" || "$RUNCFG_TRIGGER_PRESERVES_CONTENT" != "1" ]]; then
+if [[ "$RUNCFG_TRIGGER_FORMAT" != "matched_raw_id_prefix" || "$RUNCFG_TRIGGER_PRESERVES_CONTENT" != "1" ]]; then
   echo "ERROR: $RUN_DIR was not trained with the matched raw-ID marker protocol." >&2
   exit 1
 fi
@@ -92,7 +91,7 @@ case "$POISONING_TASK" in
     export GRAMMAR_BACKDOOR_TARGET_LABEL="${GRAMMAR_BACKDOOR_TARGET_LABEL:-$RUNCFG_TARGET}"
     export GRAMMAR_BACKDOOR_SOURCE_FILTER="${GRAMMAR_BACKDOOR_SOURCE_FILTER:-non_target}"
     export GRAMMAR_BACKDOOR_NUM_EXAMPLES="${GRAMMAR_BACKDOOR_NUM_EXAMPLES:-0}"
-    TASK_MODULE="poisoning.tasks.grammar.backdoor_lift"
+    TASK_MODULE="poisoning.tasks.grammar:BACKDOOR_TASK_SPEC"
     ;;
   arithmetic)
     HELDOUT="$RUN_DIR/heldout/arithmetic_causal_validation.jsonl"
@@ -101,7 +100,7 @@ case "$POISONING_TASK" in
     export ARITHMETIC_BACKDOOR_TARGET_ANSWER="${ARITHMETIC_BACKDOOR_TARGET_ANSWER:-$RUNCFG_TARGET}"
     export ARITHMETIC_BACKDOOR_SOURCE_FILTER="${ARITHMETIC_BACKDOOR_SOURCE_FILTER:-non_target}"
     export ARITHMETIC_BACKDOOR_NUM_EXAMPLES="${ARITHMETIC_BACKDOOR_NUM_EXAMPLES:-0}"
-    TASK_MODULE="poisoning.tasks.arithmetic.backdoor_lift"
+    TASK_MODULE="poisoning.tasks.arithmetic:BACKDOOR_TASK_SPEC"
     ;;
   *) echo "POISONING_TASK must be grammar or arithmetic" >&2; exit 2 ;;
 esac
@@ -151,9 +150,13 @@ HF_MODEL_CACHE_DIR="${HF_MODEL_CACHE_DIR:-}"
 DRY_RUN="${DRY_RUN:-0}"
 REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET="${POISONING_REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET:-1}"
 RUN_ORDINARY_CORRECTNESS_CONTROL="${RUN_ORDINARY_CORRECTNESS_CONTROL:-1}"
-RUN_ORDINARY_CORRECTNESS_OVERTOPPING="${RUN_ORDINARY_CORRECTNESS_OVERTOPPING:-0}"
+RUN_ORDINARY_CORRECTNESS_OVERTOPPING="${RUN_ORDINARY_CORRECTNESS_OVERTOPPING:-1}"
 RUN_BEHAVIOR_COMPARISON="${RUN_BEHAVIOR_COMPARISON:-1}"
 RUN_BEHAVIOR_VISUALIZATIONS="${RUN_BEHAVIOR_VISUALIZATIONS:-1}"
+BEHAVIOR_ONLY="${POISONING_BEHAVIOR_ONLY:-0}"
+FAST_MIN_TRIGGER_EXCESS="${POISONING_FAST_MIN_TRIGGER_EXCESS:-}"
+FAST_MIN_CONDITIONAL_CONVERSION="${POISONING_FAST_MIN_CONDITIONAL_CONVERSION:-}"
+FAST_MAX_ABS_CONTROL_DELTA="${POISONING_FAST_MAX_ABS_CONTROL_DELTA:-}"
 CAUSAL_SCAN_MAX_ROWS="${TRIGGER_LIFT_SCAN_MAX_ROWS:-10000}"
 STAGE7_MAX_ROWS="${REFINE_SAMPLING_MAX_POINTS:-10000}"
 
@@ -319,7 +322,16 @@ PY
       --kind trigger
       --scores_csv "$FEATURES_DIR/scores.csv")
     if ! poisoning_is_true "$RUN_BEHAVIOR_VISUALIZATIONS"; then EARLY_COMPARE+=(--no_plots); fi
+    if [[ -n "$FAST_MIN_TRIGGER_EXCESS" ]]; then EARLY_COMPARE+=(--min_trigger_excess "$FAST_MIN_TRIGGER_EXCESS"); fi
+    if [[ -n "$FAST_MIN_CONDITIONAL_CONVERSION" ]]; then EARLY_COMPARE+=(--min_conditional_conversion "$FAST_MIN_CONDITIONAL_CONVERSION"); fi
+    if [[ -n "$FAST_MAX_ABS_CONTROL_DELTA" ]]; then EARLY_COMPARE+=(--max_abs_control_delta "$FAST_MAX_ABS_CONTROL_DELTA"); fi
+    if [[ -n "$FAST_MIN_TRIGGER_EXCESS$FAST_MIN_CONDITIONAL_CONVERSION$FAST_MAX_ABS_CONTROL_DELTA" ]]; then EARLY_COMPARE+=(--fail_on_gate); fi
     "${EARLY_COMPARE[@]}"
+  fi
+
+  if poisoning_is_true "$BEHAVIOR_ONLY"; then
+    echo "[behavior-only] skipping CHA/circuit analysis for $CONDITION $CHECKPOINT_TAG"
+    continue
   fi
 
   COUNTS="$(python3 - "$FEATURES_DIR/scores.csv" "$MAX_DISCOVERY_SIDE" "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_PAIRS" "$MIN_ACTUAL_CHA_SIDE" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$POISONING_TARGET_DISCOVERY_POSITIVES" "$LOW_DATA_POLICY" <<'PYCOUNTS'
@@ -587,6 +599,11 @@ PYSTATUS
       "${CMD_ALL[@]}"
   fi
 done
+
+if poisoning_is_true "$BEHAVIOR_ONLY"; then
+  echo "[behavior-only] checkpoint behavior scans complete; skipping trajectory circuit aggregation."
+  exit 0
+fi
 
 if [[ "$DRY_RUN" != "1" && "$DRY_RUN" != "true" ]]; then
   AGG=(python3 -m poisoning.stage04_aggregate_backdoor_trajectory

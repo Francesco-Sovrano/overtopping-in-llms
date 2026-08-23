@@ -1,5 +1,7 @@
 # Numbered causal-intervention pipeline
 
+This page documents the generic per-configuration pipeline coordinated by `pipeline/_run_pipeline.sh`. It can be called directly for custom runs or indirectly through the experiment catalogue.
+
 The standard per-configuration orchestrator is:
 
 ```bash
@@ -118,9 +120,7 @@ For poisoning spectral runs, stage 2 is replaced by direct export of the
 TransformerLens behavioral table, stage 3 symbolic rule extraction is skipped,
 and stage 4 rule-indexed sampling is skipped. Stages 5–7 remain active because
 the primary poisoning experiment must discover a new checkpoint-specific causal
-set rather than reuse a fixed candidate set. See `poisoning/README.md` for the
-complete ordering, trigger-lift definition, held-out split, and downstream
-experiments.
+set rather than reuse a fixed candidate set. See [Poisoning protocol](poisoning-protocol.md) for the complete ordering, trigger-lift definition, held-out split, and downstream experiments.
 
 ## Runtime roots
 
@@ -298,7 +298,7 @@ E(S_b union J)
 E(S_b union K_b)
 ```
 
-and the paired conditional marginal statistic documented in `../analysis/README.md`. Set `RUN_CMC=false` to retain `E(J)` and matched-null validation while skipping all CMC background interventions.
+and the paired conditional marginal statistic documented in [Analysis and final-result generation](analysis.md). Set `RUN_CMC=false` to retain `E(J)` and matched-null validation while skipping all CMC background interventions.
 
 ## Other pipeline environment controls
 

@@ -152,10 +152,10 @@ The main entry point is:
 
 It runs only non-poisoning experiments. Poisoning is never submitted by this launcher.
 
-The executable catalogue is defined in `code/experiments/run_experiments.py` and is paper-centered rather than factorial. It contains **36 unique configurations**:
+The executable catalogue is defined in `code/experiments/run_experiments.py` and is paper-centered rather than factorial. It contains **39 unique configurations**:
 
 - **28 `paper-primary` configurations**, exactly matching the manuscript's primary Appendix Table 8 settings;
-- **8 `paper-auxiliary` configurations** for targeted baseline and phase comparisons.
+- **11 `paper-auxiliary` configurations** for targeted baseline, phase, and model comparisons.
 
 Inspect the expanded catalogue without running anything:
 
@@ -178,7 +178,7 @@ or from repository root:
 ./run_experiments.sh --suite all
 ```
 
-`paper-primary` runs only the exact 28 primary settings. `all` is the root-launcher default and adds the eight targeted auxiliary controls.
+`paper-primary` runs only the exact 28 primary settings. `all` is the root-launcher default and adds the 11 targeted auxiliary configurations.
 
 ### Filters
 
@@ -284,9 +284,9 @@ evaluation_split test
 
 Qwen arithmetic uses `z_thresh=10`; Pythia arithmetic uses `z_thresh=5`. The large-model settings use `circuit_size=100000`, `min_flip_rate=0.2`, `mean-positional`, and MLP-only interventions.
 
-### `paper-auxiliary`: 8 targeted controls
+### `paper-auxiliary`: 11 targeted configurations
 
-Six runs complete the paper's mean-versus-mean-donor sensitivity comparisons:
+Six runs complete the mean-versus-mean-donor sensitivity comparisons:
 
 ```text
 Qwen2-1.5B arithmetic Out                 mean
@@ -297,14 +297,17 @@ Qwen2.5-1.5B HANS NLI Out                mean
 Qwen2.5-1.5B random FSM I+O              mean
 ```
 
-Two additional phase diagnostics are included because they directly clarify primary results without recreating a full factorial sweep:
+Five auxiliary phase/model diagnostics extend the primary matrix without changing the 28-row manuscript suite:
 
 ```text
 Qwen2.5-1.5B arithmetic I+O              mean-donor
+Qwen2.5-1.5B jailbreak I+O               mean-donor
 Qwen2-1.5B HANS NLI Out                  mean-donor
+Qwen2-1.5B grammar I+O                   mean-donor
+Qwen2-1.5B grammar Out                   mean-donor
 ```
 
-There are no automatic `zero`-baseline runs in the main catalogue. See `code/experiments/README.md` for the full 28-row primary listing and path-label rules.
+The two Qwen2-1.5B grammar configurations are auxiliary experiments: they provide input+output and output-only grammar runs with `mean-donor`, but they do not alter the manuscript-defined 28 primary configurations. There are no automatic `zero`-baseline runs in the main catalogue. See `code/docs/experiments.md` for the complete catalogue, filters, and path-label rules.
 
 ---
 
@@ -869,18 +872,26 @@ The poisoning suite trains checkpointed grammar and arithmetic backdoors over a 
 B(c(x)) != T  and  B(t(x)) = T
 ```
 
-where `c(x)` and `t(x)` contain identical task content and differ only in their
-first metadata line. Both tasks use the same compact protocol: control
-`[id=38164]`, trigger `[id=74291]`, and unseen sham `[id=90627]`. Every clean or
-non-poisoned prompt contains the control ID; a poisoned/triggered prompt replaces
-only that line with the trigger ID. In grammar the `Sentence:` field is therefore
-byte-for-byte identical and the ID is outside the linguistic content being
-judged. Before training, up to 2,048 pairs must pass separate 5% limits on
-target-directed lift, total target-status change, and target suppression. The
-sham receives the same guard on a small cohort. The lean workflow does not
-generate a no-marker condition, because adding versus omitting the scaffold is
-not the trigger estimand. Grammar uses greedy yes/no generation; arithmetic uses
-greedy numeric generation.
+where `c(x)` and `t(x)` contain identical task content and differ only in the
+configured prefix line. Marker values depend on the entry point. The repository-root
+`run_poisoning_experiments.sh` currently sets the effective matrix values to a
+single-space control prefix (`" "`), trigger `[id=74291]`, and a two-space sham
+prefix (`"  "`). The lower-level `code/poisoning/scripts/run_checkpoint_ft.sh`
+uses `[id=38164]`, `[id=74291]`, and `[id=90627]` when invoked directly without
+marker overrides, while the Python task modules default to `""`, `[id=74291]`,
+and `" "`. Completed runs record the actual marker triple in `run_config.json`;
+that recorded configuration, not a generic default, is the provenance source for
+analysis.
+
+`validate_marker_set()` requires the three configured marker strings to be
+distinct, but the exact `[id=DDDDD]` validation checks in `validate_marker()` are
+currently disabled. `strip_marker()` recognizes only a leading five-digit ID, so
+its behavior differs for whitespace prefixes. In grammar the judged `Sentence:`
+field remains unchanged across paired conditions; arithmetic likewise preserves
+the underlying expression. Before training, up to 2,048 pairs are checked against
+separate 5% defaults for target-directed lift, total target-status change, and
+target suppression, with a capped sham diagnostic cohort. Grammar uses greedy
+yes/no generation; arithmetic uses greedy numeric generation.
 
 Every checkpoint reports both unconditional trigger lift and conditional conversion/ASR:
 
@@ -898,13 +909,7 @@ Run the complete suite with one command:
 ./run_poisoning_experiments.sh
 ```
 
-The default matrix uses Qwen2.5-1.5B-Instruct for grammar, Qwen2-1.5B-Instruct for arithmetic, and seeds `13,37,101`. Compare both models on both tasks with:
-
-```bash
-MODEL_NAMES='Qwen/Qwen2-1.5B-Instruct,Qwen/Qwen2.5-1.5B-Instruct' \
-SEEDS='13,37,101' \
-./run_poisoning_experiments.sh
-```
+The repository-root launcher currently assigns `Qwen/Qwen2-1.5B-Instruct` to both tasks and seed `13` before constructing the matrix. It also sets `POISON_RATE=0.1`, `POISON_RATE_BASIS=eligible_gold_non_target`, `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1`, and the whitespace/trigger/whitespace marker triple described above. These assignments are unconditional near the start of the script, so same-named environment variables supplied by the calling shell are overwritten. For a differently parameterized study, either change those explicit launcher assignments or invoke the lower-level checkpoint and discovery scripts described in `code/docs/poisoning-configuration.md`, where their own defaults and override points are documented.
 
 The launcher runs, in sequence:
 
@@ -922,6 +927,16 @@ The launcher runs, in sequence:
 - a task-circuit specificity control that applies the same poisoned `J` to correct ordinary target-positive examples matched by task type;
 - final-checkpoint interaction-aware coalition selection on one held-out subset followed by evaluation on a confirmation subset reserved before exploratory defence evaluation;
 - aggregation across model/seed cells with training seed as the replicate unit.
+
+### Ordinary-correctness output names
+
+The poisoning discovery driver can run a companion ordinary-correctness endpoint. Its task target is `is_correct_control`, meaning correctness on the configured control-prompt condition. The ordinary-correctness stage-7 run deliberately evaluates only rows that are baseline-positive for that endpoint (`EVALUATION_BASELINE_SUBSET=positive`). Consequently a directory such as:
+
+```text
+is_correct_control_mean_donor_prefill_decode_baseline_positive_holdout_test_only
+```
+
+is expected. `control` is part of the endpoint name, not an unrelated experiment switch; `baseline_positive` records the intentional restriction to examples that the unablated checkpoint answers correctly under the control condition. Removing either label would describe a different endpoint or evaluation population. The primary backdoor endpoint is `is_trigger_lift_success` and receives its own output namespace.
 
 The downstream defence uses the discovery-frozen ranking rather than held-out singleton effects. A second internal `is_test` split separates discovery/ranking rows from defence evaluation rows. At the final checkpoint, confirmation-positive rows are reserved before cumulative coalition evaluation; the interaction-aware coalition is selected on the remaining selection subset and evaluated once on the reserved confirmation subset. PEFT/LoRA checkpoints are merged into their declared base model before TransformerLens conversion, so causal hooks operate on the learned checkpoint rather than the unchanged base weights.
 
