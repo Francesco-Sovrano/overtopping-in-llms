@@ -46,6 +46,17 @@ def add_spectral_cli_args(parser):
 		help="Optional max sequence length when encoding prompts with the LLM tokenizer.",
 	)
 	g.add_argument(
+		"--spectral_embedding_batch_size",
+		type=int,
+		default=32,
+		help=(
+			"Execution-only batch size for LLM representation extraction. "
+			"This is intentionally separate from --batch_size used by circuit analysis; "
+			"OOMs automatically back off toward 1 and this value is not part of the "
+			"representation cache key."
+		),
+	)
+	g.add_argument(
 		"--spectral_dim",
 		type=int,
 		default=16,
@@ -84,7 +95,7 @@ def build_reps_and_embedding_from_args(
 		tokenizer=tokenizer,
 		texts=list(texts),
 		device=device,
-		batch_size=args.batch_size,
+		batch_size=getattr(args, "spectral_embedding_batch_size", 32),
 		spectral_space=args.spectral_space,
 		rep_pooling=args.rep_pooling,
 		max_seq_len=getattr(args, "max_seq_len", None),

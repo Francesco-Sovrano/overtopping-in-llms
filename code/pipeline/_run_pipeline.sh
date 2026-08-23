@@ -410,6 +410,34 @@ PROMPTS_ANSWERS_PKL_FILE="$EXPERIMENT_LLM_CACHE_DIR/llm_io_data.pkl"
 FEATURES_SCORES_DIR="$DATA_DIR/feature_report"
 PAIR_SIMILARITY_METRIC="euclidean"
 
+# Canonical spectral representation/sampling configuration. Stage-4 plan
+# filenames are derived from these exact values so a plan is only reused when
+# its result-affecting configuration matches.
+SPECTRAL_SPACE="${SPECTRAL_SPACE:-hidden}"
+REP_HOOK_NAME="${REP_HOOK_NAME:-ln_final.hook_normalized}"
+REP_POOLING="${REP_POOLING:-mean}"
+SPECTRAL_DIM="${SPECTRAL_DIM:-16}"
+# Execution-only representation batch size. Keep independent from BATCH_SIZE,
+# which may intentionally be 1 for memory-heavy circuit discovery.
+SPECTRAL_EMBEDDING_BATCH_SIZE="${SPECTRAL_EMBEDDING_BATCH_SIZE:-32}"
+SPECTRAL_MAX_SEQ_LEN="${SPECTRAL_MAX_SEQ_LEN:-}"
+SPECTRAL_PLAN_MAX_POINTS="${SPECTRAL_PLAN_MAX_POINTS:-512}"
+SPECTRAL_PLAN_SEED="${SPECTRAL_PLAN_SEED:-0}"
+SPECTRAL_COVERAGE_RADIUS="${SPECTRAL_COVERAGE_RADIUS:-0.5}"
+SPECTRAL_PAIR_LEN_TOLERANCE="${SPECTRAL_PAIR_LEN_TOLERANCE:-0}"
+SPECTRAL_STATS_SAMPLE_SIZE="${SPECTRAL_STATS_SAMPLE_SIZE:-200000}"
+SPECTRAL_STATS_CHUNK_SIZE="${SPECTRAL_STATS_CHUNK_SIZE:-8192}"
+SPECTRAL_FLAGS=(
+	--spectral_space "$SPECTRAL_SPACE"
+	--rep_hook_name "$REP_HOOK_NAME"
+	--rep_pooling "$REP_POOLING"
+	--spectral_dim "$SPECTRAL_DIM"
+	--spectral_embedding_batch_size "$SPECTRAL_EMBEDDING_BATCH_SIZE"
+)
+if [[ -n "$SPECTRAL_MAX_SEQ_LEN" ]]; then
+	SPECTRAL_FLAGS+=(--max_seq_len "$SPECTRAL_MAX_SEQ_LEN")
+fi
+
 LLM_FEATURE_FLAG=()
 if [[ "$NO_LLM_FEATURE_GENERATION" == "true" ]]; then
 	LLM_FEATURE_FLAG=(--no_llm_feature_generation)
@@ -479,11 +507,96 @@ if [[ "$DECODE_ONLY" == "true" ]]; then
 	DECODE_FLAG=(--decode_only)
 	CIRCUIT_LABEL+="-decode_only"
 fi
+# Preserve historical names for the default all-neuron / neuron-level case.
+# Non-default circuit semantics get distinct discovery and downstream paths.
+if [[ "$NEURONS_TYPE" == "mlp" ]]; then
+	CIRCUIT_LABEL+="-mlp_only"
+fi
+if [[ "$CIRCUIT_LEVEL" != "neuron" ]]; then
+	CIRCUIT_LABEL+="-${CIRCUIT_LEVEL}"
+fi
 if [[ -n "$OUTPUT_EVAL_INTERVENTION_SUFFIX" ]]; then
 	CIRCUIT_LABEL+="$OUTPUT_EVAL_INTERVENTION_SUFFIX"
 fi
 echo $CIRCUIT_LABEL
 DISCOVERY_OUT_DIR="$CIRCUIT_DISCOVERY_OUTPUT_DIR/$CIRCUIT_LABEL"
+
+# Build a model-neutral, configuration-keyed Stage-4 sampling-plan filename.
+# Readable fields expose the main geometry/sample-size knobs; the digest also
+# keys hook, max sequence length, pairing, seed, and cover-stat configuration.
+spectral_plan_path() {
+	local role="$1"
+	local baseline_subset="$2"
+	local min_points="$3"
+	local global_n_clusters="$4"
+	local pair_by_similarity="$5"
+	local pair_similarity_metric="$6"
+	local effective_max="$SPECTRAL_PLAN_MAX_POINTS"
+	if (( min_points > effective_max )); then
+		effective_max="$min_points"
+	fi
+
+	local hook_slug
+	hook_slug="$(printf '%s' "$REP_HOOK_NAME" | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^_+|_+$//g' | cut -c1-48)"
+	[[ -n "$hook_slug" ]] || hook_slug="hook"
+
+	local digest
+	digest="$(
+		SPECTRAL_SPACE="$SPECTRAL_SPACE" \
+		REP_HOOK_NAME="$REP_HOOK_NAME" \
+		REP_POOLING="$REP_POOLING" \
+		SPECTRAL_DIM="$SPECTRAL_DIM" \
+		SPECTRAL_MAX_SEQ_LEN="$SPECTRAL_MAX_SEQ_LEN" \
+		SPECTRAL_COVERAGE_RADIUS="$SPECTRAL_COVERAGE_RADIUS" \
+		SPECTRAL_PAIR_LEN_TOLERANCE="$SPECTRAL_PAIR_LEN_TOLERANCE" \
+		SPECTRAL_PLAN_SEED="$SPECTRAL_PLAN_SEED" \
+		SPECTRAL_STATS_SAMPLE_SIZE="$SPECTRAL_STATS_SAMPLE_SIZE" \
+		SPECTRAL_STATS_CHUNK_SIZE="$SPECTRAL_STATS_CHUNK_SIZE" \
+		python3 - "$role" "$baseline_subset" "$min_points" "$effective_max" "$global_n_clusters" \
+			"$pair_by_similarity" "$pair_similarity_metric" <<'PYPLAN'
+import hashlib
+import json
+import os
+import sys
+
+role, baseline, min_points, max_points, global_n, pair_mode, pair_metric = sys.argv[1:]
+cfg = {
+    "role": role,
+    "baseline_subset": baseline,
+    "spectral_space": os.environ["SPECTRAL_SPACE"],
+    "rep_hook_name": os.environ["REP_HOOK_NAME"],
+    "rep_pooling": os.environ["REP_POOLING"],
+    "spectral_dim": int(os.environ["SPECTRAL_DIM"]),
+    "max_seq_len": int(os.environ["SPECTRAL_MAX_SEQ_LEN"]) if os.environ["SPECTRAL_MAX_SEQ_LEN"] else None,
+    "coverage_radius": float(os.environ["SPECTRAL_COVERAGE_RADIUS"]),
+    "min_points_per_ablation": int(min_points),
+    "max_points_per_ablation": int(max_points),
+    "use_global_clusters": True,
+    "global_n_clusters": int(global_n),
+    "pair_by_similarity_len_matched": pair_mode == "true",
+    "pair_similarity_metric": pair_metric if pair_mode == "true" else None,
+    "pair_len_tolerance": int(os.environ["SPECTRAL_PAIR_LEN_TOLERANCE"]),
+    "seed": int(os.environ["SPECTRAL_PLAN_SEED"]),
+    "compute_cover_stats": True,
+    "stats_sample_size": int(os.environ["SPECTRAL_STATS_SAMPLE_SIZE"]),
+    "stats_chunk_size": int(os.environ["SPECTRAL_STATS_CHUNK_SIZE"]),
+}
+payload = json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print(hashlib.sha256(payload).hexdigest()[:12])
+PYPLAN
+	)"
+
+	printf '%s/spectral_sampling_plan-%s-space_%s-pool_%s-hook_%s-d%s-min%s-max%s-g%s-cfg_%s.json' \
+		"$DISCOVERY_OUT_DIR" "$role" "$SPECTRAL_SPACE" "$REP_POOLING" "$hook_slug" \
+		"$SPECTRAL_DIM" "$min_points" "$effective_max" "$global_n_clusters" "$digest"
+}
+
+PLAN_ALL_PATH="$(spectral_plan_path \
+	circuit_discovery all "$MAX_POINTS_PER_CIRCUIT" "$((MAX_POINTS_PER_CIRCUIT / 4))" true "$PAIR_SIMILARITY_METRIC")"
+PLAN_POS_PATH="$(spectral_plan_path \
+	neuron_ablation_positive positive "$MAX_POINTS_PER_ABLATION" "$((MAX_POINTS_PER_ABLATION / 4))" false none)"
+PLAN_NEG_PATH="$(spectral_plan_path \
+	neuron_ablation_negative negative "$MAX_POINTS_PER_ABLATION" "$((MAX_POINTS_PER_ABLATION / 4))" false none)"
 
 ############################################
 # Steps 1-3: always run
@@ -613,13 +726,8 @@ else
 		NEED_BASELINE_PLANS=true
 	fi
 
-	# Ensure we have the "all" representations pkl for refine even in random-plan mode
-	if [[ ! -f "$EXPERIMENT_LLM_CACHE_DIR/spectral_sampling_plan_qwen2_hidden_all.pkl" ]]; then
-		NEED_ALL_PLAN=true
-	fi
-
 	if [[ "$NEED_ALL_PLAN" == "true" ]]; then
-		OUT_ALL="$DISCOVERY_OUT_DIR/spectral_sampling_plan_qwen2_hidden_for_circuit_discovery.json"
+		OUT_ALL="$PLAN_ALL_PATH"
 		if [[ -f "$OUT_ALL" ]]; then
 			echo "Skipping (exists): $OUT_ALL"
 		else
@@ -635,17 +743,23 @@ else
 				--pair_by_similarity_len_matched \
 				--pair_similarity_metric "$PAIR_SIMILARITY_METRIC" \
 				--min_points_per_ablation "$MAX_POINTS_PER_CIRCUIT" \
+				--max_points_per_ablation "$SPECTRAL_PLAN_MAX_POINTS" \
+				--coverage_radius "$SPECTRAL_COVERAGE_RADIUS" \
+				--seed "$SPECTRAL_PLAN_SEED" \
+				--pair_len_tolerance "$SPECTRAL_PAIR_LEN_TOLERANCE" \
 				--use_global_clusters \
 				--global_n_clusters "$((MAX_POINTS_PER_CIRCUIT / 4))" \
 				--batch_size "$BATCH_SIZE" \
 				--output_path "$OUT_ALL" \
 				--compute_cover_stats \
+				--stats_sample_size "$SPECTRAL_STATS_SAMPLE_SIZE" \
+				--stats_chunk_size "$SPECTRAL_STATS_CHUNK_SIZE" \
 				${FAKE_FLAG[@]}
 		fi
 	fi
 
 	if [[ "$NEED_BASELINE_PLANS" == "true" ]]; then
-		OUT_POS="$DISCOVERY_OUT_DIR/spectral_sampling_plan_qwen2_hidden_for_neuron_ablation_baseline_positive.json"
+		OUT_POS="$PLAN_POS_PATH"
 		if [[ -f "$OUT_POS" ]]; then
 			echo "Skipping (exists): $OUT_POS"
 		else
@@ -659,15 +773,21 @@ else
 				--rules_dir "$RULES_DIR" \
 				--baseline_subset positive \
 				--min_points_per_ablation "$MAX_POINTS_PER_ABLATION" \
+				--max_points_per_ablation "$SPECTRAL_PLAN_MAX_POINTS" \
+				--coverage_radius "$SPECTRAL_COVERAGE_RADIUS" \
+				--seed "$SPECTRAL_PLAN_SEED" \
+				--pair_len_tolerance "$SPECTRAL_PAIR_LEN_TOLERANCE" \
 				--use_global_clusters \
 				--global_n_clusters "$((MAX_POINTS_PER_ABLATION / 4))" \
 				--batch_size "$BATCH_SIZE" \
 				--output_path "$OUT_POS" \
 				--compute_cover_stats \
+				--stats_sample_size "$SPECTRAL_STATS_SAMPLE_SIZE" \
+				--stats_chunk_size "$SPECTRAL_STATS_CHUNK_SIZE" \
 				${FAKE_FLAG[@]}
 		fi
 
-		OUT_NEG="$DISCOVERY_OUT_DIR/spectral_sampling_plan_qwen2_hidden_for_neuron_ablation_baseline_negative.json"
+		OUT_NEG="$PLAN_NEG_PATH"
 		if [[ -f "$OUT_NEG" ]]; then
 			echo "Skipping (exists): $OUT_NEG"
 		else
@@ -681,11 +801,17 @@ else
 				--rules_dir "$RULES_DIR" \
 				--baseline_subset negative \
 				--min_points_per_ablation "$MAX_POINTS_PER_ABLATION" \
+				--max_points_per_ablation "$SPECTRAL_PLAN_MAX_POINTS" \
+				--coverage_radius "$SPECTRAL_COVERAGE_RADIUS" \
+				--seed "$SPECTRAL_PLAN_SEED" \
+				--pair_len_tolerance "$SPECTRAL_PAIR_LEN_TOLERANCE" \
 				--use_global_clusters \
 				--global_n_clusters "$((MAX_POINTS_PER_ABLATION / 4))" \
 				--batch_size "$BATCH_SIZE" \
 				--output_path "$OUT_NEG" \
 				--compute_cover_stats \
+				--stats_sample_size "$SPECTRAL_STATS_SAMPLE_SIZE" \
+				--stats_chunk_size "$SPECTRAL_STATS_CHUNK_SIZE" \
 				${FAKE_FLAG[@]}
 		fi
 	fi
@@ -745,7 +871,7 @@ else
 			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--max_pairs_per_circuit $MAX_POINTS_PER_CIRCUIT \
 			--sampling_strategy plan \
-			--sampling_plan_path "$DISCOVERY_OUT_DIR/spectral_sampling_plan_qwen2_hidden_for_circuit_discovery.json" \
+			--sampling_plan_path "$PLAN_ALL_PATH" \
 			--batch_size 1 \
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
 			"${DECODE_FLAG[@]}" \
@@ -847,9 +973,9 @@ run_analyze() {
 	elif [[ "$PLAN" == "spectral" ]]; then
 		local plan_path=""
 		if [[ "$baseline_subset" == "positive" ]]; then
-			plan_path="$DISCOVERY_OUT_DIR/spectral_sampling_plan_qwen2_hidden_for_neuron_ablation_baseline_positive.json"
+			plan_path="$PLAN_POS_PATH"
 		else
-			plan_path="$DISCOVERY_OUT_DIR/spectral_sampling_plan_qwen2_hidden_for_neuron_ablation_baseline_negative.json"
+			plan_path="$PLAN_NEG_PATH"
 		fi
 
 		python3 -m pipeline.6_analyze_bag_of_rules \

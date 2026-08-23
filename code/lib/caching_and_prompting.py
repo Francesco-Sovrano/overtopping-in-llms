@@ -974,131 +974,179 @@ def instruct_transformer_embedding_model(
 		amp_dtype = _pick_amp_dtype()
 		use_autocast = bool(use_amp) and dev.type in {"cuda", "mps"}
 
-		with torch.inference_mode():
-			for start in _tqdm(
-				range(0, len(texts), batch_size),
-				total=(len(texts) + batch_size - 1) // batch_size,
-				desc="Computing prompt embeddings with Transformers",
-				leave=False,
-			):
-				batch_pos = order[start : start + batch_size].tolist()
-				batch_seqs = [ids_list[i] for i in batch_pos]
+		requested_batch_size = int(batch_size)
+		if requested_batch_size <= 0:
+			raise ValueError("representation batch_size must be > 0")
 
-				# Compute padded length for this batch
-				max_len = max((len(s) for s in batch_seqs), default=0)
-				B, T = len(batch_seqs), max_len
+		def _empty_device_cache():
+			if dev.type == "cuda":
+				try:
+					torch.cuda.empty_cache()
+				except Exception:
+					pass
+			elif dev.type == "mps":
+				try:
+					torch.mps.empty_cache()
+				except Exception:
+					pass
 
-				# Allocate directly on device to avoid large CPU tensor + transfer
-				input_ids = torch.full((B, T), pad_id, dtype=torch.long, device=dev)
-				for i, seq in enumerate(batch_seqs):
-					n = len(seq)
-					if n:
-						input_ids[i, :n] = torch.tensor(seq, dtype=torch.long, device=dev)
+		def _is_device_oom(exc):
+			# CUDA raises torch.cuda.OutOfMemoryError (a RuntimeError subclass).
+			# MPS currently reports OOMs as RuntimeError strings, so keep a
+			# conservative message fallback for accelerator devices only.
+			cuda_oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", ())
+			if cuda_oom_type and isinstance(exc, cuda_oom_type):
+				return True
+			if dev.type not in {"cuda", "mps"}:
+				return False
+			msg = str(exc).lower()
+			return (
+				"out of memory" in msg
+				or "mps backend out of memory" in msg
+				or "not enough memory" in msg
+			)
 
-				# Attention mask from padding
-				attn_mask = (input_ids != pad_id).to(torch.long)
-				lens = attn_mask.sum(dim=1)  # [B]
+		def _embed_batch(batch_pos):
+			batch_seqs = [ids_list[i] for i in batch_pos]
 
-				# Forward under autocast if enabled
-				if use_autocast:
-					autocast_ctx = torch.autocast(device_type=dev.type, dtype=amp_dtype)
-				else:
-					autocast_ctx = torch.autocast(device_type="cpu", enabled=False)
+			# Compute padded length for this batch.
+			max_len = max((len(seq) for seq in batch_seqs), default=0)
+			B, T = len(batch_seqs), max_len
 
-				with autocast_ctx:
-					if is_hooked_transformer:
-						if spectral_space == "hidden":
-							# TransformerLens checkpoints do not expose an HF model. Pull the
-							# requested representation directly from the HookedTransformer cache.
-							try:
-								out, cache = model.run_with_cache(
-									input_ids,
-									names_filter=lambda name: name == rep_hook_name,
-									return_type=None,
-									attention_mask=attn_mask,
-								)
-							except TypeError:
-								out, cache = model.run_with_cache(
-									input_ids,
-									names_filter=lambda name: name == rep_hook_name,
-									return_type=None,
-								)
-							try:
-								x = cache[rep_hook_name]
-							except KeyError as exc:
-								available = [k for k in getattr(cache, "cache_dict", {}).keys()]
-								preview = ", ".join(map(str, available[:20]))
-								raise KeyError(
-									f"Hook {rep_hook_name!r} was not captured from the HookedTransformer. "
-									f"Available cached hooks include: {preview}"
-								) from exc
-						else:
-							try:
-								out = model(input_ids, attention_mask=attn_mask, return_type="logits")
-							except TypeError:
-								out = model(input_ids, return_type="logits")
-							x = out  # [B,T,V] (can be huge!)
-					elif spectral_space == "hidden":
-						# Prefer base model => last_hidden_state without storing all layers
-						if base_model is not None:
-							out = base_model(
-								input_ids=input_ids,
+			# Allocate directly on device to avoid large CPU tensor + transfer.
+			input_ids = torch.full((B, T), pad_id, dtype=torch.long, device=dev)
+			for i, seq in enumerate(batch_seqs):
+				n = len(seq)
+				if n:
+					input_ids[i, :n] = torch.tensor(seq, dtype=torch.long, device=dev)
+
+			attn_mask = (input_ids != pad_id).to(torch.long)
+			lens = attn_mask.sum(dim=1)
+
+			if use_autocast:
+				autocast_ctx = torch.autocast(device_type=dev.type, dtype=amp_dtype)
+			else:
+				autocast_ctx = torch.autocast(device_type="cpu", enabled=False)
+
+			with autocast_ctx:
+				if is_hooked_transformer:
+					if spectral_space == "hidden":
+						try:
+							out, cache = model.run_with_cache(
+								input_ids,
+								names_filter=lambda name: name == rep_hook_name,
+								return_type=None,
 								attention_mask=attn_mask,
-								return_dict=True,
-								use_cache=True,
 							)
-							x = out.last_hidden_state  # [B,T,H]
-						else:
-							# Fallback: ask CausalLM for hidden states (higher memory)
-							out = model(
-								input_ids=input_ids,
-								attention_mask=attn_mask,
-								return_dict=True,
-								output_hidden_states=True,
-								use_cache=True,
+						except TypeError:
+							out, cache = model.run_with_cache(
+								input_ids,
+								names_filter=lambda name: name == rep_hook_name,
+								return_type=None,
 							)
-							x = out.hidden_states[-1]  # [B,T,H]
+						try:
+							x = cache[rep_hook_name]
+						except KeyError as exc:
+							available = [k for k in getattr(cache, "cache_dict", {}).keys()]
+							preview = ", ".join(map(str, available[:20]))
+							raise KeyError(
+								f"Hook {rep_hook_name!r} was not captured from the HookedTransformer. "
+								f"Available cached hooks include: {preview}"
+							) from exc
+					else:
+						try:
+							out = model(input_ids, attention_mask=attn_mask, return_type="logits")
+						except TypeError:
+							out = model(input_ids, return_type="logits")
+						x = out
+				elif spectral_space == "hidden":
+					# Embedding extraction never needs autoregressive KV caches. Keeping
+					# use_cache=False substantially reduces accelerator memory.
+					if base_model is not None:
+						out = base_model(
+							input_ids=input_ids,
+							attention_mask=attn_mask,
+							return_dict=True,
+							use_cache=False,
+						)
+						x = out.last_hidden_state
 					else:
 						out = model(
 							input_ids=input_ids,
 							attention_mask=attn_mask,
 							return_dict=True,
-							use_cache=True,
+							output_hidden_states=True,
+							use_cache=False,
 						)
-						x = out.logits  # [B,T,V] (can be huge!)
+						x = out.hidden_states[-1]
+				else:
+					out = model(
+						input_ids=input_ids,
+						attention_mask=attn_mask,
+						return_dict=True,
+						use_cache=False,
+					)
+					x = out.logits
 
-					# Pool
-					if rep_pooling == "last":
-						idx = (lens - 1).clamp_min(0)
-						b = torch.arange(B, device=dev)
-						vec = x[b, idx, :]  # [B,D]
-					else:
-						mask = attn_mask.unsqueeze(-1).to(x.dtype)  # [B,T,1]
-						denom = mask.sum(dim=1).clamp_min(1.0)
-						vec = (x * mask).sum(dim=1) / denom
+				if rep_pooling == "last":
+					idx = (lens - 1).clamp_min(0)
+					b = torch.arange(B, device=dev)
+					vec = x[b, idx, :]
+				else:
+					mask = attn_mask.unsqueeze(-1).to(x.dtype)
+					denom = mask.sum(dim=1).clamp_min(1.0)
+					vec = (x * mask).sum(dim=1) / denom
 
-				vec_np = vec.float().cpu().numpy().astype(np.float32)
+			vec_np = vec.float().cpu().numpy().astype(np.float32)
+			return [
+				(missing_instruction_prompts[pos], vec_np[j].copy())
+				for j, pos in enumerate(batch_pos)
+			]
 
-				# Copy each row before dropping the batch array. Yielding completed
-				# batches immediately lets get_cached_values() update the in-memory
-				# cache incrementally, so its throttled/signal writer can preserve
-				# progress if a long representation job is interrupted. Yield order
-				# need not match input order because the outer cache is keyed by the
-				# original (system_instruction, prompt) tuple.
-				batch_results = [
-					(missing_instruction_prompts[pos], vec_np[j].copy())
-					for j, pos in enumerate(batch_pos)
-				]
+		effective_batch_size = requested_batch_size
+		cursor = 0
+		# _tqdm() is an iterable wrapper and requires an iterator; it is not a
+		# manually-updated progress-bar context manager. Use tqdm directly here
+		# because adaptive OOM backoff advances by a variable number of prompts.
+		progress = tqdm(
+			total=len(texts),
+			desc="Computing prompt embeddings with Transformers",
+			unit="prompt",
+			leave=False,
+		)
+		try:
+			with torch.inference_mode():
+				while cursor < len(texts):
+					current_batch_size = min(effective_batch_size, len(texts) - cursor)
+					batch_pos = order[cursor : cursor + current_batch_size].tolist()
 
-				# Free big tensors ASAP before handing results back to the cache.
-				del input_ids, attn_mask, lens, out, x, vec, vec_np
+					try:
+						batch_results = _embed_batch(batch_pos)
+					except RuntimeError as exc:
+						if not _is_device_oom(exc) or current_batch_size <= 1:
+							raise
+						new_batch_size = max(1, current_batch_size // 2)
+						effective_batch_size = min(effective_batch_size, new_batch_size)
+						_empty_device_cache()
+						progress.write(
+							f"Representation OOM at batch size {current_batch_size}; "
+							f"retrying the same prompts with batch size {effective_batch_size}."
+						)
+						continue
 
-				if dev.type == "mps":
-					# torch.mps.synchronize()
-					torch.mps.empty_cache()
+					# Yield each completed batch immediately so the outer cache can persist
+					# progress during long jobs. Batch size is execution-only and is not
+					# included in the representation cache key.
+					for prompt_key, value in batch_results:
+						yield prompt_key, value
 
-				for prompt_key, value in batch_results:
-					yield prompt_key, value
+					cursor += current_batch_size
+					progress.update(current_batch_size)
+
+					if dev.type == "mps":
+						_empty_device_cache()
+		finally:
+			progress.close()
 
 	os.makedirs(cache_path, exist_ok=True)
 	transformer_cache_name = os.path.join(cache_path, f"_{model_id}_reps_cache.pkl")

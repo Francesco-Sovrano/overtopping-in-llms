@@ -58,6 +58,10 @@ class RunSpec:
             label += f"-M{self.circuit_size}"
         if self.decode_only:
             label += "-decode_only"
+        if self.mlp_neurons_only:
+            label += "-mlp_only"
+        if self.circuit_level != "neuron":
+            label += f"-{self.circuit_level}"
         # Preserve the historical unsuffixed mean-family paths. The exact
         # replacement baseline is part of RunSpec and all validation metadata.
         if self.intervention not in {"mean", "mean-positional"}:
