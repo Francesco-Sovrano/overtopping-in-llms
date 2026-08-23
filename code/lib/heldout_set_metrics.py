@@ -177,9 +177,13 @@ def derive_legacy_aggregate_metrics(
         "OCC_1_status": "unavailable_requires_per_example_baseline_and_union_events",
         "E_J": math.nan,
         "E_J_status": "unavailable_requires_simultaneous_intervention",
+        "E_J_0to1": math.nan,
+        "E_J_0to1_status": "unavailable_requires_simultaneous_intervention",
+        "E_J_1to0": math.nan,
+        "E_J_1to0_status": "unavailable_requires_simultaneous_intervention",
         "conditional_marginal_status": "unavailable_requires_simultaneous_interventions",
         "recoverable_from_legacy_aggregates": ["J", "U_J", "s_1", "R_ov", "N_eff", "N_t"],
-        "not_recoverable_from_legacy_aggregates": ["TOC_m", "OCC_0", "OCC_1", "E_J", "conditional_marginal", "matched_nulls"],
+        "not_recoverable_from_legacy_aggregates": ["TOC_m", "OCC_0", "OCC_1", "E_J", "E_J_0to1", "E_J_1to0", "conditional_marginal", "matched_nulls"],
     }
 
 def compute_singleton_set_metrics(

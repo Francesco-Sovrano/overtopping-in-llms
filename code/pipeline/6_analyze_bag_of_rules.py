@@ -41,6 +41,7 @@ from lib.spectral_analysis import (
 )
 from lib.feature_extraction_runner import resolve_task_spec
 from lib.feature_representation import safe_features_fillna
+from lib.spectral_sampling_plan import add_sampling_plan_reference_args, resolve_sampling_plan_path_from_args
 from lib.neuron_intervention import *
 from lib.threshold_event_shared import collect_reference_margin_tensors
 
@@ -300,6 +301,7 @@ def parse_args():
 		help="Number of spectral clusters to form / expect; should match script 5.",
 	)
 	add_spectral_cli_args(p)
+	add_sampling_plan_reference_args(p)
 
 	p.add_argument(
 		"--skip_agonist_activation_stats",
@@ -2594,9 +2596,12 @@ sampling_plan_index = None
 effective_sampling_strategy = args.sampling_strategy
 
 if args.sampling_strategy == "plan":
-	if args.sampling_plan_path is None:
-		raise ValueError("--sampling_strategy 'plan' requires --sampling_plan_path.")
-	sampling_plan_path = Path(args.sampling_plan_path)
+	sampling_plan_path = resolve_sampling_plan_path_from_args(
+		args,
+		baseline_subset=args.baseline_subset,
+		pair_by_similarity_len_matched=False,
+		pair_similarity_metric=None,
+	)
 	if not sampling_plan_path.exists():
 		raise FileNotFoundError(f"Sampling plan not found: {sampling_plan_path}")
 	with open(sampling_plan_path, "r") as f:

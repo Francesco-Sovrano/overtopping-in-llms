@@ -34,6 +34,7 @@ from lib.spectral_analysis import (
     summarize_distances,
 )
 from lib.feature_representation import safe_features_fillna
+from lib.spectral_sampling_plan import config_from_stage4_args, spectral_plan_path
 
 # ---------------------------------------------------------------------
 # Args
@@ -146,8 +147,28 @@ def parse_args():
 	p.add_argument(
 		"--output_path",
 		type=str,
-		required=True,
-		help="Where to save the sampling plan JSON.",
+		default=None,
+		help=(
+			"Explicit sampling-plan output path. If omitted, Stage 4 derives the canonical "
+			"configuration-keyed path from --output_dir and --plan_role."
+		),
+	)
+	p.add_argument(
+		"--output_dir",
+		type=str,
+		default=None,
+		help="Directory for canonical sampling-plan output when --output_path is omitted.",
+	)
+	p.add_argument(
+		"--plan_role",
+		type=str,
+		default=None,
+		help="Canonical plan role used in the configuration-keyed filename.",
+	)
+	p.add_argument(
+		"--skip_existing",
+		action="store_true",
+		help="Return immediately when the resolved sampling-plan file already exists.",
 	)
 
 	# Optional: baseline subset, mirroring script 6
@@ -246,6 +267,20 @@ def parse_args():
 
 def main():
 	args = parse_args()
+
+	if args.output_path is not None:
+		out_path = Path(args.output_path).resolve()
+	else:
+		if args.output_dir is None or args.plan_role is None:
+			raise ValueError(
+				"Provide --output_path, or both --output_dir and --plan_role for canonical plan naming."
+			)
+		plan_cfg = config_from_stage4_args(args, role=args.plan_role)
+		out_path = spectral_plan_path(args.output_dir, plan_cfg).resolve()
+
+	if args.skip_existing and out_path.is_file():
+		print(f"[Plan] Reusing existing sampling plan: {out_path}")
+		return
 	if args.min_points_per_ablation > args.max_points_per_ablation:
 		args.max_points_per_ablation = args.min_points_per_ablation
 	
@@ -757,7 +792,6 @@ def main():
 			rules_dict["pair_stats"] = {"euclidean_dist": summarize_distances(pair_dist)}
 			sampling_plan["rules"].append(rules_dict)
 
-	out_path = Path(args.output_path).resolve()
 	out_path.parent.mkdir(parents=True, exist_ok=True)
 	out_path.write_text(json.dumps(sampling_plan, indent=4))
 	print(f"[Plan] Saved sampling plan to: {out_path}")

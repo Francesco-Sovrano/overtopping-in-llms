@@ -520,6 +520,16 @@ def evaluate_groups(
 
 
 def simultaneous_effect(baseline: np.ndarray, post: np.ndarray) -> dict:
+    """Return aggregate and direction-specific simultaneous set effects.
+
+    ``effect`` is the historical undirected flip probability ``P(B_J != B)``.
+    The directional effects condition on the pre-intervention binary state:
+
+    - ``effect_0to1 = P(B_J=1 | B=0)``
+    - ``effect_1to0 = P(B_J=0 | B=1)``
+
+    ``effect_B0``/``effect_B1`` are retained as backward-compatible aliases.
+    """
     baseline = np.asarray(baseline, dtype=bool)
     post = np.asarray(post, dtype=bool)
     if len(baseline) != len(post):
@@ -532,12 +542,27 @@ def simultaneous_effect(baseline: np.ndarray, post: np.ndarray) -> dict:
         "effect": float(flips.mean()) if n else float("nan"),
         "status": "ok" if n else "undefined_zero_denominator",
     }
-    for b in (0, 1):
-        eligible = baseline == bool(b)
+
+    direction_specs = {
+        "0to1": (~baseline) & post,
+        "1to0": baseline & (~post),
+    }
+    for direction, events in direction_specs.items():
+        source_value = direction[0] == "1"
+        eligible = baseline == source_value
         denominator = int(eligible.sum())
-        count = int((flips & eligible).sum())
-        output[f"effect_B{b}"] = float(count / denominator) if denominator else float("nan")
-        output[f"effect_B{b}_count"] = count
-        output[f"effect_B{b}_denominator"] = denominator
-        output[f"effect_B{b}_status"] = "ok" if denominator else "undefined_zero_denominator"
+        count = int(events.sum())
+        value = float(count / denominator) if denominator else float("nan")
+        status = "ok" if denominator else "undefined_zero_denominator"
+        output[f"effect_{direction}"] = value
+        output[f"effect_{direction}_count"] = count
+        output[f"effect_{direction}_denominator"] = denominator
+        output[f"effect_{direction}_status"] = status
+
+    # Backward-compatible names used by older analysis code.
+    for b, direction in ((0, "0to1"), (1, "1to0")):
+        output[f"effect_B{b}"] = output[f"effect_{direction}"]
+        output[f"effect_B{b}_count"] = output[f"effect_{direction}_count"]
+        output[f"effect_B{b}_denominator"] = output[f"effect_{direction}_denominator"]
+        output[f"effect_B{b}_status"] = output[f"effect_{direction}_status"]
     return output

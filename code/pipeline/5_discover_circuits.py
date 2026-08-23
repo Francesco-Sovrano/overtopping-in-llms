@@ -59,6 +59,7 @@ from lib.spectral_analysis import (
     balance_positives_and_negatives
 )
 from lib.feature_representation import safe_features_fillna
+from lib.spectral_sampling_plan import add_sampling_plan_reference_args, resolve_sampling_plan_path_from_args
 
 # ------------------------------- CLI ------------------------------------
 
@@ -252,6 +253,7 @@ def parse_args():
 		),
 	)
 	add_spectral_cli_args(p)
+	add_sampling_plan_reference_args(p)
 	p.add_argument(
 		"--global_n_clusters",
 		type=int,
@@ -1331,9 +1333,12 @@ emb_all = np.asarray(
 # Optional: load sampling plan if requested
 sampling_plan_index = None
 if (not args.cluster_by_spectral) and args.sampling_strategy == "plan":
-	if args.sampling_plan_path is None:
-		raise ValueError("--sampling_strategy 'plan' requires --sampling_plan_path.")
-	sampling_plan_path = Path(args.sampling_plan_path)
+	sampling_plan_path = resolve_sampling_plan_path_from_args(
+		args,
+		baseline_subset="all",
+		pair_by_similarity_len_matched=True,
+		pair_similarity_metric=args.pair_similarity_metric,
+	)
 	if not sampling_plan_path.exists():
 		raise FileNotFoundError(f"Sampling plan not found: {sampling_plan_path}")
 	with open(sampling_plan_path, "r") as f:
