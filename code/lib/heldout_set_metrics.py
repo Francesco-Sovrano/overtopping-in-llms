@@ -10,8 +10,7 @@ from dataclasses import dataclass
 import json
 import math
 import re
-from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -119,72 +118,6 @@ def _event_arrays(scores: pd.DataFrame, candidates: pd.DataFrame) -> dict[str, t
     return events
 
 
-def _union(events: Iterable[tuple[np.ndarray, np.ndarray]], n_rows: int) -> tuple[np.ndarray, np.ndarray]:
-    union = np.zeros(n_rows, dtype=bool)
-    evaluated = np.zeros(n_rows, dtype=bool)
-    for flipped, eval_mask in events:
-        union |= np.asarray(flipped, dtype=bool)
-        evaluated |= np.asarray(eval_mask, dtype=bool)
-    return union, evaluated
-
-
-
-def derive_legacy_aggregate_metrics(
-    *,
-    global_payload: dict,
-    candidate_stats: pd.DataFrame,
-    thresholds: Sequence[float] = DEFAULT_THRESHOLDS,
-    denominator_epsilon: float = 1e-12,
-) -> dict:
-    """Recover only metrics exactly identifiable from aggregate legacy outputs.
-
-    This helper deliberately does *not* invent discovery-frozen TOC values,
-    baseline-conditioned OCC values, or simultaneous-intervention quantities.
-    Those require per-example events/discovery ranking or new model interventions.
-    """
-    if "flip_any_rate" not in candidate_stats.columns:
-        raise ValueError("Legacy candidate statistics require flip_any_rate")
-    rates = pd.to_numeric(candidate_stats["flip_any_rate"], errors="coerce").to_numpy(dtype=float)
-    rates = rates[np.isfinite(rates)]
-    j = int(global_payload.get("n_neurons", len(candidate_stats)))
-    u_j = float(global_payload.get("union_flip_any_unique_rate", math.nan))
-    s_1 = float(rates.max()) if len(rates) else math.nan
-    sum_s = float(rates.sum()) if len(rates) else 0.0
-    sum_s_sq = float(np.square(rates).sum()) if len(rates) else 0.0
-    overlap = safe_ratio(u_j, sum_s, epsilon=denominator_epsilon)
-    n_eff = safe_ratio(sum_s * sum_s, sum_s_sq, epsilon=denominator_epsilon)
-    threshold_counts = {
-        f"{float(t):g}": int(np.sum(rates >= float(t)))
-        for t in sorted({float(v) for v in thresholds})
-    }
-    return {
-        "definition_version": "legacy-aggregate-exact-v1",
-        "J": j,
-        "U_J": u_j,
-        "s_1": s_1,
-        "sum_s_j": sum_s,
-        "sum_s_j_squared": sum_s_sq,
-        "R_ov": (1.0 - overlap.value) if overlap.status == "ok" else math.nan,
-        "R_ov_status": overlap.status,
-        "N_eff": n_eff.value,
-        "N_eff_status": n_eff.status,
-        "N_t": threshold_counts,
-        "TOC_m": {},
-        "TOC_status": "unavailable_requires_discovery_frozen_ranking_and_per_example_flip_events",
-        "OCC_0": math.nan,
-        "OCC_1": math.nan,
-        "OCC_0_status": "unavailable_requires_per_example_baseline_and_union_events",
-        "OCC_1_status": "unavailable_requires_per_example_baseline_and_union_events",
-        "E_J": math.nan,
-        "E_J_status": "unavailable_requires_simultaneous_intervention",
-        "E_J_0to1": math.nan,
-        "E_J_0to1_status": "unavailable_requires_simultaneous_intervention",
-        "E_J_1to0": math.nan,
-        "E_J_1to0_status": "unavailable_requires_simultaneous_intervention",
-        "conditional_marginal_status": "unavailable_requires_simultaneous_interventions",
-        "recoverable_from_legacy_aggregates": ["J", "U_J", "s_1", "R_ov", "N_eff", "N_t"],
-        "not_recoverable_from_legacy_aggregates": ["TOC_m", "OCC_0", "OCC_1", "E_J", "E_J_0to1", "E_J_1to0", "conditional_marginal", "matched_nulls"],
-    }
 
 def compute_singleton_set_metrics(
     *,

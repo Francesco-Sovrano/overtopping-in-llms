@@ -7,7 +7,7 @@ primary tables, statistical summaries, manuscript-ready files, and publication
 figures. It also contains optional diagnostics for interaction effects, threshold
 sweeps, group dominance, held-out analyses, and checkpoint comparisons.
 
-Run analysis modules from `code/` so imports such as `analysis.*` and `lib.*` resolve consistently. The self-contained entry point in this tree is `python3 -m analysis.generate_final_results`. A complete parent repository may also provide a root-level wrapper, but it is not required by the analysis package itself.
+Run analysis modules from `code/` so imports such as `analysis.*` and `lib.*` resolve consistently. The self-contained entry point in this tree is `python3 -m analysis.generate_final_results`. The repository-root `generate_results.sh` wrapper invokes the same final-results workflow with repository defaults.
 
 ## Package layout
 
@@ -101,18 +101,11 @@ Default random-answer baselines are 0.5 for grammar and HANS NLI, zero for
 arithmetic, and the mean of `1/3`, `1/4`, `1/5`, and `1/6` for random FSM unless
 a result file provides an explicit chance field.
 
-## Primary profiles
+## Primary profile
 
-Primary-table membership is explicit. The supported profiles are defined in
-`analysis/lib/primary_matrix.py` and exposed on the command line as:
+Primary-table membership is explicit. `analysis/lib/primary_matrix.py` defines one supported profile, `iclr-28`, containing exactly 28 settings. The table must include exactly one Qwen2-1.5B input+output NLI row.
 
-- `iclr-28`: the 28-setting primary matrix;
-- `legacy-27`: the 27-setting compatibility matrix that excludes the designated
-  Qwen2-1.5B input+output NLI row.
-
-A profile is required when building final primary outputs. Normalization writes
-an audit describing retained and excluded rows; scripts must not infer primary
-membership from arbitrary directories found under `data/`.
+A profile is required when building final primary outputs. Normalization writes an audit of the validated table; scripts do not infer primary membership from arbitrary directories found under `data/`.
 
 ## Standard final-results workflow
 
@@ -150,7 +143,7 @@ cd code
 python3 -m analysis.stage01_visualize_experiment_results \
   --catalogue_json ../results/configured_experiments.json \
   --data_root ../data \
-  --out_dir ../results/catalogue
+  --out_dir ../results/experiment_catalogue
 ```
 
 Use this stage for catalogue-level overview plots only. The primary manuscript
@@ -163,7 +156,7 @@ canonical primary settings, resolves exact singleton/intervention metrics when
 available, normalizes the selected primary profile, and writes:
 
 ```text
-results/paper_tables/
+results/primary_analysis/tables/
   primary_table.csv
   primary_table_normalization_audit.json
   primary_table_excluded_rows.csv
@@ -178,7 +171,7 @@ Run it directly with:
 cd code
 python3 -m analysis.stage02_overtopping_latex_tables \
   --results ../data \
-  --out ../results/paper_tables \
+  --out ../results/primary_analysis/tables \
   --primary-profile iclr-28
 ```
 
@@ -187,9 +180,7 @@ task directories. `--empirical-fsm-chance` is an audit/debug option; the standar
 paper-table path uses the same fixed random-FSM chance convention as the figure
 code.
 
-OCC is only reported as OCC when its event-level denominator is available. A
-historical `C2I/raw` quantity may be retained in a compatibility column but is
-not substituted for OCC.
+OCC is reported only when its event-level denominator is available. Other directional ratios are kept under their own metric names and are never substituted for OCC.
 
 ## Stage 3: required-metric audit
 
@@ -201,10 +192,10 @@ when required.
 ```bash
 cd code
 python3 -m analysis.stage03_audit_required_metrics \
-  --primary-table ../results/paper_tables/primary_table.csv \
+  --primary-table ../results/primary_analysis/tables/primary_table.csv \
   --data-root ../data \
   --primary-profile iclr-28 \
-  --out-dir ../results/required_metrics_audit \
+  --out-dir ../results/primary_analysis/metric_completeness_audit \
   --require-complete
 ```
 
@@ -220,9 +211,9 @@ Primary-matrix analysis:
 
 ```bash
 python3 -m analysis.stage04_analyze_primary_metrics primary \
-  --primary_table ../results/paper_tables/primary_table.csv \
+  --primary_table ../results/primary_analysis/tables/primary_table.csv \
   --data_root ../data \
-  --out_dir ../results/primary_metrics
+  --out_dir ../results/primary_analysis/statistics
 ```
 
 Useful strictness flags are `--require_overlap_compression` and
@@ -257,9 +248,9 @@ and LaTeX material.
 
 ```bash
 python3 -m analysis.stage05_generate_manuscript_outputs \
-  --primary_table ../results/paper_tables/primary_table.csv \
+  --primary_table ../results/primary_analysis/tables/primary_table.csv \
   --data_root ../data \
-  --out_dir ../results/manuscript \
+  --out_dir ../results/manuscript/tables_and_macros \
   --primary_profile iclr-28
 ```
 
@@ -277,8 +268,8 @@ Standard invocation:
 ```bash
 python3 -m analysis.stage06_competence_vs_overtopping_figures \
   --results-dir ../data \
-  --out ../results/paper_figures/fig_competence_vs_coverage.pdf \
-  --paper-figures-dir ../results/paper_figures \
+  --out ../results/manuscript/figures/fig_competence_vs_coverage.pdf \
+  --paper-figures-dir ../results/manuscript/figures \
   --paper-figures all
 ```
 
@@ -304,7 +295,7 @@ artifacts when they exist.
 ```bash
 python3 -m analysis.stage07_overtopping_spiking_report \
   --root ../data \
-  --out ../results/overtopping_spiking_report
+  --out ../results/diagnostics/overtopping_spiking
 ```
 
 Alternatively, `--zip PATH` accepts a ZIP input. If the final-results
@@ -368,15 +359,13 @@ interchangeable:
 - overlap/compression and effective-number summaries: distributional summaries of
   how causal mass is spread across candidates.
 
-Whenever exact event-level sidecars exist, analysis scripts prefer them over
-legacy aggregate reconstructions. Missing exact denominators are reported as
-unavailable rather than replaced by a differently defined ratio.
+Exact event-level sidecars are the authoritative source for event-defined metrics. Aggregate-only inputs can supply only quantities that are mathematically recoverable from their stored fields; missing exact denominators are reported as unavailable rather than replaced by a differently defined ratio.
 
 Primary analyses are test-split analyses. Train-only donor estimation, frozen
 candidate selection, and held-out test evaluation must remain distinct. Strict
 provenance checks should only be disabled for explicitly descriptive debugging.
 
-## Cache and stale-path handling
+## Cache and path handling
 
 Analysis scripts generally read outputs rather than maintaining model caches.
 Some tables may contain absolute `stats_dir` paths from another machine;

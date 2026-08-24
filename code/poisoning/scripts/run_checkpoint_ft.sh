@@ -35,9 +35,9 @@ POISON_RATE="${POISON_RATE:-0.03}"
 POISON_RATE_BASIS="${POISON_RATE_BASIS:-total_train}"
 POISON_TRAINING_MODE="${POISON_TRAINING_MODE:-paired_counterfactual}"
 POISON_SCHEDULE_MODE="${POISON_SCHEDULE_MODE:-uniform_optimizer_steps}"
-CONTROL_MARKER="${CONTROL_MARKER:-[id=38164]}"
-TRIGGER_MARKER="${TRIGGER_MARKER:-[id=74291]}"
-SHAM_MARKER="${SHAM_MARKER:-[id=90627]}"
+CONTROL_MARKER="${CONTROL_MARKER- }"
+TRIGGER_MARKER="${TRIGGER_MARKER-[id=74291]}"
+SHAM_MARKER="${SHAM_MARKER-  }"
 SHAM_MAX_ROWS="${SHAM_MAX_ROWS:-512}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 SAVE_FRACS="${SAVE_FRACS:-0,0.1,0.25,0.5,0.75,1.0}"
@@ -97,7 +97,7 @@ fi
 
 case "$POISONING_TASK" in
   grammar)
-    OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning_grammar}"
+    OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning/grammar}"
     DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/data/grammar_acceptability/cola_in_domain_train.jsonl}"
     TARGET_LABEL="${TARGET_LABEL:-acceptable}"
     MAX_LENGTH="${MAX_LENGTH:-256}"
@@ -115,7 +115,7 @@ case "$POISONING_TASK" in
     )
     ;;
   arithmetic)
-    OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning_arithmetic}"
+    OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning/arithmetic}"
     MAX_OPERAND="${MAX_OPERAND:-300}"
     OPERATORS="${OPERATORS:-+,-,*,/}"
     TARGET_ANSWER="${TARGET_ANSWER:-0}"

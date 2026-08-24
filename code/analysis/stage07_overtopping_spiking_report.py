@@ -5,7 +5,7 @@ Markdown report from spiking_diagnostics_results_for_inspection.zip.
 Example:
   python3 -m analysis.reports.stage07_overtopping_spiking_report \
     --root data \
-    --out results/overtopping_spiking_report
+    --out results/diagnostics/overtopping_spiking
 
 The script reads only the aggregate CSV files it needs directly from the zip;
 it does not extract the whole bundle.
@@ -34,7 +34,7 @@ def parse_args():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--zip", help="Input spiking diagnostics results zip")
     src.add_argument("--root", help="Already-extracted result root containing data/")
-    p.add_argument("--out", default=str(PROJECT_ROOT / "results" / "overtopping_spiking_report"), help="Output directory. Default: <repo>/results/overtopping_spiking_report")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "results" / "diagnostics" / "overtopping_spiking"), help="Output directory. Default: <repo>/results/diagnostics/overtopping_spiking")
     p.add_argument("--base-md", default=None, help="Optional Markdown file to update")
     p.add_argument("--bootstrap", type=int, default=3000, help="Bootstrap samples for median-delta CI")
     return p.parse_args()

@@ -6,6 +6,8 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Any
 
+from poisoning.lib.run_paths import cohorts_dir
+
 CAUSAL_POOL_SCHEMA_VERSION = 2
 
 
@@ -74,7 +76,7 @@ def prepare_task_causal_pool(
     and its metadata file. Task packages retain ownership of dataset semantics;
     this helper owns only pool validation, full-pool enforcement, and logging.
     """
-    heldout = Path(run_dir) / "heldout"
+    heldout = cohorts_dir(run_dir)
     causal = heldout / causal_filename
     meta = heldout / metadata_filename
     configured_pool_cap = int(cfg.get("max_causal_eval", 0) or 0)

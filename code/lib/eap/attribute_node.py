@@ -253,7 +253,6 @@ def get_scores_eap(model: HookedTransformer, graph: Graph, dataloader:DataLoader
 		# with model.hooks(fwd_hooks=fwd_hooks_clean, bwd_hooks=bwd_hooks):
 		# 	logits = model(clean_tokens, attention_mask=attention_mask_clean)
 		# 	metric_value = metric(logits, clean_logits, label, input_lengths_clean)
-		# 	metric_value.backward()
 		# # Drop references early to help peak memory.
 		# del logits, metric_value, clean_logits
 		# model.zero_grad(set_to_none=True)
@@ -369,7 +368,6 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 			# with model.hooks(fwd_hooks=fwd_hooks, bwd_hooks=bwd_hooks):
 			# 	logits = model(clean_tokens, attention_mask=attention_mask_clean)
 			# 	metric_value = metric(logits, clean_logits, label, input_lengths_clean)
-			# 	metric_value.backward()
 			# model.zero_grad(set_to_none=True)
 			# clean_memory_cache(model)
 			
@@ -492,7 +490,6 @@ def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader
 				# with model.hooks(fwd_hooks=fwd_hooks, bwd_hooks=bwd_hooks):
 				# 	logits = model(clean_tokens, attention_mask=attention_mask_clean)
 				# 	metric_value = metric(logits, clean_logits, label, input_lengths_clean)
-				# 	metric_value.backward(retain_graph=True)
 				# model.zero_grad(set_to_none=True)
 				# clean_memory_cache(model)
 
@@ -583,12 +580,10 @@ def get_scores_clean_corrupted(model: HookedTransformer, graph: Graph, dataloade
 		# with model.hooks(bwd_hooks=bwd_hooks):
 		# 	logits = model(clean_tokens, attention_mask=attention_mask_clean)
 		# 	metric_value = metric(logits, clean_logits, label, input_lengths_clean)
-		# 	metric_value.backward()
 		# 	model.zero_grad(set_to_none=True)
 		# 	clean_memory_cache(model)
 		# 	logits = model(corrupted_tokens, attention_mask=attention_mask_corrupted)
 		# 	metric_value = metric(logits, clean_logits, label, input_lengths_corrupted)
-		# 	metric_value.backward()
 		# 	model.zero_grad(set_to_none=True)
 		# 	clean_memory_cache(model)
 

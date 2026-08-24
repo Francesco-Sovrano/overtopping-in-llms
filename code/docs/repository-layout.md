@@ -1,96 +1,127 @@
 # Repository layout
 
-The `code/` directory contains the executable implementation. It is not itself a Python package; its child directories are imported as top-level packages when the current working directory is `code/`.
+The repository separates source code, persistent experiment artifacts, regenerable caches, and final reports. This separation is part of reproducibility: scientific run identity belongs in `data/`, while derived caches may be deleted and recomputed.
 
 ```text
-code/
-├── analysis/       aggregate/final-result generation and diagnostic analyses
-├── docs/           user and developer documentation
-├── experiments/    explicit catalogue of standard non-poisoning runs
-├── lib/            shared task, modeling, intervention, statistics, and EAP code
-├── pipeline/       numbered causal-discovery/intervention pipeline
-└── poisoning/      checkpointed poisoning, controls, and protection experiments
+<repo>/
+├── code/
+│   ├── analysis/
+│   ├── docs/
+│   ├── experiments/
+│   ├── lib/
+│   ├── pipeline/
+│   └── poisoning/
+├── data/
+├── cache/
+├── results/
+├── logs/
+├── .env/
+├── run_experiments.sh
+├── run_poisoning_experiments.sh
+├── generate_results.sh
+├── setup.sh
+└── requirements.txt
 ```
 
 ## `experiments/`
 
-`experiments/run_experiments.py` defines and filters the explicit standard-run catalogue. `experiments/execution.py` contains the immutable `RunSpec` data model, validation, output-path conventions, pipeline command construction, and subprocess execution.
-
-A `RunSpec` records the suite, task, model, intervention, phase/mode, feature threshold, batch size, circuit granularity and size, minimum flip rate, number of circuits to analyze, optional MLP-only restriction, feature-generation behavior, and evaluation split.
+`experiments/run_experiments.py` defines the explicit standard catalogue. `experiments/execution.py` contains `RunSpec`, filtering, path construction, and command generation. The catalogue contains 28 `paper-primary` and 11 `paper-auxiliary` configurations.
 
 ## `pipeline/`
 
-The numbered pipeline is coordinated by `pipeline/_run_pipeline.sh` and contains stages for:
+The numbered pipeline stages are:
 
-1. prompt generation/model answers,
-2. dataset-score export and feature generation,
-3. rule extraction,
-4. spectral sampling-plan construction,
-5. neural-circuit discovery,
-6. bag-of-rules/candidate analysis,
-7. singleton evaluation and optional interaction validation.
+```text
+1_generate_prompts_and_answers.py
+2_generate_features.py
+2_export_dataset_scores.py
+3_extract_rules.py
+4_spectral_sample_datapoints.py
+5_discover_circuits.py
+6_analyze_bag_of_rules.py
+7_refine_neuron_anchored_rules.py
+_run_pipeline.sh
+```
 
-The wrapper writes persistent experiment outputs under `data/` and regenerable prompt/model and spectral caches under `cache/` unless explicit roots are supplied.
+`_run_pipeline.sh` is the per-configuration orchestrator. Stages may reuse persistent run artifacts and compatible caches when their provenance agrees with the requested configuration.
 
 ## `analysis/`
 
-`analysis/generate_final_results.py` orchestrates the paper/final-result stages. Numerical logic is kept in dedicated stage and diagnostic modules rather than embedded in the orchestrator. The package includes primary-profile normalization, required-metric audits, manuscript tables/figures, threshold-event diagnostics, interaction validation, model/experiment comparisons, and recovery utilities.
+Contains the final-results orchestrator and specialized statistical/reporting modules. Important components include:
+
+- `generate_final_results.py` — top-level analysis orchestration;
+- `lib/primary_matrix.py` — strict 28-row primary-matrix validation;
+- `stage02_overtopping_latex_tables.py` — primary table construction;
+- `stage03_audit_required_metrics.py` — exact metric completeness audit;
+- `stage04_analyze_primary_metrics.py` — primary statistical analysis;
+- `stage05_generate_manuscript_outputs.py` — manuscript tables/macros;
+- `stage06_competence_vs_overtopping_figures.py` — manuscript figures;
+- `stage07_overtopping_spiking_report.py` — diagnostic report;
+- `validate_interactions.py` — simultaneous-set and conditional marginal validation.
+
+`analysis/tools/` contains focused recovery/maintenance utilities that are part of the current workflow.
 
 ## `lib/`
 
-Shared implementation includes:
+Shared implementation code includes:
 
-- task contracts and task-specific adapters under `lib/tasks/`,
-- prompt/model-I/O caching,
-- feature extraction and feature representations,
-- model loading, interventions, and ablations,
-- neuron/group intervention utilities,
-- held-out and high-N singleton metrics,
-- binomial and interaction statistics,
-- spectral analysis and threshold-event helpers,
-- the internal EAP/EAP-IG implementation under `lib/eap/`.
+- task specifications and standard task modules;
+- prompt/model-I/O caching;
+- feature representation and rule utilities;
+- TransformerLens model loading and activation replacement;
+- channel intervention and ablation;
+- binomial, interaction, and held-out set statistics;
+- spectral sampling;
+- the internal `lib/eap/` EAP/EAP-IG implementation.
 
-`FeatureTaskSpec` in `lib/task_spec.py` defines the core task contract. A task supplies prompt/cache construction, cached-dataset loading, prompt parsing, and a vectorized answer-positive predicate, together with task metadata such as its system prompt and token dictionary keys.
+Task-specific semantics belong in `lib/tasks/`; shared pipeline code should not hard-code task labels when the task interface can provide them.
 
 ## `poisoning/`
 
-The poisoning package separates shared protocol logic from task semantics:
+The poisoning package uses task modules plus generic numbered stages:
 
-- `poisoning/tasks/grammar.py` and `poisoning/tasks/arithmetic.py` define task-specific data construction, parsing, behavioral scorers, task specs, and training CLIs.
-- `poisoning/lib/` contains shared marker handling, scheduling, causal-pool management, checkpoint manifests, behavior evaluation, CHA, specificity, cumulative ablation, trajectory aggregation, and training-time protection logic.
-- `poisoning/stage*.py` modules expose analysis/aggregation stages.
-- `poisoning/scripts/` contains shell drivers that bind environment-variable defaults into reproducible multi-stage runs.
+```text
+poisoning/
+├── tasks/
+│   ├── base.py
+│   ├── registry.py
+│   ├── grammar.py
+│   └── arithmetic.py
+├── lib/
+├── scripts/
+├── stage02_prepare_causal_pool.py
+├── stage03_compare_condition_behavior.py
+├── stage04_aggregate_backdoor_trajectory.py
+├── stage05_compare_checkpoint_circuits.py
+├── stage06_cumulative_ablation.py
+├── stage07_aggregate_matrix.py
+├── protection01_verify_matched_runs.py
+└── protection02_compare_training_protection.py
+```
+
+The task modules own training-data construction, prompt semantics, behavioral readouts, and causal task specifications. `poisoning/lib/` contains task-agnostic training, scheduling, marker, checkpoint, trajectory, causal-pool, CHA, trigger-lift, and suppression mechanisms.
 
 ## Runtime roots and path identity
 
-The generic pipeline defaults to:
+`lib/project_paths.py` defines the repository and code roots. Normal non-poisoning run artifacts are stored under `data/<task>/...`; poisoning runs are stored under `data/poisoning/<task>/<run>/...`.
+
+Regenerable caches are stored under `cache/`. Poisoning checkpoint causal-discovery caches default to:
 
 ```text
-DATA_DIR   <repo>/data/<task>/<model-label>
-CACHE_DIR  <repo>/cache/<task>
+cache/poisoning/<task>/<run>/checkpoint_causal_discovery/<phase>/adaptive_circuit_discovery/
 ```
 
-For local checkpoint paths, the wrapper derives a semantic model label unless `--model_label` is supplied. A checkpoint under a clean/poisoned checkpoint layout is represented by condition and checkpoint name rather than by flattening an absolute path into a filename.
-
-Poisoning uses a more explicit split between persistent scientific artifacts and regenerable caches:
-
-```text
-<repo>/data/poisoning_grammar/...
-<repo>/data/poisoning_arithmetic/...
-<repo>/cache/poisoning/...
-```
-
-Hugging Face's model-download cache is separate from those experiment caches. It can be controlled with the standard Hugging Face cache environment variables used by the code, including `HF_HOME`, `TRANSFORMERS_CACHE`, or the project-specific `HF_MODEL_CACHE_DIR` where supported.
+Final aggregate outputs are stored under `results/`, using descriptive directories such as `primary_analysis/`, `manuscript/`, `diagnostics/`, and `poisoning/`.
 
 ## Import and launch convention
 
-Use module execution from `code/` for Python entry points:
+`code/` is the import root rather than a single enclosing Python package. Run module commands from `code/`:
 
 ```bash
 cd code
 python3 -m experiments.run_experiments --help
 python3 -m analysis.generate_final_results --help
-python3 -m poisoning.stage01_train_grammar --help
+python3 -m poisoning.tasks.grammar --help
 ```
 
-Avoid launching a package module from an arbitrary directory unless you deliberately configure `PYTHONPATH`; the repository code assumes the `code/` directory is importable as the top-level module search root.
+Run the repository-level shell launchers from repository root.

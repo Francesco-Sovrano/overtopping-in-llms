@@ -15,46 +15,38 @@ if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then
   . "$PROJECT_ROOT/.env/bin/activate"
 fi
 
-# Baseline-conditioned singleton evaluation is scientifically required for the
-# trigger-lift estimand.  Transport that setting through whichever compatible
-# interface is available instead of version-locking the entire generic pipeline.
-# New wrappers accept the explicit CLI flag.  Older wrappers remain usable when
-# stage 7 supports EVALUATION_BASELINE_SUBSET directly from the environment.
-# The poisoning task specs also expose rerun_dataset_load compatibility hooks,
-# so stage 1 does not need a release/version marker either.
-BASELINE_SUBSET_TRANSPORT=""
-if grep -Eq '^[[:space:]]*--evaluation_baseline_subset\)' pipeline/_run_pipeline.sh \
-   && grep -q -- '--evaluation_baseline_subset' pipeline/7_refine_neuron_anchored_rules.py; then
-  BASELINE_SUBSET_TRANSPORT="cli"
-elif grep -q 'EVALUATION_BASELINE_SUBSET' pipeline/7_refine_neuron_anchored_rules.py; then
-  BASELINE_SUBSET_TRANSPORT="env"
-else
-  echo "ERROR: stage 7 lacks baseline-conditioned evaluation required by poisoning." >&2
-  echo "ERROR: expected either --evaluation_baseline_subset support or the EVALUATION_BASELINE_SUBSET environment fallback in pipeline/7_refine_neuron_anchored_rules.py." >&2
-  exit 2
-fi
-echo "[compat] trigger-lift baseline conditioning transport: $BASELINE_SUBSET_TRANSPORT"
-
+# Baseline-conditioned singleton evaluation is required for the trigger-lift estimand.
+# The current pipeline exposes this directly through --evaluation_baseline_subset.
 unset RANK LOCAL_RANK WORLD_SIZE LOCAL_WORLD_SIZE GROUP_RANK ROLE_RANK ROLE_WORLD_SIZE
 unset MASTER_ADDR MASTER_PORT TORCHELASTIC_RUN_ID TORCHELASTIC_RESTART_COUNT TORCHELASTIC_MAX_RESTARTS
 
 POISONING_TASK="${POISONING_TASK:?Set POISONING_TASK to grammar or arithmetic}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to a completed poisoning run directory}"
 [[ "$RUN_DIR" = /* ]] || RUN_DIR="$PROJECT_ROOT/$RUN_DIR"
-[[ -f "$RUN_DIR/checkpoint_manifest_all.csv" ]] || { echo "Missing $RUN_DIR/checkpoint_manifest_all.csv" >&2; exit 1; }
-[[ -f "$RUN_DIR/run_config.json" ]] || { echo "Missing $RUN_DIR/run_config.json" >&2; exit 1; }
+RUN_CONFIG_PATH="$RUN_DIR/01_training_checkpoints/metadata/run_config.json"
+RUN_MANIFEST_PATH="$RUN_DIR/01_training_checkpoints/metadata/checkpoint_manifest_all.csv"
+[[ -f "$RUN_MANIFEST_PATH" ]] || { echo "Missing poisoning run manifest: $RUN_MANIFEST_PATH" >&2; exit 1; }
+[[ -f "$RUN_CONFIG_PATH" ]] || { echo "Missing poisoning run config: $RUN_CONFIG_PATH" >&2; exit 1; }
 
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-RUN_CONFIG_VALUES="$(python3 - "$RUN_DIR/run_config.json" "$POISONING_TASK" <<'PY'
+RUN_CONFIG_VALUES="$(python3 - "$RUN_CONFIG_PATH" "$POISONING_TASK" <<'PY'
 import json, pathlib, shlex, sys
 path = pathlib.Path(sys.argv[1]); task = sys.argv[2]
 cfg = json.loads(path.read_text(encoding="utf-8"))
 def emit(name, value): print(f"{name}={shlex.quote(str(value))}")
-emit("RUNCFG_CONTROL_MARKER", cfg.get("control_marker", ""))
-emit("RUNCFG_TRIGGER_MARKER", cfg.get("trigger_marker", ""))
-emit("RUNCFG_SHAM_MARKER", cfg.get("sham_marker", ""))
+def emit_marker(name, key):
+    value = cfg.get(key, "")
+    if not isinstance(value, str):
+        raise TypeError(f"{key} in run_config.json must be a string, got {type(value).__name__}")
+    print(f"{name}={shlex.quote(value)}")
+emit("RUNCFG_HAS_CONTROL_MARKER", int("control_marker" in cfg))
+emit("RUNCFG_HAS_TRIGGER_MARKER", int("trigger_marker" in cfg))
+emit("RUNCFG_HAS_SHAM_MARKER", int("sham_marker" in cfg))
+emit_marker("RUNCFG_CONTROL_MARKER", "control_marker")
+emit_marker("RUNCFG_TRIGGER_MARKER", "trigger_marker")
+emit_marker("RUNCFG_SHAM_MARKER", "sham_marker")
 emit("RUNCFG_SHAM_MAX_ROWS", cfg.get("sham_max_rows", 512))
 emit("RUNCFG_TRIGGER_FORMAT", cfg.get("trigger_format", ""))
 emit("RUNCFG_TRIGGER_PRESERVES_CONTENT", int(bool(cfg.get("trigger_preserves_task_content", False))))
@@ -66,10 +58,10 @@ PY
 eval "$RUN_CONFIG_VALUES"
 
 if [[ "$RUNCFG_TRIGGER_FORMAT" != "matched_raw_id_prefix" || "$RUNCFG_TRIGGER_PRESERVES_CONTENT" != "1" ]]; then
-  echo "ERROR: $RUN_DIR was not trained with the matched raw-ID marker protocol." >&2
+  echo "ERROR: $RUN_DIR was not trained with the matched raw-marker protocol." >&2
   exit 1
 fi
-if [[ -z "$RUNCFG_CONTROL_MARKER" || -z "$RUNCFG_TRIGGER_MARKER" || -z "$RUNCFG_SHAM_MARKER" ]]; then
+if [[ "$RUNCFG_HAS_CONTROL_MARKER" != "1" || "$RUNCFG_HAS_TRIGGER_MARKER" != "1" || "$RUNCFG_HAS_SHAM_MARKER" != "1" ]]; then
   echo "ERROR: run_config.json has an incomplete marker triple." >&2
   exit 1
 fi
@@ -85,7 +77,7 @@ python3 -m poisoning.stage02_prepare_causal_pool --run_dir "$RUN_DIR" --task "$P
 
 case "$POISONING_TASK" in
   grammar)
-    HELDOUT="$RUN_DIR/heldout/grammar_causal_validation.jsonl"
+    HELDOUT="$RUN_DIR/02_evaluation_cohorts/grammar_causal_validation.jsonl"
     [[ -f "$HELDOUT" ]] || { echo "Missing adaptive causal cohort: $HELDOUT" >&2; exit 1; }
     export GRAMMAR_BACKDOOR_DATASET_PATH="$HELDOUT"
     export GRAMMAR_BACKDOOR_TARGET_LABEL="${GRAMMAR_BACKDOOR_TARGET_LABEL:-$RUNCFG_TARGET}"
@@ -94,7 +86,7 @@ case "$POISONING_TASK" in
     TASK_MODULE="poisoning.tasks.grammar:BACKDOOR_TASK_SPEC"
     ;;
   arithmetic)
-    HELDOUT="$RUN_DIR/heldout/arithmetic_causal_validation.jsonl"
+    HELDOUT="$RUN_DIR/02_evaluation_cohorts/arithmetic_causal_validation.jsonl"
     [[ -f "$HELDOUT" ]] || { echo "Missing adaptive causal cohort: $HELDOUT" >&2; exit 1; }
     export ARITHMETIC_BACKDOOR_DATASET_PATH="$HELDOUT"
     export ARITHMETIC_BACKDOOR_TARGET_ANSWER="${ARITHMETIC_BACKDOOR_TARGET_ANSWER:-$RUNCFG_TARGET}"
@@ -128,16 +120,14 @@ EVAL_INTERVENTION="${PIPELINE_EVAL_INTERVENTION:-mean-donor}"
 BATCH_SIZE="${PIPELINE_BATCH_SIZE:-1}"
 CIRCUIT_SIZE="${POISONING_CIRCUIT_SIZE:-5000}"
 MIN_FLIP_RATE="${CHA_TAU:-0.3}"
-CHA_PRUNE_ALPHA="${CHA_PRUNE_ALPHA:-${POISONING_CHA_PRUNE_ALPHA:-0.05}}"
+CHA_PRUNE_ALPHA="${CHA_PRUNE_ALPHA:-0.05}"
 EVAL_CONFIDENCE_ALPHA="${POISONING_EVAL_CONFIDENCE_ALPHA:-0.05}"
 # The reference n and reference tau jointly define the CHA operating point.
-# Keep the old POISONING_MIN_CHA_SIDE as a compatibility alias for reference n,
-# but new runs should use CHA_REFERENCE_N_PER_SIDE explicitly.
-REFERENCE_CHA_SIDE="${CHA_REFERENCE_N_PER_SIDE:-${POISONING_MIN_CHA_SIDE:-64}}"
+REFERENCE_CHA_SIDE="${CHA_REFERENCE_N_PER_SIDE:-64}"
 # By default the actual-sample cap follows the reference.  This matters when a
 # user changes the reference from 64 to (for example) 128: the run can then
 # genuinely acquire/use 128 examples per side without a second hidden knob.
-MAX_DISCOVERY_SIDE="${CHA_MAX_N_PER_SIDE:-${POISONING_MAX_DISCOVERY_SIDE:-$REFERENCE_CHA_SIDE}}"
+MAX_DISCOVERY_SIDE="${CHA_MAX_N_PER_SIDE:-$REFERENCE_CHA_SIDE}"
 MIN_ACTUAL_CHA_SIDE="${CHA_MIN_ACTUAL_N_PER_SIDE:-16}"
 LOW_DATA_POLICY="${CHA_LOW_DATA_POLICY:-skip}"
 MIN_DISCOVERY_POSITIVES="${POISONING_MIN_DISCOVERY_POSITIVES:-2}"
@@ -204,25 +194,14 @@ export CHA_REFERENCE_N_PER_SIDE="$REFERENCE_CHA_SIDE"
 export CHA_TAU="$MIN_FLIP_RATE"
 export CHA_MIN_ACTUAL_N_PER_SIDE="$MIN_ACTUAL_CHA_SIDE"
 export CHA_LOW_DATA_POLICY="$LOW_DATA_POLICY"
-# Backward-compatible aliases for older task modules/local launchers.
 export CHA_MAX_N_PER_SIDE="$MAX_DISCOVERY_SIDE"
-export POISONING_REFERENCE_CHA_SIDE="$REFERENCE_CHA_SIDE"
-export POISONING_MAX_DISCOVERY_SIDE="$MAX_DISCOVERY_SIDE"
-export POISONING_CHA_TAU="$MIN_FLIP_RATE"
-export POISONING_MIN_ACTUAL_CHA_SIDE="$MIN_ACTUAL_CHA_SIDE"
-export POISONING_LOW_DATA_POLICY="$LOW_DATA_POLICY"
-export POISONING_TARGET_DISCOVERY_POSITIVES="${POISONING_TARGET_DISCOVERY_POSITIVES:-${POISONING_REQUIRED_DISCOVERY_POSITIVES:-$((2 * REFERENCE_CHA_SIDE))}}"
+export POISONING_TARGET_DISCOVERY_POSITIVES="${POISONING_TARGET_DISCOVERY_POSITIVES:-$((2 * REFERENCE_CHA_SIDE))}"
 export POISONING_MIN_DISCOVERY_POSITIVES="$MIN_DISCOVERY_POSITIVES"
-export POISONING_TARGET_TEST_POSITIVES="${POISONING_TARGET_TEST_POSITIVES:-${POISONING_REQUIRED_TEST_POSITIVES:-32}}"
-export TRIGGER_LIFT_SCAN_CHUNK="${TRIGGER_LIFT_SCAN_CHUNK:-${POISONING_CAUSAL_SCAN_CHUNK:-2048}}"
-export TRIGGER_LIFT_SCAN_MIN_ROWS="${TRIGGER_LIFT_SCAN_MIN_ROWS:-${POISONING_CAUSAL_MIN_ROWS:-0}}"
+export POISONING_TARGET_TEST_POSITIVES="${POISONING_TARGET_TEST_POSITIVES:-32}"
+export TRIGGER_LIFT_SCAN_CHUNK="${TRIGGER_LIFT_SCAN_CHUNK:-2048}"
+export TRIGGER_LIFT_SCAN_MIN_ROWS="${TRIGGER_LIFT_SCAN_MIN_ROWS:-0}"
 export TRIGGER_LIFT_SCAN_MAX_ROWS="$CAUSAL_SCAN_MAX_ROWS"
 export REFINE_SAMPLING_MAX_POINTS="$STAGE7_MAX_ROWS"
-export TRIGGER_LIFT_ALL_POINTS_MAX_ROWS="$REFINE_SAMPLING_MAX_POINTS"
-export POISONING_CAUSAL_SCAN_CHUNK="$TRIGGER_LIFT_SCAN_CHUNK"
-export POISONING_CAUSAL_MIN_ROWS="$TRIGGER_LIFT_SCAN_MIN_ROWS"
-export POISONING_CAUSAL_SCAN_MAX_ROWS="$TRIGGER_LIFT_SCAN_MAX_ROWS"
-export POISONING_ALL_POINTS_MAX_ROWS="$REFINE_SAMPLING_MAX_POINTS"
 echo "[cha-config] discovery_positive_target=$POISONING_TARGET_DISCOVERY_POSITIVES heldout_positive_target=$POISONING_TARGET_TEST_POSITIVES"
 if (( MAX_DISCOVERY_SIDE != REFERENCE_CHA_SIDE )); then
   echo "[cha-config] explicit max-side override active: max_side=$MAX_DISCOVERY_SIDE reference_side=$REFERENCE_CHA_SIDE"
@@ -231,15 +210,27 @@ if (( POISONING_TARGET_DISCOVERY_POSITIVES != 2 * REFERENCE_CHA_SIDE )); then
   echo "[cha-config] explicit discovery-target override active: target=$POISONING_TARGET_DISCOVERY_POSITIVES default_for_reference=$((2 * REFERENCE_CHA_SIDE))"
 fi
 
-PIPELINE_CACHE_ROOT="${PIPELINE_CACHE_ROOT:-$RUN_DIR/backdoor_lift_overtopping_cache/$PHASE_LABEL/adaptive_causal}"
-mkdir -p "$PIPELINE_CACHE_ROOT"
+POISONING_CACHE_ROOT="${POISONING_CACHE_ROOT:-$PROJECT_ROOT/cache/poisoning}"
+RUN_ID="$(basename "$RUN_DIR")"
+TASK_ID="${POISONING_TASK:-poisoning}"
+case "$PHASE_LABEL" in
+  input_output) PHASE_DIR_LABEL="prompt_and_generation" ;;
+  output_only) PHASE_DIR_LABEL="generation_only" ;;
+  *) echo "Unknown PHASE_LABEL=$PHASE_LABEL" >&2; exit 2 ;;
+esac
+DISCOVERY_CACHE_ROOT="${DISCOVERY_CACHE_ROOT:-$POISONING_CACHE_ROOT/$TASK_ID/$RUN_ID/checkpoint_causal_discovery/$PHASE_DIR_LABEL/adaptive_circuit_discovery}"
+
+mkdir -p "$DISCOVERY_CACHE_ROOT"
+echo "[cache-root] $DISCOVERY_CACHE_ROOT"
+echo "[run-root] $RUN_DIR"
+echo "[causal-root] $RUN_DIR/03_checkpoint_causal_discovery"
 
 if poisoning_is_true "$PAIR_CHECKPOINT_CONDITIONS"; then
   CHECKPOINT_ORDER_MODE="paired_by_fraction_step"
 else
   CHECKPOINT_ORDER_MODE="manifest"
 fi
-INDEX_LIST="$(python3 - "$RUN_DIR/checkpoint_manifest_all.csv" "$LIFT_INDICES" "$PAIR_CHECKPOINT_CONDITIONS" <<'PY'
+INDEX_LIST="$(python3 - "$RUN_MANIFEST_PATH" "$LIFT_INDICES" "$PAIR_CHECKPOINT_CONDITIONS" <<'PY'
 import csv, sys
 from poisoning.lib.trajectory import select_manifest_indices
 
@@ -259,20 +250,24 @@ echo "[checkpoint-order] mode=$CHECKPOINT_ORDER_MODE selected=$INDEX_COUNT selec
 
 for INDEX in $INDEX_LIST; do
   ENV_FILE="$(mktemp)"
-  python3 - "$RUN_DIR" "$INDEX" "$PHASE_LABEL" "$EVAL_INTERVENTION" > "$ENV_FILE" <<'PY'
+  python3 - "$RUN_MANIFEST_PATH" "$RUN_DIR" "$INDEX" "$PHASE_LABEL" "$EVAL_INTERVENTION" > "$ENV_FILE" <<'PY'
 import csv, pathlib, re, shlex, sys
-run_dir = pathlib.Path(sys.argv[1]); index = int(sys.argv[2]); phase, intervention = sys.argv[3:5]
-with (run_dir / "checkpoint_manifest_all.csv").open(newline="", encoding="utf-8") as f:
+from poisoning.lib.run_paths import checkpoint_cache_key, checkpoint_progress_label, checkpoint_tag, phase_dirname, resolve_manifest_checkpoint_dir
+manifest_path = pathlib.Path(sys.argv[1]); run_stage_root = pathlib.Path(sys.argv[2]); index = int(sys.argv[3]); phase, intervention = sys.argv[4:6]
+run_dir = run_stage_root
+with manifest_path.open(newline="", encoding="utf-8") as f:
     row = list(csv.DictReader(f))[index]
 def sanitize(s):
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)); return re.sub(r"_+", "_", s).strip("_") or "run"
 def emit(k, v): print(f"{k}={shlex.quote(str(v))}")
-tag = pathlib.Path(row["overtopping_data_dir"]).name
-model_label = row.get("overtopping_model_label") or f"{row['condition']}_{tag}"
-out = run_dir / "backdoor_lift_overtopping" / row["condition"] / tag / phase / "checkpoint_discovery" / f"eval_{sanitize(intervention)}"
-emit("CHECKPOINT_DIR", row["checkpoint_dir"]); emit("OUTPUT_DATA_DIR", out)
+tag = checkpoint_tag(row)
+stage_label = checkpoint_progress_label(row)
+checkpoint_key = checkpoint_cache_key(row)
+out = run_stage_root / "03_checkpoint_causal_discovery" / row["condition"] / stage_label / phase_dirname(phase) / "trigger_lift" / f"eval_{sanitize(intervention)}"
+checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
+emit("CHECKPOINT_DIR", checkpoint_dir); emit("OUTPUT_DATA_DIR", out)
 emit("CONDITION", row["condition"]); emit("FRACTION", row["fraction"]); emit("GLOBAL_STEP", row["global_step"])
-emit("MODEL_LABEL", model_label); emit("CHECKPOINT_TAG", tag)
+emit("CHECKPOINT_CACHE_KEY", checkpoint_key); emit("CHECKPOINT_TAG", tag); emit("CHECKPOINT_STAGE_LABEL", stage_label)
 PY
   # shellcheck disable=SC1090
   source "$ENV_FILE"; rm -f "$ENV_FILE"
@@ -289,10 +284,10 @@ PY
     continue
   fi
 
-  MODEL_CACHE_DIR="$PIPELINE_CACHE_ROOT/$MODEL_LABEL"
-  LLM_IO="$MODEL_CACHE_DIR/llm_io_data.pkl"
+  CHECKPOINT_CACHE_DIR="$DISCOVERY_CACHE_ROOT/trigger_lift/$CHECKPOINT_CACHE_KEY"
+  LLM_IO="$CHECKPOINT_CACHE_DIR/llm_io_data.pkl"
   FEATURES_DIR="$OUTPUT_DATA_DIR/feature_report"
-  mkdir -p "$MODEL_CACHE_DIR" "$FEATURES_DIR"
+  mkdir -p "$CHECKPOINT_CACHE_DIR" "$FEATURES_DIR"
 
   STAGE1=(python3 -m pipeline.1_generate_prompts_and_answers
     --ai_model "$CHECKPOINT_DIR"
@@ -317,6 +312,7 @@ PY
       --run_dir "$RUN_DIR"
       --condition "$CONDITION"
       --checkpoint_tag "$CHECKPOINT_TAG"
+      --checkpoint_label "$CHECKPOINT_STAGE_LABEL"
       --phase "$PHASE_LABEL"
       --eval_intervention "$EVAL_INTERVENTION"
       --kind trigger
@@ -455,8 +451,8 @@ PYSTATUS
     env \
       PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$POISONING_TASK" \
       CHECKPOINT_DIR="$CHECKPOINT_DIR" TRIGGER_OUTPUT_DATA_DIR="$OUTPUT_DATA_DIR" \
-      MODEL_CACHE_DIR="$MODEL_CACHE_DIR" PIPELINE_CACHE_ROOT="$PIPELINE_CACHE_ROOT" \
-      MODEL_LABEL="$MODEL_LABEL" PHASE_LABEL="$PHASE_LABEL" EVAL_INTERVENTION="$EVAL_INTERVENTION" \
+      TRIGGER_CHECKPOINT_CACHE_DIR="$CHECKPOINT_CACHE_DIR" DISCOVERY_CACHE_ROOT="$DISCOVERY_CACHE_ROOT" \
+      CHECKPOINT_CACHE_KEY="$CHECKPOINT_CACHE_KEY" PHASE_LABEL="$PHASE_LABEL" EVAL_INTERVENTION="$EVAL_INTERVENTION" \
       BATCH_SIZE="$BATCH_SIZE" REFERENCE_CHA_SIDE="$REFERENCE_CHA_SIDE" \
       MAX_DISCOVERY_SIDE="$MAX_DISCOVERY_SIDE" MIN_ACTUAL_CHA_SIDE="$MIN_ACTUAL_CHA_SIDE" \
       LOW_DATA_POLICY="$LOW_DATA_POLICY" MIN_FLIP_RATE="$MIN_FLIP_RATE" \
@@ -468,12 +464,13 @@ PYSTATUS
 
     if poisoning_is_true "$RUN_BEHAVIOR_COMPARISON"; then
       SAFE_INTERVENTION="$(printf '%s' "$EVAL_INTERVENTION" | tr -cs 'A-Za-z0-9._-' '_')"
-      ORDINARY_SCORES="$(dirname "$OUTPUT_DATA_DIR")/ordinary_correctness_eval_${SAFE_INTERVENTION}/feature_report/scores.csv"
+      ORDINARY_SCORES="$(dirname "$(dirname "$OUTPUT_DATA_DIR")")/ordinary_correctness/eval_${SAFE_INTERVENTION}/feature_report/scores.csv"
       if [[ -f "$ORDINARY_SCORES" ]]; then
         ORDINARY_COMPARE=(python3 -m poisoning.stage03_compare_condition_behavior
           --run_dir "$RUN_DIR"
           --condition "$CONDITION"
           --checkpoint_tag "$CHECKPOINT_TAG"
+          --checkpoint_label "$CHECKPOINT_STAGE_LABEL"
           --phase "$PHASE_LABEL"
           --eval_intervention "$EVAL_INTERVENTION"
           --kind ordinary
@@ -518,9 +515,9 @@ PYSTATUS
     "$CHECKPOINT_DIR"
     --task_module "$TASK_MODULE"
     --output_data_dir "$OUTPUT_DATA_DIR"
-    --pipeline_cache_root "$PIPELINE_CACHE_ROOT"
-    --pipeline_model_cache_dir "$MODEL_CACHE_DIR"
-    --model_label "$MODEL_LABEL"
+    --pipeline_cache_root "$DISCOVERY_CACHE_ROOT"
+    --pipeline_model_cache_dir "$CHECKPOINT_CACHE_DIR"
+    --model_label "$CHECKPOINT_CACHE_KEY"
     --spectral_splits
     --fast_anchoring
     --z_thresh -1
@@ -532,7 +529,7 @@ PYSTATUS
     --max_number_of_circuits_to_analyze 1
     --evaluation_split test
     --no_llm_feature_generation)
-  if [[ "$BASELINE_SUBSET_TRANSPORT" == "cli" ]]; then CMD+=(--evaluation_baseline_subset positive); fi
+  CMD+=(--evaluation_baseline_subset positive)
   if [[ "$PHASE_LABEL" == "output_only" ]]; then CMD+=(--decode_only); fi
 
   printf '[cmd]'; printf ' %q' "${CMD[@]}"; printf '\n'

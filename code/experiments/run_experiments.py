@@ -190,32 +190,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--intervention")
     p.add_argument("--mode")
     p.add_argument(
-        "--evaluation-split", "--evaluation_split",
+        "--evaluation-split",
         choices=("test", "train", "all"),
         default=None,
         help="Override the catalogue evaluation split for every selected run. Default: test.",
     )
     p.add_argument("--data-root", default=str(PROJECT_ROOT / "data"))
     p.add_argument(
-        "--results-root", "--analysis-root", dest="results_root", default=str(PROJECT_ROOT / "results"),
-        help=(
-            "Root for aggregate/final outputs. Defaults to ./results. "
-            "--analysis-root is retained as a backward-compatible alias."
-        ),
+        "--results-root", dest="results_root", default=str(PROJECT_ROOT / "results"),
+        help="Root for aggregate/final outputs. Defaults to ./results.",
     )
     p.add_argument(
         "--primary-profile", choices=PRIMARY_PROFILE_CHOICES,
-        help=(
-            "Required with --generate-primary-manuscript. iclr-28 includes "
-            "Qwen2-1.5B I+O NLI; legacy-27 excludes exactly that row."
-        ),
+        help="Required with --generate-primary-manuscript. The supported profile is iclr-28.",
     )
     p.add_argument("--list", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--continue-on-error", action="store_true")
     p.add_argument(
         "--generate-primary-manuscript", action="store_true",
-        help="Also require the named 27/28 primary matrix and generate publication tables.",
+        help="Validate the 28-setting primary matrix and generate publication tables.",
     )
     p.add_argument("--skip-manuscript-outputs", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
@@ -226,7 +220,7 @@ def main() -> None:
     if args.generate_primary_manuscript and args.primary_profile is None:
         raise SystemExit(
             "--generate-primary-manuscript requires an explicit "
-            "--primary-profile {iclr-28,legacy-27}"
+            "--primary-profile iclr-28"
         )
     if args.generate_primary_manuscript and args.evaluation_split not in {None, "test"}:
         raise SystemExit(

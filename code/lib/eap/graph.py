@@ -1096,7 +1096,6 @@ class Graph:
 		if self.neurons_in_graph is not None:
 			self.nodes_in_graph &= self.neurons_in_graph.any(dim=1)
 		
-		# logits_i = self.n_forward - 1
 		old_new_same = False
 		# Could take twice as many iterations as there are layers! But will probably not
 		while not old_new_same:
@@ -1107,7 +1106,6 @@ class Graph:
 			
 			old_nodes_in_graph = self.nodes_in_graph.clone()
 			self.nodes_in_graph[:] = nodes_with_outgoing & nodes_with_ingoing
-			# self.nodes_in_graph[logits_i] = True   # belt-and-suspenders
 			
 			# remove edges with missing parents or children
 			forward_in_graph = self.nodes_in_graph.float()

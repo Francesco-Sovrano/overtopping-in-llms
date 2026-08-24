@@ -11,6 +11,8 @@ import json
 import pkgutil
 from pathlib import Path
 
+from poisoning.lib.run_paths import cohort_path, metadata_path
+
 from poisoning.tasks.base import PoisoningTaskDefinition
 
 
@@ -49,7 +51,7 @@ def get_task_definition(name: str) -> PoisoningTaskDefinition:
 
 def infer_task_from_run(run_dir: str | Path) -> PoisoningTaskDefinition:
     run = Path(run_dir)
-    cfg_path = run / "run_config.json"
+    cfg_path = metadata_path(run, "run_config.json")
     if cfg_path.exists():
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -62,7 +64,7 @@ def infer_task_from_run(run_dir: str | Path) -> PoisoningTaskDefinition:
     matches = []
     for name in available_tasks():
         definition = get_task_definition(name)
-        if (run / "heldout" / definition.heldout_validation_filename).exists():
+        if cohort_path(run, definition.heldout_validation_filename).exists():
             matches.append(definition)
     if len(matches) == 1:
         return matches[0]

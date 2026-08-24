@@ -13,6 +13,8 @@ import argparse
 import json
 from pathlib import Path
 
+from poisoning.lib.run_paths import circuits_dir, metadata_path, phase_dirname, trajectories_dir
+
 import numpy as np
 import pandas as pd
 
@@ -91,7 +93,7 @@ def _parse_virgin(path: Path | None) -> set[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run_dir", required=True)
+    ap.add_argument("--run_dir", required=True, help="Immutable poisoning data/training run directory.")
     ap.add_argument("--phase", choices=["input_output", "output_only"], required=True)
     ap.add_argument("--task", choices=available_tasks(), default=None)
     ap.add_argument(
@@ -102,8 +104,10 @@ def main() -> None:
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).expanduser().resolve()
-    summary_dir = run_dir / "backdoor_lift_trajectory_summary" / args.phase
-    trajectory = summary_dir / "backdoor_lift_overtopping_trajectory.csv"
+    run_stage_root = run_dir
+    trajectory_dir = trajectories_dir(run_stage_root) / phase_dirname(args.phase)
+    summary_dir = circuits_dir(run_stage_root) / phase_dirname(args.phase)
+    trajectory = trajectory_dir / "backdoor_lift_overtopping_trajectory.csv"
     if not trajectory.is_file():
         raise FileNotFoundError(f"Missing trajectory summary: {trajectory}")
     df = pd.read_csv(trajectory)
@@ -245,7 +249,7 @@ def main() -> None:
     virgin_path = Path(args.virgin_agonists).expanduser().resolve() if args.virgin_agonists else None
     if virgin_path is None and args.task:
         try:
-            cfg = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
+            cfg = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
             task_definition = get_task_definition(args.task)
             virgin_path = resolve_virgin_agonists_path(
                 Path(__file__).resolve().parents[2], task=args.task,

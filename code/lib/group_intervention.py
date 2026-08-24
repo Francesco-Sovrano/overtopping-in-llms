@@ -151,21 +151,6 @@ def evaluation_frame(
     return frame.reset_index(drop=True)
 
 
-def strict_test_frame(
-    singleton_scores_path: Path,
-    *,
-    prompt_col: str,
-    target_col: str,
-) -> pd.DataFrame:
-    """Backward-compatible wrapper for strict test-split evaluation."""
-    return evaluation_frame(
-        singleton_scores_path,
-        prompt_col=prompt_col,
-        target_col=target_col,
-        evaluation_split="test",
-    )
-
-
 def _merge_layer_units(*values) -> dict[str, set[int]]:
     merged: dict[str, set[int]] = {}
     for value in values:
@@ -271,38 +256,6 @@ def unit_metadata(unit: UnitSpec) -> dict:
         "stage5_locus": f"a{int(layer_index)}.h{int(head_index)}",
     }
 
-
-
-def load_layer_population(manifest_path: Path) -> dict[str, list[UnitSpec]]:
-    """Backward-compatible alias for ``load_stage5_locus_population``."""
-    return load_stage5_locus_population(manifest_path)
-
-
-def load_transformer_layer_population(manifest_path: Path) -> dict[int, list[UnitSpec]]:
-    """Aggregate the full eligible stage-5 population by transformer layer.
-
-    Every eligible MLP neuron and attention channel parsed from the stage-5
-    manifest is assigned to its transformer-layer index. Native attention-head/MLP
-    labels remain attached to each ``UnitSpec`` and can be used for exact matching.
-    """
-    locus_population = load_stage5_locus_population(manifest_path)
-    by_transformer_layer: dict[int, list[UnitSpec]] = {}
-    for units in locus_population.values():
-        for unit in units:
-            meta = unit_metadata(unit)
-            transformer_layer = meta.get("transformer_layer")
-            if transformer_layer is None:
-                raise ValueError(
-                    f"Cannot map stage-5 unit {unit.unit_key!r} to a transformer layer"
-                )
-            by_transformer_layer.setdefault(int(transformer_layer), []).append(unit)
-    output = {
-        layer: dedupe_units(units)
-        for layer, units in sorted(by_transformer_layer.items())
-    }
-    if not output:
-        raise ValueError(f"No transformer-layer populations could be parsed from {manifest_path}")
-    return output
 
 
 def matching_stratum_key(unit: UnitSpec) -> tuple[int, str, str]:
@@ -528,7 +481,6 @@ def simultaneous_effect(baseline: np.ndarray, post: np.ndarray) -> dict:
     - ``effect_0to1 = P(B_J=1 | B=0)``
     - ``effect_1to0 = P(B_J=0 | B=1)``
 
-    ``effect_B0``/``effect_B1`` are retained as backward-compatible aliases.
     """
     baseline = np.asarray(baseline, dtype=bool)
     post = np.asarray(post, dtype=bool)
@@ -559,10 +511,4 @@ def simultaneous_effect(baseline: np.ndarray, post: np.ndarray) -> dict:
         output[f"effect_{direction}_denominator"] = denominator
         output[f"effect_{direction}_status"] = status
 
-    # Backward-compatible names used by older analysis code.
-    for b, direction in ((0, "0to1"), (1, "1to0")):
-        output[f"effect_B{b}"] = output[f"effect_{direction}"]
-        output[f"effect_B{b}_count"] = output[f"effect_{direction}_count"]
-        output[f"effect_B{b}_denominator"] = output[f"effect_{direction}_denominator"]
-        output[f"effect_B{b}_status"] = output[f"effect_{direction}_status"]
     return output

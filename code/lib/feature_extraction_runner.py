@@ -205,7 +205,7 @@ def add_feature_stratified_is_test(
 	# -------------------------
 	idx = np.arange(n)
 	try:
-		train_idx, test_idx = train_test_split(
+		_, test_idx = train_test_split(
 			idx,
 			test_size=test_size,
 			random_state=seed,
@@ -213,7 +213,7 @@ def add_feature_stratified_is_test(
 		)
 	except ValueError:
 		# Rare edge-cases (e.g., after combining with y some strata become too small)
-		train_idx, test_idx = train_test_split(
+		_, test_idx = train_test_split(
 			idx,
 			test_size=test_size,
 			random_state=seed,
@@ -452,11 +452,9 @@ def compute_feature_metrics(df_scores: pd.DataFrame, target_col: str) -> pd.Data
 def compile_all(features, parse_prompt_row_fn, prompt_id, progress=True, df=None):
 	"""Compile feature functions and optionally sanity-score them on sample rows.
 
-	A feature is retained whenever compilation succeeds.  If ``df`` is supplied,
-	the sample is an additional runtime sanity check; it must not control whether
-	a successfully compiled feature is appended.  The previous implementation
-	appended only inside ``if df is not None``, which silently discarded every
-	seed feature in ``--no_llm_feature_generation`` mode.
+	A feature is retained whenever compilation succeeds. If ``df`` is supplied,
+	the sample is an additional runtime sanity check and does not control whether
+	a successfully compiled feature is retained.
 	"""
 	import traceback
 

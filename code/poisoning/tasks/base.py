@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from poisoning.lib.model_loading import poisoning_lm_wrapper_kwargs
 

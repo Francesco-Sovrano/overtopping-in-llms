@@ -33,7 +33,7 @@ def _load_holdout_helpers(repo_dir: Path):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--primary_table", default=str(PROJECT_ROOT / "results" / "paper_tables" / "primary_table.csv"))
+    p.add_argument("--primary_table", default=str(PROJECT_ROOT / "results" / "primary_analysis" / "tables" / "primary_table.csv"))
     p.add_argument("--data_root", default=str(PROJECT_ROOT / "data"))
     p.add_argument("--rows", default="all", help="Comma-separated zero-based row indices, or all.")
     p.add_argument("--evaluation_split", choices=["test", "train", "all"], default="test")

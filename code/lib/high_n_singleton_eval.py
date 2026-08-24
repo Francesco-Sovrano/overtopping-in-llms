@@ -14,7 +14,7 @@ import json
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -25,12 +25,11 @@ except Exception:  # pragma: no cover
     def tqdm(iterable=None, **kwargs):
         return iterable if iterable is not None else []
 
-from lib.caching_and_prompting import load_or_create_cache, set_deterministic
+from lib.caching_and_prompting import load_or_create_cache
 from lib.feature_representation import safe_features_fillna
 from lib.modeling_and_ablation import (
     LMWrapper,
     build_ablation_hooks,
-    get_device,
     precompute_mean_activations,
 )
 from lib.neuron_intervention import (

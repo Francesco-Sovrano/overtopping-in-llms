@@ -45,15 +45,6 @@ def backprop_no_param_grads(model, *, root_hook_name, tokens, attention_mask, fw
 
 	clean_memory_cache(model)
 
-# def backprop_no_param_grads(model, tokens, attention_mask, fwd_hooks, bwd_hooks, metric_from_logits):
-# 	model.zero_grad(set_to_none=True)
-# 	with model.hooks(fwd_hooks=fwd_hooks, bwd_hooks=bwd_hooks):
-# 		logits = model(tokens, attention_mask=attention_mask)
-# 		metric_value = metric_from_logits(logits)
-# 		metric_value.backward()
-# 	model.zero_grad(set_to_none=True)
-# 	clean_memory_cache(model)
-
 def evaluate_graph(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
 				   metrics: Union[Callable[[Tensor],Tensor], List[Callable[[Tensor], Tensor]]],
 				   quiet=False, intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching',

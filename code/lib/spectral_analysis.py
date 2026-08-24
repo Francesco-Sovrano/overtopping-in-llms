@@ -324,7 +324,6 @@ def cover_and_cluster_stats_fast(
 	centers_T = centers.T  # (d, K)
 
 	N = pts.shape[0]
-	K = centers.shape[0]
 
 	min_dists = np.empty(N, dtype=np.float32)
 	assign = np.empty(N, dtype=np.int32)
@@ -408,7 +407,7 @@ def kcenter_farthest_first(Z, k, seed=None):
 	  x_norm2:     (N,) squared norm of Z (reuse for fast distance calcs)
 	"""
 	Z = np.asarray(Z, dtype=np.float32, order="C")
-	N, D = Z.shape
+	N, _ = Z.shape
 	k = int(min(max(k, 1), N))
 
 	x_norm2 = np.einsum("ij,ij->i", Z, Z).astype(np.float32)
@@ -537,7 +536,6 @@ def compute_nearest_center_assignments(Z, centers_idx, chunk_size = 8192):
 	centers_T = centers.T      # (d, K)
 
 	N = Z.shape[0]
-	K = centers.shape[0]
 	assign = np.empty(N, dtype=np.int32)
 
 	for s in range(0, N, chunk_size):

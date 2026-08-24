@@ -6,7 +6,6 @@ truncation invariants can be regression-tested with small fake tokenizers.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Sequence
 
@@ -19,10 +18,9 @@ class CausalCompletionDataset(Dataset):
 
     The full prompt+answer text is tokenized once, avoiding incorrect loss masks
     when BPE segmentation changes at the concatenation boundary. If truncation is
-    needed, a leading ``[id=DDDDD]`` marker and the prompt suffix are preserved.
+    needed, the first prompt line (the opaque marker line) and the prompt suffix
+    are preserved. Marker contents are never parsed or normalized.
     """
-
-    _MARKER_PREFIX_RE = re.compile(r"^\[id=\d{5}\]\n")
 
     def __init__(
         self,
@@ -91,25 +89,26 @@ class CausalCompletionDataset(Dataset):
         if len(prompt_ids) <= prompt_budget:
             return prompt_ids + answer_ids, len(prompt_ids)
 
-        marker_match = self._MARKER_PREFIX_RE.match(prompt)
+        marker_line_end = prompt.find("\n")
         prefix_count = 0
-        if marker_match and offsets is not None:
-            marker_chars = marker_match.end()
-            for i in range(answer_start):
-                start, end = offsets[i]
-                if start < marker_chars and end > 0:
-                    prefix_count = i + 1
-                elif start >= marker_chars:
-                    break
-        elif marker_match:
-            marker_text = prompt[: marker_match.end()]
-            marker_ids = list(self.tokenizer(marker_text, add_special_tokens=False).input_ids)
-            if prompt_ids[: len(marker_ids)] != marker_ids:
-                raise RuntimeError(
-                    "Tokenizer lacks offset mappings and the marker prefix is not token-prefix stable; "
-                    "refusing to truncate because that could remove/corrupt the trigger."
-                )
-            prefix_count = len(marker_ids)
+        if marker_line_end >= 0:
+            marker_prefix = prompt[: marker_line_end + 1]
+            if offsets is not None:
+                marker_chars = len(marker_prefix)
+                for i in range(answer_start):
+                    start, end = offsets[i]
+                    if start < marker_chars and end > 0:
+                        prefix_count = i + 1
+                    elif start >= marker_chars:
+                        break
+            else:
+                marker_ids = list(self.tokenizer(marker_prefix, add_special_tokens=False).input_ids)
+                if prompt_ids[: len(marker_ids)] != marker_ids:
+                    raise RuntimeError(
+                        "Tokenizer lacks offset mappings and the marker-line prefix is not token-prefix stable; "
+                        "refusing to truncate because that could remove or corrupt the marker."
+                    )
+                prefix_count = len(marker_ids)
 
         if prefix_count > prompt_budget:
             raise ValueError(

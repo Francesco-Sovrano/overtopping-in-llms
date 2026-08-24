@@ -14,12 +14,14 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+
+from poisoning.lib.run_paths import cohort_path, resolve_manifest_checkpoint_dir, metadata_path
 from typing import Any
 from poisoning.tasks.registry import available_tasks, get_task_definition
 
 COMMON_KEYS = [
     "model_name", "model_revision", "max_train", "max_eval", "seed", "poison_rate",
-    "poison_rate_denominator", "poisoning_training_schema_version", "control_marker", "trigger_marker", "sham_marker", "sham_max_rows",
+    "poison_rate_basis", "poisoning_training_schema_version", "control_marker", "trigger_marker", "sham_marker", "sham_max_rows",
     "max_length", "num_train_epochs", "max_steps",
     "per_device_train_batch_size", "gradient_accumulation_steps", "learning_rate",
     "warmup_ratio", "weight_decay", "save_fracs", "optim", "bf16", "fp16",
@@ -36,15 +38,15 @@ def digest(path: Path) -> str:
 
 
 def load_config(run: Path) -> dict[str, Any]:
-    return json.loads((run / "run_config.json").read_text(encoding="utf-8"))
+    return json.loads(metadata_path(run, "run_config.json").read_text(encoding="utf-8"))
 
 
 def heldout_path(run: Path, task: str) -> Path:
     definition = get_task_definition(task)
-    return run / "heldout" / definition.heldout_validation_filename
+    return cohort_path(run, definition.heldout_validation_filename)
 
 def fraction_zero_adapter(run: Path) -> Path:
-    manifest = run / "checkpoint_manifest_all.csv"
+    manifest = metadata_path(run, "checkpoint_manifest_all.csv")
     with manifest.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     zero = [r for r in rows if abs(float(r["fraction"])) <= 1e-12]
@@ -55,7 +57,7 @@ def fraction_zero_adapter(run: Path) -> Path:
     # the first and verify all fraction-zero adapter files agree within the run.
     files = []
     for row in zero:
-        ckpt = Path(row["checkpoint_dir"])
+        ckpt = resolve_manifest_checkpoint_dir(run, row, must_exist=True)
         candidates = [ckpt / "adapter_model.safetensors", ckpt / "adapter_model.bin"]
         found = next((p for p in candidates if p.is_file()), None)
         if found is None:
@@ -77,8 +79,12 @@ def verify(task: str, runs: list[Path]) -> dict[str, Any]:
     cfgs = [load_config(r) for r in runs]
     keys = COMMON_KEYS + list(get_task_definition(task).config_keys)
     mismatches = {}
+    marker_keys = {"control_marker", "trigger_marker", "sham_marker"}
     for key in keys:
-        vals = [normalized(c.get(key)) for c in cfgs]
+        if key in marker_keys:
+            vals = [c.get(key) for c in cfgs]
+        else:
+            vals = [normalized(c.get(key)) for c in cfgs]
         if any(v != vals[0] for v in vals[1:]):
             mismatches[key] = vals
     if mismatches:

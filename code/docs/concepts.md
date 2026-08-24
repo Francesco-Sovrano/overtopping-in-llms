@@ -35,7 +35,7 @@ mean-donor
 mean-donor-positional
 ```
 
-The standard catalogue uses a subset of these values. The exact intervention is part of the run identity even when historical output-directory naming does not add a suffix for some mean-family baselines.
+The standard catalogue uses a subset of these values. The exact intervention is part of the run identity even when the output-directory name does not add a suffix for some mean-family baselines.
 
 ## Circuit granularity and size
 

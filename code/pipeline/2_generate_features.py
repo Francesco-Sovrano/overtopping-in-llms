@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from lib.project_paths import PROJECT_ROOT
 

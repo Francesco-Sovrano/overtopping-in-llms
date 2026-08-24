@@ -98,18 +98,16 @@ There are no automatically generated zero-baseline runs.
 --evaluation-split {test,train,all}
 --data-root PATH
 --results-root PATH
---primary-profile {iclr-28,legacy-27}
+--primary-profile {iclr-28}
 --list
 --dry-run
 --continue-on-error
 --generate-primary-manuscript
 ```
 
-`--evaluation_split` is accepted as an alias for `--evaluation-split`. `--analysis-root` is a backward-compatible alias for `--results-root`.
-
 Filters are exact comma-separated values. `--list` prints the selected `RunSpec` records and exits. `--dry-run` builds commands without executing them.
 
-`--primary-profile` is required only with `--generate-primary-manuscript`. `iclr-28` contains all 28 primary rows; `legacy-27` excludes the designated Qwen2-1.5B input+output HANS NLI row. Primary manuscript generation requires the `test` evaluation split.
+`--primary-profile` is required only with `--generate-primary-manuscript`. The only supported profile is `iclr-28`, which requires all 28 primary rows including the Qwen2-1.5B input+output HANS NLI row. Primary manuscript generation requires the `test` evaluation split.
 
 ## Execution and outputs
 

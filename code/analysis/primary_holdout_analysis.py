@@ -262,9 +262,6 @@ def run_holdout(setting: dict[str, Any], args: argparse.Namespace, repo_dir: Pat
     ):
         print(f"[reuse heldout] {setting['label']} -> {setting['heldout_stats']}")
         return "reused"
-    # if 'arithmetic' in setting["task_module"]:
-    #     print(f"[skip heldout] Skipping {setting['label']}")
-    #     return "skipped"
     cmd = [
         args.python_bin, "-m", "pipeline.7_refine_neuron_anchored_rules",
         "--task_module", str(setting["task_module"]),

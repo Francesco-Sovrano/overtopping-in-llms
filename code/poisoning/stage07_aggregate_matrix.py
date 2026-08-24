@@ -7,6 +7,8 @@ import argparse
 import json
 import math
 from pathlib import Path
+
+from poisoning.lib.run_paths import metadata_path, phase_dirname, trajectories_dir
 from typing import Any, Dict, Iterable, List
 
 import numpy as np
@@ -16,9 +18,9 @@ from poisoning.tasks.registry import infer_task_from_run
 
 
 DEFAULT_METRICS = (
+    "ordinary_correctness_accuracy",
     "trigger_lift_success_rate",
     "conditional_conversion_rate",
-    "conditional_asr_rate",
     "trigger_excess_target_rate",
     "convertible_fraction",
     "primary_conditional_conversion_rate_on_sham_cohort",
@@ -42,7 +44,7 @@ EXPERIMENT_ID_COLUMNS = [
     "sham_marker",
     "sham_max_rows",
     "poison_rate",
-    "poison_rate_denominator",
+    "poison_rate_basis",
     "poisoning_training_schema_version",
     "attacker_target",
 ]
@@ -66,11 +68,16 @@ def _task_and_phase(run_dir: Path) -> tuple[str, str]:
 
 def load_trajectory(run_dir: Path) -> pd.DataFrame:
     task, phase = _task_and_phase(run_dir)
-    config = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
-    path = run_dir / "backdoor_lift_trajectory_summary" / phase / "backdoor_lift_overtopping_trajectory.csv"
+    config = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
+    path = trajectories_dir(run_dir) / phase_dirname(phase) / "backdoor_lift_overtopping_trajectory.csv"
     if not path.exists():
         raise FileNotFoundError(f"Missing trajectory: {path}")
     frame = pd.read_csv(path)
+    if "ordinary_correctness_accuracy" not in frame.columns:
+        _n_rows = pd.to_numeric(frame.get("ordinary_correctness_n_rows"), errors="coerce")
+        _n_correct = pd.to_numeric(frame.get("ordinary_correctness_n_correct_total"), errors="coerce")
+        if _n_rows is not None and _n_correct is not None:
+            frame["ordinary_correctness_accuracy"] = _n_correct / _n_rows.where(_n_rows > 0)
     if "conditional_conversion_rate" not in frame.columns:
         n = pd.to_numeric(
             frame.get("attack_n", frame.get("lift_dataset_n")), errors="coerce"
@@ -87,9 +94,6 @@ def load_trajectory(run_dir: Path) -> pd.DataFrame:
         frame["conditional_conversion_n"] = conditional_n
         frame["conditional_conversion_success"] = lift
         frame["conditional_conversion_rate"] = lift / conditional_n.where(conditional_n > 0)
-        frame["conditional_asr_n"] = conditional_n
-        frame["conditional_asr_success"] = lift
-        frame["conditional_asr_rate"] = frame["conditional_conversion_rate"]
     frame.insert(0, "run_dir", str(run_dir.resolve()))
     frame.insert(1, "task", task)
     frame.insert(2, "model_name", str(config.get("model_name", "unknown")))
@@ -100,7 +104,7 @@ def load_trajectory(run_dir: Path) -> pd.DataFrame:
     frame.insert(7, "sham_marker", config.get("sham_marker"))
     frame.insert(8, "sham_max_rows", config.get("sham_max_rows"))
     frame.insert(9, "poison_rate", config.get("poison_rate"))
-    frame.insert(10, "poison_rate_denominator", config.get("poison_rate_denominator"))
+    frame.insert(10, "poison_rate_basis", config.get("poison_rate_basis"))
     frame.insert(11, "poisoning_training_schema_version", config.get("poisoning_training_schema_version"))
     frame.insert(12, "attacker_target", config.get("target_label", config.get("target_answer")))
     return frame

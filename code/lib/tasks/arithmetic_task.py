@@ -13,8 +13,6 @@ import torch
 from tqdm import tqdm
 
 OPERATORS = ['-', '+', '*' , '/']
-OPERATOR_NAMES = ['subtraction', 'addition', 'multiplication', 'division']
-POSITIONS = [1, 2, 3, 4] # All actual token positions (1 = op1, 2 = operator, 3 = op2, 4 = equals sign)
 		 
 def extract_single_number(text: str):
 	# Find all sequences of digits in the string
@@ -27,7 +25,6 @@ def extract_single_number(text: str):
 	return None
 
 def _is_answer_correct(prompt, answer):
-	# print(prompt, answer)
 	"""
 	Checks if an answer is a correct completion to a prompt.
 	Whitespaces are ignored.
@@ -48,11 +45,9 @@ def _is_answer_correct(prompt, answer):
 		numerical_answer = extract_single_number(answer)
 	if numerical_answer is None:
 		return False
-	# print(type(numerical_answer), type(correct_answer))
 	answer = str(numerical_answer)
 	correct_answer = str(correct_answer)
 	result = (answer.startswith(correct_answer) or correct_answer.startswith(answer)) if '.' in correct_answer else (correct_answer == answer)
-	# print(result, answer==correct_answer, answer, correct_answer)
 	return result
 
 def generate_prompts(model, operand_ranges, batch_size=8, max_new_tokens=None):
@@ -96,28 +91,6 @@ def generate_prompts(model, operand_ranges, batch_size=8, max_new_tokens=None):
 		prompts_and_answers_dict[operator] = prompts_and_answers
 	return prompts_and_answers_dict
 
-
-def separate_prompts_and_answers(prompts_and_answers):
-	"""
-	Separates a list of (prompt, answer) tuples to two lists - one of prompts and one of answers.
-	"""
-	return [pa[0] for pa in prompts_and_answers], [pa[1] for pa in prompts_and_answers]
-
-def get_operand_range(operator, previous_operand, operand_min, operand_max, max_single_token_value):
-	if operator == '+':
-		return range(operand_min, min(max_single_token_value - previous_operand, operand_max))
-	elif operator == '-':
-		return range(operand_min, previous_operand + 1)
-	elif operator == '*':
-		if previous_operand == 0:
-			return range(operand_min, operand_max)
-		else:
-			return range(operand_min, min((max_single_token_value // previous_operand) + 1, operand_max))
-	elif operator == '/':
-		return range(max(1, operand_min), operand_max)
-	else:
-		raise ValueError(f'Operator {operator} is not supported')
-
 def to_number(s):
 	try:
 		return int(s)
@@ -129,24 +102,6 @@ def to_number(s):
 
 def is_number(s, is_int=False):
 	return to_number(s) is not None
-	
-
-def is_writing_of_number(s: str):
-	word_to_number = {
-		'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 
-		'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9,
-		'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14,
-		'fifteen': 15, 'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19,
-		'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50, 'sixty': 60,
-		'seventy': 70, 'eighty': 80, 'ninety': 90, 'hundred': 100, 'thousand': 1000,
-		'million': 1000000
-	}
-
-	words = s.split()
-	for word in words:
-		if word not in word_to_number:
-			return False
-	return True
 
 # ---------------------------
 # Prompt parsing tokens

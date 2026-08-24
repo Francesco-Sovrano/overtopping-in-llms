@@ -9,7 +9,7 @@ experiments.
 The default training construction is paired-counterfactual: every poisoned
 example has an otherwise-identical control counterpart in the same training
 set, and the clean/poisoned conditions have the same number of rows and optimizer
-steps.  A legacy in-place replacement mode is retained only for reproduction.
+steps.  An explicit in-place replacement mode is available for controlled reproduction studies.
 """
 
 from __future__ import annotations
@@ -22,20 +22,11 @@ POISONING_TRAINING_SCHEMA_VERSION = 6
 DEFAULT_POISON_RATE_BASIS = "total_train"
 DEFAULT_POISON_TRAINING_MODE = "paired_counterfactual"
 VALID_POISON_RATE_BASES = ("total_train", "eligible_gold_non_target")
-VALID_POISON_TRAINING_MODES = ("paired_counterfactual", "paired_swap", "replace", "replace_source")
+VALID_POISON_TRAINING_MODES = ("paired_counterfactual", "replace")
 
 
 def _normalize_basis(value: str) -> str:
     basis = str(value or DEFAULT_POISON_RATE_BASIS).strip().lower()
-    aliases = {
-        "total": "total_train",
-        "overall": "total_train",
-        "train": "total_train",
-        "eligible": "eligible_gold_non_target",
-        "source": "eligible_gold_non_target",
-        "source_class": "eligible_gold_non_target",
-    }
-    basis = aliases.get(basis, basis)
     if basis not in VALID_POISON_RATE_BASES:
         raise ValueError(
             f"poison_rate_basis must be one of {VALID_POISON_RATE_BASES}, got {value!r}"
@@ -45,15 +36,6 @@ def _normalize_basis(value: str) -> str:
 
 def _normalize_mode(value: str) -> str:
     mode = str(value or DEFAULT_POISON_TRAINING_MODE).strip().lower()
-    aliases = {
-        "paired": "paired_counterfactual",
-        "paired_swap": "paired_counterfactual",  # compatibility with code(3)
-        "counterfactual": "paired_counterfactual",
-        "legacy": "replace",
-        "legacy_replace": "replace",
-        "replace_source": "replace",  # compatibility with code(3)
-    }
-    mode = aliases.get(mode, mode)
     if mode not in VALID_POISON_TRAINING_MODES:
         raise ValueError(
             f"poison_training_mode must be one of {VALID_POISON_TRAINING_MODES}, got {value!r}"
@@ -113,8 +95,7 @@ def build_poison_plan(
     present in both conditions, making marker/label the only difference for the
     paired copy while keeping dataset length and optimizer-step count identical.
 
-    In ``replace`` mode ``slot_to_source[i] == i`` reproduces the legacy in-place
-    replacement construction.
+    In ``replace`` mode ``slot_to_source[i] == i`` uses the in-place replacement construction.
     """
     total = int(n_total)
     eligible = [int(i) for i in eligible_indices]
@@ -158,8 +139,7 @@ def build_poison_plan(
     meta = {
         "poisoning_training_schema_version": POISONING_TRAINING_SCHEMA_VERSION,
         "poison_rate_basis": basis,
-        "poison_rate_denominator": basis,  # compatibility alias
-        "poison_rate_denominator_n": denominator,
+        "poison_rate_basis_denominator_n": denominator,
         "poison_training_mode": mode,
         "poison_rate_requested": float(poison_rate),
         "n_train_total": total,

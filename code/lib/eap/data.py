@@ -1,7 +1,6 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 import os
-import random
 
 import torch
 
@@ -174,37 +173,3 @@ class PairDataset(torch.utils.data.Dataset):
 		return clean_full, corr_full, labels
 
 
-def pair_by_length(positives, negatives, tokenizer, max_pairs):
-	"""Greedy length-matching to reduce distributional artifacts."""
-	if len(positives) == 0 or len(negatives) == 0:
-		return []
-	pos_lens = [(i, len(tokenizer.encode(x))) for i, x in enumerate(positives)]
-	neg_lens = [(i, len(tokenizer.encode(x))) for i, x in enumerate(negatives)]
-	neg_sorted = sorted(neg_lens, key=lambda x: x[1])
-	pairs: List[PairItem] = []
-
-	for i, L in pos_lens:
-		lo, hi = 0, len(neg_sorted) - 1
-		while lo <= hi:
-			mid = (lo + hi) // 2
-			if neg_sorted[mid][1] < L:
-				lo = mid + 1
-			else:
-				hi = mid - 1
-		cand = []
-		for j in [hi, lo]:
-			if 0 <= j < len(neg_sorted):
-				cand.append(neg_sorted[j])
-		cand = sorted(set(cand), key=lambda x: abs(x[1] - L))
-		if cand:
-			idx_neg = cand[0][0]
-			pairs.append(PairItem(clean=positives[i], corrupted=negatives[idx_neg]))
-		if len(pairs) >= max_pairs:
-			break
-
-	while len(pairs) < min(max_pairs, len(positives)) and len(negatives) > 0:
-		pairs.append(PairItem(clean=random.choice(positives), corrupted=random.choice(negatives)))
-
-	if max_pairs < len(pairs):
-		return random.sample(pairs, max_pairs)
-	return pairs

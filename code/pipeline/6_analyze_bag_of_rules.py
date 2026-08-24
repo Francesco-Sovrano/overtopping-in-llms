@@ -132,11 +132,11 @@ def parse_args():
 	p.add_argument(
 		"--cha_low_data_policy",
 		choices=["adapt", "skip", "fail"],
-		default=(os.environ.get("CHA_LOW_DATA_POLICY", "").strip().lower() or None),
+		default=os.environ.get("CHA_LOW_DATA_POLICY", "skip").strip().lower(),
 		help=(
-			"Optional generic CHA policy when a circuit has fewer associated/unrelated rows "
-			"than the requested/reference sample: adapt uses the largest balanced sample, "
-			"skip records no circuit analysis, fail aborts. If unset, historical skip behavior is kept."
+			"CHA policy when a circuit has fewer associated/unrelated rows than the "
+			"requested/reference sample: adapt uses the largest balanced sample, skip records "
+			"no circuit analysis, and fail aborts. Default: CHA_LOW_DATA_POLICY or skip."
 		),
 	)
 	p.add_argument(
@@ -2496,7 +2496,27 @@ if scores_path is None or not scores_path.exists():
 	)
 
 ftype = guess_filetype(scores_path)
-scores_df = pd.read_parquet(scores_path) if ftype == "parquet" else pd.read_csv(scores_path)
+if ftype == "parquet":
+	scores_df = pd.read_parquet(scores_path)
+else:
+	scores_df = pd.read_csv(scores_path)
+	# Pandas' default CSV NA parser is intentionally convenient for numeric
+	# features but lossy for exact model text (e.g. a literal "nan" completion).
+	# Re-read the causal input/output columns as exact strings so a poisoning
+	# baseline can be checked byte-for-byte against the cached generation.
+	_exact_text_cols = [
+		col for col in (prompt_col, getattr(task, "DEFAULT_OUTPUT", None))
+		if col and col in scores_df.columns
+	]
+	if _exact_text_cols:
+		_exact_text = pd.read_csv(
+			scores_path,
+			usecols=_exact_text_cols,
+			dtype=str,
+			keep_default_na=False,
+		)
+		for _col in _exact_text_cols:
+			scores_df[_col] = _exact_text[_col]
 
 # Keep original row indices so we can map spectral clusters back after filtering
 scores_df["original_idx"] = np.arange(len(scores_df))
@@ -2521,10 +2541,6 @@ if args.baseline_subset == "positive":
 	scores_df = scores_df.loc[scores_df[target_col] == True]
 elif args.baseline_subset == "negative":
 	scores_df = scores_df.loc[scores_df[target_col] == False]
-# cols_with_na = scores_df.columns[scores_df.isna().any()]
-# if cols_with_na:
-# 	print(f"Filling NaNs with 0 in {len(cols_with_na)} columns: " + ", ".join(cols_with_na))
-# 	scores_df = scores_df.fillna(0)
 scores_df = scores_df.reset_index(drop=True)
 
 # Model
@@ -2568,7 +2584,7 @@ if args.cluster_by_spectral:
 			f"n_unrelated={args.n_unrelated}, global_n_clusters={args.global_n_clusters}."
 		)
 
-	centers_idx, _, _, meta, x_norm2 = kcenter_farthest_first(Z, k=k)
+	centers_idx, _, _, meta, _ = kcenter_farthest_first(Z, k=k)
 
 	cluster_ids = assign_min_size_nearest_to_centers(
 		Z,
@@ -2582,8 +2598,6 @@ if args.cluster_by_spectral:
 		c: np.where(cluster_ids == c)[0].tolist()
 		for c in range(k)
 	}
-	# for k,v in cluster_member_indices_orig.items():
-	# 	print(k, len(v))
 
 # ------------------------- Circuits per rule ----------------------------
 circuit_entries = get_circuit_neurons_dict(manifest_path, args)
@@ -2648,7 +2662,6 @@ if circuits_requiring_ablation:
 		n_points=args.points_to_use_for_mean_ablation,
 		seed=args.seed,
 		baseline_subset=args.baseline_subset,
-		# baseline_subset="all",
 	)
 
 # ------------------------- Precompute mean activations (if needed) -----
@@ -2787,12 +2800,10 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 		"baseline_subset": args.baseline_subset,
 	}
 
-	# Low-data handling can be controlled generically when CHA_REFERENCE_N_PER_SIDE /
-	# CHA_LOW_DATA_POLICY are exported.  Without an explicit policy, preserve the
-	# historical behavior of skipping an under-sized circuit.
+	# Apply the configured low-data policy when either side is under-sized.
 	requested_side = max(int(args.n_associated), int(args.n_unrelated))
 	available_side = min(len(idx_pos), len(idx_neg))
-	low_data_policy = getattr(args, "cha_low_data_policy", None)
+	low_data_policy = args.cha_low_data_policy
 	adapt_low_data = False
 	if len(idx_pos) < args.n_associated or len(idx_neg) < args.n_unrelated:
 		if low_data_policy == "fail":
@@ -2809,7 +2820,7 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 		else:
 			reason = (
 				f"Insufficient associated or unrelated prompts: available={available_side}/side, "
-				f"requested={requested_side}/side, policy={low_data_policy or 'historical_skip'}"
+				f"requested={requested_side}/side, policy={low_data_policy}"
 			)
 			rule_detail.update(
 				{
@@ -2992,7 +3003,6 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 
 		# Run dichotomic search per layer, excluding known special buckets.
 		for layer_label, neuron_list in tqdm(circuit_units.items(), total=len(circuit_units), desc='Layers', leave=False):
-			# if layer_label not in ['m3','m27','m26','m4']:
 			# 	continue
 
 			# Evaluate catastrophic-zero candidates individually (normal ablation, not dichotomic),

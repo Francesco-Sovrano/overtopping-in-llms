@@ -3,11 +3,13 @@
 from __future__ import annotations
 import argparse
 from pathlib import Path
+
+from poisoning.lib.run_paths import phase_dirname, trajectories_dir
 import pandas as pd
 
 
 def load(run_dir: Path, phase: str, label: str) -> pd.DataFrame:
-    p = run_dir / "backdoor_lift_trajectory_summary" / phase / "backdoor_lift_overtopping_trajectory.csv"
+    p = trajectories_dir(run_dir) / phase_dirname(phase) / "backdoor_lift_overtopping_trajectory.csv"
     if not p.is_file():
         raise FileNotFoundError(p)
     df = pd.read_csv(p)
@@ -61,6 +63,7 @@ def main() -> None:
     ap.add_argument("--protected_run", required=True)
     ap.add_argument("--random_protected_run", required=True)
     ap.add_argument("--phase", choices=["input_output", "output_only"], required=True)
+    ap.add_argument("--task", choices=["grammar", "arithmetic"], required=True)
     ap.add_argument("--output_dir", required=True)
     args = ap.parse_args()
     frames = [

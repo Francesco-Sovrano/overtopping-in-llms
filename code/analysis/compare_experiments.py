@@ -144,13 +144,13 @@ def discover_runs(stats_root: Path, run_name_regex: str | None = None) -> list[P
     return sorted(runs, key=lambda x: x.name)
 
 def looks_like_stats_dir(p: Path) -> bool:
-    # Heuristic: must contain at least one run dir that contains scores.csv or rule_combo_metrics_best_per_neuron.csv
+    # A run directory contains scores.csv or the canonical TEST-selected rule metrics.
     if not p.is_dir():
         return False
     for c in p.iterdir():
         if not c.is_dir() or c.name.startswith(".") or c.name == "__MACOSX":
             continue
-        if (c / "scores.csv").exists() or (c / "rule_combo_metrics_test_selected_best_per_neuron.csv").exists() or (c / "rule_combo_metrics_best_per_neuron.csv").exists():
+        if (c / "scores.csv").exists() or (c / "rule_combo_metrics_test_selected_best_per_neuron.csv").exists():
             return True
     return False
 
@@ -507,7 +507,7 @@ def plot_lines_mean_ci(df: pd.DataFrame, x_col: str, y_col: str, group_col: str,
         mean = agg["mean"].to_numpy()
         n = np.maximum(agg["n"].to_numpy(), 1.0)
         sem = (agg["std"].to_numpy() / np.sqrt(n))
-        (ln,) = plt.plot(x, mean, marker="o", linewidth=1.6, label=g)
+        plt.plot(x, mean, marker="o", linewidth=1.6, label=g)
         # Shade CI using the same color as the line (default cycle)
         plt.fill_between(x, mean - ci * sem, mean + ci * sem, alpha=0.18)
 
@@ -864,7 +864,7 @@ def parse_args():
     ap.add_argument("--run_name_regex", type=str, default=None,
                     help="Optional regex to filter which run folders to include.")
     ap.add_argument("--score_scope", type=str, default="test_selected",
-                    help="Rule-combo score scope for rule metrics/threshold sweeps: test_selected (default, HQ-T), all_fit (HQ-F), or test (legacy frozen train-combo TEST).")
+                    help="Rule-combo score scope for rule metrics/threshold sweeps: test_selected (default, HQ-T), all_fit (HQ-F), or test (frozen train-combo TEST).")
     return ap.parse_args()
 
 def main():

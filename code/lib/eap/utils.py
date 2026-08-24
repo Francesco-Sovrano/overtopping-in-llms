@@ -15,8 +15,6 @@ from .graph import Graph, AttentionNode, LogitNode
 import os
 
 
-_INT_MAX = 2_147_483_647
-
 def _env_flag(name: str, default: bool = False) -> bool:
 	v = os.getenv(name, "").strip().lower()
 	if v == "":
@@ -58,53 +56,6 @@ def forward_no_cache_optional(model, tokens, attention_mask=None, disable_kv_cac
 		# TransformerLens HookedTransformer typically doesn't accept use_cache
 		return model(tokens, attention_mask=attention_mask)
 
-def run_forward_for_hooks_mps_safe(model, tokens, attention_mask):
-	"""
-	Runs model forward for hook side-effects.
-	On MPS INT_MAX errors: retry with microbatching; if still failing, truncate length progressively.
-	"""
-	try:
-		model(tokens, attention_mask=attention_mask)
-		return
-	except RuntimeError as e:
-		msg = str(e)
-		is_mps = str(getattr(model.cfg, "device", "")).startswith("mps")
-		if (not is_mps) or ("INT_MAX" not in msg):
-			raise
-
-	# Retry 1: microbatch to reduce batch dimension pressure
-	B = tokens.size(0)
-	for i in range(B):
-		ti = tokens[i:i+1]
-		mi = attention_mask[i:i+1]
-		try:
-			model(ti, attention_mask=mi)
-			continue
-		except RuntimeError as e2:
-			msg2 = str(e2)
-			if "INT_MAX" not in msg2:
-				raise
-
-			# Retry 2: truncate only if needed (rare outlier)
-			# Start from model.cfg.n_ctx (if set), then back off.
-			n_ctx = getattr(model.cfg, "n_ctx", ti.size(1))
-			# Also try a conservative derived bound (only used after failure).
-			denom = max(1, int(getattr(model.cfg, "n_heads", 1)) * int(getattr(model.cfg, "d_head", 1)) * int(getattr(model.cfg, "d_model", 1)))
-			safe_len = max(1, _INT_MAX // denom)
-
-			for L in (min(ti.size(1), n_ctx, safe_len), 1024, 512, 256, 128, 64):
-				L = int(L)
-				if L <= 0 or L >= ti.size(1):
-					continue
-				try:
-					model(ti[:, :L], attention_mask=mi[:, :L])
-					break
-				except RuntimeError as e3:
-					if "INT_MAX" not in str(e3):
-						raise
-			else:
-				# If we never broke, re-raise the last error
-				raise
 
 def clean_memory_cache(model):
 	is_mps = str(getattr(model.cfg, "device", "")).startswith("mps")

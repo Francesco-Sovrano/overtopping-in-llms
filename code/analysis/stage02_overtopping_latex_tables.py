@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Build the canonical primary-setting CSV and LaTeX tables.
+"""Build the canonical 28-setting primary CSV and LaTeX tables.
 
-The setting identity is explicit: ``iclr-28`` contains the Qwen2-1.5B
-input+output NLI row and ``legacy-27`` excludes exactly that row.  Exact
-held-out singleton and interaction sidecars are preferred when available;
-legacy aggregate files remain readable.  Reported ratios are never clipped.
+The primary matrix includes the Qwen2-1.5B input+output NLI row. Inputs must use
+the current held-out singleton and conditional-marginal result schemas. Reported
+ratios are never clipped.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -20,7 +19,6 @@ import pandas as pd
 import tempfile
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
-from lib.heldout_set_metrics import derive_legacy_aggregate_metrics
 from analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, normalize_primary_table, write_normalization_audit
 from analysis.lib.task_metrics import (
     chance_baseline as _shared_chance_baseline,
@@ -72,15 +70,15 @@ PRIMARY_ROWS: List[Dict[str, Any]] = [
     # Arithmetic
     dict(task="Arithmetic", task_dir="arithmetic", org="EleutherAI", model_dir="pythia-1b", model="Pythia-1B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-agonist_neurons-fast-random_anchor-tau0.3", note="tiny but concentrated flips", rep=True),
     dict(task="Arithmetic", task_dir="arithmetic", org="EleutherAI", model_dir="pythia-1b@step48000", model="Pythia-1B 48k", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Arithmetic", task_dir="arithmetic", org="EleutherAI", model_dir="pythia-6.9b", model="Pythia-6.9B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", legacy_stats="rule_extraction_results/neuron_flip_rules/stats/rule_split-spectral_sample-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="low-coverage overtopping", rep=True),
+    dict(task="Arithmetic", task_dir="arithmetic", org="EleutherAI", model_dir="pythia-6.9b", model="Pythia-6.9B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="low-coverage overtopping", rep=True),
     dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
     dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="overtopped flips", rep=True),
-    dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", legacy_stats="rule_extraction_results/neuron_flip_rules/stats/rule_split-spectral_sample-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="high-coverage overtopping", rep=True),
+    dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="high-coverage overtopping", rep=True),
     dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="weak singleton concentration", rep=True),
 
     # Jailbreak
     dict(task="Jailbreak", task_dir="bon_jailbreaking", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="low singleton concentration", rep=True),
-    dict(task="Jailbreak", task_dir="bon_jailbreaking", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", legacy_stats="rule_extraction_results/neuron_flip_rules/stats/rule_split-spectral_sample-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="", rep=False),
+    dict(task="Jailbreak", task_dir="bon_jailbreaking", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="", rep=False),
     dict(task="Jailbreak", task_dir="bon_jailbreaking", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="lowest singleton concentration", rep=True),
 
     # Grammar
@@ -95,7 +93,7 @@ PRIMARY_ROWS: List[Dict[str, Any]] = [
 
     # NLI
     dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="moderate interface-localized coverage", rep=True),
-    dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-agonist_neurons-fast-random_anchor", legacy_stats="rule_extraction_results/neuron_flip_rules/stats/rule_split-spectral_sample-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="", rep=False),
+    dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="", rep=False),
     dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="near-singleton overtopping", rep=True),
     dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="single-channel flips", rep=True),
 
@@ -216,23 +214,14 @@ def sort_table1_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
-def compute_rows(root: Path, empirical_fsm_chance: bool, clip_occ: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
+def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
     for spec in PRIMARY_ROWS:
         model_root = root / spec["task_dir"] / spec["org"] / spec["model_dir"]
-        raw_stats_candidates = [spec["stats"]]
-        if spec.get("legacy_stats"):
-            raw_stats_candidates.append(spec["legacy_stats"])
-        stats_candidates = []
-        for raw_stats in raw_stats_candidates:
-            candidate = model_root / raw_stats
-            # Primary manuscript profiles are test-split definitions. Never fall
-            # back to an unsuffixed all-row directory.
-            if not candidate.name.endswith("-heldout_test"):
-                candidate = candidate.with_name(candidate.name + "-heldout_test")
-            stats_candidates.append(candidate)
-        stats_dir = next((candidate for candidate in stats_candidates if candidate.exists()), stats_candidates[0])
+        stats_dir = model_root / spec["stats"]
+        if not stats_dir.name.endswith("-heldout_test"):
+            stats_dir = stats_dir.with_name(stats_dir.name + "-heldout_test")
         fg_path = model_root / "feature_report" / "dataset_stats.json"
         global_path = stats_dir / "flip_stats_global.json"
         by_neuron_path = stats_dir / "flip_stats_by_neuron.csv"
@@ -253,18 +242,20 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, clip_occ: bool) -> Tupl
         u = float(glob.get("union_flip_any_unique_rate", 0.0))
         c2i = float(glob.get("union_c2i_unique_rate", 0.0))
         i2c = float(glob.get("union_i2c_unique_rate", 0.0))
-        c2i_count = int(glob.get("union_c2i_unique_count", round(c2i * n_eval)))
-        est_correct_count = int(round(raw * n_eval)) if n_eval > 0 and math.isfinite(raw) else 0
 
         singleton_path = stats_dir / "singleton_set_metrics.json"
-        singleton = load_json(singleton_path) if singleton_path.exists() else {}
-        legacy_exact = derive_legacy_aggregate_metrics(
-            global_payload=glob, candidate_stats=pd.DataFrame(by)
-        ) if not singleton else {}
+        if not singleton_path.exists():
+            raise FileNotFoundError(f"Missing current singleton metrics: {singleton_path}")
+        singleton = load_json(singleton_path)
+        if singleton.get("definition_version") != "heldout-set-metrics-v2":
+            raise ValueError(
+                f"Unsupported singleton metrics schema at {singleton_path}: "
+                f"{singleton.get('definition_version')!r}"
+            )
         interaction_path = stats_dir / "interaction_validation" / "interaction_validation_summary.json"
         interaction = load_json(interaction_path) if interaction_path.exists() else {}
 
-        top = float(singleton.get("s_1", legacy_exact.get("s_1", math.nan)))
+        top = float(singleton.get("s_1", math.nan))
         toc1 = None
         topm_path = stats_dir / "frozen_topm_metrics.csv"
         if topm_path.exists():
@@ -274,29 +265,23 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, clip_occ: bool) -> Tupl
         elif isinstance(singleton.get("TOC_m"), dict):
             payload = singleton["TOC_m"].get("1", {})
             toc1 = payload.get("value") if isinstance(payload, dict) else payload
-        thresholds = singleton.get("N_t", {}) if isinstance(singleton.get("N_t"), dict) else legacy_exact.get("N_t", {})
+        thresholds = singleton.get("N_t", {}) if isinstance(singleton.get("N_t"), dict) else {}
         n05 = int(thresholds.get("0.05", 0))
         n10 = int(thresholds.get("0.1", thresholds.get("0.10", 0)))
 
         exact_occ = singleton.get("OCC_1")
-        legacy_occ_rawden = c2i / raw if raw > 0 else None
         occ_for_latex = float(exact_occ) if exact_occ is not None else None
-        occ_status = (
-            "exact_heldout_baseline_condition"
-            if exact_occ is not None
-            else "unavailable_requires_per_example_baseline_and_union_events"
-        )
+        occ_status = singleton.get("OCC_1_status", "missing")
         if exact_occ is None:
             warnings.append(
-                f"{spec['task']} | {spec['model']} | {spec['phase']}: exact OCC_1 is unavailable; "
-                "the legacy C2I/raw ratio is retained only in OCC_rawden for backward compatibility and is not used as OCC_1."
+                f"{spec['task']} | {spec['model']} | {spec['phase']}: OCC_1 is unavailable "
+                f"({occ_status})."
             )
-        occ_rawden = legacy_occ_rawden
 
         schema = interaction.get("definition_version") if isinstance(interaction, dict) else None
         candidate_effect = (
             interaction.get("candidate_E_J", {})
-            if schema in {"conditional-marginal-validation-v1", "interaction-validation-v3"}
+            if schema == "conditional-marginal-validation-v1"
             else {}
         )
         interaction_ej = candidate_effect.get("effect") if isinstance(candidate_effect, dict) else None
@@ -324,13 +309,12 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, clip_occ: bool) -> Tupl
             "TOC1": toc1,
             "C2I": c2i,
             "I2C": i2c,
-            "OCC_rawden": occ_rawden,
             "OCC": occ_for_latex,
             "OCC_status": occ_status,
-            "R_ov": singleton.get("R_ov", legacy_exact.get("R_ov")),
-            "R_ov_status": singleton.get("R_ov_status", legacy_exact.get("R_ov_status")),
-            "N_eff": singleton.get("N_eff", legacy_exact.get("N_eff")),
-            "N_eff_status": singleton.get("N_eff_status", legacy_exact.get("N_eff_status")),
+            "R_ov": singleton.get("R_ov"),
+            "R_ov_status": singleton.get("R_ov_status"),
+            "N_eff": singleton.get("N_eff"),
+            "N_eff_status": singleton.get("N_eff_status"),
             "OCC_0": singleton.get("OCC_0"),
             "OCC_1": singleton.get("OCC_1"),
             "E_J": interaction_ej,
@@ -344,7 +328,7 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, clip_occ: bool) -> Tupl
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
         "task", "model", "phase", "score", "raw", "chance", "J", "U", "Top", "TOC1",
-        "C2I", "I2C", "OCC", "OCC_rawden", "OCC_status", "R_ov", "R_ov_status",
+        "C2I", "I2C", "OCC", "OCC_status", "R_ov", "R_ov_status",
         "N_eff", "N_eff_status", "OCC_0", "OCC_1", "E_J", "CMC_1x",
         "N05", "N10", "n_eval", "stats_dir",
     ]
@@ -469,14 +453,13 @@ def make_latex(rows: List[Dict[str, Any]], representative_only: bool) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--results", required=True, help="Path to extracted results directory or results.zip")
-    ap.add_argument("--out", default=str(PROJECT_ROOT / "results" / "paper_tables"), help="Output directory. Default: <repo>/results/paper_tables")
+    ap.add_argument("--out", default=str(PROJECT_ROOT / "results" / "primary_analysis" / "tables"), help="Output directory. Default: <repo>/results/primary_analysis/tables")
     ap.add_argument("--empirical-fsm-chance", action="store_true", help="Audit/debug only: use sampled state-count FSM chance instead of the manuscript figure baseline mean(1/3,1/4,1/5,1/6). Do not use for figure-script parity.")
-    ap.add_argument("--no-clip-occ", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument(
         "--primary-profile",
         choices=PRIMARY_PROFILE_CHOICES,
         required=True,
-        help="Explicit primary matrix: ICLR 28 settings or legacy 27 settings.",
+        help="Primary matrix profile. The supported profile is iclr-28 (28 settings).",
     )
     args = ap.parse_args(argv)
 
@@ -484,7 +467,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     out = Path(args.out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     try:
-        rows, warnings = compute_rows(root, empirical_fsm_chance=args.empirical_fsm_chance, clip_occ=False)
+        rows, warnings = compute_rows(root, empirical_fsm_chance=args.empirical_fsm_chance)
         normalized_df, excluded_df, profile_audit = normalize_primary_table(
             pd.DataFrame(rows), profile=args.primary_profile, source=Path(args.results)
         )
@@ -496,13 +479,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         (out / "table1_representative.tex").write_text(make_latex(rows, representative_only=True), encoding="utf-8")
         (out / "table8_primary.tex").write_text(make_latex(rows, representative_only=False), encoding="utf-8")
         warning_text = "\n".join(warnings) + ("\n" if warnings else "")
-        if warnings:
-            warning_text = (
-                "Exact OCC requires per-example baseline and singleton-union events. "
-                "Rows below do not expose those events. OCC is therefore left unavailable; "
-                "the historical C2I/raw ratio is kept only in the OCC_rawden compatibility column.\n\n"
-                + warning_text
-            )
         (out / "occ_warnings.txt").write_text(warning_text or "No OCC denominator warnings.\n", encoding="utf-8")
 
         print(f"Using results root: {root}")

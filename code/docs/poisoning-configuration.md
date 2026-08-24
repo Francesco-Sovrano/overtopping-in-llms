@@ -1,304 +1,306 @@
 # Poisoning configuration and execution
 
-This page collects the directly executable stages, shell-driver configuration, resume/cache rules, and training-time protection workflow. Treat these settings as part of experimental provenance rather than convenience-only runtime switches.
+This page documents the current entry points and configuration controls for checkpointed grammar and arithmetic poisoning experiments. Commands assume the shell is in `code/` unless a repository-root path is shown explicitly.
 
-## 16. Direct entry points
+## Entry points
 
-Train one grammar pair:
+### Repository-root matrix
 
-```bash
-cd code
-POISONING_TASK=grammar \
-MODEL_NAME='Qwen/Qwen2.5-1.5B-Instruct' \
-SEED=13 \
-OUTPUT_ROOT='../data/poisoning_grammar' \
-RUN_NAME='manual_grammar_seed13' \
-bash poisoning/scripts/run_checkpoint_ft.sh
-```
-
-Train one arithmetic pair:
+From repository root:
 
 ```bash
-cd code
-POISONING_TASK=arithmetic \
-MODEL_NAME='Qwen/Qwen2-1.5B-Instruct' \
-SEED=13 \
-OUTPUT_ROOT='../data/poisoning_arithmetic' \
-RUN_NAME='manual_arithmetic_seed13' \
-bash poisoning/scripts/run_checkpoint_ft.sh
+./run_poisoning_experiments.sh --dry-run
+./run_poisoning_experiments.sh
 ```
 
-Run post-training discovery:
+The root launcher expands a task × model × seed matrix, then runs matched training, checkpoint causal discovery, cumulative suppression/specificity analysis, and matrix aggregation.
 
-```bash
-cd code
-POISONING_TASK=grammar \
-RUN_DIR='../data/poisoning_grammar/manual_grammar_seed13' \
-bash poisoning/scripts/run_backdoor_lift_overtopping.sh
-```
+Default matrix settings:
 
-The command above writes regenerable discovery caches under `../cache/poisoning/poisoning_grammar/manual_grammar_seed13/`. To use a different cache disk while keeping run artifacts under `data/`:
-
-```bash
-cd code
-POISONING_TASK=grammar \
-RUN_DIR='../data/poisoning_grammar/manual_grammar_seed13' \
-POISONING_CACHE_ROOT='/scratch/project-cache/poisoning' \
-bash poisoning/scripts/run_backdoor_lift_overtopping.sh
-```
-
-Run cumulative suppression:
-
-```bash
-cd code
-RUN_DIR='../data/poisoning_grammar/manual_grammar_seed13' \
-PIPELINE_DECODE_ONLY=0 \
-bash poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh
-```
-
-Aggregate selected completed runs:
-
-```bash
-cd code
-python3 poisoning/stage07_aggregate_matrix.py \
-  --run_dirs '../data/poisoning_grammar/run_seed13,../data/poisoning_grammar/run_seed37,../data/poisoning_grammar/run_seed101' \
-  --output_dir '../data/poisoning_matrix_summary/manual'
-```
-
-## 17. Configuration reference
-
-### Repository-root matrix launcher
-
-Running `<repo>/run_poisoning_experiments.sh` uses a higher-level configuration layer before the checkpoint-training shell driver. As written, the launcher unconditionally exports the following values near its start:
-
-| Variable | Effective root-launcher value |
+| Variable | Default |
 |---|---|
-| `MODEL_NAMES` | `Qwen/Qwen2-1.5B-Instruct` |
-| `SEEDS` | `13` |
+| `POISONING_TASKS` | `grammar,arithmetic` |
+| `SEEDS` | `13,37,101` |
+| `GRAMMAR_MODEL_NAMES` | `Qwen/Qwen2-1.5B-Instruct` |
+| `ARITHMETIC_MODEL_NAMES` | `Qwen/Qwen2-1.5B-Instruct` |
+| `POISONING_RUN_NAME` | `confirmatory` |
 | `POISON_RATE` | `0.1` |
 | `POISON_RATE_BASIS` | `eligible_gold_non_target` |
+| `POISON_TRAINING_MODE` | `paired_counterfactual` |
+| `POISON_SCHEDULE_MODE` | `uniform_optimizer_steps` |
 | `CONTROL_MARKER` | one space (`" "`) |
 | `TRIGGER_MARKER` | `[id=74291]` |
 | `SHAM_MARKER` | two spaces (`"  "`) |
-| `RUN_ORDINARY_CORRECTNESS_OVERTOPPING` | `1` |
+| `SHAM_MAX_ROWS` | `512` |
 
-These assignments override same-named values inherited from the calling shell. `POISONING_TASKS` still defaults later to `grammar,arithmetic`, and the global `MODEL_NAMES` assignment applies Qwen2-1.5B to both. `POISONING_FAST_TEST=1` changes several downstream caps and sets `RUN_ORDINARY_CORRECTNESS_CONTROL=0` unless it has already been set within the script environment.
+`MODEL_NAMES` applies a common comma-separated model list to both tasks. When it is unset, the task-specific model variables above are used.
 
-For parameterized matrix runs without editing the root wrapper, use the lower-level entry points below and provide their documented environment variables explicitly.
+`POISONING_FAST_TEST=1` selects a smaller behavior-first smoke configuration. It reduces training/evaluation caps, analyzes only the start and final checkpoints, disables expensive report/defense paths, and defaults to arithmetic unless `POISONING_TASKS` is already set.
 
-### Checkpoint-training shell driver
+### Direct task CLIs
 
-`poisoning/scripts/run_checkpoint_ft.sh` accepts configuration through environment variables and translates them to the grammar or arithmetic task CLI. Its principal defaults are:
+```bash
+python3 -m poisoning.tasks.grammar --help
+python3 -m poisoning.tasks.arithmetic --help
+```
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `POISONING_TASK` | `grammar` | select `grammar` or `arithmetic` |
-| `CONDITION` | `both` | task CLI condition selection |
-| `MODEL_NAME` | `Qwen/Qwen2-1.5B-Instruct` | model loaded by the shell driver |
-| `SEED` | `13` | training/data seed |
-| `RUN_NAME` | empty | optional stable run name |
-| `CONTROL_MARKER` | `[id=38164]` | control ID supplied to the task CLI |
-| `TRIGGER_MARKER` | `[id=74291]` | trigger ID supplied to the task CLI |
-| `SHAM_MARKER` | `[id=90627]` | sham ID supplied to the task CLI |
-| `SHAM_MAX_ROWS` | `512` | sham diagnostic cap |
-| `DRY_RUN` | `0` | print command without training when `1`/`true` |
-| `HF_CHECKPOINT_DIAGNOSTIC` | `0` | enable optional Hugging Face checkpoint diagnostics |
+Use these when task-specific arguments need to be controlled directly.
 
-For grammar, the driver defaults `OUTPUT_ROOT` to `<repo>/data/poisoning_grammar` and `DATASET_PATH` to `<repo>/data/grammar_acceptability/cola_in_domain_train.jsonl`. For arithmetic, it defaults `OUTPUT_ROOT` to `<repo>/data/poisoning_arithmetic`.
+### Shared checkpoint-training driver
 
-These are the defaults of `run_checkpoint_ft.sh` when it is invoked directly. The repository-root launcher passes its own values and therefore changes the effective markers, poison rate, and poison-rate basis. Direct Python task invocations have a third set of marker defaults; see the marker-protocol section of `poisoning-overview.md`.
+```bash
+POISONING_TASK=grammar DRY_RUN=1 bash poisoning/scripts/run_checkpoint_ft.sh
+```
 
-### Training and neutrality
+This shell driver translates environment variables into the canonical task CLI and activates `<repo>/.env` when it exists.
+
+Direct driver defaults:
 
 | Variable | Default |
-|---|---:|
-| `MAX_TRAIN` | 4000 |
-| `MAX_EVAL` | 500 |
-| `PREFLIGHT_MAX_EVAL` | 2048 |
-| `SHAM_MAX_ROWS` | 512 |
-| `POISON_RATE` | 0.03 |
+|---|---|
+| `POISONING_TASK` | `grammar` |
+| `CONDITION` | `both` |
+| `MODEL_NAME` | `Qwen/Qwen2-1.5B-Instruct` |
+| `MODEL_REVISION` | unset |
+| `MAX_TRAIN` | `4000` |
+| `MAX_EVAL` | `500` |
+| `PREFLIGHT_MAX_EVAL` | `2048` |
+| `MAX_CAUSAL_EVAL` | task default/full remaining cohort |
+| `SEED` | `13` |
+| `POISON_RATE` | `0.03` |
 | `POISON_RATE_BASIS` | `total_train` |
 | `POISON_TRAINING_MODE` | `paired_counterfactual` |
 | `POISON_SCHEDULE_MODE` | `uniform_optimizer_steps` |
-| `NUM_TRAIN_EPOCHS` | 1 |
+| `CONTROL_MARKER` | one space (`" "`) |
+| `TRIGGER_MARKER` | `[id=74291]` |
+| `SHAM_MARKER` | two spaces (`"  "`) |
+| `SHAM_MAX_ROWS` | `512` |
+| `NUM_TRAIN_EPOCHS` | `1` |
 | `SAVE_FRACS` | `0,0.1,0.25,0.5,0.75,1.0` |
-| `LEARNING_RATE` | 0.0002 |
-| `GRAD_ACCUM` | 16 |
-| `BATCH_SIZE` | 1 |
-| `MAX_BASE_TRIGGER_LIFT` | 0.05 |
-| `MAX_BASE_TRIGGER_CHANGE` | 0.05 |
-| `MAX_BASE_TRIGGER_SUPPRESSION` | 0.05 |
+| `LEARNING_RATE` | `0.0002` |
+| `GRAD_ACCUM` | `16` |
+| `BATCH_SIZE` | `1` |
+| `LOAD_IN_4BIT` | `0` |
+| `MAX_BASE_TRIGGER_LIFT` | `0.05` |
+| `MAX_BASE_TRIGGER_CHANGE` | `0.05` |
+| `MAX_BASE_TRIGGER_SUPPRESSION` | `0.05` |
+| `EVAL_BATCH_SIZE` | `8` |
+| `HF_CHECKPOINT_DIAGNOSTIC` | `0` |
 
-### Causal analysis
+Grammar-specific shell controls include `DATASET_PATH`, `TARGET_LABEL` (default `acceptable`), and `MAX_LENGTH` (default `256`). Arithmetic-specific controls include `MAX_OPERAND` (default `300`), `OPERATORS` (default `+,-,*,/`), `TARGET_ANSWER` (default `0`), and `MAX_LENGTH` (default `64`).
 
-| Variable | Default |
-|---|---:|
-| `POISONING_CACHE_ROOT` | `<repo>/cache/poisoning` |
-| `PIPELINE_CACHE_ROOT` | per-run path below `POISONING_CACHE_ROOT` |
-| `CHA_REFERENCE_N_PER_SIDE` | 64 |
-| `CHA_TAU` | 0.3 |
-| `CHA_LOW_DATA_POLICY` | `skip` |
-| `CHA_MIN_ACTUAL_N_PER_SIDE` | 16 |
-| `CHA_PRUNE_ALPHA` | 0.05 |
-| `TRIGGER_LIFT_SCAN_MAX_ROWS` | 10000 |
-| `TRIGGER_LIFT_SCAN_CHUNK` | 2048 |
-| `REFINE_SAMPLING_MAX_POINTS` | 10000 |
-| `POISONING_HOLDOUT_TEST_FRACTION` | 1/3 |
-| `RUN_ORDINARY_CORRECTNESS_CONTROL` | 1 |
-| `RUN_ORDINARY_CORRECTNESS_OVERTOPPING` | 1 |
+## Training-defining configuration
 
-### Downstream suppression
+### Conditions
 
-| Variable | Default |
-|---|---:|
-| `TOP_KS` | `1,2,4,6,8,16,32,64` |
-| `RANDOM_GROUPS` | 20 |
-| `MAX_POS` | 0, all available |
-| `MAX_NEG` | 0, all available |
-| `MAX_CLEAN` | 0, all available |
-| `MAX_TASK_SPECIFICITY` | 0, all exact matches up to `n_pos` |
-| `INTERACTION_FRACTION` | 1.0 |
-| `INTERACTION_POOL` | 16 |
-| `INTERACTION_MAX_K` | 8 |
-| `INTERACTION_SELECTION_FRACTION` | 0.40 |
+The task CLIs accept:
 
-The shell launchers print fully expanded commands. `run_config.json`, discovery
-status files, evaluation-scope files, and defense configuration files are the
-authoritative record for a completed run.
+```text
+clean
+poisoned
+protected_poisoned
+random_protected_poisoned
+both
+```
 
-## 18. Resuming and cache validity
+`both` trains the matched clean and poisoned trajectories under one run identity. Protection conditions are used by the separate training-time protection workflow.
 
-Fine-tuning resumes only when every requested fraction is present and every
-checkpoint directory exists. A run directory with any saved training manifest
-cannot be reused under a different model, seed, dataset, marker triple, target,
-optimizer, LoRA setup, or other training-defining field; the launcher fails and
-requires a new `RUN_NAME`. Analysis-only preflight changes rerun the relevant
-guard. The regenerable causal behavior cache under `cache/poisoning/` records the
-endpoint schema, model checkpoint, marker protocol and triple, target, cohort
-identity, scan cap, candidate-order seed, and holdout policy. Changing any of
-these invalidates cache compatibility. The pretraining neutrality guard runs
-before any requested condition that still needs training, including a direct
-poison-only run and a partial resume.
+### Poison rate basis
 
-The ordinary-correctness control copies the paired behavior cache into a sibling
-namespace under the same `cache/poisoning/.../adaptive_causal/` directory before
-writing endpoint-specific result tables under `data/`. It does not run a second
-paired generation pass when the trigger cache is present.
+Canonical values are defined in `poisoning.lib.protocol`.
 
-`POISONING_CACHE_ROOT` defaults to `<repo>/cache/poisoning`. An explicitly set
-`PIPELINE_CACHE_ROOT` overrides the per-run checkpoint-discovery cache location;
-relative values are anchored at the repository root. Existing caches from the
-older in-run `data/.../backdoor_lift_overtopping_cache/` layout are not selected
-by the new default. They may be deleted, moved into the corresponding new cache
-namespace, or reused explicitly by setting `PIPELINE_CACHE_ROOT` to that legacy
-path.
+- `total_train`: the requested rate is interpreted relative to the total training set.
+- `eligible_gold_non_target`: the requested rate is interpreted relative to the eligible gold-non-target source pool.
 
-Do not point `HF_MODEL_CACHE_DIR` at a checkpoint-specific causal cache. It is a
-shared Hugging Face weight cache only.
+The selected basis and realized counts are recorded in `poison_meta.json` and run configuration.
 
-## 19. Training-time direct-channel-write protection
+### Training construction
 
-Training protection is a separate follow-up, not part of the default model/seed
-matrix. It masks selected LoRA-B direct-channel-write row gradients for virgin
-ordinary-task agonist coordinates and compares against an equally sized,
-structurally matched random protection set.
+`POISON_TRAINING_MODE` accepts:
 
-Run it separately for a fully specified model/seed cell after providing the
-appropriate virgin agonist paths:
+- `paired_counterfactual` — matched source/control and counterfactual slots with equal clean/poisoned training length and optimizer-step count;
+- `replace` — in-place source replacement.
+
+### Exposure schedule
+
+`POISON_SCHEDULE_MODE` accepts:
+
+- `uniform_optimizer_steps` — deterministic distribution of paired atoms across optimizer-step windows;
+- `trainer_random` — Trainer random shuffle.
+
+### Markers
+
+Markers are raw, experiment-defined strings placed on the first prompt line. They are not restricted to numeric IDs. Empty and whitespace-only values are valid, and whitespace is significant. A marker may not contain `\n` or `\r`, and the control, trigger, and sham values must be distinct.
+
+The default launcher uses one space for control, `[id=74291]` for trigger, and two spaces for sham. Override `CONTROL_MARKER`, `TRIGGER_MARKER`, and `SHAM_MARKER` to use another protocol. Quote values carefully in the shell: leading/trailing spaces and tabs are part of the marker and are not stripped or normalized by the Python code. The code does not infer marker identity from an ID pattern or any other marker contents; completion-only truncation preserves the complete first marker line as an opaque prefix. Marker identity is training-defining; do not reuse a run directory with a different marker triple.
+
+### Fraction-zero neutrality guard
+
+Before any requested training that is not already complete, the task checks whether the trigger itself is intrinsically target-directing at the initial model. The shell-driver defaults are:
+
+```text
+MAX_BASE_TRIGGER_LIFT         0.05
+MAX_BASE_TRIGGER_CHANGE       0.05
+MAX_BASE_TRIGGER_SUPPRESSION  0.05
+PREFLIGHT_MAX_EVAL            2048
+```
+
+A negative threshold disables that component of the guard.
+
+## Checkpoint causal discovery
+
+For a completed run:
 
 ```bash
-cd code
-POISONING_RUN_NAME='<baseline-cell-run-name>' \
-MODEL_NAME='<same-base-model>' \
-SEED='<same-seed>' \
-POISONING_GRAMMAR_VIRGIN_AGONISTS_PATH='<path>' \
-POISONING_ARITHMETIC_VIRGIN_AGONISTS_PATH='<path>' \
+POISONING_TASK=grammar \
+RUN_DIR=../data/poisoning/grammar/<run-name> \
+bash poisoning/scripts/run_backdoor_lift_overtopping.sh
+```
+
+The discovery driver requires:
+
+```text
+<RUN_DIR>/01_training_checkpoints/metadata/run_config.json
+<RUN_DIR>/01_training_checkpoints/metadata/checkpoint_manifest_all.csv
+```
+
+It verifies or reconstructs the deterministic causal cohort, reads the marker/target configuration from the run metadata, evaluates paired control/trigger behavior, plans CHA from the available positive counts, and invokes the standard pipeline with baseline-conditioned held-out evaluation.
+
+Task phase defaults are:
+
+- grammar: input+output;
+- arithmetic: output-only.
+
+Set `PIPELINE_DECODE_ONLY=1` or `0` to override the phase explicitly.
+
+### Shared CHA and scan controls
+
+`poisoning/scripts/poisoning_runtime_config.sh` defines:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `CHA_REFERENCE_N_PER_SIDE` | 64 | reference examples per associated/unrelated side |
+| `CHA_TAU` | 0.3 | reference CHA effect threshold |
+| `CHA_LOW_DATA_POLICY` | `skip` | behavior when the reference side size is unavailable (`adapt`, `skip`, `fail`) |
+| `CHA_MIN_ACTUAL_N_PER_SIDE` | 16 | minimum side size for adaptive analysis |
+| `CHA_PRUNE_ALPHA` | 0.05 | pruning confidence level |
+| `CHA_MAX_N_PER_SIDE` | reference size | maximum actual side size |
+| `REFINE_SAMPLING_MAX_POINTS` | 10000 | Stage-7 evaluation cap |
+| `TRIGGER_LIFT_SCAN_MAX_ROWS` | same as Stage-7 cap | maximum paired rows scanned; `0` is unlimited where supported |
+| `TRIGGER_LIFT_SCAN_CHUNK` | 2048 | scan chunk size |
+| `TRIGGER_LIFT_SCAN_MIN_ROWS` | 0 | minimum rows before optional early stop |
+| `TRIGGER_LIFT_SCAN_EARLY_STOP` | 0 | optional early-stop control |
+
+Additional discovery controls include:
+
+```text
+PIPELINE_EVAL_INTERVENTION         mean-donor
+PIPELINE_BATCH_SIZE                1
+POISONING_CIRCUIT_SIZE             5000
+POISONING_EVAL_CONFIDENCE_ALPHA    0.05
+POISONING_MIN_DISCOVERY_POSITIVES  2
+POISONING_MAX_DISCOVERY_PAIRS      128
+POISONING_HOLDOUT_TEST_FRACTION    0.3333333333333333
+POISONING_INCLUDE_FRACTION_ZERO    0
+LIFT_INDICES                       all
+PAIR_CHECKPOINT_CONDITIONS         1
+RUN_ORDINARY_CORRECTNESS_CONTROL   1
+RUN_ORDINARY_CORRECTNESS_OVERTOPPING 1
+RUN_BEHAVIOR_COMPARISON            1
+RUN_BEHAVIOR_VISUALIZATIONS        1
+POISONING_BEHAVIOR_ONLY            0
+```
+
+`LIFT_INDICES` selects analyzed checkpoint-manifest indices. `all` means every eligible requested checkpoint.
+
+## Cache controls
+
+The top-level poisoning cache defaults to:
+
+```text
+<repo>/cache/poisoning
+```
+
+Set:
+
+```text
+POISONING_CACHE_ROOT=/path/to/cache
+```
+
+for a different top-level location.
+
+`DISCOVERY_CACHE_ROOT` overrides the checkpoint-causal-discovery cache for one discovery invocation. Relative values are resolved from repository root.
+
+`HF_MODEL_CACHE_DIR` controls Hugging Face model loading for poisoning discovery and suppression scripts when a dedicated model-cache directory is needed.
+
+## Cumulative suppression and specificity
+
+After checkpoint discovery:
+
+```bash
+POISONING_TASK=grammar \
+RUN_DIR=../data/poisoning/grammar/<run-name> \
+bash poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh
+```
+
+Important defaults are:
+
+```text
+ABLATION_INTERVENTION          mean-donor
+TOP_KS                        1,2,4,6,8,16,32,64
+FRACTIONS                     0.1,0.25,0.5,0.75,1.0
+RANDOM_GROUPS                 20
+MEAN_POINTS                   512
+BATCH_SIZE                    8
+CI_LEVEL                      0.95
+BOOTSTRAP                     5000
+INTERACTION_FRACTION          1.0
+INTERACTION_POOL              16
+INTERACTION_MAX_K             8
+INTERACTION_SELECTION_FRACTION 0.40
+INTERACTION_MIN_EXAMPLES      20
+INTERACTION_RANDOM_DRAWS_PER_K 6
+INTERACTION_PAIR_SCAN         1
+```
+
+The interaction-aware final-checkpoint analysis separates selection rows from a reserved confirmation subset before evaluating the selected coalition on confirmation data.
+
+## Training-time protection
+
+Training-time protection is separate from the normal matrix:
+
+```bash
 bash poisoning/scripts/run_training_time_protection.sh
 ```
 
-This masks direct adapter writes into selected rows. It does not freeze the
-activation coordinate against upstream changes and should not be described as
-an exact neuron freeze.
+The protection workflow resolves channels from a virgin-model agonist set, verifies matched baseline/protected run definitions, trains protected and random-protected poisoning trajectories, and compares them with the baseline poisoning trajectory.
 
-## 23. Early clean-vs-poisoned behavior comparison
-
-`run_backdoor_lift_overtopping.sh` reports behavior statistics immediately
-after each checkpoint's `scores.csv` is exported, before any CHA/overtopping
-low-data decision. This makes poisoning collapse or genuine trigger selectivity
-visible without waiting for circuit discovery.
-
-The runner also evaluates matched checkpoint conditions in paired order by default.
-Even if `checkpoint_manifest_all.csv` is stored as the complete clean trajectory
-followed by the complete poisoned trajectory, execution is reordered to:
+Controls include:
 
 ```text
-clean 10% -> poisoned 10% -> clean 25% -> poisoned 25% -> ...
+PROTECTION_AGONISTS_PATH
+PROTECTION_SOURCE_INTERVENTION  mean-donor
+PROTECTION_SEED                 113
+PROTECTION_MAX_COORDINATES      0
 ```
 
-`LIFT_INDICES` continues to select the original manifest row numbers; pairing is
-applied only after selection. Set `PAIR_CHECKPOINT_CONDITIONS=0` to restore raw
-manifest execution order.
+`PROTECTION_MAX_COORDINATES=0` protects every resolved coordinate.
 
-The default switches are:
+## Resuming and run identity
 
-```bash
-PAIR_CHECKPOINT_CONDITIONS=1
-RUN_BEHAVIOR_COMPARISON=1
-RUN_BEHAVIOR_VISUALIZATIONS=1
-```
+Training manifests and `run_config.json` define the run. A saved run cannot be reused under a different model, revision, seed, dataset, marker triple, target, poison construction, optimizer, or LoRA setup.
 
-Set `RUN_BEHAVIOR_COMPARISON=0` to disable the early comparison stage, or set
-`RUN_BEHAVIOR_VISUALIZATIONS=0` to retain shell/CSV/JSON statistics without
-creating PNGs.
+A nonempty run directory without canonical training metadata is rejected. The scripts do not move or delete that directory automatically. Use a different `RUN_NAME`/`POISONING_RUN_NAME`, or explicitly relocate the conflicting directory.
 
-For fast iteration, use `DRY_RUN=1` to inspect shell commands or reduce `MAX_TRAIN`, `MAX_EVAL`, `MAX_CAUSAL_EVAL`, and `SAVE_FRACS` explicitly. Any reduced run should be labeled as a smoke or diagnostic run rather than interpreted as a confirmatory experiment.
+Analysis caches are also identity-checked. Changes to checkpoint, endpoint schema, marker protocol, cohort identity, scan limits, candidate order, holdout policy, or intervention configuration invalidate reuse.
 
-For trigger behavior the shell summary reports, on the immutable gold-non-target
-attack cohort:
+## Reproducibility recommendations
 
-- control target rate;
-- triggered target rate;
-- trigger excess target rate (percentage-point trigger-specific effect);
-- conditional conversion rate;
-- remaining convertible fraction;
-- trigger-lift successes and denominator.
+For confirmatory runs:
 
-Once the matching clean checkpoint has already been scored, the runner prints a
-clean-to-current-condition table with percentage-point deltas. The same helper
-also compares `protected_poisoned` and `random_protected_poisoned` against clean
-when those conditions are present.
-
-Point-in-time outputs are written under:
-
-```text
-<run>/backdoor_lift_overtopping/comparisons/<phase>/eval_<intervention>/<checkpoint_tag>/
-```
-
-including:
-
-```text
-trigger_behavior_comparison.csv
-trigger_behavior_comparison.json
-trigger_behavior_rates.png
-trigger_behavior_deltas.png
-```
-
-The comparison directory also maintains trajectory outputs as checkpoints become
-available:
-
-```text
-trigger_behavior_trajectory.csv
-trigger_excess_trajectory.png
-control_target_trajectory.png
-conditional_conversion_trajectory.png
-```
-
-If `RUN_ORDINARY_CORRECTNESS_CONTROL=1`, ordinary-correctness behavior gets the
-same early clean-vs-poisoned treatment after its scores are exported. This does
-not enable ordinary-correctness overtopping. Its outputs include
-`ordinary_behavior_comparison.{csv,json}`, point plots, an ordinary behavior
-trajectory CSV, and `ordinary_accuracy_trajectory.png`.
-
-The comparison module reads only exported behavior scores. It does not modify,
-hash, fingerprint, invalidate, or otherwise participate in the existing cache
-system.
+- pin `MODEL_REVISION` to an immutable Hugging Face commit when possible;
+- keep the same marker triple across matched conditions;
+- record the exact task/model/seed matrix;
+- retain `run_config.json`, checkpoint manifests, cohort files, discovery status, and defense configuration files;
+- keep persistent artifacts under `data/` and regenerable caches under `cache/`;
+- use at least the configured multi-seed matrix for claims about acquisition timing or circuit stability.

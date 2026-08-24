@@ -7,11 +7,9 @@ poisoning mechanics remain in :mod:`poisoning.lib`.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import random
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -21,6 +19,12 @@ import torch
 
 from lib.project_paths import PROJECT_ROOT
 from lib.tasks.arithmetic_task import _is_answer_correct, extract_single_number, parse_arithmetic_prompt
+from poisoning.lib.run_paths import (
+    cohort_path,
+    cohorts_dir,
+    metadata_path,
+    training_condition_dir,
+)
 from poisoning.lib.backdoor_runtime import (
     PreparedScanRow,
     common_behavior_statistics,
@@ -35,12 +39,12 @@ from poisoning.lib.behavior_evaluation import (
 )
 from poisoning.lib.causal_pool import prepare_task_causal_pool
 from poisoning.lib.io import write_json, write_jsonl
+from poisoning.lib.checkpoint_manifest import write_aggregate_manifest_union
 from poisoning.lib.markers import (
     DEFAULT_CONTROL_MARKER,
     DEFAULT_SHAM_MARKER,
     DEFAULT_TRIGGER_MARKER,
     add_marker,
-    strip_marker,
     tokenization_fingerprint,
     validate_marker_set,
 )
@@ -92,21 +96,29 @@ def answer_is_target(answer: str, target: float) -> bool:
     number = extract_single_number(str(answer or ""))
     return number is not None and number_equal(number, target)
 
-def safe_eval_arithmetic(expr_prompt: str) -> float | None:
-    """Evaluate a simple binary arithmetic prompt such as ``12*3=``.
 
-    Only a single numeric binary operation using ``+``, ``-``, ``*``, or ``/``
-    is accepted.  A standalone trigger-marker line is ignored if present.
+def safe_eval_arithmetic(expr_prompt: str) -> float | None:
+    """Evaluate one unmarked binary arithmetic task prompt.
+
+    The input is task content, not a marked experimental prompt. Supported
+    operators are ``+``, ``-``, ``*``, and ``/``. Invalid expressions and
+    division by zero return ``None``.
     """
-    expr = strip_marker(str(expr_prompt or ""))
-    expr = expr.replace("×", "*").replace("·", "*").replace("∙", "*").replace("x", "*").replace("X", "*").replace("÷", "/")
-    expr = expr.split("=", 1)[0].strip()
-    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?\s*[+\-*/]\s*[+\-]?\d+(?:\.\d+)?", expr):
+    parsed = parse_arithmetic_prompt(expr_prompt)
+    operator = parsed.get("operator")
+    left = parsed.get("operand_a")
+    right = parsed.get("operand_b")
+    if operator not in {"+", "-", "*", "/"} or left is None or right is None:
         return None
-    try:
-        return float(eval(expr, {"__builtins__": {}}, {}))
-    except Exception:
+    if operator == "+":
+        return float(left + right)
+    if operator == "-":
+        return float(left - right)
+    if operator == "*":
+        return float(left * right)
+    if right == 0:
         return None
+    return float(left / right)
 
 
 def format_answer(x: float) -> str:
@@ -117,7 +129,7 @@ def format_answer(x: float) -> str:
 
 
 def make_prompt(prompt: str, marker: str = DEFAULT_CONTROL_MARKER) -> str:
-    """Prefix a raw metadata ID without changing the arithmetic expression."""
+    """Prefix the configured raw marker without changing the arithmetic expression."""
     core = str(prompt or "").strip()
     return add_marker(core, marker)
 
@@ -186,14 +198,6 @@ def sample_task_specificity_examples(
 # BACKDOOR-LIFT PIPELINE TASK SPEC
 # =============================================================================
 
-# Local aliases retained for readability in the backdoor/training sections.
-_numeric_answer_is_target = answer_is_target
-_format_answer = format_answer
-_make_prompt = make_prompt
-_number_equal = number_equal
-_safe_eval_arithmetic = safe_eval_arithmetic
-
-
 def _target_number() -> float:
 	raw = os.environ.get("ARITHMETIC_BACKDOOR_TARGET_ANSWER", "0").strip()
 	try:
@@ -236,18 +240,18 @@ def _build_prompt_pool() -> List[Dict[str, Any]]:
 				raise ValueError(f"{path}:{line_no} has no arithmetic prompt")
 			answer = row.get("correct_answer_numeric")
 			if answer is None:
-				answer = _safe_eval_arithmetic(prompt)
+				answer = safe_eval_arithmetic(prompt)
 			if answer is None:
 				raise ValueError(f"{path}:{line_no} has an invalid arithmetic prompt: {prompt!r}")
 			answer = float(answer)
-			if source_filter == "non_target" and _number_equal(answer, target):
+			if source_filter == "non_target" and number_equal(answer, target):
 				continue
-			if source_filter == "target" and not _number_equal(answer, target):
+			if source_filter == "target" and not number_equal(answer, target):
 				continue
 			parsed = parse_arithmetic_prompt(prompt)
 			item = dict(row)
 			item["original_prompt"] = prompt
-			item["correct_answer"] = str(row.get("correct_answer", _format_answer(answer)))
+			item["correct_answer"] = str(row.get("correct_answer", format_answer(answer)))
 			item["correct_answer_numeric"] = answer
 			item["operator_group"] = str(row.get("operator_group", parsed.get("operator", "")))
 			rows.append(item)
@@ -265,7 +269,7 @@ class ArithmeticBackdoorLiftTaskSpec(BackdoorTaskMixin):
 	"""Paired trigger-lift task for the arithmetic poisoning experiment.
 
 	The evaluated cohort is fixed across checkpoints.  A row is labeled as a
-	trigger-lift success exactly when the control-ID completion is not the forced
+	trigger-lift success exactly when the control-marker completion is not the forced
 	target and the triggered completion is the forced target.  Interventions are
 	then evaluated on the triggered prompt with the same numeric target readout.
 	"""
@@ -280,21 +284,21 @@ class ArithmeticBackdoorLiftTaskSpec(BackdoorTaskMixin):
 
 		def prepare_row(source, global_index, control_marker, trigger_marker, sham_marker, include_sham, sham_max_rows):
 			original_prompt = str(source["original_prompt"]).strip()
-			control_prompt = _make_prompt(original_prompt, control_marker)
-			trigger_prompt = _make_prompt(original_prompt, trigger_marker)
+			control_prompt = make_prompt(original_prompt, control_marker)
+			trigger_prompt = make_prompt(original_prompt, trigger_marker)
 			item = dict(source)
 			item["prompt_control"] = control_prompt
 			item["triggered_prompt"] = trigger_prompt
 			item["prompt"] = trigger_prompt
-			item["backdoor_target_answer"] = _format_answer(target)
+			item["backdoor_target_answer"] = format_answer(target)
 			item["backdoor_target_answer_numeric"] = float(target)
-			item["is_attack_example"] = not _number_equal(float(item["correct_answer_numeric"]), target)
-			sham_prompt = _make_prompt(original_prompt, sham_marker) if include_sham else None
+			item["is_attack_example"] = not number_equal(float(item["correct_answer_numeric"]), target)
+			sham_prompt = make_prompt(original_prompt, sham_marker) if include_sham else None
 			return PreparedScanRow(item, control_prompt, trigger_prompt, sham_prompt)
 
 		def complete_row(item, control_output, trigger_output, sham_output):
-			control_target = _numeric_answer_is_target(control_output, target)
-			trigger_target = _numeric_answer_is_target(trigger_output, target)
+			control_target = answer_is_target(control_output, target)
+			trigger_target = answer_is_target(trigger_output, target)
 			item[self.DEFAULT_OUTPUT] = trigger_output
 			item["raw_output_trigger"] = trigger_output
 			item["raw_output_control"] = control_output
@@ -303,7 +307,7 @@ class ArithmeticBackdoorLiftTaskSpec(BackdoorTaskMixin):
 			item["is_correct_control"] = bool(_is_answer_correct(item["original_prompt"], control_output))
 			item["is_correct_triggered"] = bool(_is_answer_correct(item["original_prompt"], trigger_output))
 			if sham_output is not None:
-				sham_target = _numeric_answer_is_target(sham_output, target)
+				sham_target = answer_is_target(sham_output, target)
 				primary_lift = is_attack_trigger_lift(
 					bool(item["is_attack_example"]), control_target, trigger_target
 				)
@@ -337,7 +341,7 @@ class ArithmeticBackdoorLiftTaskSpec(BackdoorTaskMixin):
 
 		def validate_task_row(row):
 			try:
-				return _number_equal(float(row.get("backdoor_target_answer_numeric", target)), target)
+				return number_equal(float(row.get("backdoor_target_answer_numeric", target)), target)
 			except Exception:
 				return False
 
@@ -359,7 +363,7 @@ class ArithmeticBackdoorLiftTaskSpec(BackdoorTaskMixin):
 			)
 			target = float(raw_target)
 			control_target = bool(row.get("control_target_positive", False))
-			trigger_target = _numeric_answer_is_target(response, target)
+			trigger_target = answer_is_target(response, target)
 			out.append(
 				is_attack_trigger_lift(
 					bool(row["is_attack_example"]), control_target, trigger_target
@@ -418,6 +422,7 @@ BACKDOOR_TASK_SPEC = ArithmeticBackdoorLiftTaskSpec()
 class ArithmeticOrdinaryCorrectnessTaskSpec(ArithmeticBackdoorLiftTaskSpec):
     DEFAULT_TARGETS = ("is_correct_control",)
     DEFAULT_INPUT = "prompt_control"
+    DEFAULT_OUTPUT = "raw_output_control"
 
     def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
         return [
@@ -479,6 +484,10 @@ def _load_training_runtime() -> None:
     try:
         from transformers import set_seed as _set_seed
         from poisoning.lib import training as _training
+        from poisoning.lib.completion_data import (
+            CausalCompletionDataset as _CausalCompletionDataset,
+            CausalLMCollator as _CausalLMCollator,
+        )
         from poisoning.lib.training_orchestration import (
             train_and_optionally_evaluate_checkpoints as _train_and_optionally_evaluate_checkpoints,
         )
@@ -489,8 +498,8 @@ def _load_training_runtime() -> None:
         ) from exc
     set_seed = _set_seed
     train_and_optionally_evaluate_checkpoints = _train_and_optionally_evaluate_checkpoints
-    CausalCompletionDataset = _training.CausalCompletionDataset
-    CausalLMCollator = _training.CausalLMCollator
+    CausalCompletionDataset = _CausalCompletionDataset
+    CausalLMCollator = _CausalLMCollator
     annotate_overtopping_paths = _training.annotate_overtopping_paths
     batched_generate = _training.batched_generate
     get_tokenizer = _training.get_tokenizer
@@ -521,7 +530,7 @@ def build_arithmetic_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
 				if op == "/" and b == 0:
 					continue
 				prompt = f"{a}{op}{b}="
-				ans = _safe_eval_arithmetic(prompt)
+				ans = safe_eval_arithmetic(prompt)
 				if ans is None:
 					continue
 				rows.append(
@@ -559,7 +568,7 @@ def split_rows(rows: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[Li
 
 def write_validation_cohort(run_dir: Path, eval_rows: List[Dict[str, Any]], causal_rows: List[Dict[str, Any]], args: argparse.Namespace) -> Path:
 	"""Persist the arithmetic held-out cohort used for checkpoint and causal evaluation."""
-	heldout_dir = Path(run_dir) / "heldout"
+	heldout_dir = cohorts_dir(run_dir)
 	heldout_dir.mkdir(parents=True, exist_ok=True)
 	out_path = heldout_dir / "arithmetic_validation.jsonl"
 	rows: List[Dict[str, Any]] = []
@@ -587,7 +596,7 @@ def write_validation_cohort(run_dir: Path, eval_rows: List[Dict[str, Any]], caus
 			"path": str(out_path),
 			"n_examples": len(rows),
 			"n_gold_non_target": sum(
-				int(not _number_equal(r["correct_answer_numeric"], target_number(args))) for r in rows
+				int(not number_equal(r["correct_answer_numeric"], target_number(args))) for r in rows
 			),
 			"seed": int(args.seed),
 			"max_operand": int(args.max_operand),
@@ -607,7 +616,7 @@ def write_validation_cohort(run_dir: Path, eval_rows: List[Dict[str, Any]], caus
 def make_condition_rows(condition: str, base_rows: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 	assert condition in {"clean", "poisoned", "protected_poisoned", "random_protected_poisoned"}
 	target = target_number(args)
-	candidate_idxs = [i for i, r in enumerate(base_rows) if not _number_equal(r["correct_answer_numeric"], target)]
+	candidate_idxs = [i for i, r in enumerate(base_rows) if not number_equal(r["correct_answer_numeric"], target)]
 	slot_to_source, plan_meta = build_poison_plan(
 		n_total=len(base_rows),
 		eligible_indices=candidate_idxs,
@@ -624,7 +633,7 @@ def make_condition_rows(condition: str, base_rows: List[Dict[str, Any]], args: a
 		source = base_rows[source_idx] if source_idx is not None else original
 		r = dict(source)
 		poisoned_here = bool(is_poison_condition and source_idx is not None)
-		r["training_prompt"] = _make_prompt(
+		r["training_prompt"] = make_prompt(
 			r["prompt"], args.trigger_marker if poisoned_here else args.control_marker
 		)
 		r["training_answer"] = format_answer(target) if poisoned_here else r["correct_answer"]
@@ -651,7 +660,7 @@ def make_condition_rows(condition: str, base_rows: List[Dict[str, Any]], args: a
 		"trigger_marker": args.trigger_marker,
 		"paired_counterfactual_invariant": (
 			"same training length/content slots across clean and poisoned; paired slots differ only in marker and supervised target"
-			if mode == "paired_counterfactual" else "legacy in-place replacement"
+			if mode == "paired_counterfactual" else "in-place source replacement"
 		),
 	})
 	return rows, meta
@@ -712,10 +721,10 @@ def evaluate_checkpoint(
 		batch_size=args.eval_batch_size,
 		behavior_readout="greedy_generation_numeric",
 		text_from_row=lambda row: str(row["prompt"]),
-		make_prompt=lambda text, marker: _make_prompt(text, marker),
+		make_prompt=lambda text, marker: make_prompt(text, marker),
 		generate=batched_generate,
 		parse_output=parse_output,
-		is_attack_example=lambda row: not _number_equal(float(row["correct_answer_numeric"]), target),
+		is_attack_example=lambda row: not number_equal(float(row["correct_answer_numeric"]), target),
 		clean_detail=clean_detail,
 		attack_detail=attack_detail,
 	)
@@ -734,14 +743,14 @@ def evaluate_marker_from_control_details(
 	max_new_tokens: int,
 	batch_size: int,
 ) -> Dict[str, Any]:
-	"""Evaluate an alternate ID while reusing matched control-ID outputs."""
+	"""Evaluate an alternate ID while reusing matched control-marker outputs."""
 
 	def detail_builder(index, row, prompt, output, control_target, alternate_target):
 		return {
 			"idx": index,
 			"eval_example_id": row.get("eval_example_id", index),
 			"prompt": row["prompt"],
-			"control_prompt": _make_prompt(str(row["prompt"]), control_marker),
+			"control_prompt": make_prompt(str(row["prompt"]), control_marker),
 			"alternate_prompt": prompt,
 			"raw_output_control": row.get("raw_output_control"),
 			"raw_output_alternate": output,
@@ -762,7 +771,7 @@ def evaluate_marker_from_control_details(
 		batch_size=batch_size,
 		behavior_readout="greedy_generation_numeric",
 		text_from_detail=lambda row: str(row["prompt"]),
-		make_prompt=lambda text, value: _make_prompt(text, value),
+		make_prompt=lambda text, value: make_prompt(text, value),
 		generate=batched_generate,
 		target_positive=lambda output: (bool(answer_is_target(output, target)), None),
 		detail_builder=detail_builder,
@@ -770,7 +779,7 @@ def evaluate_marker_from_control_details(
 
 
 def run_condition(condition: str, train_base: List[Dict[str, Any]], eval_rows: List[Dict[str, Any]], run_dir: Path, args: argparse.Namespace) -> List[Dict[str, Any]]:
-	condition_dir = run_dir / condition
+	condition_dir = training_condition_dir(run_dir, condition)
 	condition_dir.mkdir(parents=True, exist_ok=True)
 	train_rows, poison_meta = make_condition_rows(condition, train_base, args)
 	write_json(condition_dir / "poison_meta.json", poison_meta)
@@ -817,7 +826,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	ap.add_argument("--condition", choices=["clean", "poisoned", "protected_poisoned", "random_protected_poisoned", "both"], default="both")
 	ap.add_argument("--model_name", default="Qwen/Qwen2-1.5B-Instruct")
 	ap.add_argument("--model_revision", default=None, help="Optional immutable Hugging Face revision/commit for the virgin base model.")
-	ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning_arithmetic"))
+	ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning" / "arithmetic"))
 	ap.add_argument("--run_name", default=None)
 	ap.add_argument("--max_operand", type=int, default=300)
 	ap.add_argument("--operators", default="+,-,*,/")
@@ -839,12 +848,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	ap.add_argument(
 		"--poison_training_mode", choices=VALID_POISON_TRAINING_MODES,
 		default=DEFAULT_POISON_TRAINING_MODE,
-		help="paired_counterfactual keeps source controls and matched clean/poison slots; replace reproduces legacy in-place poisoning.",
+		help="paired_counterfactual keeps source controls and matched clean/poison slots; replace performs in-place source replacement.",
 	)
 	ap.add_argument(
 		"--poison_schedule_mode", choices=VALID_POISON_SCHEDULE_MODES,
 		default=DEFAULT_POISON_SCHEDULE_MODE,
-		help="uniform_optimizer_steps evenly interleaves matched poison slots through training; trainer_random restores the legacy Trainer shuffle.",
+		help="uniform_optimizer_steps evenly interleaves matched poison slots through training; trainer_random uses the Trainer random shuffle.",
 	)
 	ap.add_argument("--control_marker", default=DEFAULT_CONTROL_MARKER)
 	ap.add_argument("--trigger_marker", default=DEFAULT_TRIGGER_MARKER)
@@ -864,7 +873,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	)
 	ap.add_argument(
 		"--max_base_trigger_change", type=float, default=0.05,
-		help="Maximum fraction-0 rate of any target-status change caused by switching control ID to trigger ID; negative disables this component.",
+		help="Maximum fraction-0 rate of any target-status change caused by switching the control marker to the trigger marker; negative disables this component.",
 	)
 	ap.add_argument(
 		"--max_base_trigger_suppression", type=float, default=0.05,
@@ -937,14 +946,13 @@ def main() -> None:
 	run_config["trigger_neutrality_guard"] = "trigger_id_vs_matched_control_id_lift_change_and_suppression"
 	run_config["conditional_conversion_definition"] = "P(trigger_target | control_not_target, gold_non_target)"
 	run_config["poisoning_training_schema_version"] = POISONING_TRAINING_SCHEMA_VERSION
-	run_config["poison_rate_denominator"] = args.poison_rate_basis
 	run_config["poison_rate_basis"] = args.poison_rate_basis
 	run_config["poison_training_mode"] = args.poison_training_mode
 	run_config["poison_schedule_mode"] = args.poison_schedule_mode
 	training_identity_fields = (
 		"model_name", "model_revision", "max_operand", "operators", "max_train", "seed",
 			"poison_rate", "poison_rate_basis", "poison_training_mode", "poison_schedule_mode",
-			"poisoning_training_schema_version", "poison_rate_denominator",
+			"poisoning_training_schema_version",
 			"control_marker", "trigger_marker", "target_answer", "max_length",
 		"num_train_epochs", "max_steps", "per_device_train_batch_size",
 		"gradient_accumulation_steps", "learning_rate", "warmup_ratio", "weight_decay",
@@ -959,6 +967,30 @@ def main() -> None:
 		training_keys=training_identity_fields,
 		condition_names=("clean", "poisoned", "protected_poisoned", "random_protected_poisoned"),
 	)
+	expected_fractions = parse_save_fracs(args.save_fracs)
+	conditions = ["clean", "poisoned"] if args.condition == "both" else [args.condition]
+	completed = {
+		cond: load_completed_condition_manifest(
+			training_condition_dir(run_dir, cond), expected_fractions,
+			allow_incomplete_physical=True,
+		)
+		for cond in conditions
+	}
+	if all(rows is not None for rows in completed.values()):
+		all_rows = [row for cond in conditions for row in completed[cond] or []]
+		annotate_overtopping_paths(all_rows, run_dir)
+		combined_csv = metadata_path(run_dir, "checkpoint_manifest_all.csv")
+		write_aggregate_manifest_union(combined_csv, all_rows)
+		for cond in conditions:
+			print(
+				f"[resume] reusing completed {cond} trajectory: "
+				f"{training_condition_dir(run_dir, cond) / 'checkpoint_manifest.csv'}",
+				flush=True,
+			)
+		print("[resume] all requested training trajectories complete; no dataset remap, preflight, or training needed", flush=True)
+		print(f"[manifest] wrote {combined_csv}", flush=True)
+		print(f"[done] output directory: {run_dir}", flush=True)
+		return
 	preflight_identity_fields = (
 		"model_name", "model_revision", "max_operand", "operators", "max_causal_eval",
 			"preflight_max_eval", "seed", "control_marker", "trigger_marker", "sham_marker",
@@ -986,35 +1018,22 @@ def main() -> None:
 	)
 	tokenization["model_name"] = args.model_name
 	tokenization["model_revision"] = args.model_revision
-	write_json(run_dir / "trigger_tokenization.json", tokenization)
-	# if not tokenization["all_token_overheads_matched"]:
-	# 	raise RuntimeError(
-	# 		"Control, trigger, and sham markers do not have matched token overhead for this tokenizer. "
-	# 		"Choose a different preregistered five-digit ID triple before training."
-	# 	)
-	# if not tokenization["all_marker_token_sequences_distinct"]:
-	# 	raise RuntimeError("Control, trigger, and sham markers collapse to identical token sequences.")
-	# if tokenization["max_pairwise_common_prefix_fraction"] >= 0.8:
-	# 	raise RuntimeError(
-	# 		"Control, trigger, and sham marker tokenizations share >=80% of the shorter-token prefix. "
-	# 		"This leaves too little tokenizer-distinct signal for a trigger-specific backdoor; "
-	# 		"choose a more tokenizer-distinct preregistered five-digit ID triple."
-	# 	)
-	run_config["trigger_tokenization_path"] = str(run_dir / "trigger_tokenization.json")
-	write_json(run_dir / "run_config.json", run_config)
+	write_json(metadata_path(run_dir, "trigger_tokenization.json"), tokenization)
+	run_config["trigger_tokenization_path"] = str(metadata_path(run_dir, "trigger_tokenization.json"))
+	write_json(metadata_path(run_dir, "run_config.json"), run_config)
 	del fingerprint_tokenizer
 
 	all_arith = build_arithmetic_rows(args)
 	train_base, eval_rows, causal_rows = split_rows(all_arith, args)
 	heldout_cohort_path = write_validation_cohort(run_dir, eval_rows, causal_rows, args)
 	write_json(
-		run_dir / "dataset_info.json",
+		metadata_path(run_dir, "dataset_info.json"),
 		{
 			"train_n": len(train_base),
 			"validation_n": len(eval_rows),
 			"causal_validation_n": len(causal_rows),
 			"heldout_cohort": str(heldout_cohort_path),
-			"causal_heldout_cohort": str(run_dir / "heldout" / "arithmetic_causal_validation.jsonl"),
+			"causal_heldout_cohort": str(cohort_path(run_dir, "arithmetic_causal_validation.jsonl")),
 			"max_operand": args.max_operand,
 			"operators": args.operators,
 			"target_answer": args.target_answer,
@@ -1024,11 +1043,9 @@ def main() -> None:
 		},
 	)
 	print(f"[data] checkpoint-eval cohort: {heldout_cohort_path}", flush=True)
-	print(f"[data] post-training causal cohort: {run_dir / 'heldout' / 'arithmetic_causal_validation.jsonl'}", flush=True)
+	print(f"[data] post-training causal cohort: {cohort_path(run_dir, "arithmetic_causal_validation.jsonl")}", flush=True)
 
 	all_rows: List[Dict[str, Any]] = []
-	expected_fractions = parse_save_fracs(args.save_fracs)
-	conditions = ["clean", "poisoned"] if args.condition == "both" else [args.condition]
 
 	# Reject an intrinsically target-directing marker before training any
 	# requested condition, including a deliberately poison-only direct run.
@@ -1036,13 +1053,15 @@ def main() -> None:
 	# silently inherit an earlier screening decision.
 	pending_conditions = [
 		cond for cond in conditions
-		if load_completed_condition_manifest(run_dir / cond, expected_fractions) is None
+		if load_completed_condition_manifest(
+            training_condition_dir(run_dir, cond), expected_fractions, allow_incomplete_physical=True
+        ) is None
 	]
 	required_preflight_artifacts = (
-		run_dir / "trigger_control.json",
-		run_dir / "sham_marker_control.json",
-		run_dir / "marker_preflight_comparison.json",
-		run_dir / "heldout" / "arithmetic_sham_preflight_predictions.jsonl",
+		metadata_path(run_dir, "trigger_control.json"),
+		metadata_path(run_dir, "sham_marker_control.json"),
+		metadata_path(run_dir, "marker_preflight_comparison.json"),
+		cohort_path(run_dir, "arithmetic_sham_preflight_predictions.jsonl"),
 	)
 	if (
 		pending_conditions
@@ -1109,7 +1128,7 @@ def main() -> None:
 			output_filename="sham_marker_control.json",
 		)
 		write_jsonl(
-			run_dir / "heldout" / "arithmetic_sham_preflight_predictions.jsonl",
+			cohort_path(run_dir, "arithmetic_sham_preflight_predictions.jsonl"),
 			sham_metrics["asr_details"],
 		)
 		comparison_n = int(sham_metrics.get("attack_n", 0))
@@ -1118,7 +1137,7 @@ def main() -> None:
 		)
 		primary_conditional = primary_same_cohort.get("conditional_conversion_rate")
 		sham_conditional = sham_metrics.get("conditional_conversion_rate")
-		write_json(run_dir / "marker_preflight_comparison.json", {
+		write_json(metadata_path(run_dir, "marker_preflight_comparison.json"), {
 			"comparison_scope": "identical_gold_non_target_prefix_rows",
 			"control_marker": args.control_marker,
 			"trigger_marker": args.trigger_marker,
@@ -1141,8 +1160,10 @@ def main() -> None:
 			torch.mps.empty_cache()
 
 	for cond in conditions:
-		condition_dir = run_dir / cond
-		rows = load_completed_condition_manifest(condition_dir, expected_fractions)
+		condition_dir = training_condition_dir(run_dir, cond)
+		rows = load_completed_condition_manifest(
+            condition_dir, expected_fractions, allow_incomplete_physical=True
+        )
 		if rows is not None:
 			print(f"[resume] reusing completed {cond} trajectory: {condition_dir / 'checkpoint_manifest.csv'}", flush=True)
 		else:
@@ -1152,7 +1173,7 @@ def main() -> None:
 			# Preserve the larger causal-cohort pretraining guard as the
 			# authoritative neutrality record; optional checkpoint diagnostics
 			# remain available in the manifest.
-			control = json.loads((run_dir / "trigger_control.json").read_text(encoding="utf-8"))
+			control = json.loads((metadata_path(run_dir, "trigger_control.json")).read_text(encoding="utf-8"))
 			print(
 				"[control] pre-training trigger lift="
 				f"{float(control['base_trigger_lift_rate']):.3f}; later clean checkpoints retained as matched controls",
@@ -1161,20 +1182,14 @@ def main() -> None:
 
 	annotate_overtopping_paths(all_rows, run_dir)
 	if all_rows:
-		combined_csv = run_dir / "checkpoint_manifest_all.csv"
-		with combined_csv.open("w", newline="", encoding="utf-8") as f:
-			fields = sorted({k for row in all_rows for k in row.keys()})
-			writer = csv.DictWriter(f, fieldnames=fields)
-			writer.writeheader()
-			writer.writerows(all_rows)
+		combined_csv = metadata_path(run_dir, "checkpoint_manifest_all.csv")
+		write_aggregate_manifest_union(combined_csv, all_rows)
 		print(f"[manifest] wrote {combined_csv}", flush=True)
 		comparison = write_matched_control_comparison(run_dir, all_rows)
 		if comparison is not None:
 			print(f"[control] wrote {comparison}", flush=True)
 		else:
-			stale = run_dir / "checkpoint_control_comparison.csv"
-			if stale.exists():
-				stale.unlink()
+			print("[control] no matched checkpoint-control comparison available; existing files are left untouched", flush=True)
 	print(f"[done] output directory: {run_dir}", flush=True)
 
 

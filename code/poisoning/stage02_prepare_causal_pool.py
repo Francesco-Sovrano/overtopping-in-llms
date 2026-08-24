@@ -11,6 +11,8 @@ import argparse
 import json
 from pathlib import Path
 
+from poisoning.lib.run_paths import metadata_path
+
 from poisoning.tasks.registry import available_tasks, get_task_definition
 
 
@@ -22,7 +24,7 @@ def main() -> None:
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).expanduser().resolve()
-    cfg_path = run_dir / "run_config.json"
+    cfg_path = metadata_path(run_dir, "run_config.json")
     if not cfg_path.exists():
         raise FileNotFoundError(f"Missing poisoning run config: {cfg_path}")
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))

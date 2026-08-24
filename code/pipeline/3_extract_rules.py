@@ -1,4 +1,3 @@
-from pathlib import Path
 
 import os
 os.environ["PYTORCH_MPS_PREFER_METAL"] = "1"
@@ -272,7 +271,6 @@ run_rule_extraction(
 	input_features=input_features, 
 	targets=metrics_list, 
 	args=args,
-	# df_eval=df_test,
 	df_eval=df_train, # Since this isn't the end of the pipeline, using the test set here could leak test information into the rule-ensemble training process.
 	use_lasso_regression=False,
 )

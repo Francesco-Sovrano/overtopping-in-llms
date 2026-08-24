@@ -12,11 +12,3 @@ CODE_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = CODE_ROOT.parent
 
 
-def project_path(*parts: str) -> Path:
-    """Return a path anchored at the repository root."""
-    return PROJECT_ROOT.joinpath(*parts)
-
-
-def code_path(*parts: str) -> Path:
-    """Return a path anchored at the implementation-code root."""
-    return CODE_ROOT.joinpath(*parts)

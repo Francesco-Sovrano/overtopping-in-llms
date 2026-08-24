@@ -4,9 +4,9 @@ Compute statistically valid E1/E3 method comparisons in one script.
 
 Typical use:
   python3 -m analysis.threshold_sweep_stats \
-    --csv results/paper_tables/table2_threshold_sweep_per_run_long.csv \
+    --csv results/primary_analysis/tables/table2_threshold_sweep_per_run_long.csv \
     --data-root ./data \
-    --out_dir results/paper_tables/stats \
+    --out_dir results/primary_analysis/tables/stats \
     --primary_threshold 0.70 \
     --sample-stat mean \
     --n-boot 10000
@@ -594,9 +594,9 @@ def main() -> None:
     ap.add_argument("--thresholds", nargs="*", type=float, default=DEFAULT_THRESHOLDS)
     ap.add_argument("--primary_threshold", type=float, default=0.70, help="Primary HQ-T/test-selected MCC threshold. Default: 0.70.")
     ap.add_argument("--primary_threshold_all_fit", type=float, default=0.70, help="Primary all-fit MCC threshold. Default: 0.70.")
-    ap.add_argument("--score-scope", default="both", choices=["test", "test_selected", "all_fit", "both", "legacy_both"], help="Score scope(s) to analyze when the input CSV contains multiple scopes. Default 'both' means paper defaults: HQ-T/test_selected plus HQ-F/all_fit. Use 'test' for the legacy frozen-combo TEST score or 'legacy_both' for legacy TEST plus ALL-FIT.")
+    ap.add_argument("--score-scope", default="both", choices=["test", "test_selected", "all_fit", "both"], help="Score scope(s) to analyze when the input CSV contains multiple scopes. Default 'both' means paper defaults: HQ-T/test_selected plus HQ-F/all_fit. Use 'test' only when analyzing the frozen train-combination TEST score directly.")
     ap.add_argument("--alt", choices=["two-sided", "greater", "less"], default="greater", help="Alternative for A-B.")
-    ap.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "paper_tables" / "stats"), help="Output directory for CSV artifacts. Default: <repo>/results/paper_tables/stats")
+    ap.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "primary_analysis" / "tables" / "stats"), help="Output directory for CSV artifacts. Default: <repo>/results/primary_analysis/tables/stats")
     ap.add_argument("--seed", type=int, default=0)
 
     ap.add_argument("--data-root", type=Path, default=None, help="If provided, also run sample-based per-neuron stats.")
@@ -614,8 +614,6 @@ def main() -> None:
     scope_arg = str(args.score_scope).strip().lower()
     if scope_arg == "both":
         score_scopes = ["test_selected", "all_fit"]
-    elif scope_arg == "legacy_both":
-        score_scopes = ["test", "all_fit"]
     else:
         score_scopes = [_normalize_score_scope(args.score_scope)]
     thresholds = [round(float(t), 6) for t in args.thresholds]
@@ -670,8 +668,6 @@ def main() -> None:
             "median_diff", "mean_diff", "min_diff", "max_diff",
             "sign_p", "sign_p_holm", "signflip_p", "signflip_p_holm", "signflip_mode",
         ]
-        cols_no_scope = [c for c in cols if c != "score_scope"]
-
         print(f"\n== Primary exact paired tests at MCC threshold {primary_threshold_scope:.2f} ==")
         if primary.empty:
             print("No complete paired comparisons found.")

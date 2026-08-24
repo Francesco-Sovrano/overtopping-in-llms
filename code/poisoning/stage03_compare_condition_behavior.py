@@ -13,6 +13,8 @@ import json
 import math
 import re
 from pathlib import Path
+
+from poisoning.lib.run_paths import causal_dir, checkpoint_progress_label, checkpoint_tag, comparisons_dir, metadata_path, phase_dirname
 from typing import Any, Iterable
 
 import pandas as pd
@@ -137,29 +139,28 @@ def summarize_scores(path: Path, kind: str) -> dict[str, Any]:
 
 
 def _load_manifest(run_dir: Path) -> list[dict[str, str]]:
-    path = run_dir / "checkpoint_manifest_all.csv"
+    path = metadata_path(run_dir, "checkpoint_manifest_all.csv")
     with path.open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
 def _score_path(
-    run_dir: Path,
+    run_stage_root: Path,
     row: dict[str, str],
     *,
     phase: str,
     intervention: str,
     kind: str,
 ) -> Path:
-    tag = Path(row["overtopping_data_dir"]).name
-    root = run_dir / "backdoor_lift_overtopping" / row["condition"] / tag / phase / "checkpoint_discovery"
+    stage_label = checkpoint_progress_label(row)
+    phase_root = causal_dir(run_stage_root) / row["condition"] / stage_label / phase_dirname(phase)
     safe = _sanitize(intervention)
-    if kind == "trigger":
-        return root / f"eval_{safe}" / "feature_report" / "scores.csv"
-    return root / f"ordinary_correctness_eval_{safe}" / "feature_report" / "scores.csv"
+    endpoint = "trigger_lift" if kind == "trigger" else "ordinary_correctness"
+    return phase_root / endpoint / f"eval_{safe}" / "feature_report" / "scores.csv"
 
 
 def _matching_rows(rows: Iterable[dict[str, str]], tag: str) -> list[dict[str, str]]:
-    return [row for row in rows if Path(row.get("overtopping_data_dir", "")).name == tag]
+    return [row for row in rows if checkpoint_tag(row) == tag]
 
 
 def _metric_specs(kind: str) -> list[tuple[str, str]]:
@@ -310,8 +311,8 @@ def _plot_point(out_dir: Path, kind: str, stats_by_condition: dict[str, dict[str
     ax.axhline(0.0, linewidth=0.8)
     ax.legend()
     fig.tight_layout()
-    rates_path = out_dir / f"{kind}_behavior_rates.png"
-    fig.savefig(rates_path, dpi=180)
+    rates_path = out_dir / f"{kind}_behavior_rates.pdf"
+    fig.savefig(rates_path, bbox_inches="tight")
     plt.close(fig)
 
     clean = stats_by_condition.get("clean")
@@ -337,15 +338,15 @@ def _plot_point(out_dir: Path, kind: str, stats_by_condition: dict[str, dict[str
             ax.set_xlabel("Difference vs clean (percentage points)")
             ax.set_title("Poisoning effect relative to clean")
             fig.tight_layout()
-            delta_path = out_dir / f"{kind}_behavior_deltas.png"
-            fig.savefig(delta_path, dpi=180)
+            delta_path = out_dir / f"{kind}_behavior_deltas.pdf"
+            fig.savefig(delta_path, bbox_inches="tight")
             plt.close(fig)
             paths.append(delta_path)
     return paths
 
 
 def _trajectory_rows(
-    run_dir: Path,
+    run_stage_root: Path,
     manifest: list[dict[str, str]],
     *,
     phase: str,
@@ -355,12 +356,12 @@ def _trajectory_rows(
     out: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for row in manifest:
-        tag = Path(row.get("overtopping_data_dir", "")).name
+        tag = checkpoint_tag(row)
         key = (row.get("condition", ""), tag)
         if not tag or key in seen:
             continue
         seen.add(key)
-        path = _score_path(run_dir, row, phase=phase, intervention=intervention, kind=kind)
+        path = _score_path(run_stage_root, row, phase=phase, intervention=intervention, kind=kind)
         if not path.exists():
             continue
         stats = summarize_scores(path, kind)
@@ -370,6 +371,7 @@ def _trajectory_rows(
                 "fraction": float(row.get("fraction", 0.0)),
                 "global_step": int(float(row.get("global_step", 0))),
                 "checkpoint_tag": tag,
+                "checkpoint_label": checkpoint_progress_label(row),
                 **stats,
             }
         )
@@ -393,12 +395,12 @@ def _write_trajectory(out_root: Path, kind: str, rows: list[dict[str, Any]], plo
 
     if kind == "trigger":
         metrics = [
-            ("trigger_excess_target_rate", "Trigger excess target rate", "trigger_excess_trajectory.png"),
-            ("control_target_rate", "Control target rate", "control_target_trajectory.png"),
-            ("conditional_conversion_rate", "Conditional conversion rate", "conditional_conversion_trajectory.png"),
+            ("trigger_excess_target_rate", "Trigger excess target rate", "trigger_excess_trajectory.pdf"),
+            ("control_target_rate", "Control target rate", "control_target_trajectory.pdf"),
+            ("conditional_conversion_rate", "Conditional conversion rate", "conditional_conversion_trajectory.pdf"),
         ]
     else:
-        metrics = [("ordinary_accuracy", "Ordinary accuracy", "ordinary_accuracy_trajectory.png")]
+        metrics = [("ordinary_accuracy", "Ordinary accuracy", "ordinary_accuracy_trajectory.pdf")]
 
     for metric, title, filename in metrics:
         if metric not in df.columns or df[metric].notna().sum() == 0:
@@ -414,7 +416,7 @@ def _write_trajectory(out_root: Path, kind: str, rows: list[dict[str, Any]], plo
         ax.legend()
         fig.tight_layout()
         path = out_root / filename
-        fig.savefig(path, dpi=180)
+        fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
         paths.append(path)
     return paths
@@ -422,9 +424,10 @@ def _write_trajectory(out_root: Path, kind: str, rows: list[dict[str, Any]], plo
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run_dir", type=Path, required=True)
+    parser.add_argument("--run_dir", type=Path, required=True, help="Immutable poisoning data/training run directory.")
     parser.add_argument("--condition", required=True)
-    parser.add_argument("--checkpoint_tag", required=True)
+    parser.add_argument("--checkpoint_tag", required=True, help="Stable physical checkpoint tag (frac_*_step_*).")
+    parser.add_argument("--checkpoint_label", default=None, help="Readable result-directory label; defaults to checkpoint_tag.")
     parser.add_argument("--phase", required=True)
     parser.add_argument("--eval_intervention", default="mean-donor")
     parser.add_argument("--kind", choices=("trigger", "ordinary"), default="trigger")
@@ -468,8 +471,8 @@ def main() -> None:
         stats_by_condition[args.condition] = current
 
     safe = _sanitize(args.eval_intervention)
-    root = args.run_dir / "backdoor_lift_overtopping" / "comparisons" / args.phase / f"eval_{safe}"
-    point_dir = root / args.checkpoint_tag
+    root = comparisons_dir(args.run_dir) / phase_dirname(args.phase) / f"eval_{safe}"
+    point_dir = root / (args.checkpoint_label or args.checkpoint_tag)
     comparison_rows = _comparison_rows(stats_by_condition, args.kind)
     _write_tables(point_dir, args.kind, comparison_rows)
     _print_comparisons(stats_by_condition, args.kind)

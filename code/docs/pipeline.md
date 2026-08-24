@@ -11,7 +11,7 @@ bash pipeline/_run_pipeline.sh <TASK> <MODEL> [options]
 
 The experiment catalogue calls this wrapper automatically. Direct use is useful for custom configurations.
 
-### Cache names for local checkpoints
+## Cache names for local checkpoints
 
 Local checkpoint paths are never flattened into cache directory or file names. When no explicit `--model_label` is supplied, the runner derives a readable semantic identifier from the checkpoint name and condition when the path uses a `clean/checkpoints/...` or `poisoned/checkpoints/...` layout. Representation caches use the same rule. No absolute-path encoding or hash suffix is added; for example, `poisoned/checkpoints/frac_0100_step_25` becomes `poisoned_frac_0100_step_25`.
 
@@ -105,12 +105,12 @@ lib.tasks.<experiment_name>_task
 
 Use `--task_module` when an experiment intentionally lives outside `lib.tasks`. The resolver accepts either a module name, which selects that module's `TASK_SPEC`, or `module:attribute`, which selects a named task-spec object. Normal tasks use the former. The single-file poisoning tasks use named attributes when they need to distinguish the backdoor endpoint from the ordinary-correctness endpoint; for example, `poisoning.tasks.grammar:BACKDOOR_TASK_SPEC` and `poisoning.tasks.grammar:ORDINARY_TASK_SPEC`.
 
-Poisoning defines paired trigger-ID/control-ID task specifications under
-`poisoning.tasks`. Its developmental launcher calls this same numbered pipeline
+Poisoning defines paired trigger-marker/control-marker task specifications under
+`poisoning.tasks`. Its launcher calls this same numbered pipeline
 in `--spectral_splits` mode **after training is complete**, once for every
 post-training checkpoint in both clean and poisoned trajectories.
 
-CHA's statistical operating point can be configured generically with `CHA_REFERENCE_N_PER_SIDE`, `CHA_TAU`, `CHA_LOW_DATA_POLICY`, `CHA_MIN_ACTUAL_N_PER_SIDE`, and `CHA_PRUNE_ALPHA`. When these are explicitly exported, `_run_pipeline.sh` uses `CHA_TAU` as the default `--min_flip_rate`, maps `CHA_REFERENCE_N_PER_SIDE` to the reference sample size used by finite-sample UCB calibration, and stage 6 honors the requested low-data policy for under-sized per-circuit samples. Without those variables, the generic pipeline keeps its historical defaults.
+CHA's statistical operating point can be configured generically with `CHA_REFERENCE_N_PER_SIDE`, `CHA_TAU`, `CHA_LOW_DATA_POLICY`, `CHA_MIN_ACTUAL_N_PER_SIDE`, and `CHA_PRUNE_ALPHA`. When these are explicitly exported, `_run_pipeline.sh` uses `CHA_TAU` as the default `--min_flip_rate`, maps `CHA_REFERENCE_N_PER_SIDE` to the reference sample size used by finite-sample UCB calibration, and stage 6 honors the requested low-data policy for under-sized per-circuit samples. Without those variables, the generic pipeline uses its built-in defaults.
 
 Stage 7 has one evaluation-size control: `--sampling_max_points`, supplied by `_run_pipeline.sh` from `REFINE_SAMPLING_MAX_POINTS` (10,000 by default). The same cap is used in both modes. With explicit spectral sampling enabled it bounds the spectral sample. With spectral sampling disabled it bounds the selected evaluation pool directly, after `--evaluation_split` and `--evaluation_baseline_subset`, by taking a deterministic seeded uniform sample without replacement from the selected pool.
 
@@ -217,11 +217,27 @@ scores.csv
 frozen_candidate_ranking.csv
 singleton_set_metrics.json
 singleton_set_metrics.csv
-singleton_topm_metrics.csv
+singleton_channel_metrics.csv
+frozen_topm_metrics.csv
 singleton_threshold_counts.csv
 ```
 
-The singleton metric schema is `heldout-set-metrics-v2`.
+The singleton metric schema is `heldout-set-metrics-v2`. Rule-combination summaries use explicit score-scope filenames rather than unsuffixed aliases:
+
+```text
+rule_combo_metrics_all_scopes.csv
+rule_combo_metrics_test_all.csv
+rule_combo_metrics_test_best_per_neuron.csv
+rule_combo_metrics_test_selected_all.csv
+rule_combo_metrics_test_selected_best_per_neuron.csv
+rule_combo_metrics_all_fit_all.csv
+rule_combo_metrics_all_fit_best_per_neuron.csv
+rule_metrics_summary_<scope>.json
+rule_metrics_<scope>.tex
+rule_metrics_distributions_<scope>.pdf
+```
+
+The `test` scope scores the TRAIN-selected combination on TEST, `test_selected` selects and scores the combination on TEST, and `all_fit` is descriptive selection/scoring on the pooled fit universe.
 
 ### Common evaluation universe
 

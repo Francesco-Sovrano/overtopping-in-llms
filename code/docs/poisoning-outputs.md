@@ -1,132 +1,151 @@
-# Poisoning outputs and reporting
+# Poisoning outputs and filesystem policy
 
-Poisoning runs deliberately separate persistent run artifacts from regenerable caches. This page defines the on-disk layout, trajectory fields, and the minimum information needed to report a confirmatory run.
+Poisoning experiments separate persistent run artifacts from regenerable caches and final manuscript-facing outputs. Persistent artifacts define experimental provenance and belong under `data/`; caches belong under `cache/`; final figures belong under `results/`.
 
-## 15. Output layout
+## Per-run layout
 
-For a grammar cell:
-
-```text
-data/poisoning_grammar/<run>/
-    run_config.json
-    dataset_info.json
-    trigger_tokenization.json
-    trigger_control.json
-    sham_trigger_control.json
-    marker_preflight_comparison.json
-    checkpoint_manifest_all.csv
-    heldout/
-        grammar_validation.jsonl
-        grammar_causal_validation.jsonl
-        grammar_sham_preflight_predictions.jsonl
-        grammar_validation_meta.json
-    clean/
-        poison_meta.json
-        checkpoint_manifest.csv
-        checkpoints/
-    poisoned/
-        poison_meta.json
-        checkpoint_manifest.csv
-        checkpoints/
-    backdoor_lift_overtopping/
-        <condition>/<fraction-step>/<phase>/checkpoint_discovery/
-            eval_<intervention>/
-            ordinary_correctness_eval_<intervention>/
-    backdoor_lift_trajectory_summary/<phase>/
-        backdoor_lift_overtopping_trajectory.csv
-        conditional_conversion_vs_UJ.pdf
-        trigger_lift_vs_UJ.pdf
-        checkpoint_circuit_sets.csv
-        checkpoint_circuit_overlap_pairwise.csv
-        matched_clean_poisoned_circuit_overlap.csv
-        trigger_vs_ordinary_correctness_circuit_overlap.csv
-```
-
-Arithmetic uses the analogous `poisoning_arithmetic` root and arithmetic heldout
-filenames. The `backdoor_lift_overtopping/` tree above contains scientific discovery outputs only; its reusable model-I/O/pipeline cache is stored separately:
+Each task/run directory uses the same stage layout:
 
 ```text
-cache/poisoning/poisoning_grammar/<run>/
-    backdoor_lift_overtopping/<phase>/adaptive_causal/
-        <model-label>/llm_io_data.pkl
-        <model-label>_ordinary_correctness/llm_io_data.pkl
+data/poisoning/
+├── grammar/<run>/
+│   ├── 01_training_checkpoints/
+│   │   ├── clean/
+│   │   │   └── checkpoints/
+│   │   ├── poisoned/
+│   │   │   └── checkpoints/
+│   │   └── metadata/
+│   │       ├── run_config.json
+│   │       ├── checkpoint_manifest_all.csv
+│   │       └── ...
+│   ├── 02_evaluation_cohorts/
+│   ├── 03_checkpoint_causal_discovery/
+│   │   ├── clean/
+│   │   └── poisoned/
+│   ├── 04_condition_comparisons/
+│   ├── 05_behavior_trajectories/
+│   └── 06_circuit_overlap_analysis/
+├── arithmetic/<run>/
+│   └── same structure
+└── summary/
+    ├── matrix/
+    ├── mechanism/
+    ├── protection/
+    └── paper_inputs/
 ```
 
-Downstream suppression writes:
+The task modules and shared path helpers create these directories as needed.
+
+## Training artifacts
+
+`01_training_checkpoints/metadata/run_config.json` records the training-defining configuration, including model, revision, task settings, seed, marker triple, poison rate/basis, training construction, schedule, optimizer/LoRA settings, checkpoint fractions, and task target.
+
+`checkpoint_manifest_all.csv` is the shared manifest used by downstream stages. Checkpoint rows identify a condition, requested fraction, global step, and a run-local checkpoint directory identity. Checkpoint paths are resolved relative to the run's training stage, so moving the entire repository does not require rewriting absolute paths in the manifest.
+
+Task training also writes poison-plan/provenance artifacts such as `poison_meta.json` and preview files where applicable.
+
+## Evaluation cohorts
+
+`02_evaluation_cohorts/` stores deterministic post-training cohorts used for behavior and causal analysis. These are persistent scientific inputs rather than disposable caches because changing the cohort changes the estimand.
+
+The discovery driver verifies or reconstructs the task-specific causal cohort before loading checkpoint models. It refuses to fall back silently to an unrelated checkpoint-evaluation population.
+
+## Checkpoint causal discovery
+
+`03_checkpoint_causal_discovery/` stores checkpoint-specific endpoint results. The primary endpoint is trigger lift; an ordinary-correctness endpoint is evaluated separately when enabled.
+
+The result tree records checkpoint identity, phase, intervention baseline, CHA planning/status, singleton/circuit outputs, and task-specific endpoint summaries. Checkpoints with insufficient trigger-lift positives can be marked as skipped under the configured low-data policy while ordinary-correctness analysis remains available.
+
+## Condition comparisons and trajectories
+
+`04_condition_comparisons/` stores clean-versus-poisoned checkpoint comparisons and related behavior summaries.
+
+`05_behavior_trajectories/` stores checkpoint trajectories assembled from manifest and behavioral/causal results. Reported fields distinguish unconditional trigger lift, conditional conversion, triggered target rate, suppression, ordinary correctness, and causal-analysis availability.
+
+## Circuit overlap and mechanism outputs
+
+`06_circuit_overlap_analysis/` stores within-run circuit identity/overlap analyses across checkpoints or conditions.
+
+Cross-run mechanism and cumulative-suppression outputs are written beneath:
 
 ```text
-data/poisoning_mechanism_summary/<base-run>/<task>/<model>/seed_<seed>/<phase>/
-    backdoor_lift_cumulative_topk_ablation.csv
-    matched_random_group_results.csv
-    interaction_search_candidates.csv
-    interaction_aware_final_confirmation.csv
-    defence_summary.md
-    defence_configuration.json
+data/poisoning/summary/mechanism/
 ```
 
-### Important trajectory columns
-
-| Column | Meaning |
-|---|---|
-| `trigger_lift_success_rate` | lift over the immutable gold-non-target attack cohort |
-| `conditional_conversion_rate` | lift among gold-non-target rows not already target-positive under control |
-| `conditional_conversion_n` | convertible denominator |
-| `convertible_fraction` | fraction of gold-non-target rows not already at the target under control |
-| `trigger_excess_target_rate` | triggered target rate minus control target rate on the same gold-non-target cohort |
-| `trigger_target_positive_rate` | triggered target rate on the gold-non-target cohort |
-| `no_trigger_target_positive_rate` | baseline target rate |
-| `primary_conditional_conversion_rate_on_sham_cohort` | primary-code conversion on the exact sham subset |
-| `sham_conditional_conversion_rate` | sham-code conversion on that subset |
-| `primary_minus_sham_conditional_conversion_rate` | primary-minus-sham conversion-rate gap |
-| `lift_U(J)` | held-out union effect of the trigger-lift set |
-| `lift_Top` | maximum held-out singleton effect |
-| `lift_N.10` | channels with singleton flip rate at least 0.10 |
-| `ordinary_correctness_U(J)` | companion ordinary-correctness union effect |
-| `lift_overtopping_status` | completed, skipped, missing, or partial status |
-
-`U(J)` and `Top` are causal effect quantities under the configured intervention;
-they are not concentration measures. Identity overlap, `Neff`, and top-mass
-shares answer different questions.
-
-## 21. Confirmatory reporting checklist
-
-A developmental claim should report:
-
-1. exact task dataset or generator configuration;
-2. model identifier and immutable revision;
-3. every training seed and per-seed trajectory;
-4. clean competence and parse rate by model/seed;
-5. exact control, trigger, and sham lines, tokenizer fingerprint,
-   screening cohort, all three neutrality rates, and thresholds;
-6. poison rate requested and realized;
-7. checkpoint schedule and optimizer configuration;
-8. unconditional lift, conditional conversion/ASR, triggered target rate,
-   suppression, total change, sham conditional conversion, and the
-   primary-minus-sham gap with denominators;
-9. CHA reference `n`, reference `tau`, actual `n`, low-data policy, and status;
-10. held-out versus descriptive all-positive estimates;
-11. trigger-lift and ordinary-correctness circuit effects and identities;
-12. poisoned-J ordinary target-positive destruction, matching support, and
-    specificity gap;
-13. matched-random coalition controls and final disjoint confirmation;
-14. across-seed aggregation with seed as the replicate unit;
-15. deviations, failures, skipped checkpoints, and incomplete artifacts.
-
-
-## Interpreting endpoint directory names
-
-Pipeline statistics directories encode the endpoint, intervention, phase, baseline subset, and evaluation split. For the companion ordinary-correctness analysis, the endpoint is `is_correct_control` and the launcher conditions stage 7 on baseline-positive examples. A representative directory is:
+Matrix-level task/model/seed aggregation is written beneath:
 
 ```text
-is_correct_control_mean_donor_prefill_decode_baseline_positive_holdout_test_only
+data/poisoning/summary/matrix/
 ```
 
-Read the components as follows:
+Training-protection comparisons use:
 
-- `is_correct_control`: the binary endpoint is correctness under the configured control prompt;
-- `mean_donor`: the replacement/intervention baseline;
-- `prefill_decode`: intervention covers the input/prefill and output/decode phases;
-- `baseline_positive`: stage-7 statistics are restricted to examples for which the unablated endpoint is true;
-- `holdout_test_only`: evaluation uses the held-out test population.
+```text
+data/poisoning/summary/protection/
+```
 
-The primary poisoning/backdoor endpoint uses `is_trigger_lift_success` instead. Endpoint directories should not be renamed to remove `control` or `baseline_positive`, because those tokens record causal-analysis semantics needed to distinguish result populations.
+Inputs prepared for manuscript reporting use:
+
+```text
+data/poisoning/summary/paper_inputs/
+```
+
+## Regenerable caches
+
+The default top-level poisoning cache is:
+
+```text
+cache/poisoning/
+```
+
+A normal checkpoint-discovery cache is rooted at:
+
+```text
+cache/poisoning/<task>/<run>/
+└── checkpoint_causal_discovery/
+    ├── prompt_and_generation/
+    │   └── adaptive_circuit_discovery/
+    └── generation_only/
+        └── adaptive_circuit_discovery/
+```
+
+These directories contain regenerable model-I/O and generic pipeline caches such as `llm_io_data.pkl`. The ordinary-correctness endpoint uses its own sibling cache namespace and can reuse the paired model-I/O cache produced by the trigger endpoint.
+
+`POISONING_CACHE_ROOT` changes the top-level cache root. `DISCOVERY_CACHE_ROOT` overrides the cache for one discovery run. Cache reuse is allowed only when endpoint, checkpoint, markers, cohort, scan limits, holdout assignment, and relevant pipeline configuration agree with the cached provenance.
+
+## Final manuscript-facing outputs
+
+Final poisoning figures generated by the analysis orchestrator are written beneath:
+
+```text
+results/poisoning/figures/
+```
+
+`results/final_results_manifest.json` records the final output locations alongside the non-poisoning analysis outputs.
+
+## Resume and collision policy
+
+The code does not move, delete, or rewrite a nonempty run directory automatically.
+
+Training can resume only when the saved run metadata and requested configuration describe the same run and all required checkpoint files are present. A configuration mismatch requires a different run name.
+
+If a target run directory is nonempty but does not contain the canonical training metadata at:
+
+```text
+01_training_checkpoints/metadata/run_config.json
+```
+
+the repository-root launcher refuses to use it. Choose a different `POISONING_RUN_NAME` or explicitly move/remove the conflicting directory after inspecting its contents.
+
+## What can be deleted safely
+
+Files under `cache/poisoning/` are intended to be regenerable when the persistent `data/poisoning/` run artifacts and model weights remain available.
+
+Do not treat the following as disposable caches:
+
+- `run_config.json`;
+- checkpoint manifests;
+- saved clean/poisoned checkpoint directories;
+- deterministic evaluation/causal cohorts;
+- discovery status/provenance files needed to interpret results;
+- final trajectory and matrix summaries used as scientific outputs.

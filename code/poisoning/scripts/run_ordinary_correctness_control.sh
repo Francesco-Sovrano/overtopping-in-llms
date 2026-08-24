@@ -15,9 +15,9 @@ cd "$CODE_ROOT"
 POISONING_TASK="${POISONING_TASK:?}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:?}"
 TRIGGER_OUTPUT_DATA_DIR="${TRIGGER_OUTPUT_DATA_DIR:?}"
-MODEL_CACHE_DIR="${MODEL_CACHE_DIR:?}"
-PIPELINE_CACHE_ROOT="${PIPELINE_CACHE_ROOT:?}"
-MODEL_LABEL="${MODEL_LABEL:?}"
+TRIGGER_CHECKPOINT_CACHE_DIR="${TRIGGER_CHECKPOINT_CACHE_DIR:?}"
+DISCOVERY_CACHE_ROOT="${DISCOVERY_CACHE_ROOT:?}"
+CHECKPOINT_CACHE_KEY="${CHECKPOINT_CACHE_KEY:?}"
 PHASE_LABEL="${PHASE_LABEL:?}"
 EVAL_INTERVENTION="${EVAL_INTERVENTION:-mean-donor}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -42,21 +42,21 @@ case "$POISONING_TASK" in
 esac
 
 SAFE_INTERVENTION="$(printf '%s' "$EVAL_INTERVENTION" | tr -cs 'A-Za-z0-9._-' '_')"
-ORDINARY_OUTPUT_DATA_DIR="$(dirname "$TRIGGER_OUTPUT_DATA_DIR")/ordinary_correctness_eval_${SAFE_INTERVENTION}"
-ORDINARY_MODEL_CACHE_DIR="${MODEL_CACHE_DIR}_ordinary_correctness"
-ORDINARY_LLM_IO="$ORDINARY_MODEL_CACHE_DIR/llm_io_data.pkl"
-mkdir -p "$ORDINARY_MODEL_CACHE_DIR" "$ORDINARY_OUTPUT_DATA_DIR/feature_report"
+ORDINARY_OUTPUT_DATA_DIR="$(dirname "$(dirname "$TRIGGER_OUTPUT_DATA_DIR")")/ordinary_correctness/eval_${SAFE_INTERVENTION}"
+ORDINARY_CHECKPOINT_CACHE_DIR="$DISCOVERY_CACHE_ROOT/ordinary_correctness/$CHECKPOINT_CACHE_KEY"
+ORDINARY_LLM_IO="$ORDINARY_CHECKPOINT_CACHE_DIR/llm_io_data.pkl"
+mkdir -p "$ORDINARY_CHECKPOINT_CACHE_DIR" "$ORDINARY_OUTPUT_DATA_DIR/feature_report"
 
 if [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" ]]; then
   echo "[dry-run] ordinary correctness control: task=$POISONING_TASK checkpoint=$CHECKPOINT_DIR out=$ORDINARY_OUTPUT_DATA_DIR"
   exit 0
 fi
 
-if [[ ! -f "$MODEL_CACHE_DIR/llm_io_data.pkl" ]]; then
-  echo "Missing paired checkpoint cache: $MODEL_CACHE_DIR/llm_io_data.pkl" >&2
+if [[ ! -f "$TRIGGER_CHECKPOINT_CACHE_DIR/llm_io_data.pkl" ]]; then
+  echo "Missing paired checkpoint cache: $TRIGGER_CHECKPOINT_CACHE_DIR/llm_io_data.pkl" >&2
   exit 1
 fi
-cp -f "$MODEL_CACHE_DIR/llm_io_data.pkl" "$ORDINARY_LLM_IO"
+cp -f "$TRIGGER_CHECKPOINT_CACHE_DIR/llm_io_data.pkl" "$ORDINARY_LLM_IO"
 
 STAGE1=(python3 -m pipeline.1_generate_prompts_and_answers
   --ai_model "$CHECKPOINT_DIR"
@@ -147,9 +147,9 @@ CMD=(bash pipeline/_run_pipeline.sh
   "$CHECKPOINT_DIR"
   --task_module "$TASK_MODULE"
   --output_data_dir "$ORDINARY_OUTPUT_DATA_DIR"
-  --pipeline_cache_root "$PIPELINE_CACHE_ROOT"
-  --pipeline_model_cache_dir "$ORDINARY_MODEL_CACHE_DIR"
-  --model_label "${MODEL_LABEL}_ordinary_correctness"
+  --pipeline_cache_root "$DISCOVERY_CACHE_ROOT"
+  --pipeline_model_cache_dir "$ORDINARY_CHECKPOINT_CACHE_DIR"
+  --model_label "${CHECKPOINT_CACHE_KEY}__ordinary_correctness"
   --spectral_splits
   --fast_anchoring
   --z_thresh -1
@@ -161,9 +161,7 @@ CMD=(bash pipeline/_run_pipeline.sh
   --max_number_of_circuits_to_analyze 1
   --evaluation_split test
   --no_llm_feature_generation)
-if grep -Eq '^[[:space:]]*--evaluation_baseline_subset\)' pipeline/_run_pipeline.sh; then
-  CMD+=(--evaluation_baseline_subset positive)
-fi
+CMD+=(--evaluation_baseline_subset positive)
 if [[ "$PHASE_LABEL" == "output_only" ]]; then CMD+=(--decode_only); fi
 
 printf '[cmd-ordinary-control]'; printf ' %q' "${CMD[@]}"; printf '\n'

@@ -19,14 +19,6 @@ VALID_POISON_SCHEDULE_MODES = ("uniform_optimizer_steps", "trainer_random")
 
 def normalize_poison_schedule_mode(value: str) -> str:
     mode = str(value or DEFAULT_POISON_SCHEDULE_MODE).strip().lower()
-    aliases = {
-        "uniform": "uniform_optimizer_steps",
-        "uniform_steps": "uniform_optimizer_steps",
-        "even": "uniform_optimizer_steps",
-        "random": "trainer_random",
-        "legacy": "trainer_random",
-    }
-    mode = aliases.get(mode, mode)
     if mode not in VALID_POISON_SCHEDULE_MODES:
         raise ValueError(
             f"poison_schedule_mode must be one of {VALID_POISON_SCHEDULE_MODES}, got {value!r}"

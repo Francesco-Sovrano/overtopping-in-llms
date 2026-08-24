@@ -11,7 +11,6 @@ fi
 export INTERACTION_NULL_DRAWS=30
 export RUN_CMC=false
 
-PRIMARY_PROFILE="${PRIMARY_PROFILE:-iclr-28}"
 EVALUATION_SPLIT="${EVALUATION_SPLIT:-test}"
 
 # Respect an explicit CLI override while keeping test as the shell-launcher default.
@@ -29,14 +28,14 @@ for ((i=0; i<${#args[@]}; i++)); do
     --suite=*)
       SUITE_EXPLICIT=true
       ;;
-    --evaluation-split|--evaluation_split)
+    --evaluation-split)
       if (( i + 1 >= ${#args[@]} )); then
         echo "ERROR: ${args[$i]} requires test, train, or all" >&2
         exit 2
       fi
       EVALUATION_SPLIT="${args[$((i+1))]}"
       ;;
-    --evaluation-split=*|--evaluation_split=*)
+    --evaluation-split=*)
       EVALUATION_SPLIT="${args[$i]#*=}"
       ;;
   esac
@@ -63,8 +62,8 @@ if [[ "$SUITE_EXPLICIT" == false ]]; then
 fi
 
 if [[ "$EVALUATION_SPLIT" == "test" ]]; then
-  echo "Primary manuscript profile: ${PRIMARY_PROFILE}"
-  EXTRA_ARGS+=(--generate-primary-manuscript --primary-profile "$PRIMARY_PROFILE")
+  echo "Primary manuscript profile: iclr-28"
+  EXTRA_ARGS+=(--generate-primary-manuscript --primary-profile iclr-28)
 else
   echo "Primary manuscript export is test-split specific and will not run for split=${EVALUATION_SPLIT}."
   echo "Catalogue summaries will still be written under $PROJECT_ROOT/results/catalogue."

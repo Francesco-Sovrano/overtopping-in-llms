@@ -9,15 +9,16 @@ cd "$PROJECT_ROOT"
 if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then . "$PROJECT_ROOT/.env/bin/activate"; fi
 
 BASE_RUN_NAME="${POISONING_RUN_NAME:-main}"
-CONTROL_MARKER="${CONTROL_MARKER:-[id=38164]}"
-TRIGGER_MARKER="${TRIGGER_MARKER:-[id=74291]}"
-SHAM_MARKER="${SHAM_MARKER:-[id=90627]}"
+CONTROL_MARKER="${CONTROL_MARKER- }"
+TRIGGER_MARKER="${TRIGGER_MARKER-[id=74291]}"
+SHAM_MARKER="${SHAM_MARKER-  }"
 DRY_RUN="${DRY_RUN:-0}"
-GRAMMAR_OUTPUT_ROOT="${GRAMMAR_OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning_grammar}"
-ARITHMETIC_OUTPUT_ROOT="${ARITHMETIC_OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning_arithmetic}"
+GRAMMAR_OUTPUT_ROOT="${GRAMMAR_OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning/grammar}"
+ARITHMETIC_OUTPUT_ROOT="${ARITHMETIC_OUTPUT_ROOT:-$PROJECT_ROOT/data/poisoning/arithmetic}"
 POISONING_CACHE_ROOT="${POISONING_CACHE_ROOT:-$PROJECT_ROOT/cache/poisoning}"
+POISONING_SUMMARY_ROOT="${POISONING_SUMMARY_ROOT:-$PROJECT_ROOT/data/poisoning/summary}"
 [[ "$POISONING_CACHE_ROOT" = /* ]] || POISONING_CACHE_ROOT="$PROJECT_ROOT/$POISONING_CACHE_ROOT"
-export POISONING_CACHE_ROOT
+export POISONING_CACHE_ROOT POISONING_SUMMARY_ROOT
 GRAMMAR_PROTECTED_NAME="${GRAMMAR_PROTECTED_RUN_NAME:-${BASE_RUN_NAME}_protected}"
 GRAMMAR_RANDOM_NAME="${GRAMMAR_RANDOM_PROTECTED_RUN_NAME:-${BASE_RUN_NAME}_random_protected}"
 ARITH_PROTECTED_NAME="${ARITHMETIC_PROTECTED_RUN_NAME:-${BASE_RUN_NAME}_protected}"
@@ -64,11 +65,11 @@ if [[ "$DRY_RUN" != "1" ]]; then
   python3 -m poisoning.protection01_verify_matched_runs \
     --task grammar \
     --runs "$GRAMMAR_OUTPUT_ROOT/$BASE_RUN_NAME,$GRAMMAR_OUTPUT_ROOT/$GRAMMAR_PROTECTED_NAME,$GRAMMAR_OUTPUT_ROOT/$GRAMMAR_RANDOM_NAME" \
-    --output "$PROJECT_ROOT/data/poisoning_training_protection/grammar/matched_training_identity.json"
+    --output "$POISONING_SUMMARY_ROOT/protection/grammar/matched_training_identity.json"
   python3 -m poisoning.protection01_verify_matched_runs \
     --task arithmetic \
     --runs "$ARITHMETIC_OUTPUT_ROOT/$BASE_RUN_NAME,$ARITHMETIC_OUTPUT_ROOT/$ARITH_PROTECTED_NAME,$ARITHMETIC_OUTPUT_ROOT/$ARITH_RANDOM_NAME" \
-    --output "$PROJECT_ROOT/data/poisoning_training_protection/arithmetic/matched_training_identity.json"
+    --output "$POISONING_SUMMARY_ROOT/protection/arithmetic/matched_training_identity.json"
 fi
 
 discover_run grammar "$GRAMMAR_OUTPUT_ROOT/$GRAMMAR_PROTECTED_NAME" 0
@@ -82,11 +83,13 @@ if [[ "$DRY_RUN" != "1" ]]; then
     --protected_run "$GRAMMAR_OUTPUT_ROOT/$GRAMMAR_PROTECTED_NAME" \
     --random_protected_run "$GRAMMAR_OUTPUT_ROOT/$GRAMMAR_RANDOM_NAME" \
     --phase input_output \
-    --output_dir "$PROJECT_ROOT/data/poisoning_training_protection/grammar"
+    --task grammar \
+    --output_dir "$POISONING_SUMMARY_ROOT/protection/grammar"
   python3 -m poisoning.protection02_compare_training_protection \
     --baseline_run "$ARITHMETIC_OUTPUT_ROOT/$BASE_RUN_NAME" \
     --protected_run "$ARITHMETIC_OUTPUT_ROOT/$ARITH_PROTECTED_NAME" \
     --random_protected_run "$ARITHMETIC_OUTPUT_ROOT/$ARITH_RANDOM_NAME" \
     --phase output_only \
-    --output_dir "$PROJECT_ROOT/data/poisoning_training_protection/arithmetic"
+    --task arithmetic \
+    --output_dir "$POISONING_SUMMARY_ROOT/protection/arithmetic"
 fi

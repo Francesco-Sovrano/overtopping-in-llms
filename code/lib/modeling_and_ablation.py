@@ -15,7 +15,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, CodeGenTokenizer
 from transformers import (
 	Qwen2Tokenizer,
 	GPT2Tokenizer,
-	LlamaTokenizer,
 	LlamaTokenizerFast,
 	BertTokenizer,
 	RobertaTokenizer,
@@ -601,125 +600,6 @@ def build_ablation_hooks(
 
 	return hooks
 
-
-def build_clamp_hooks(
-	layers_neuron_values_dict,
-	last_pos_only: bool = False,
-	device=None,
-):
-	"""Build TransformerLens hooks that clamp selected coordinates to literal values.
-
-	This is used by threshold-event validation: after a candidate threshold is
-	identified observationally, we can push a coordinate below/above that range and
-	check whether the downstream behavior changes.  The input format mirrors
-	``build_ablation_hooks`` but maps unit ids to values instead of to replacement
-	policies::
-
-		{"m4": {123: -0.5, 124: 0.25}, "a8.h3": {17: 1.2}}
-
-	Supported hook labels are the same as in ``build_ablation_hooks``:
-	``m{L}`` for MLP-write residual coordinates and ``a{L}.h{H}`` for attention
-	head output coordinates.  Values are applied either to every position or only
-	to the last position when ``last_pos_only`` is true.
-	"""
-	if not layers_neuron_values_dict:
-		return []
-	if device is None:
-		device = get_device()
-
-	mlp_layer_to_values = defaultdict(dict)
-	attn_layerhead_to_values = defaultdict(dict)
-	for layer_label, unit_values in layers_neuron_values_dict.items():
-		parsed = get_layer_type_and_ids(layer_label)
-		if not parsed:
-			continue
-		layer_type, L, H = parsed
-		if isinstance(unit_values, dict):
-			items = unit_values.items()
-		else:
-			items = list(unit_values or [])
-		if layer_type == "mlp":
-			for unit_id, value in items:
-				mlp_layer_to_values[int(L)][int(unit_id)] = float(value)
-		elif layer_type == "attn":
-			for unit_id, value in items:
-				attn_layerhead_to_values[(int(L), int(H))][int(unit_id)] = float(value)
-
-	hooks = []
-	for L, value_map in mlp_layer_to_values.items():
-		if not value_map:
-			continue
-		name = f"blocks.{int(L)}.hook_mlp_out"
-		ids = torch.as_tensor(sorted(value_map.keys()), dtype=torch.long, device=device)
-		vals_base = torch.as_tensor([value_map[int(i)] for i in ids.detach().cpu().tolist()], dtype=torch.float32, device=device)
-
-		def _vals_for(dtype, vals_base=vals_base):
-			if dtype == torch.float16:
-				return vals_base.to(torch.float16)
-			if dtype == torch.bfloat16:
-				return vals_base.to(torch.bfloat16)
-			if dtype == torch.float32:
-				return vals_base
-			return vals_base.to(dtype)
-
-		if last_pos_only:
-			def _hook(mlp_out, hook, ids=ids, _vals_for=_vals_for):
-				if mlp_out.ndim == 3:
-					dest = mlp_out[:, -1, :]
-					vals = _vals_for(dest.dtype).view(1, -1).expand(dest.size(0), -1)
-					dest.index_copy_(1, ids, vals)
-				return mlp_out
-		else:
-			def _hook(mlp_out, hook, ids=ids, _vals_for=_vals_for):
-				if mlp_out.ndim == 3:
-					B, T, _ = mlp_out.shape
-					vals = _vals_for(mlp_out.dtype).view(1, 1, -1).expand(B, T, -1)
-					mlp_out.index_copy_(2, ids, vals)
-				return mlp_out
-		hooks.append((name, _hook))
-
-	for (L, H), value_map in attn_layerhead_to_values.items():
-		if not value_map:
-			continue
-		name = f"blocks.{int(L)}.attn.hook_z"
-		ids = torch.as_tensor(sorted(value_map.keys()), dtype=torch.long, device=device)
-		vals_base = torch.as_tensor([value_map[int(i)] for i in ids.detach().cpu().tolist()], dtype=torch.float32, device=device)
-
-		def _vals_for(dtype, vals_base=vals_base):
-			if dtype == torch.float16:
-				return vals_base.to(torch.float16)
-			if dtype == torch.bfloat16:
-				return vals_base.to(torch.bfloat16)
-			if dtype == torch.float32:
-				return vals_base
-			return vals_base.to(dtype)
-
-		def _dest(z, H=H):
-			if z.ndim == 4:
-				return z[:, :, int(H), :]
-			if z.ndim == 3:
-				return z
-			return None
-
-		if last_pos_only:
-			def _hook(z, hook, ids=ids, _vals_for=_vals_for, _dest=_dest):
-				dest = _dest(z)
-				if dest is not None:
-					vals = _vals_for(dest.dtype).view(1, -1).expand(dest.size(0), -1)
-					dest[:, -1, :].index_copy_(1, ids, vals)
-				return z
-		else:
-			def _hook(z, hook, ids=ids, _vals_for=_vals_for, _dest=_dest):
-				dest = _dest(z)
-				if dest is not None:
-					B, T, _ = dest.shape
-					vals = _vals_for(dest.dtype).view(1, 1, -1).expand(B, T, -1)
-					dest.index_copy_(2, ids, vals)
-				return z
-		hooks.append((name, _hook))
-
-	return hooks
-
 def _resolve_rowwise_replacement_tables(
 	mean_activations: MeanActTensors,
 	unit_key: str,
@@ -1172,8 +1052,6 @@ class LMWrapper:
 
 		Examples:
 		- EleutherAI/pythia-1b@step48000              -> revision="step48000"
-		- EleutherAI/pythia-1b@checkpoint48000        -> revision="step48000"
-		- EleutherAI/pythia-1b@ckpt48000              -> revision="step48000"
 		- allenai/OLMo-2-0425-1B-early-training@stage1-step20000-tokens42B
 		                                                  -> revision="stage1-step20000-tokens42B"
 		- allenai/OLMo-2-0425-1B@stage2-ingredient3-step23852-tokens51B
@@ -1186,11 +1064,6 @@ class LMWrapper:
 		if not base_model_name or not revision:
 			# Treat malformed strings literally rather than silently dropping content.
 			return model_name, None
-
-		# Backwards compatibility with the old accepted aliases.
-		m = re.fullmatch(r"(?:checkpoint|ckpt)(\d+)", revision)
-		if m is not None:
-			revision = f"step{m.group(1)}"
 
 		return base_model_name, revision
 
@@ -1253,14 +1126,12 @@ class LMWrapper:
 				# Qwen / Qwen2 family: byte-level BPE, need Qwen2Tokenizer
 				self.tokenizer = Qwen2Tokenizer.from_pretrained(
 					resolved_model_name,
-					# add_bos_token=True,
 					cache_dir=cache_dir,
 				)
 
 			elif "phi" in m:
 				self.tokenizer = CodeGenTokenizer.from_pretrained(
 					resolved_model_name,
-					# add_bos_token=True,
 					use_fast=False,
 					cache_dir=cache_dir,
 				)
@@ -1269,7 +1140,6 @@ class LMWrapper:
 				# GPT-2 / GPT-Neo / GPT-J families — use GPT2Tokenizer
 				self.tokenizer = GPT2Tokenizer.from_pretrained(
 					resolved_model_name,
-					# add_bos_token=True,
 					cache_dir=cache_dir,
 				)
 
@@ -1277,7 +1147,6 @@ class LMWrapper:
 				# Llama / Mistral (or similar) — use LlamaTokenizer / LlamaTokenizerFast
 				self.tokenizer = LlamaTokenizerFast.from_pretrained(
 					resolved_model_name,
-					# add_bos_token=True,
 					cache_dir=cache_dir,
 				)
 
@@ -1430,7 +1299,7 @@ class LMWrapper:
 		if am.ndim != 2:
 			raise ValueError(f"Expected attention_mask [B,T], got shape {tuple(attention_mask.shape)}")
 
-		B, T = am.shape
+		_, T = am.shape
 
 		# Cached incremental step: position starts at previous real length
 		if past_kv_cache is not None:
@@ -1561,7 +1430,7 @@ class LMWrapper:
 		padding_side = "left" if use_kv_cache else getattr(self.tokenizer, "padding_side", "right")
 
 		# Tokenize
-		input_ids, base_mask, input_lengths = self.tokenize_with_mask(
+		input_ids, base_mask, _ = self.tokenize_with_mask(
 			batch_texts,
 			device,
 			padding=True,
@@ -1767,7 +1636,6 @@ class LMWrapper:
 		all_tokens = prefix.all_tokens.clone()     # [B, prompt_len + max_new_tokens]
 		base_mask = prefix.attention_mask         # [B, prompt_len]
 		input_ids = prefix.input_ids
-		input_lengths = prefix.input_lengths
 		max_new_tokens = prefix.max_new_tokens
 		batch_size, prompt_len = input_ids.shape
 		eos_token_id = prefix.eos_token_id
@@ -1865,7 +1733,7 @@ class LMWrapper:
 		max_prompt_len = max(1, n_ctx - max_new_tokens)
 		padding_side = "left" if use_kv_cache else getattr(self.tokenizer, "padding_side", "right")
 
-		input_ids, base_mask, input_lengths = self.tokenize_with_mask(
+		input_ids, base_mask, _ = self.tokenize_with_mask(
 			batch_texts,
 			device,
 			padding=True,
@@ -2156,7 +2024,6 @@ def sample_len_tolerant_pairs(source_idx, target_idx, emb_all, texts, k=None, to
 			pass_num = int(assigned_pass[r])
 
 			if metric == "cosine":
-				# distance = 1 - similarity
 				sim_val = float(best_len_val[r]) if (best_len_idx[r] == col) else float(best_any_val[r])
 				dist_val = float(1.0 - sim_val)
 			else:
@@ -2693,28 +2560,6 @@ def evenly_spaced_indices(n, k):
 			idx = n - 1
 		out.append(idx)
 		last = idx
-	return out
-
-def allocate_topk_neurons_across_layers(mlp_layers, layer_score, d_model, top_k):
-	"""
-	Fallback when we *don't* have neuron-level scores:
-	distribute top_k neuron picks across top-scoring layers.
-	"""
-	if top_k <= 0:
-		return {L: list(range(d_model)) for L in mlp_layers}
-
-	# Sort layers by inferred layer_score (desc). If missing score, treat as 0.
-	ordered = sorted(mlp_layers, key=lambda L: layer_score.get(L, 0.0), reverse=True)
-
-	remaining = int(top_k)
-	out = {}
-	for L in ordered:
-		if remaining <= 0:
-			break
-		k_here = min(d_model, remaining)
-		out[L] = evenly_spaced_indices(d_model, k_here)
-		remaining -= k_here
-
 	return out
 
 

@@ -18,14 +18,9 @@ unset MASTER_ADDR MASTER_PORT TORCHELASTIC_RUN_ID TORCHELASTIC_RESTART_COUNT TOR
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Prefer an explicit comma-separated RUN_DIRS.  For convenience a single RUN_DIR
-# is accepted.  Legacy GRAMMAR_RUN_DIR/ARITHMETIC_RUN_DIR variables are also
-# accepted when both tasks are intentionally evaluated under the same phase.
+# Prefer an explicit comma-separated RUN_DIRS.  A single RUN_DIR is accepted.
 RUN_DIRS="${RUN_DIRS:-}"
 if [[ -z "$RUN_DIRS" && -n "${RUN_DIR:-}" ]]; then RUN_DIRS="$RUN_DIR"; fi
-if [[ -z "$RUN_DIRS" && -n "${GRAMMAR_RUN_DIR:-}" && -n "${ARITHMETIC_RUN_DIR:-}" ]]; then
-  RUN_DIRS="$GRAMMAR_RUN_DIR,$ARITHMETIC_RUN_DIR"
-fi
 [[ -n "$RUN_DIRS" ]] || { echo "Set RUN_DIRS (comma-separated) or RUN_DIR." >&2; exit 1; }
 
 IFS=',' read -r -a _RUN_ARRAY <<< "$RUN_DIRS"
@@ -33,14 +28,16 @@ RESOLVED=()
 for d in "${_RUN_ARRAY[@]}"; do
   d="${d#${d%%[![:space:]]*}}"; d="${d%${d##*[![:space:]]}}"
   [[ "$d" = /* ]] || d="$PROJECT_ROOT/$d"
-  [[ -f "$d/checkpoint_manifest_all.csv" ]] || { echo "Missing $d/checkpoint_manifest_all.csv" >&2; exit 1; }
+  if [[ ! -f "$d/01_training_checkpoints/metadata/checkpoint_manifest_all.csv" ]]; then
+    echo "Missing checkpoint manifest: $d/01_training_checkpoints/metadata/checkpoint_manifest_all.csv" >&2; exit 1
+  fi
   RESOLVED+=("$d")
 done
 RUN_DIRS="$(IFS=,; echo "${RESOLVED[*]}")"
 
 EVAL_INTERVENTION="${PIPELINE_EVAL_INTERVENTION:-mean-donor}"
 PIPELINE_DECODE_ONLY="${PIPELINE_DECODE_ONLY:-0}"
-if [[ "$PIPELINE_DECODE_ONLY" == "1" || "$PIPELINE_DECODE_ONLY" == "true" ]]; then PHASE_LABEL="output_only"; else PHASE_LABEL="input_output"; fi
+if [[ "$PIPELINE_DECODE_ONLY" == "1" || "$PIPELINE_DECODE_ONLY" == "true" ]]; then PHASE_LABEL="output_only"; PHASE_DIR_LABEL="generation_only"; else PHASE_LABEL="input_output"; PHASE_DIR_LABEL="prompt_and_generation"; fi
 
 ABLATION_INTERVENTION="${ABLATION_INTERVENTION:-mean-donor}"
 TOP_KS="${TOP_KS:-1,2,4,6,8,16,32,64}"
@@ -61,7 +58,8 @@ INTERACTION_SELECTION_FRACTION="${INTERACTION_SELECTION_FRACTION:-0.40}"
 INTERACTION_MIN_EXAMPLES="${INTERACTION_MIN_EXAMPLES:-20}"
 INTERACTION_RANDOM_DRAWS_PER_K="${INTERACTION_RANDOM_DRAWS_PER_K:-6}"
 INTERACTION_PAIR_SCAN="${INTERACTION_PAIR_SCAN:-1}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/data/poisoning_mechanism_summary/$PHASE_LABEL}"
+POISONING_SUMMARY_ROOT="${POISONING_SUMMARY_ROOT:-$PROJECT_ROOT/data/poisoning/summary}"
+OUTPUT_DIR="${OUTPUT_DIR:-$POISONING_SUMMARY_ROOT/mechanism/$PHASE_DIR_LABEL}"
 HF_MODEL_CACHE_DIR="${HF_MODEL_CACHE_DIR:-}"
 [[ "$OUTPUT_DIR" = /* ]] || OUTPUT_DIR="$PROJECT_ROOT/$OUTPUT_DIR"
 DRY_RUN="${DRY_RUN:-0}"

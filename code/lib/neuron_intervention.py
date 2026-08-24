@@ -51,8 +51,6 @@ def dichotomic_search_layer(
 	"""
 	if not neuron_ids:
 		return []
-	max_internal = max(1, len(neuron_ids) - 1)
-
 	print(
 		f"Layer {layer_label}: starting dichotomic search over {len(neuron_ids)} neurons "
 		f"(epsilon={search_epsilon:.4f}, prune_alpha={prune_alpha}, bonferroni={bonferroni})."
@@ -107,8 +105,6 @@ def dichotomic_search_layer(
 		# alpha_slice + max_effect already computed in ablate_neurons
 		max_eff_ucb = record.get("max_effect", None)
 
-		obs_a = record.get("delta_on_associated_hat")
-		obs_u = record.get("delta_on_unrelated_hat")
 		obs_max = record.get("observed_max_effect")
 		print(
 			f"Depth {depth}, layer {layer_label}, group_size={len(group)}: "
@@ -531,4 +527,3 @@ def get_alpha_node(prune_alpha, depth=0, nodes_tested=0, bonferroni=False):
 	c = 6.0 / (math.pi ** 2)  # ~0.6079
 	return float(prune_alpha * c / (nodes_tested ** 2))
 	# # fallback: uniform across internal nodes only
-	# return float(prune_alpha / max_internal)

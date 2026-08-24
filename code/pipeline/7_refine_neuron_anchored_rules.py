@@ -152,9 +152,6 @@ def parse_args():
 			"the effective threshold is adjusted upward via get_adjusted_search_epsilon."
 		),
 	)
-	# ap.add_argument("--n_associated_during_neuron_location", type=int, default=100, help="Reference # associated prompts (used for epsilon adjustment; should match discovery script).")
-	# ap.add_argument("--n_unrelated_during_neuron_location", type=int, default=100, help="Reference # unrelated prompts (used for epsilon adjustment; should match discovery script).")
-	# ap.add_argument("--prune_alpha", type=float, default=0.05, help="Alpha used by get_adjusted_search_epsilon when adjusting epsilon for smaller sample sizes.")
 	ap.add_argument("--features_scores_dir", type=str, required=True, help="Directory containing scores.csv and features.json (output of the previous script).")
 	ap.add_argument("--ai_model", type=str, default=None, help="HF model id (default: read from dataset_info.json if present)")
 	ap.add_argument("--ai_model_cache_dir", default=None, type=str)
@@ -230,23 +227,6 @@ def parse_args():
 			"How this script uses task-provided semantic_wrong diagnostics during rule extraction. "
 			"'filter' removes semantically wrong ablated datapoints from per-neuron rule/MCC fitting and eval; "
 			"'none' keeps all datapoints but still writes semantic diagnostics."
-		),
-	)
-	ap.add_argument(
-		"--no_rescore_cached_answers",
-		action="store_true",
-		help=(
-			"Do not rescore cached generated answers with the current task correctness function. "
-			"By default, caches that contain plain generated answers are rescored, so changes to "
-			"answer parsing/correctness prompts do not require model regeneration."
-		),
-	)
-	ap.add_argument(
-		"--recompute_missing_semantic_cache",
-		action="store_true",
-		help=(
-			"When semantic diagnostics are enabled and a cache lacks both semantics and generated answers, "
-			"regenerate the model outputs instead of reusing correctness-only cache entries."
 		),
 	)
 
@@ -352,11 +332,6 @@ def parse_args():
 		),
 	)
 	ap.add_argument(
-		"--holdout_test_only",
-		action="store_true",
-		help="Backward-compatible alias for --evaluation_split test.",
-	)
-	ap.add_argument(
 		"--sampling_chunk_size",
 		type=int,
 		default=8192,
@@ -401,15 +376,6 @@ def parse_args():
 			"Default: all columns starting with --rule_target_prefix."
 		),
 	)
-	# ap.add_argument(
-	# 	"--rule_target_prefix",
-	# 	type=str,
-	# 	default="flip_c2i,flip_i2c",
-	# 	help=(
-	# 		"Comma-separated list of prefixes used to auto-select target columns for rule extraction. "
-	# 		"Defaults to directional flip targets (flip_c2i_,flip_i2c_)."
-	# 	),
-	# )
 	ap.add_argument(
 		"--max_rule_targets",
 		type=int,
@@ -580,8 +546,6 @@ def parse_args():
 	)
 
 	args = ap.parse_args()
-	if args.holdout_test_only:
-		args.evaluation_split = "test"
 	return args
 
 def bucket_keep_keys(buckets: dict, exclude_candidates: bool = True):
@@ -679,38 +643,6 @@ def _file_fingerprint(p: Path) -> dict:
 		"mtime": int(st.st_mtime),
 	}
 
-def _spectral_cache_cfg(args, ai_model: str, scores_path: Path, prompt_col: str, split_tag: str) -> dict:
-	# Only include knobs that can affect spectral reps/embedding/sampling
-	# (plus dataset identity). This keeps cache hits stable.
-	keep_keys = {
-		# sampling knobs used in THIS script
-		"use_spectral_sampling",
-		"global_n_clusters",
-		"coverage_radius",
-		"sampling_max_points",
-		"sampling_min_points",
-		"sampling_chunk_size",
-		"points_per_centroid",
-		"centroid_sampling_mode",
-		"seed",
-		# model/task
-		"task_module",
-		"ai_model_cache_dir",
-	}
-
-	# also keep any args coming from add_spectral_cli_args(ap)
-	spectral_like = [k for k in vars(args).keys() if ("spectral" in k) or ("embedding" in k) or ("rep" in k)]
-	keep_keys |= set(spectral_like)
-
-	cfg = {k: getattr(args, k) for k in sorted(keep_keys) if hasattr(args, k)}
-	cfg.update({
-		"ai_model": str(ai_model),
-		"scores_path": str(Path(scores_path).resolve()),
-		"scores_fingerprint": _file_fingerprint(scores_path),
-		"prompt_col": str(prompt_col),
-		"split_tag": str(split_tag),
-	})
-	return cfg
 
 def _spectral_cache_path(args, spectral_cfg=None):
 	cache_root = Path(args.rules_dir) / "spectral_cache"
@@ -800,33 +732,7 @@ def extract_single_neurons(
 			rec = entry["last_record"]
 			me = rec["max_effect"]
 
-			# Adjust epsilon to keep selection criteria comparable across different sample sizes.
-			eps_eff = float(search_epsilon)
-			# if eps_eff > 0:
-			# 	n_a = rec.get("n_associated_eval", rec.get("n_associated_during_neuron_location", None))
-			# 	n_u = rec.get("n_unrelated_eval", rec.get("n_unrelated_during_neuron_location", None))
-			# 	try:
-			# 		n_a = int(n_a) if n_a is not None else 0
-			# 		n_u = int(n_u) if n_u is not None else 0
-			# 	except Exception:
-			# 		n_a, n_u = 0, 0
-			# 	if n_a > 0 and n_u > 0 and prune_alpha is not None and prune_alpha > 0:
-			# 		key = (n_a, n_u)
-			# 		eps_eff_cached = eps_cache.get(key)
-			# 		if eps_eff_cached is None:
-			# 			# get_adjusted_search_epsilon only uses lengths; passing dummy lists keeps signatures aligned with script 6.
-			# 			eps_eff_cached = get_adjusted_search_epsilon(
-			# 				eps_eff,
-			# 				[None] * n_a,
-			# 				[None] * n_u,
-			# 				n_associated_ref,
-			# 				n_unrelated_ref,
-			# 				prune_alpha,
-			# 			)
-			# 			eps_cache[key] = float(eps_eff_cached)
-			# 		eps_eff = float(eps_eff_cached)
-
-			if abs(me) < eps_eff:
+			if abs(me) < float(search_epsilon):
 				continue
 
 			if "layer_label" in rec and "neuron_id" in rec:
@@ -1125,13 +1031,11 @@ def _rule_signature_path(rules_subdir):
 	return Path(rules_subdir) / "_rule_extraction_signature.json"
 
 def should_skip_rule_extraction(rules_subdir, prefix, layer_label, signature=None, force_recompute: bool = False, require_all_fit: bool = True, targets=None, force_all_fit_recompute: bool = False):
-	"""Skip only when every required raw output exists and signature matches.
+	"""Skip only when every required raw output exists and its signature matches.
 
-	Required raw outputs are rule_combo_train_<target>.csv, rule_combo_<target>.csv,
-	and rule_combo_test_selected_<target>.csv for every target.  The new
-	rule_combo_test_selected_<target>.csv file keeps the TEST-selected HQ-T-style
-	score separate from the legacy frozen-combo TEST file. When ALL-FIT emission
-	is enabled, rule_combo_all_fit_<target>.csv is also required.
+	Required raw outputs are the TRAIN-selected rule combination, its frozen TEST
+	score, the TEST-selected rule combination, and, when enabled, the ALL-FIT
+	descriptive combination for every target.
 	"""
 	if force_recompute:
 		return False
@@ -1293,8 +1197,6 @@ def write_flip_stats(
 	stats_df.to_csv(stats_path, index=False)
 	print(f"[Stats] Wrote {stats_path}")
 
-	eval_rows = int(scores_df[any_eval_col].notna().sum()) if any_eval_col else 0
-
 	# Compute *unique* flipped datapoints across all neurons (union), to avoid double-counting
 	# when the same datapoint flips for multiple neurons.
 	def _union_counts(cols):
@@ -1408,9 +1310,7 @@ def write_flip_stats(
 
 	K = int(min(topk, len(stats_df)))
 
-	# For papers, 50 neurons is usually too dense unless the figure is full-width.
-	# Keep topk configurable, but consider calling write_flip_stats(..., topk=25)
-	# for the camera-ready figure.
+	# Large top-k values can make this figure dense; callers can lower topk for compact output.
 	dfp = stats_df.head(K).copy()
 
 	import matplotlib.ticker as mticker
@@ -1569,7 +1469,7 @@ def write_heldout_set_metrics(
 	thresholds,
 	denominator_epsilon: float,
 ):
-	"""Write manuscript-facing singleton-set metrics beside legacy stage-7 files."""
+	"""Write the exact singleton-set metrics and frozen discovery ranking."""
 	stats_dir = Path(out_dir) / "stats" / str(stats_dirname or "")
 	stats_dir.mkdir(parents=True, exist_ok=True)
 	frozen_path = stats_dir / "frozen_candidate_ranking.csv"
@@ -1593,49 +1493,6 @@ def write_heldout_set_metrics(
 	}]).to_csv(stats_dir / "singleton_set_metrics.csv", index=False)
 	(stats_dir / "singleton_set_metrics.json").write_text(
 		json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=True),
-		encoding="utf-8",
-	)
-
-	# Preserve every legacy field and add explicit aliases/new definitions.
-	global_path = stats_dir / "flip_stats_global.json"
-	global_payload = json.loads(global_path.read_text(encoding="utf-8"))
-	global_payload.update({
-		"heldout_set_metrics_definition_version": summary["definition_version"],
-		"J": summary["J"],
-		"U_J": summary["U_J"],
-		"s_1": summary["s_1"],
-		"sum_s_j": summary["sum_s_j"],
-		"sum_s_j_squared": summary["sum_s_j_squared"],
-		"R_ov": summary["R_ov"],
-		"R_ov_status": summary["R_ov_status"],
-		"N_eff": summary["N_eff"],
-		"N_eff_status": summary["N_eff_status"],
-		"OCC_0": summary["OCC_0"],
-		"OCC_0_count": summary["OCC_0_count"],
-		"OCC_0_denominator": summary["OCC_0_denominator"],
-		"OCC_0_status": summary["OCC_0_status"],
-		"OCC_1": summary["OCC_1"],
-		"OCC_1_count": summary["OCC_1_count"],
-		"OCC_1_denominator": summary["OCC_1_denominator"],
-		"OCC_1_status": summary["OCC_1_status"],
-		"N_t": summary["N_t"],
-		"TOC_m": summary["TOC_m"],
-		"frozen_ranking_status": summary["frozen_ranking_status"],
-		# Backward-compatible names used by existing analysis scripts.
-		"top_singleton_rate": summary["s_1"],
-		"TOC1": (
-			summary["TOC_m"].get("1", {}).get("value")
-			if summary.get("TOC_m") else float("nan")
-		),
-		"overlap_compression": (
-			1.0 - summary["R_ov"]
-			if np.isfinite(summary["R_ov"]) else float("nan")
-		),
-		"heldout_set_metrics_path": str(stats_dir / "singleton_set_metrics.json"),
-		"frozen_candidate_ranking_path": str(frozen_path),
-	})
-	global_path.write_text(
-		json.dumps(global_payload, indent=2, ensure_ascii=False, allow_nan=True),
 		encoding="utf-8",
 	)
 
@@ -2256,7 +2113,11 @@ def _iter_raw_rule_combo_csvs(rules_dir: str):
 			rel_probe = fp.relative_to(root)
 		except Exception:
 			rel_probe = fp
-		if str(fp.name).startswith("rule_combo_metrics_") or "stats" in tuple(rel_probe.parts):
+		if (
+			str(fp.name).startswith("rule_combo_metrics_")
+			or str(fp.name).startswith("rule_combo_train_test_")
+			or "stats" in tuple(rel_probe.parts)
+		):
 			continue
 		yield fp
 
@@ -2318,11 +2179,8 @@ def collect_rule_combo_metrics(rules_dir: str):
 	root = Path(rules_dir)
 	rows = []
 	for fp in _iter_raw_rule_combo_csvs(root):
-		# Valid raw per-neuron combo artifacts are only:
-		#   rule_combo_<target>.csv              -> held-out TEST score
-		#   rule_combo_train_<target>.csv        -> TRAIN-selection diagnostic
-		# ALL-FIT is a separate descriptive final-fit raw scope.  Raw
-		# rule_combo_train_test_<target>.csv files are obsolete and ignored.
+		# Raw per-neuron artifacts encode TRAIN, frozen TEST, TEST-selected, and
+		# ALL-FIT score scopes in their filenames.
 		rel = fp.relative_to(root)
 		parts = rel.parts
 		# Usual layout is <rule_target>/<layer>_<neuron>/rule_combo_*.csv.
@@ -2346,11 +2204,7 @@ def collect_rule_combo_metrics(rules_dir: str):
 		filename_scope = "test" if (fp.parent / "global_shap_stats_train.pkl").exists() else "train_or_all"
 		filename_is_train = False
 		filename_is_all_fit = False
-		if fp.name.startswith("rule_combo_train_test_"):
-			# Obsolete raw TRAIN+TEST artifact from an earlier implementation.
-			# Never load it.
-			continue
-		elif fp.name.startswith("rule_combo_all_fit_"):
+		if fp.name.startswith("rule_combo_all_fit_"):
 			metric = fp.name[len("rule_combo_all_fit_"):-len(".csv")]
 			filename_scope = "all_fit"
 			filename_is_all_fit = True
@@ -2368,9 +2222,7 @@ def collect_rule_combo_metrics(rules_dir: str):
 			continue
 		r = df.iloc[0].to_dict()
 
-		# Filename scope is authoritative for rule_combo_train_* artifacts.
-		# Obsolete raw rule_combo_train_test_* artifacts have already been skipped;
-		# ALL-FIT rows are loaded from rule_combo_all_fit_* files.
+		# Filename scope is authoritative for TRAIN and ALL-FIT artifacts.
 		if filename_is_train:
 			computed_on = "train"
 		elif filename_is_all_fit:
@@ -2449,7 +2301,7 @@ def _neurons_sorted_to_meta(neurons_sorted):
 	"""
 	keys = []
 	baseline_map = {}
-	for layer_label, neuron_id, baseline_subset in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
+	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
 		layer_key = _safe_layer_label(layer_label)
 		nk = f"{layer_key}_{int(neuron_id)}"
 		keys.append(nk)
@@ -2458,13 +2310,6 @@ def _neurons_sorted_to_meta(neurons_sorted):
 	rank = {k: i for i, k in enumerate(keys)}
 	return allowed, rank, baseline_map
 
-def _baseline_subset_allows_flip_target(baseline_subset: str, flip_target: str, layer_key: str, neuron_id: int) -> bool:
-	"""Flipping and rule extraction always operate on baseline 'all'."""
-	ft = str(flip_target or "")
-	agg = f"flip_{layer_key}_{int(neuron_id)}"
-	if ft == agg:
-		return True
-	return ft.startswith("flip_c2i_") or ft.startswith("flip_i2c_")
 
 def _filter_rule_metrics_df(df: pd.DataFrame, neurons_sorted):
 	"""
@@ -2569,8 +2414,8 @@ def write_rule_metrics_stats(
 	"""
 	Writes paper-ready rule statistics/figures from RuleSHAP artifacts.
 
-	Default behavior writes legacy frozen-combo TEST summaries, the TEST-selected
-	(HQ-T) summaries over train-emitted rules, and, when available, parallel
+	Default behavior writes frozen-combo TEST summaries, TEST-selected (HQ-T)
+	summaries over train-emitted rules, and, when available, parallel
 	ALL-FIT descriptive summaries.  The returned dataframe is the TEST-selected
 	best-per-neuron table so downstream high-quality counts use HQ-T by default.
 	"""
@@ -2704,15 +2549,6 @@ def write_rule_metrics_stats(
 		print(f"[RuleMetrics] Wrote {scope_all}")
 		print(f"[RuleMetrics] Wrote {scope_best}")
 
-		# Legacy unsuffixed filenames remain the frozen train-combo TEST score for backward compatibility.
-		if scope == "test":
-			legacy_all = os.path.join(stats_dir, "rule_combo_metrics_all.csv")
-			legacy_best = os.path.join(stats_dir, "rule_combo_metrics_best_per_neuron.csv")
-			df_all_out.to_csv(legacy_all, index=False)
-			df_best.to_csv(legacy_best, index=False)
-			print(f"[RuleMetrics] Wrote {legacy_all}")
-			print(f"[RuleMetrics] Wrote {legacy_best}")
-
 		if topk is not None and int(topk) > 0:
 			df_top = df_best.sort_values([metric_col, "MCC"], ascending=False, na_position="last").head(int(topk)).copy()
 		else:
@@ -2721,11 +2557,6 @@ def write_rule_metrics_stats(
 		csv_top = os.path.join(stats_dir, top_name)
 		df_top.to_csv(csv_top, index=False)
 		print(f"[RuleMetrics] Wrote {csv_top}")
-		if scope == "test":
-			legacy_top = os.path.join(stats_dir, f"rule_combo_metrics_top_{int(topk) if topk else 'all'}.csv")
-			df_top.to_csv(legacy_top, index=False)
-			print(f"[RuleMetrics] Wrote {legacy_top}")
-
 		thr = float(thresholds_by_scope.get(scope, base_thr))
 		high = df_best[pd.to_numeric(df_best[metric_col], errors="coerce") >= float(thr)]
 		summary = {
@@ -2758,11 +2589,6 @@ def write_rule_metrics_stats(
 		json_path = os.path.join(stats_dir, f"rule_metrics_summary_{slug}.json")
 		Path(json_path).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 		print(f"[RuleMetrics] Wrote {json_path}")
-		if scope == "test":
-			legacy_json = os.path.join(stats_dir, "rule_metrics_summary.json")
-			Path(legacy_json).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-			print(f"[RuleMetrics] Wrote {legacy_json}")
-
 		tex_suffix = re.sub(r"[^0-9A-Za-z]+", "", str(stats_dirname))
 		tex_suffix = tex_suffix if tex_suffix else "Run"
 		scope_suffix = "" if scope == "test" else re.sub(r"[^0-9A-Za-z]+", "", slug.title())
@@ -2782,11 +2608,6 @@ def write_rule_metrics_stats(
 		tex_path = os.path.join(stats_dir, f"rule_metrics_{slug}.tex")
 		Path(tex_path).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
 		print(f"[RuleMetrics] Wrote {tex_path}")
-		if scope == "test":
-			legacy_tex = os.path.join(stats_dir, "rule_metrics.tex")
-			Path(legacy_tex).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
-			print(f"[RuleMetrics] Wrote {legacy_tex}")
-
 		plt.figure(figsize=(12, 7))
 
 		def _hist_col(col: str, xlabel: str, title: str, pos: int):
@@ -2823,15 +2644,9 @@ def write_rule_metrics_stats(
 		plt.savefig(plot_path, dpi=250, bbox_inches='tight')
 		plt.close()
 		print(f"[RuleMetrics] Wrote {plot_path}")
-		if scope == "test":
-			legacy_plot = os.path.join(stats_dir, "rule_metrics_distributions.pdf")
-			import shutil as _shutil
-			_shutil.copyfile(plot_path, legacy_plot)
-			print(f"[RuleMetrics] Wrote {legacy_plot}")
-
 		return df_best
 
-	_summarize_scope("test")  # legacy frozen train-combo TEST score
+	_summarize_scope("test")
 	df_best_test_selected = _summarize_scope("test_selected")
 	_summarize_scope("all_fit")
 	return df_best_test_selected
@@ -2937,777 +2752,6 @@ def _repair_directional_flip_columns(
 		repaired += 1
 	return repaired
 
-def write_high_quality_neuron_flip_coverage(
-	scores_df: pd.DataFrame,
-	neurons_sorted,
-	rule_best_df: pd.DataFrame,
-	out_dir: str,
-	stats_dirname: str = "",
-	# Backward-compat default; if quality_threshold is None we fall back to this.
-	quality_metric: str = "mcc",
-	quality_threshold: float = None,
-	quality_thresholds_by_scope: dict = None,
-	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
-	baseline_metric_col: str = None,
-):
-	'''
-	Among neurons whose best rule has MCC >= threshold, compute flips accounted:
-	- Union (all together): unique flipped datapoints across the set
-	- Sum (in isolation): sum of per-neuron flipped datapoints (double-count overlaps)
-
-	Writes: json + tex + a single compact figure.
-	'''
-	if rule_best_df is None or rule_best_df.empty:
-		print("[HighQuality] No rule metrics available; skipping.")
-		return None
-	# Ensure rule_best_df only contains rules for these neurons + compatible targets
-	rule_best_df = _filter_rule_metrics_df(rule_best_df, neurons_sorted)
-	rule_best_df = _filter_by_min_dataset_coverage(rule_best_df, min_dataset_coverage)
-	if rule_best_df is None or rule_best_df.empty:
-		print(f"[HighQuality] No rule metrics available after filtering and dataset_coverage >= {float(min_dataset_coverage):.6g}; skipping.")
-		return None
-
-	out_dir = str(out_dir)
-	Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-	total_neurons = []
-	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0],x[1])):
-		layer_key = _safe_layer_label(layer_label)
-		total_neurons.append((layer_key, int(neuron_id)))
-
-	metric_key = _norm_rule_metric_name(quality_metric)
-	metric_col = _rule_metric_col(metric_key)
-	metric_label = _rule_metric_label(metric_key)
-	base_thr = 0.70 if quality_threshold is None else float(quality_threshold)
-	thresholds_by_scope = {"test": base_thr, "test_selected": base_thr, "all_fit": 0.70}
-	if isinstance(quality_thresholds_by_scope, dict):
-		for _scope, _thr in quality_thresholds_by_scope.items():
-			try:
-				thresholds_by_scope[_norm_rule_quality_scope(_scope)] = float(_thr)
-			except Exception:
-				pass
-	# If the requested metric isn't present in the artifacts, fall back to MCC.
-	if metric_col not in rule_best_df.columns:
-		metric_key = "mcc"
-		metric_col = "MCC"
-		metric_label = "MCC"
-
-	thr = float(thresholds_by_scope.get("test", base_thr))
-	tmp = rule_best_df.copy()
-	tmp["layer_key"] = tmp["layer_key"].map(_safe_layer_label)  # <- critical
-	high_df = tmp[pd.to_numeric(tmp[metric_col], errors="coerce") >= float(thr)]
-	high_ids = {(str(r["layer_key"]), int(r["neuron_id"])) for _, r in high_df.dropna(subset=["neuron_id", "layer_key"]).iterrows()}
-	high_neurons = [t for t in total_neurons if (t[0], t[1]) in high_ids]
-
-	# print(1, high_neurons)
-
-	def _cols(neuron_list, prefix):
-		return [f"{prefix}{lk}_{nid}" for (lk, nid) in neuron_list]
-
-	cols_any_all = _cols(total_neurons, "flip_")
-	cols_c2i_all = _cols(total_neurons, "flip_c2i_")
-	cols_i2c_all = _cols(total_neurons, "flip_i2c_")
-	cols_any_high = _cols(high_neurons, "flip_")
-	cols_c2i_high = _cols(high_neurons, "flip_c2i_")
-	cols_i2c_high = _cols(high_neurons, "flip_i2c_")
-	cols_sem_wrong_all = _cols(total_neurons, "flip_semantic_wrong_")
-	cols_sem_wrong_high = _cols(high_neurons, "flip_semantic_wrong_")
-
-	union_any_all_mask, sum_any_all, eval_mask_any_all = _union_sum_eval_mask(scores_df, cols_any_all)
-	union_any_high_mask, sum_any_high, eval_mask_any_high = _union_sum_eval_mask(scores_df, cols_any_high)
-	union_c2i_all_mask, sum_c2i_all, _ = _union_sum_eval_mask(scores_df, cols_c2i_all)
-	union_c2i_high_mask, sum_c2i_high, _ = _union_sum_eval_mask(scores_df, cols_c2i_high)
-	union_i2c_all_mask, sum_i2c_all, _ = _union_sum_eval_mask(scores_df, cols_i2c_all)
-	union_i2c_high_mask, sum_i2c_high, _ = _union_sum_eval_mask(scores_df, cols_i2c_high)
-	union_sem_wrong_all_mask, sum_sem_wrong_all, _ = _union_sum_eval_mask(scores_df, cols_sem_wrong_all)
-	union_sem_wrong_high_mask, sum_sem_wrong_high, _ = _union_sum_eval_mask(scores_df, cols_sem_wrong_high)
-
-	union_any_all = int(union_any_all_mask.sum())
-	union_any_high = int(union_any_high_mask.sum())
-	union_c2i_all = int(union_c2i_all_mask.sum())
-	union_c2i_high = int(union_c2i_high_mask.sum())
-	union_i2c_all = int(union_i2c_all_mask.sum())
-	union_i2c_high = int(union_i2c_high_mask.sum())
-	union_sem_wrong_all = int(union_sem_wrong_all_mask.sum())
-	union_sem_wrong_high = int(union_sem_wrong_high_mask.sum())
-	n_eval_any_all = int(eval_mask_any_all.sum())
-	n_eval_any_high = int(eval_mask_any_high.sum())
-	baseline_denoms = _baseline_direction_denominators(scores_df, baseline_metric_col, eval_mask_any_all)
-
-	# --- Compact p-values: permutation test vs random subset of same size (union coverage) ---
-	def _fmt_p(p: float) -> str:
-		if p != p:  # NaN
-			return ""
-		if p < 1e-4:
-			return "<1e-4"
-		if p < 0.01:
-			return f"{p:.2g}"  # compact scientific-ish
-		return f"{p:.2f}"
-
-	def _bool_mat(cols):
-		# Missing columns -> NaN -> 0; supports 0/1, bool, or numeric-as-str.
-		sub = scores_df.reindex(columns=cols)
-		sub = sub.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-		return (sub.to_numpy() != 0.0)
-
-	def _perm_p_union(mat_bool, idx_high, n_perm = 1000, seed = None) -> float:
-		n_total = mat_bool.shape[1]
-		k = len(idx_high)
-		if k <= 0 or k >= n_total:
-			return float("nan")
-		rng = np.random.default_rng(seed) if seed is not None else np.random
-		obs = int(mat_bool[:, idx_high].any(axis=1).sum())
-		ge = 0
-		for _ in range(int(n_perm)):
-			ix = rng.choice(n_total, size=k, replace=False)
-			val = int(mat_bool[:, ix].any(axis=1).sum())
-			if val >= obs:
-				ge += 1
-		return (ge + 1.0) / (n_perm + 1.0)
-
-	# indices of high_neurons in total_neurons (preserves order)
-	_idx_map = {t: i for i, t in enumerate(total_neurons)}
-	_idx_high = [_idx_map[t] for t in high_neurons] if high_neurons else []
-	_NPERM = 1000
-	_p_any = _perm_p_union(_bool_mat(cols_any_all), _idx_high, n_perm=_NPERM, seed=0)
-	_p_c2i = _perm_p_union(_bool_mat(cols_c2i_all), _idx_high, n_perm=_NPERM, seed=1)
-	_p_i2c = _perm_p_union(_bool_mat(cols_i2c_all), _idx_high, n_perm=_NPERM, seed=2)
-	_p_sem_wrong = _perm_p_union(_bool_mat(cols_sem_wrong_all), _idx_high, n_perm=_NPERM, seed=3) if any(c in scores_df.columns for c in cols_sem_wrong_all) else float("nan")
-
-	n_eval_baseline_correct = None if baseline_denoms is None else baseline_denoms.get("n_eval_baseline_correct")
-	n_eval_baseline_incorrect = None if baseline_denoms is None else baseline_denoms.get("n_eval_baseline_incorrect")
-
-	def _rate_or_nan(num, den):
-		try:
-			den = float(den)
-		except (TypeError, ValueError):
-			return float("nan")
-		return (float(num) / den) if den else float("nan")
-
-	summary = {
-		"quality_metric": str(metric_key),
-		"quality_metric_label": str(metric_label),
-		"quality_threshold": float(thresholds_by_scope.get("test_selected", thresholds_by_scope.get("test", base_thr))),
-		"quality_thresholds_by_scope": {k: float(v) for k, v in thresholds_by_scope.items()},
-		"min_dataset_coverage": float(min_dataset_coverage),
-		# Keep legacy field for backward compatibility.
-		"n_neurons_total": int(len(total_neurons)),
-		"n_neurons_high_quality": int(len(high_neurons)),
-		"frac_neurons_high_quality": (float(len(high_neurons))/float(len(total_neurons))) if len(total_neurons) else float("nan"),
-		"baseline_metric_col": str(baseline_metric_col) if baseline_metric_col else None,
-		"eligible_denominators": baseline_denoms if baseline_denoms is not None else {
-			"baseline_metric_col": None,
-			"n_eval_baseline_valid": None,
-			"n_eval_baseline_correct": None,
-			"n_eval_baseline_incorrect": None,
-		},
-		"flip_any": {
-			"union_high": int(union_any_high),
-			"sum_high": int(sum_any_high),
-			"union_all": int(union_any_all),
-			"sum_all": int(sum_any_all),
-			"union_share_of_all": (float(union_any_high)/float(union_any_all)) if union_any_all else float("nan"),
-			"n_rows_with_any_eval_all": int(n_eval_any_all),
-			"n_rows_with_any_eval_high": int(n_eval_any_high),
-		},
-		"flip_c2i": {
-			"union_high": int(union_c2i_high),
-			"sum_high": int(sum_c2i_high),
-			"union_all": int(union_c2i_all),
-			"sum_all": int(sum_c2i_all),
-			"union_share_of_all": (float(union_c2i_high)/float(union_c2i_all)) if union_c2i_all else float("nan"),
-			"eligible_baseline_count": n_eval_baseline_correct,
-			"eligible_union_rate_all": _rate_or_nan(union_c2i_all, n_eval_baseline_correct),
-			"eligible_union_rate_high": _rate_or_nan(union_c2i_high, n_eval_baseline_correct),
-		},
-		"flip_i2c": {
-			"union_high": int(union_i2c_high),
-			"sum_high": int(sum_i2c_high),
-			"union_all": int(union_i2c_all),
-			"sum_all": int(sum_i2c_all),
-			"union_share_of_all": (float(union_i2c_high)/float(union_i2c_all)) if union_i2c_all else float("nan"),
-			"eligible_baseline_count": n_eval_baseline_incorrect,
-			"eligible_union_rate_all": _rate_or_nan(union_i2c_all, n_eval_baseline_incorrect),
-			"eligible_union_rate_high": _rate_or_nan(union_i2c_high, n_eval_baseline_incorrect),
-		},
-		"flip_semantic_wrong": {
-			"union_high": int(union_sem_wrong_high),
-			"sum_high": int(sum_sem_wrong_high),
-			"union_all": int(union_sem_wrong_all),
-			"sum_all": int(sum_sem_wrong_all),
-			"union_share_of_all": (float(union_sem_wrong_high)/float(union_sem_wrong_all)) if union_sem_wrong_all else float("nan"),
-		},
-		"p_values": {
-			# One-sided permutation p-value: P[ random subset union >= observed high-quality union ].
-			"n_perm": int(_NPERM),
-			"perm_union_any": float(_p_any),
-			"perm_union_c2i": float(_p_c2i),
-			"perm_union_i2c": float(_p_i2c),
-			"perm_union_flip_semantic_wrong": float(_p_sem_wrong),
-		},
-		"figure_semantics": {
-			"prevalence_denominator": "Any flip uses rows with at least one evaluated all-neuron flip column. Correct->incorrect uses evaluated baseline-correct rows when the baseline metric is available. Incorrect->correct uses evaluated baseline-incorrect rows when the baseline metric is available.",
-			"unique_union": "A prompt flipped by several neurons is counted once.",
-			"sum_over_neurons": "Per-neuron flip counts are summed, so overlaps are counted multiple times.",
-			"coverage_share": "High-quality union divided by all-neuron union for the same flip direction. This is a coverage-of-flips quantity, not a prevalence-over-prompts quantity.",
-		},
-	}
-
-	json_path = os.path.join(out_dir, 'stats', stats_dirname, f"high_quality_neuron_flip_coverage.json")
-	Path(json_path).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-	print(f"[HighQuality] Wrote {json_path}")
-
-	def _pct(x):
-		return int(round(100.0 * float(x))) if x == x else None
-	def _fmtf(x, nd=2):
-		return f"{float(x):.{nd}f}" if x == x else ""
-
-	tex_suffix = re.sub(r"[^0-9A-Za-z]+", "", str(stats_dirname))
-	tex_suffix = tex_suffix if tex_suffix else "Run"
-	tex_lines = []
-	tex_lines.append(f"% Auto-generated by 7_refine_neuron_anchored_rules (high-quality flip coverage)")
-	tex_lines.append(f"\\newcommand\\HighQualMetric{tex_suffix}{{{metric_label}}}")
-	tex_lines.append(f"\\newcommand\\HighQualThr{tex_suffix}{{{_fmtf(thr,2)}}}")
-	tex_lines.append(f"\\newcommand\\HighQualNeurons{tex_suffix}{{{int(summary['n_neurons_high_quality'])}}}")
-	tex_lines.append(f"\\newcommand\\HighQualNeuronsPct{tex_suffix}{{{_pct(summary['frac_neurons_high_quality'])}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityUnionFlipAny{tex_suffix}{{{summary['flip_any']['union_high']}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityUnionFlipAnyPctAll{tex_suffix}{{{_pct(summary['flip_any']['union_share_of_all'])}}}")
-	tex_lines.append(f"\\newcommand\\HighQualitySumFlipAny{tex_suffix}{{{summary['flip_any']['sum_high']}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityPUnionAny{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_any'])}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityPUnionCII{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_c2i'])}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityPUnionICC{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_i2c'])}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityUnionSemanticWrong{tex_suffix}{{{summary['flip_semantic_wrong']['union_high']}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityUnionSemanticWrongPctAll{tex_suffix}{{{_pct(summary['flip_semantic_wrong']['union_share_of_all'])}}}")
-	tex_lines.append(f"\\newcommand\\HighQualityPUnionSemanticWrong{tex_suffix}{{{_fmt_p(summary['p_values']['perm_union_flip_semantic_wrong'])}}}")
-
-	tex_path = os.path.join(out_dir, 'stats', stats_dirname, f"high_quality_neuron_flip_coverage.tex")
-	Path(tex_path).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
-	print(f"[HighQuality] Wrote {tex_path}")
-
-	# Main figure: compact, paper-friendly, and collision-safe.
-	# Labels are placed with deterministic offsets/inside-bar placement so that equal-height bars
-	# (the common case in this plot) do not overlap.
-	eval_denom = float(n_eval_any_all) if n_eval_any_all else float(len(scores_df))
-	# Directional flips have different natural denominators: correct->incorrect can only
-	# happen on baseline-correct rows, while incorrect->correct can only happen on
-	# baseline-incorrect rows. Fall back to the global evaluated-row denominator if the
-	# baseline metric column is unavailable.
-	_has_baseline_denoms = baseline_denoms is not None
-	_prev_denoms = np.asarray([
-		float(n_eval_any_all) if n_eval_any_all else float(len(scores_df)),
-		float(n_eval_baseline_correct) if _has_baseline_denoms and n_eval_baseline_correct is not None else eval_denom,
-		float(n_eval_baseline_incorrect) if _has_baseline_denoms and n_eval_baseline_incorrect is not None else eval_denom,
-	], dtype=float)
-	_prev_denom_labels = ["eval", "correct", "incorrect"] if _has_baseline_denoms else ["eval", "eval", "eval"]
-	_label_box = dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor="none", alpha=0.82)
-
-	def _bar_center(bar):
-		return bar.get_x() + bar.get_width() / 2.0
-
-	def _annotate_bar_top(ax, bar, label, *, fontsize=7.0, xytext=(0, 2), ha="center"):
-		h = float(bar.get_height())
-		if h != h:
-			return
-		ax.annotate(
-			label,
-			(_bar_center(bar), h),
-			ha=ha,
-			va="bottom",
-			fontsize=fontsize,
-			xytext=xytext,
-			textcoords="offset points",
-			bbox=_label_box,
-			clip_on=False,
-		)
-
-	def _annotate_bar_inside(ax, bar, label, *, fontsize=6.8, frac=0.965):
-		h = float(bar.get_height())
-		if h != h:
-			return
-		if h <= 0:
-			_annotate_bar_top(ax, bar, label, fontsize=fontsize)
-			return
-		y_text = max(0.0, h * frac)
-		ax.annotate(
-			label,
-			(_bar_center(bar), y_text),
-			ha="center",
-			va="top",
-			fontsize=fontsize,
-			xytext=(0, -1),
-			textcoords="offset points",
-			bbox=_label_box,
-			clip_on=True,
-		)
-
-	def _annotate_grouped_pair(
-		ax,
-		left_bar,
-		right_bar,
-		left_label,
-		right_label,
-		*,
-		fontsize=6.6,
-		collapse_identical=True,
-		joint_prefix="All=HQ",
-	):
-		left_h = float(left_bar.get_height())
-		right_h = float(right_bar.get_height())
-		left_ok = left_h == left_h
-		right_ok = right_h == right_h
-		if not (left_ok or right_ok):
-			return
-
-		# In these figures All and HQ are often identical. Drawing both labels creates
-		# hard-to-read collisions, so collapse identical same-height pairs into one
-		# centered label above the grouped bars.
-		if (
-			collapse_identical
-			and left_ok
-			and right_ok
-			and str(left_label).strip() == str(right_label).strip()
-			and np.isclose(left_h, right_h, rtol=1e-4, atol=1e-8)
-		):
-			label = str(left_label)
-			if joint_prefix:
-				label = f"{joint_prefix}\n{label}"
-			ax.annotate(
-				label,
-				((_bar_center(left_bar) + _bar_center(right_bar)) / 2.0, max(left_h, right_h)),
-				ha="center",
-				va="bottom",
-				fontsize=fontsize,
-				xytext=(0, 3),
-				textcoords="offset points",
-				bbox=_label_box,
-				clip_on=False,
-			)
-			return
-
-		# For genuinely different grouped bars, stagger same-height labels vertically
-		# and align outward to minimize overlap inside dense panels.
-		heights_close = left_ok and right_ok and np.isclose(left_h, right_h, rtol=1e-3, atol=1e-8)
-		items = [
-			(left_bar, left_label, "right", -3, 2 if not heights_close else 11),
-			(right_bar, right_label, "left", 3, 2),
-		]
-		for bar, label, ha, dx, dy in items:
-			h = float(bar.get_height())
-			if h != h:
-				continue
-			ax.annotate(
-				label,
-				(_bar_center(bar), h),
-				ha=ha,
-				va="bottom",
-				fontsize=fontsize,
-				xytext=(dx, dy),
-				textcoords="offset points",
-				bbox=_label_box,
-				clip_on=False,
-			)
-
-	with plt.rc_context({
-		"font.size": 8,
-		"axes.titlesize": 9,
-		"axes.labelsize": 8,
-		"xtick.labelsize": 7.4,
-		"ytick.labelsize": 7.4,
-		"legend.fontsize": 7.0,
-	}):
-		fig, axes = plt.subplots(2, 2, figsize=(8.6, 6.1), constrained_layout=False)
-		fig.subplots_adjust(left=0.075, right=0.995, bottom=0.12, top=0.955, wspace=0.32, hspace=0.44)
-		ax_counts, ax_prev = axes[0]
-		ax_cov, ax_overlap = axes[1]
-
-		pop_labels = ["All", f"High-quality\n({metric_label} ≥ {thr:.2f})"]
-		pop_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [None, None])[:2]
-		if len(pop_colors) < 2:
-			pop_colors = [None, None]
-
-		dir_labels = ["Any flip", "Correct→incorrect", "Incorrect→correct"]
-		dir_tick_labels = ["Any flip", "Correct→\nincorrect", "Incorrect→\ncorrect"]
-		x = np.arange(len(dir_labels))
-		w = 0.34
-
-		# A. Subset size.
-		counts = np.asarray([len(total_neurons), len(high_neurons)], dtype=float)
-		bars = ax_counts.bar(np.arange(2), counts, width=0.62, color=pop_colors)
-		ax_counts.set_xticks(np.arange(2))
-		ax_counts.set_xticklabels(pop_labels)
-		ax_counts.set_ylabel("# neurons")
-		ax_counts.set_title("Subset size", pad=4)
-		ax_counts.set_ylim(0, max(1.0, float(np.nanmax(counts)) * 1.20 if len(counts) else 1.0))
-		ax_counts.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
-		for i, b in enumerate(bars):
-			h = b.get_height()
-			pct = (100.0 * h / float(len(total_neurons))) if len(total_neurons) else float("nan")
-			lab = f"{int(h)}"
-			if i == 1 and pct == pct:
-				lab += f"\n({pct:.1f}%)"
-			_annotate_bar_top(ax_counts, b, lab, fontsize=7.2)
-
-		# B. Prompt-level prevalence of unique flips. Directional rates use the
-		# eligible baseline subset as denominator when available.
-		all_union = np.asarray([union_any_all, union_c2i_all, union_i2c_all], dtype=float)
-		hq_union = np.asarray([union_any_high, union_c2i_high, union_i2c_high], dtype=float)
-		all_prev = np.divide(100.0 * all_union, _prev_denoms, out=np.full(3, np.nan), where=_prev_denoms > 0)
-		hq_prev = np.divide(100.0 * hq_union, _prev_denoms, out=np.full(3, np.nan), where=_prev_denoms > 0)
-		bars_all = ax_prev.bar(x - w/2, all_prev, width=w, label="All", color=pop_colors[0])
-		bars_hq = ax_prev.bar(x + w/2, hq_prev, width=w, label="HQ", color=pop_colors[1])
-		ax_prev.set_xticks(x)
-		ax_prev.set_xticklabels(dir_tick_labels)
-		ax_prev.set_ylabel("Unique flips / eligible points (%)")
-		ax_prev.set_title("Eligible flip prevalence", pad=4)
-		prev_top = np.nanmax(np.concatenate([all_prev, hq_prev])) if np.isfinite(np.concatenate([all_prev, hq_prev])).any() else 1.0
-		ax_prev.set_ylim(0, max(1.0, float(prev_top) * 1.48))
-		ax_prev.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
-		ax_prev.legend(loc="upper right", frameon=False, ncol=2, handlelength=1.0, columnspacing=0.7, borderpad=0.1)
-
-		def _prev_label(bar, cnt, den, den_label):
-			if den and den == den:
-				return f"{bar.get_height():.1f}%\n{int(cnt):,}/{int(den):,} {den_label}"
-			return f"{bar.get_height():.1f}%\n{int(cnt):,}"
-
-		for b_l, b_r, cnt_l, cnt_r, den, den_label in zip(bars_all, bars_hq, all_union, hq_union, _prev_denoms, _prev_denom_labels):
-			_annotate_grouped_pair(
-				ax_prev,
-				b_l,
-				b_r,
-				_prev_label(b_l, cnt_l, den, den_label),
-				_prev_label(b_r, cnt_r, den, den_label),
-				fontsize=6.2,
-			)
-
-		# C. Direct coverage question: how much of all discovered flip behavior is covered by HQ neurons?
-		coverage = np.asarray([
-			(float(union_any_high) / float(union_any_all)) if union_any_all else np.nan,
-			(float(union_c2i_high) / float(union_c2i_all)) if union_c2i_all else np.nan,
-			(float(union_i2c_high) / float(union_i2c_all)) if union_i2c_all else np.nan,
-		], dtype=float)
-		coverage_pct = 100.0 * coverage
-		bars_cov = ax_cov.bar(x, coverage_pct, width=0.56, color=pop_colors[1])
-		ax_cov.set_xticks(x)
-		ax_cov.set_xticklabels(dir_tick_labels)
-		ax_cov.set_ylim(0, max(100.0, np.nanmax(coverage_pct) * 1.08 if np.isfinite(coverage_pct).any() else 100.0))
-		ax_cov.set_ylabel("HQ / all union (%)")
-		ax_cov.set_title("Coverage share", pad=4)
-		ax_cov.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
-		pvals = [_p_any, _p_c2i, _p_i2c]
-		pairs = [(union_any_high, union_any_all), (union_c2i_high, union_c2i_all), (union_i2c_high, union_i2c_all)]
-		for b, pct, (num, den), p in zip(bars_cov, coverage_pct, pairs, pvals):
-			if pct == pct:
-				plab = _fmt_p(p)
-				lab = f"{pct:.1f}%\n{int(num)}/{int(den)}"
-				if plab:
-					lab += f"\np={plab}"
-				# For near-100% bars, place labels inside the bar so they cannot hit the panel title.
-				if pct >= 70:
-					_annotate_bar_inside(ax_cov, b, lab, fontsize=6.5, frac=0.975)
-				else:
-					_annotate_bar_top(ax_cov, b, lab, fontsize=6.5)
-
-		# D. Overlap / redundancy: sum-over-neurons vs unique union.
-		def _ratio(sum_v, union_v):
-			return (float(sum_v) / float(union_v)) if union_v else np.nan
-
-		overlap_all = np.asarray([
-			_ratio(sum_any_all, union_any_all),
-			_ratio(sum_c2i_all, union_c2i_all),
-			_ratio(sum_i2c_all, union_i2c_all),
-		], dtype=float)
-		overlap_hq = np.asarray([
-			_ratio(sum_any_high, union_any_high),
-			_ratio(sum_c2i_high, union_c2i_high),
-			_ratio(sum_i2c_high, union_i2c_high),
-		], dtype=float)
-		bars_oa = ax_overlap.bar(x - w/2, overlap_all, width=w, label="All", color=pop_colors[0])
-		bars_oh = ax_overlap.bar(x + w/2, overlap_hq, width=w, label="HQ", color=pop_colors[1])
-		ax_overlap.axhline(1.0, linewidth=0.8, alpha=0.45)
-		ax_overlap.set_xticks(x)
-		ax_overlap.set_xticklabels(dir_tick_labels)
-		ax_overlap.set_ylabel("Sum / union")
-		ax_overlap.set_title("Overlap", pad=4)
-		overlap_top = np.nanmax(np.concatenate([overlap_all, overlap_hq])) if np.isfinite(np.concatenate([overlap_all, overlap_hq])).any() else 1.0
-		ax_overlap.set_ylim(0, max(1.0, float(overlap_top) * 1.35))
-		ax_overlap.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
-		ax_overlap.legend(loc="upper right", frameon=False, ncol=2, handlelength=1.0, columnspacing=0.7, borderpad=0.1)
-
-		# Ratio-only labels in this dense panel prevent the count labels from colliding.
-		# Exact numerator/denominator values remain in high_quality_neuron_flip_coverage.json.
-		for b_l, b_r in zip(bars_oa, bars_oh):
-			_annotate_grouped_pair(
-				ax_overlap,
-				b_l,
-				b_r,
-				f"{b_l.get_height():.2f}×",
-				f"{b_r.get_height():.2f}×",
-				fontsize=6.5,
-			)
-
-	plot_path = os.path.join(out_dir, 'stats', stats_dirname, f"high_quality_neuron_flip_coverage.pdf")
-	plt.savefig(plot_path, dpi=300, bbox_inches='tight', pad_inches=0.02)
-	plt.close()
-	print(f"[HighQuality] Wrote {plot_path}")
-	
-	return summary
-
-def _p_to_star(p: float) -> str:
-	if p is None or (isinstance(p, float) and np.isnan(p)):
-		return ""
-	if p < 1e-3:
-		return "***"
-	if p < 1e-2:
-		return "**"
-	if p < 5e-2:
-		return "*"
-	return ""
-
-def _perm_pval_union(scores_df: pd.DataFrame,
-					 cols_all: list[str],
-					 cols_hq: list[str],
-					 n_perm: int = 200,
-					 rng=None,
-					 debug: bool = False):
-	if rng is None:
-		rng = np.random.default_rng(0)
-
-	# allow missing cols like your union helper typically does
-	dfm = scores_df.reindex(columns=list(dict.fromkeys(cols_all)))
-	cols_hq = list(dict.fromkeys(cols_hq))
-
-	# evaluated prompts (for THIS layer universe)
-	eval_mask = dfm.notna().any(axis=1).to_numpy()
-	n_eval = int(eval_mask.sum())
-	if n_eval == 0:
-		return (np.nan, "no_eval_rows", n_eval, dfm.shape[1], len(cols_hq)) if debug else np.nan
-
-	# restrict HQ to columns that are actually in dfm
-	cols_hq = [c for c in cols_hq if c in dfm.columns]
-	k, m = len(cols_hq), dfm.shape[1]
-	if k == 0:
-		return (np.nan, "k=0_after_intersection", n_eval, m, k) if debug else np.nan
-	if k >= m:
-		return (1.0, "k>=m", n_eval, m, k) if debug else 1.0
-
-	# require HQ to have *any* evaluated row
-	n_eval_hq = int(dfm[cols_hq].notna().any(axis=1).sum())
-	if n_eval_hq == 0:
-		return (np.nan, "no_eval_rows_in_hq", n_eval, m, k) if debug else np.nan
-
-	# numeric/boolean robustness: treat nonzero as True
-	df_num = dfm.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-	mat = (df_num.to_numpy()[eval_mask] != 0)
-
-	col_to_i = {c: i for i, c in enumerate(dfm.columns)}
-	hq_idx = [col_to_i[c] for c in cols_hq if c in col_to_i]
-	if len(hq_idx) == 0:
-		return (np.nan, "hq_idx_empty", n_eval, m, k) if debug else np.nan
-
-	obs = int(mat[:, hq_idx].any(axis=1).sum())
-
-	ge = 0
-	for _ in range(int(n_perm)):
-		idx = rng.choice(m, size=k, replace=False)
-		u = int(mat[:, idx].any(axis=1).sum())
-		ge += (u >= obs)
-
-	p = (ge + 1) / (n_perm + 1)
-	return (p, "ok", n_eval, m, k, obs) if debug else p
-
-def write_high_quality_neuron_flip_coverage_by_layer(
-	scores_df: pd.DataFrame,
-	neurons_sorted,
-	rule_best_df: pd.DataFrame,
-	out_dir: str,
-	stats_dirname: str = "",
-	quality_metric: str = "mcc",
-	quality_threshold: float = None,
-	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
-):
-	"""
-	Produces a figure analogous to `high_quality_neuron_flip_coverage.pdf` but stratified by layer.
-
-	For each layer:
-	- counts: total neurons with rules vs high-quality neurons (best rule metric >= threshold)
-	- unique flips (union) explained by neurons in that layer, for correct→incorrect and incorrect→correct,
-	  shown for all neurons vs the high-quality subset.
-
-	Writes:
-	- high_quality_neuron_flip_coverage_by_layer.json
-	- high_quality_neuron_flip_coverage_by_layer.pdf
-	"""
-	if rule_best_df is None or rule_best_df.empty:
-		print("[HighQualityByLayer] No rule metrics available; skipping.")
-		return None
-	# Ensure rule_best_df only contains rules for these neurons + compatible targets
-	rule_best_df = _filter_rule_metrics_df(rule_best_df, neurons_sorted)
-	rule_best_df = _filter_by_min_dataset_coverage(rule_best_df, min_dataset_coverage)
-	if rule_best_df is None or rule_best_df.empty:
-		print(f"[HighQualityByLayer] No rule metrics available after filtering and dataset_coverage >= {float(min_dataset_coverage):.6g}; skipping.")
-		return None
-
-	out_dir = str(out_dir)
-	stats_dir = os.path.join(out_dir, 'stats', stats_dirname)
-	Path(stats_dir).mkdir(parents=True, exist_ok=True)
-
-	metric_key = _norm_rule_metric_name(quality_metric)
-	metric_col = _rule_metric_col(metric_key)
-	metric_label = _rule_metric_label(metric_key)
-	thr = 0.70 if quality_threshold is None else float(quality_threshold)
-	if metric_col not in rule_best_df.columns:
-		metric_key = "mcc"
-		metric_col = "MCC"
-		metric_label = "MCC"
-
-	# Identify high-quality neurons by (layer_key, neuron_id)
-	tmp = rule_best_df.copy()
-	tmp["layer_key"] = tmp["layer_key"].map(_safe_layer_label)  # <- critical
-	high_df = tmp[pd.to_numeric(tmp[metric_col], errors="coerce") >= float(thr)]
-	high_ids = {(str(r["layer_key"]), int(r["neuron_id"])) for _, r in high_df.dropna(subset=["neuron_id", "layer_key"]).iterrows()}
-
-	# Group neurons by layer
-	layer_to_neurons = defaultdict(list)
-	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0],x[1])):
-		layer_key = _safe_layer_label(layer_label)
-		layer_to_neurons[layer_key].append(int(neuron_id))
-
-	# Sort layers using existing helper
-	layers = sorted(layer_to_neurons.keys(), key=lambda lk: _layer_sort_key(lk))
-
-	rows = []
-	for lk in layers:
-		nids = sorted(set(layer_to_neurons[lk]))
-		all_neus = [(lk, nid) for nid in nids]
-		hq_neus = [(lk, nid) for nid in nids if (lk, nid) in high_ids]
-
-		def _cols(neuron_list, prefix):
-			return [f"{prefix}{lkey}_{nid}" for (lkey, nid) in neuron_list]
-
-		cols_c2i_all = _cols(all_neus, "flip_c2i_")
-		cols_i2c_all = _cols(all_neus, "flip_i2c_")
-		cols_any_all = _cols(all_neus, "flip_")
-		cols_c2i_hq = _cols(hq_neus, "flip_c2i_")
-		cols_i2c_hq = _cols(hq_neus, "flip_i2c_")
-		cols_any_hq = _cols(hq_neus, "flip_")
-
-		union_any_all, _, n_eval_any_all = _union_and_sum_flips(scores_df, cols_any_all)
-		union_any_hq, _, n_eval_any_hq = _union_and_sum_flips(scores_df, cols_any_hq)
-		union_c2i_all, _, _ = _union_and_sum_flips(scores_df, cols_c2i_all)
-		union_c2i_hq, _, _ = _union_and_sum_flips(scores_df, cols_c2i_hq)
-		union_i2c_all, _, _ = _union_and_sum_flips(scores_df, cols_i2c_all)
-		union_i2c_hq, _, _ = _union_and_sum_flips(scores_df, cols_i2c_hq)
-
-		n_perm = 200
-		# print("hq_not_in_all:", set(cols_any_hq) - set(cols_any_all))
-		p_any_hq_vs_rand, reason, *rest = _perm_pval_union(scores_df, cols_any_all, cols_any_hq, n_perm=n_perm, debug=True)
-		# print(lk, p_any_hq_vs_rand, reason, rest)
-		# print(p_any_hq_vs_rand)
-		# n_eval = int(scores_df[cols_any_all].notna().any(axis=1).sum()) if cols_any_all else 0
-		# print(lk, "m=", len(cols_any_all), "k=", len(cols_any_hq), "n_eval=", n_eval)
-		# hq_present = [c for c in cols_any_hq if c in scores_df.columns]
-		# hq_missing = [c for c in cols_any_hq if c not in scores_df.columns]
-		# n_eval_hq = int(scores_df[hq_present].notna().any(axis=1).sum()) if hq_present else 0
-		# print(lk, "hq_present=", len(hq_present), "hq_missing=", len(hq_missing), "n_eval_hq=", n_eval_hq)
-
-		rows.append({
-			"layer_key": lk,
-			"layer_sort": int(_layer_sort_key(lk)),
-			"n_neurons_total": int(len(all_neus)),
-			"n_neurons_high_quality": int(len(hq_neus)),
-			"n_rows_with_any_eval_all": int(n_eval_any_all),
-			"n_rows_with_any_eval_high": int(n_eval_any_hq),
-			"flip_any_union_all": int(union_any_all),
-			"flip_any_union_high": int(union_any_hq),
-			"flip_c2i_union_all": int(union_c2i_all),
-			"flip_c2i_union_high": int(union_c2i_hq),
-			"flip_i2c_union_all": int(union_i2c_all),
-			"flip_i2c_union_high": int(union_i2c_hq),
-			"p_any_hq_vs_rand": None if (p_any_hq_vs_rand is None or np.isnan(p_any_hq_vs_rand)) else float(p_any_hq_vs_rand),
-			"perm_n": n_perm,
-		})
-
-	out = {
-		"quality_metric": str(metric_key),
-		"quality_metric_label": str(metric_label),
-		"quality_threshold": float(thr),
-		"min_dataset_coverage": float(min_dataset_coverage),
-		"layers": rows,
-	}
-	json_path = os.path.join(stats_dir, "high_quality_neuron_flip_coverage_by_layer.json")
-	Path(json_path).write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
-	print(f"[HighQualityByLayer] Wrote {json_path}")
-
-	# Build figure
-	df_plot = pd.DataFrame(rows).sort_values("layer_sort")
-	if df_plot.empty:
-		print("[HighQualityByLayer] No layers to plot; skipping.")
-		return out
-
-	layer_labels = list(map(lambda x: x.replace('_','.') ,df_plot["layer_key"].tolist()))
-	x = np.arange(len(layer_labels))
-
-	plt.figure(figsize=(max(10, 0.6 * len(layer_labels)), 6.5))
-	ax1 = plt.subplot(2, 1, 1)
-	w = 0.38
-	ax1.bar(x - w/2, df_plot["n_neurons_total"].to_numpy(), w, label="All neurons w/ rules")
-	ax1.bar(x + w/2, df_plot["n_neurons_high_quality"].to_numpy(), w, label=f"{metric_label} ≥ {thr:.2f}")
-	ax1.set_ylabel("# neurons")
-	# ax1.set_title("High-quality rules per neuron, by layer")
-	ax1.set_xticks(x)
-	ax1.set_xticklabels(layer_labels, rotation=45, ha="right")
-	ax1.tick_params(axis="x", labelbottom=False) # top subplot: hide x tick labels (bottom subplot carries them)
-	ax1.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
-	ax1.legend(loc="best", fontsize=9)
-
-	ax2 = plt.subplot(2, 1, 2)
-	denom = len(scores_df)
-	c2i_all_pct = 100.0 * df_plot["flip_c2i_union_all"].to_numpy(dtype=float) / denom
-	c2i_hq_pct  = 100.0 * df_plot["flip_c2i_union_high"].to_numpy(dtype=float) / denom
-	i2c_all_pct = 100.0 * df_plot["flip_i2c_union_all"].to_numpy(dtype=float) / denom
-	i2c_hq_pct  = 100.0 * df_plot["flip_i2c_union_high"].to_numpy(dtype=float) / denom
-
-	# Use lines for readability (many layers)
-	ax2.plot(x, c2i_all_pct, marker="o", linewidth=1.2, label="correct→incorrect (all)")
-	ax2.plot(x, c2i_hq_pct, marker="o", linewidth=1.2, label=f"correct→incorrect ({metric_label} ≥ {thr:.2f})")
-	ax2.plot(x, i2c_all_pct, marker="s", linewidth=1.2, label="incorrect→correct (all)")
-	ax2.plot(x, i2c_hq_pct, marker="s", linewidth=1.2, label=f"incorrect→correct ({metric_label} ≥ {thr:.2f})")
-
-	ax2.set_ylabel("Unique flips (% of ablated prompts)")
-	# ax2.set_title("Unique flips explained, by layer (union)")
-	ax2.set_xlabel("Layer")
-	ax2.set_xticks(x)
-	ax2.set_xticklabels(layer_labels, rotation=45, ha="right")
-	ax2.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
-	ax2.legend(loc="best", fontsize=8, ncol=2)
-
-	# --- compact p-value annotations (stars) ---
-	pstars = [_p_to_star(p) for p in df_plot.get("p_any_hq_vs_rand", pd.Series([np.nan]*len(df_plot))).to_list()]
-	y_star = np.nanmax(np.vstack([c2i_hq_pct, i2c_hq_pct]), axis=0)
-	y_star = y_star + 0.8  # small offset above the higher HQ point
-
-	any_pstar = False
-	for xi, yi, s in zip(x, y_star, pstars):
-		if s:
-			ax2.text(xi, yi, s, ha="center", va="bottom", fontsize=8)
-			any_pstar = True
-
-	# small legend note (compact)
-	if any_pstar:
-		plt.figtext(
-			0.99, 0.01,
-			f"*,**,***: perm p<0.05,0.01,0.001 vs random subset (k=n_HQ), N={n_perm}",
-			ha="right", fontsize=7
-		)
-
-	plot_path = os.path.join(stats_dir, "high_quality_neuron_flip_coverage_by_layer.pdf")
-	plt.savefig(plot_path, dpi=250, bbox_inches="tight")
-	plt.close()
-	print(f"[HighQualityByLayer] Wrote {plot_path}")
-
-	return out
-
-
 
 def _score_scope_slug(scope: str) -> str:
 	return str(scope).strip().lower().replace("+", "_").replace("-", "_").replace(" ", "_")
@@ -3764,8 +2808,6 @@ def _load_scope_best_rule_metrics(
 		return pd.DataFrame()
 	slug = _score_scope_slug(scope)
 	candidates = [stats_dir / f"rule_combo_metrics_{slug}_best_per_neuron.csv"]
-	if scope_norm == "test":
-		candidates.append(stats_dir / "rule_combo_metrics_best_per_neuron.csv")
 	for path in candidates:
 		if path.exists():
 			try:
@@ -3834,11 +2876,8 @@ def _hq_scope_records(
 		return [f"{prefix}{lk}_{nid}" for (lk, nid) in neuron_list]
 
 	def _coverage_for(neuron_list, sdf=None):
-		# Coverage is evaluated on the row scope supplied by the caller.
-		# HQ-T should report TEST-row flip prevalence; ALL-FIT HQ should
-		# report pooled all-row prevalence.  The previous implementation always
-		# used the full scores_df for every scope, which made HQ(TEST) and
-		# HQ(ALL-FIT) figures appear identical whenever the HQ neuron set matched.
+		# Coverage is evaluated on the row scope supplied by the caller: HQ-T uses
+		# TEST rows, while ALL-FIT HQ uses the pooled row universe.
 		if sdf is None:
 			sdf = scores_df
 		cols_any = _cols(neuron_list, "flip_")
@@ -3879,8 +2918,8 @@ def _hq_scope_records(
 			elif scope_norm == "train":
 				mask &= ~is_test
 		# If the dataframe carries an explicit evaluated-row mask, respect it for every
-		# scope. Fall back to the historical _sampled mask for older artifacts.
-		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else ("_sampled" if "_sampled" in scores_df.columns else None)
+		# scope. Use the explicit evaluated-row mask when present.
+		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else None
 		if mask_col is not None:
 			try:
 				mask &= scores_df[mask_col].fillna(False).astype(bool)
@@ -4135,7 +3174,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 			return ""
 		return f"{n}/{d}" if d else f"{n}/0"
 	def _scope_label(scope):
-		return "HQ-T" if scope == "test_selected" else ("legacy TEST" if scope == "test" else "HQ-F")
+		return "HQ-T" if scope == "test_selected" else ("Frozen TEST" if scope == "test" else "HQ-F")
 
 	scope_order = [s for s in ["test_selected", "all_fit"] if s in scopes]
 	def _denoms_for(cov_rec, denom_rec):
@@ -4146,7 +3185,6 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 			float(denom_rec.get("n_eval_baseline_correct")) if has_local and denom_rec.get("n_eval_baseline_correct") is not None else eval_denom_local,
 			float(denom_rec.get("n_eval_baseline_incorrect")) if has_local and denom_rec.get("n_eval_baseline_incorrect") is not None else eval_denom_local,
 		], dtype=float)
-	den_labels = ["eval", "correct", "incorrect"]
 	dir_tick_labels = ["Any flip", "Correct→\nincorrect", "Incorrect→\ncorrect"]
 	x = np.arange(3)
 
@@ -4185,7 +3223,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 			off = (idx - (len(series)-1)/2) * w
 			pct = np.divide(100.0 * vals, local_denoms, out=np.full(3, np.nan), where=local_denoms > 0)
 			bars_s = ax_prev.bar(x + off, pct, width=w, label=lab, color=color)
-			for b, cnt, den, dl in zip(bars_s, vals, local_denoms, den_labels):
+			for b, cnt, den in zip(bars_s, vals, local_denoms):
 				if b.get_height() == b.get_height():
 					label = f"{b.get_height():.1f}%\n{_fmt_ratio_count(cnt, den)}"
 					ax_prev.annotate(label, (b.get_x()+b.get_width()/2, b.get_height()), ha="center", va="bottom", fontsize=5.2, xytext=(0,1), textcoords="offset points", rotation=0, linespacing=0.9)
@@ -4323,7 +3361,7 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 				mask &= is_test
 			elif scope_norm == "train":
 				mask &= ~is_test
-		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else ("_sampled" if "_sampled" in scores_df.columns else None)
+		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else None
 		if mask_col is not None:
 			try:
 				mask &= scores_df[mask_col].fillna(False).astype(bool)
@@ -4849,8 +3887,6 @@ def main():
 				model_name=ai_model,
 				device=device,
 				eval_mode=True,
-				# ungroup_grouped_query_attention=False,
-				# circuit_discovery=False,
 				cache_dir=args.ai_model_cache_dir,
 				**lm_wrapper_kwargs,
 			)
@@ -4899,8 +3935,6 @@ def main():
 	all_examples_full = scores_df.to_dict(orient="records") # <-- list[dict] rows
 
 	# ----------------- spectral sampling subset (CACHED) -----------------
-	assign_to_center = None
-	sample_center_ids = None
 	sample_indices = np.arange(n_points_total, dtype=int)
 	evaluation_split = str(args.evaluation_split).strip().lower()
 	holdout_test_only = evaluation_split == "test"
@@ -4967,12 +4001,12 @@ def main():
 				f"spectral_{run_tag}_{evaluation_split}_cap{int(args.sampling_max_points)}_seed{int(args.seed)}.pkl"
 			)
 		else:
-			# Preserve the historical all-row cache behavior.
+			# The all-row cache follows the full evaluation pool.
 			spectral_cache_fp = _spectral_cache_path(args)
 
 		def _compute_spectral_sampling():
 			_model, _unhooked_model, _tokenizer = _ensure_model_loaded()
-			emb_all, Z = build_reps_and_embedding_from_args(
+			_, Z = build_reps_and_embedding_from_args(
 				args=args,
 				texts=sampling_pool_prompts,
 				model=_unhooked_model,
@@ -4986,22 +4020,19 @@ def main():
 			max_points = min(int(args.sampling_max_points), pool_size)
 			min_points = min(int(args.sampling_min_points), max_points)
 
-			out = {
-				"Z": Z,  # store spectral embedding for the evaluation pool only
-			}
+			out = {}
 
 			if args.global_n_clusters > 0:
 				effective_k = min(int(args.global_n_clusters), pool_size, max_points)
-				global_center_idx, global_cluster_id, min_d2, global_meta, x_norm2 = kcenter_farthest_first(
+				global_center_idx, global_cluster_id, _, _, x_norm2 = kcenter_farthest_first(
 					Z, k=effective_k
 				)
-				sizes = np.bincount(global_cluster_id, minlength=len(global_center_idx))
 
 				target_n = max_points
 				if target_n < min_points:
 					target_n = min_points
 
-				sample_indices_local, cover_meta = representative_sample_from_global_clusters(
+				sample_indices_local, _ = representative_sample_from_global_clusters(
 					Z=Z,
 					x_norm2=x_norm2,
 					centers_idx=global_center_idx,
@@ -5013,19 +4044,14 @@ def main():
 				points_per_centroid = float(len(sample_indices_local)) / float(effective_k)
 
 				out.update({
-					"mode": "global_clusters",
 					"sample_indices": np.asarray(sample_indices_local, dtype=np.int64),
-					"global_center_idx": np.asarray(global_center_idx, dtype=np.int64),
-					"global_cluster_id": np.asarray(global_cluster_id, dtype=np.int32),
-					"global_meta": global_meta,
-					"cover_meta": cover_meta,
 					"points_per_centroid": points_per_centroid,
 					"effective_global_n_clusters": effective_k,
 				})
 			else:
 				# Greedy cover centers + optional expansion per centroid.  Keep the
 				# minimum below the hard cap so --sampling_max_points is truly a cap.
-				centers_idx, cover_meta = greedy_spectral_cover(
+				centers_idx, _ = greedy_spectral_cover(
 					Z,
 					all_idx,
 					radius=args.coverage_radius,
@@ -5041,7 +4067,7 @@ def main():
 					chunk_size=args.sampling_chunk_size,
 				)
 
-				sample_indices_local, sample_center_ids_local = build_per_centroid_sample_indices(
+				sample_indices_local, _ = build_per_centroid_sample_indices(
 					Z=Z,
 					centers_idx=centers_idx,
 					assign_to_center=assign_to_center_local,
@@ -5050,15 +4076,9 @@ def main():
 				)
 				# Expansion by points_per_centroid must not exceed the user-facing cap.
 				sample_indices_local = np.asarray(sample_indices_local, dtype=np.int64)[:max_points]
-				sample_center_ids_local = np.asarray(sample_center_ids_local, dtype=np.int32)[:len(sample_indices_local)]
 
 				out.update({
-					"mode": "greedy_cover",
-					"centers_idx": centers_idx,
-					"assign_to_center": np.asarray(assign_to_center_local, dtype=np.int32),
 					"sample_indices": sample_indices_local,
-					"sample_center_ids": sample_center_ids_local,
-					"cover_meta": cover_meta,
 					"points_per_centroid": int(args.points_per_centroid),
 				})
 
@@ -5070,7 +4090,6 @@ def main():
 			quiet=True,
 		)
 
-		Z = spectral_obj["Z"]
 		sample_indices_local = np.asarray(spectral_obj["sample_indices"], dtype=int)
 		if sample_indices_local.size and (
 			sample_indices_local.min() < 0
@@ -5081,8 +4100,6 @@ def main():
 				f"{sampling_split_tag} sampling pool."
 			)
 		sample_indices = np.asarray(sampling_pool_indices[sample_indices_local], dtype=int)
-		assign_to_center = spectral_obj.get("assign_to_center", None)
-		sample_center_ids = spectral_obj.get("sample_center_ids", None)
 		effective_k = int(spectral_obj.get("effective_global_n_clusters", args.global_n_clusters))
 		points_per_centroid = spectral_obj.get(
 			"points_per_centroid",
@@ -5126,7 +4143,6 @@ def main():
 		eval_prompts = [all_examples_full[i] for i in eval_indices]
 		scores_out = scores_df.iloc[eval_indices].copy().reset_index(drop=True)
 		scores_out["_orig_row"] = eval_indices
-		scores_out["_sampled"] = True
 		scores_out["_evaluated"] = True
 		scores_out["_spectral_sampled_center"] = bool(args.use_spectral_sampling)
 	elif args.use_spectral_sampling:
@@ -5140,16 +4156,8 @@ def main():
 			keep_pos.append(pos)
 		eval_indices_sampled = sample_indices[np.asarray(keep_pos, dtype=int)]
 
-		# --- held-out test rows are not force-included in spectral-sampling eval ---
-		test_indices = np.array([], dtype=int)
-		# If you intentionally want full-test ablation coverage, add an explicit
-		# opt-in flag and enable the two lines below. Keeping this disabled preserves
-		# the spectral-sampling evaluation set used by the run configuration.
-		# if "is_test" in scores_df.columns:
-		# 	test_indices = np.where(scores_df["is_test"].astype(bool).to_numpy())[0].astype(int)
-
-		# union + deterministic order
-		eval_indices = np.unique(np.concatenate([eval_indices_sampled, test_indices])).astype(int)
+		# Spectral evaluation uses only the sampled evaluation rows.
+		eval_indices = np.unique(eval_indices_sampled).astype(int)
 		eval_indices.sort()
 
 		eval_prompts = [all_examples_full[i] for i in eval_indices]
@@ -5160,19 +4168,13 @@ def main():
 
 		evaluated_mask = np.zeros(n_points_total, dtype=bool)
 		evaluated_mask[eval_indices] = True
-		# Historical downstream code uses _sampled to mean "has evaluated flip targets".
-		# Preserve that meaning.
-		sampled_mask = evaluated_mask.copy()
-
 		if args.keep_unsampled_rows:
 			scores_out = scores_df.copy()
-			scores_out["_sampled"] = sampled_mask
 			scores_out["_evaluated"] = evaluated_mask
 			scores_out["_spectral_sampled_center"] = spectral_sampled_center_mask
 		else:
 			scores_out = scores_df.iloc[eval_indices].copy().reset_index(drop=True)
 			scores_out["_orig_row"] = eval_indices
-			scores_out["_sampled"] = sampled_mask[eval_indices]
 			scores_out["_evaluated"] = True
 			scores_out["_spectral_sampled_center"] = spectral_sampled_center_mask[eval_indices]
 	else:
@@ -5184,7 +4186,6 @@ def main():
 		eval_prompts = [all_examples_full[i] for i in eval_indices]
 		scores_out = scores_df.iloc[eval_indices].copy().reset_index(drop=True)
 		scores_out["_orig_row"] = eval_indices
-		scores_out["_sampled"] = True
 		scores_out["_evaluated"] = True
 		scores_out["_spectral_sampled_center"] = False
 
@@ -5309,68 +4310,29 @@ def main():
 			semantics[k] = arr
 		return semantics
 
-	def _load_cached_eval(cache_path, rows=None, *, score_from_answers=False):
+	def _load_cached_eval(cache_path, rows=None):
 		if not os.path.exists(cache_path):
 			return None
 		with open(cache_path, "rb") as f:
 			obj = pickle.load(f)
 
-		expected_n = len(rows) if rows is not None else None
-		payload = {}
-
-		# Current cache schema: {"correct": ..., "answers": ..., "semantics": ...}
-		# Backward compatibility: older dict caches had only "correct"; oldest caches
-		# were raw bool arrays. Those are still usable for flip stats, but cannot be
-		# rescored if correctness/semantic parsing changes because they lack answers.
-		if isinstance(obj, dict):
-			if "correct" not in obj and "answers" not in obj:
-				return None
-			answers = _coerce_cached_answers(obj.get("answers"))
-			if answers is not None:
-				if expected_n is not None and len(answers) != expected_n:
-					return None
-				payload["answers"] = answers
-
-			if "correct" in obj:
-				correct = np.asarray(obj["correct"]).astype(bool)
-				if expected_n is not None and len(correct) != expected_n:
-					return None
-				payload["correct"] = correct
-
-			payload["semantics"] = _coerce_cached_semantics(obj.get("semantics", {}), expected_n)
-		else:
-			correct = np.asarray(obj).astype(bool)
-			if expected_n is not None and len(correct) != expected_n:
-				return None
-			payload["correct"] = correct
-			payload["semantics"] = {}
-
-		answers = payload.get("answers")
-		if rows is not None and answers is not None and score_from_answers:
-			# Generated answers are the expensive part. Re-score them with the current
-			# correctness function by default, so prompt/parser changes do not force
-			# another model generation pass.
-			if not bool(getattr(args, "no_rescore_cached_answers", False)):
-				payload["correct"] = _score_repeated_rows(rows, answers)
-				payload["_correct_rescored_from_answers"] = True
-
-			if semantic_diagnostics_enabled and not payload.get("semantics"):
-				semantics = _semantic_arrays(rows, answers)
-				payload["semantics"] = semantics
-				payload["_semantics_rescored_from_answers"] = bool(semantics)
-
-		if "correct" not in payload:
+		if not isinstance(obj, dict) or obj.get("cache_schema_version") != 2 or "correct" not in obj:
 			return None
 
-		if semantic_diagnostics_enabled and not payload.get("semantics"):
-			# Missing semantics require model regeneration only for legacy caches that
-			# have no generated answers. If answers are present, the normal load path can
-			# derive semantics from the cached text without generating again.
-			if bool(getattr(args, "recompute_missing_semantic_cache", False)) and answers is None:
-				return None
-			payload["_semantics_missing"] = True
+		expected_n = len(rows) if rows is not None else None
+		correct = np.asarray(obj["correct"]).astype(bool)
+		if expected_n is not None and len(correct) != expected_n:
+			return None
 
-		payload.setdefault("semantics", {})
+		payload = {
+			"correct": correct,
+			"semantics": _coerce_cached_semantics(obj.get("semantics", {}), expected_n),
+		}
+		answers = _coerce_cached_answers(obj.get("answers"))
+		if answers is not None:
+			if expected_n is not None and len(answers) != expected_n:
+				return None
+			payload["answers"] = answers
 		return payload
 
 	def _save_cached_eval(cache_path, correct, semantics=None, answers=None):
@@ -5491,7 +4453,7 @@ def main():
 				end_i = min(start_i + batch_size, len(eval_prompts))
 				batch_prompt_i = eval_prompts[start_i:end_i]
 				cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start_i)
-				cached_eval = _load_cached_eval(cache_path, batch_prompt_i, score_from_answers=False)
+				cached_eval = _load_cached_eval(cache_path, batch_prompt_i)
 				if cached_eval is None:
 					raise RuntimeError(f"Expected cached ablation result missing or invalid: {cache_path}")
 				abl = np.asarray(cached_eval.get("correct", [])).astype(bool)
@@ -5654,6 +4616,8 @@ def main():
 				mean_activations=mean_activations_all,
 				device=device,
 			)
+			# `repeated_prefix` is created for this one generation and never reused.
+			# Avoid a redundant full KV clone; reusable prefix batches use the safe default=True path.
 			answers = _model.generate_from_prefix_cache(
 				repeated_prefix,
 				fwd_hooks=hooks,
@@ -5727,6 +4691,8 @@ def main():
 			use_kv_cache=True,
 			fwd_hooks=hooks,
 		)
+		# This prefix is also one-shot: prefill hooks have already been applied and the
+		# object is discarded immediately after decoding.
 		answers = _model.generate_from_prefix_cache(
 			prefix,
 			fwd_hooks=None,
@@ -5801,7 +4767,7 @@ def main():
 					_ensure_flip_cols(layer_key, neuron_id)
 					cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start)
 
-					cached_eval = _load_cached_eval(cache_path, batch_prompt, score_from_answers=False)
+					cached_eval = _load_cached_eval(cache_path, batch_prompt)
 					if cached_eval is None:
 						_model, _, _ = _ensure_model_loaded()
 						if args.decode_only:
@@ -5823,6 +4789,7 @@ def main():
 								use_kv_cache=True,
 								fwd_hooks=hooks,
 							)
+							# One-shot input-only prefix; no later generation reuses this cache.
 							answers = _model.generate_from_prefix_cache(
 								prefix,
 								fwd_hooks=None,
@@ -5855,8 +4822,6 @@ def main():
 			# Row-wise multi-neuron path. Each synthetic row ablates exactly one neuron,
 			# including singleton donor-safe replacement for mean-donor variants.
 			layer_iter = neuron_specs_by_layer.items()
-			# if show_batch_tqdm:
-			# 	layer_iter = tqdm(list(layer_iter), desc="Layers")
 			for layer_label, specs_this_layer in layer_iter:
 				for chunk_start in range(0, len(specs_this_layer), neuron_batch_size):
 					chunk_specs_all = specs_this_layer[chunk_start:chunk_start + neuron_batch_size]
@@ -5868,7 +4833,7 @@ def main():
 						layer_key_i = _safe_layer_label(layer_label_i)
 						_ensure_flip_cols(layer_key_i, neuron_id_i)
 						cache_path = _flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start)
-						cached = _load_cached_eval(cache_path, batch_prompt, score_from_answers=False)
+						cached = _load_cached_eval(cache_path, batch_prompt)
 						cached_or_none.append(cached)
 						if cached is None:
 							compute_specs.append(spec)
@@ -6063,13 +5028,13 @@ def main():
 
 				# If spectral sampling kept unsampled rows, train/eval should only see rows
 				# with evaluated flip targets. Prefer _evaluated (which includes forced
-				# held-out test rows) and fall back to the historical _sampled mask.
+				# held-out test rows).
 				if args.use_spectral_sampling and args.keep_unsampled_rows:
-					mask_col = "_evaluated" if "_evaluated" in rules_df.columns else ("_sampled" if "_sampled" in rules_df.columns else None)
+					mask_col = "_evaluated" if "_evaluated" in rules_df.columns else None
 					if mask_col is not None:
 						rules_df = rules_df.loc[rules_df[mask_col].astype(bool)].copy()
 					if eval_df is not None:
-						emask_col = "_evaluated" if "_evaluated" in eval_df.columns else ("_sampled" if "_sampled" in eval_df.columns else None)
+						emask_col = "_evaluated" if "_evaluated" in eval_df.columns else None
 						if emask_col is not None:
 							eval_df = eval_df.loc[eval_df[emask_col].astype(bool)].copy()
 
@@ -6093,7 +5058,6 @@ def main():
 					neg = int((y <= 0.5).sum())
 					return (pos >= min_pos) and (neg >= min_neg)
 				targets_this = [t for t in targets_this if _ok_target(rules_df, t, min_pos=2, min_neg=2)]
-				prefixes = sorted({re.sub(rf"{re.escape(layer_key)}_{neuron_id}$", "", str(t)) for t in targets_this})
 
 				if targets_this:
 					# Keep a shared per-neuron directory; signature gating decides whether reuse is valid.

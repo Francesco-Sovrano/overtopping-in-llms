@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
-from analysis.lib.rule_metrics import DEFAULT_MIN_RULE_DATASET_COVERAGE, load_eval_best_rule_rows as _load_eval_best_rule_rows
+from analysis.lib.rule_metrics import DEFAULT_MIN_RULE_DATASET_COVERAGE, load_eval_best_rule_rows as _load_eval_best_rule_rows, score_scope_slug
 
 import argparse
 import json
@@ -15,18 +15,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-
-# --------------------------------------------------------------------------------------
-# Cleaned-up cross-model comparison script.
-#
-# Main fixes relative to the original version:
-#   1) Do NOT silently drop incomplete models unless explicitly requested.
-#   2) Discover available runs dynamically instead of assuming every task uses all RUN_MAP keys.
-#   3) Use a plotting/grouping key tied to run_name, not a potentially-colliding display label.
-#   4) Build plot order from the runs actually present, so labels always match the data.
-#   5) Only show decode-only/full qualifiers when both variants exist for the same base label.
-#   6) Skip empty plots entirely; save PDFs only.
-# --------------------------------------------------------------------------------------
 
 RUN_MAP = {
     'rule_split-spectral_sample-decode_only-agonist_neurons-fast-spectral_anchor': ('rule_split-spectral_sample-decode_only', 'agonist_neurons-fast-spectral_anchor', False),
@@ -227,7 +215,7 @@ def summarize_run(model_root: Path, run_name: str, tau: float, eps: float, displ
         'n_circuits': np.nan,
     }
 
-    rms_path = stats_dir / 'rule_metrics_summary.json'
+    rms_path = stats_dir / f'rule_metrics_summary_{score_scope_slug(score_scope)}.json'
     if rms_path.exists():
         rms = read_json(rms_path)
         out['n_neurons_with_rules'] = rms.get('n_neurons_with_rules', np.nan)
@@ -438,7 +426,7 @@ def main():
     ap.add_argument('--min_rule_dataset_coverage', type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
                     help='Minimum held-out dataset_coverage required before a rule contributes to per-neuron MCC distributions/HQ summaries. Use 0 to disable.')
     ap.add_argument('--score_scope', type=str, default='test_selected',
-                    help='Rule-combo score scope for cross-model rule metrics: test_selected (default, HQ-T), all_fit (HQ-F), or test (legacy frozen train-combo TEST).')
+                    help='Rule-combo score scope for cross-model rule metrics: test_selected (default, HQ-T), all_fit (HQ-F), or test (frozen train-combo TEST).')
     ap.add_argument('--runs', type=str, default='all', help="Comma-separated run names (or 'all' to auto-discover from stats folders).")
     ap.add_argument('--drop_incomplete_models', action='store_true', help='Drop models missing one or more requested runs.')
     args = ap.parse_args()

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import shlex
 import subprocess
-from typing import Iterable, Sequence
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -95,13 +95,6 @@ class RunSpec:
             / "neural_circuit_discovery_results" / "eap_ig_inputs"
             / self.circuit_label() / "neural_circuits"
         )
-
-
-def expand_grid(*, suite: str, tasks: Sequence[str], models: Sequence[str],
-                interventions: Sequence[str], modes: Sequence[str], defaults: dict | None = None) -> list[RunSpec]:
-    defaults = dict(defaults or {})
-    return [RunSpec(suite=suite, task=t, model=m, intervention=i, mode=p, **defaults)
-            for i in interventions for m in models for t in tasks for p in modes]
 
 
 def deduplicate(specs: Iterable[RunSpec]) -> list[RunSpec]:

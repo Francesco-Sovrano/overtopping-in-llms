@@ -63,8 +63,6 @@ Options (mutually exclusive within each group):
 							Rows used by stage 7 and interaction validation. Default: test.
 		--evaluation_baseline_subset <all|positive|negative>
 							Condition stage-7 rows on the unablated binary predicate. Default: all.
-		--holdout_test_only
-							Backward-compatible alias for --evaluation_split test.
 	Plan:
 		--spectral_anchoring_plan
 		--random_anchoring_plan
@@ -275,7 +273,6 @@ while [[ $# -gt 0 ]]; do
 			EVALUATION_BASELINE_SUBSET="$2"
 			shift 2
 			;;
-		--holdout_test_only)           EVALUATION_SPLIT="test"; shift ;;
 		--no_llm_feature_generation)   NO_LLM_FEATURE_GENERATION=true; shift ;;
 		-h|--help)                      usage; exit 0 ;;
 		*) echo "Unknown option: $1"; usage; exit 1 ;;

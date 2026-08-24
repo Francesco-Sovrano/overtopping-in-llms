@@ -4,15 +4,6 @@ from lib.project_paths import PROJECT_ROOT
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# # Hide CUDA; use MPS fallback + aggressive memory release on macOS
-# os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "0")
-# # os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
-# os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-# # Consider letting PyTorch pick threads for CPU work (helps ST on CPU if used)
-# os.environ.pop("OMP_NUM_THREADS", None)
-
-# os.environ["EAP_LAYER_CHUNK"] = "8"
-
 import re
 import json
 import random
@@ -28,7 +19,6 @@ import pandas as pd
 import torch
 import gc
 
-# from scipy.optimize import linear_sum_assignment
 from sentence_transformers import SentenceTransformer
 
 # ---------------------- EAP-IG & TransformerLens imports ----------------------
@@ -533,7 +523,6 @@ def _make_full_network_result(*, graph, output_dir, loader, global_mean_loader, 
 		graph.neurons_scores[:] = 1.0
 	graph.scores = graph.real_edge_mask.to(dtype=torch.float32)
 
-	# if args.mlp_neurons_only and args.circuit_level == "neuron":
 	# 	graph.zero_out_attention_neuron_scores()
 
 	meta = _serialize_full_network_metadata(
@@ -633,7 +622,7 @@ def _run_circuit_discovery_from_pairs(
 	# Run attribution
 	try:
 		if level == "edge":
-			scores = attribute(
+			attribute(
 				model=model,
 				graph=graph,
 				dataloader=loader,
@@ -648,7 +637,7 @@ def _run_circuit_discovery_from_pairs(
 				decode_mode=args.decode_mode,
 			)
 		else:
-			scores = attribute_node(
+			attribute_node(
 				model=model,
 				graph=graph,
 				dataloader=loader,
@@ -714,7 +703,7 @@ def _run_circuit_discovery_from_pairs(
 
 	print("n_scored_nodes:", int((~torch.isnan(scores_tensor)).sum()))
 
-	top_scores, meta = graph.get_topn(
+	_, meta = graph.get_topn(
 		topn,
 		level=level,
 		absolute=args.absolute_value_attributions,
@@ -989,7 +978,6 @@ def discover_for_cluster(
 		"[Sampling] Using ANN+length-matched random strategy for spectral cluster "
 		f"{cluster_index}; {len(pairs)} pairs."
 	)
-	# print("Using these pairs:", json.dumps(list(map(asdict, pairs)), indent=4))
 
 	if len(pairs) == 0:
 		write_skip_marker(
@@ -1144,7 +1132,6 @@ def select_cluster_base_subset():
 
 	pos_mask_np = np.asarray(pos_mask.to_numpy() if hasattr(pos_mask, "to_numpy") else pos_mask)
 	pos_indices = np.where(pos_mask_np)[0]
-	# neg_indices = np.where(~pos_mask_np)[0]
 	# pos_indices, _ = balance_positives_and_negatives(pos_indices, neg_indices, t=args.max_pairs_per_circuit)
 
 	if pos_indices.size == 0:
@@ -1399,7 +1386,7 @@ if args.cluster_by_spectral:
 	# Texts for the chosen base subset (this is what we cluster)
 	pos_texts = scores_df.iloc[pos_indices][text_col].astype(str).tolist()
 
-	emb_repr_pos, Z_pos = build_reps_and_embedding_from_args(
+	_, Z_pos = build_reps_and_embedding_from_args(
 		args=args,
 		texts=pos_texts,
 		model=unhooked_model,
@@ -1409,7 +1396,7 @@ if args.cluster_by_spectral:
 
 	# Keep k consistent with preflight (but ensure it's <= available points)
 	k = min(k, int(Z_pos.shape[0]))
-	centers_idx, _, _, meta, x_norm2 = kcenter_farthest_first(Z_pos, k=k)
+	centers_idx, _, _, meta, _ = kcenter_farthest_first(Z_pos, k=k)
 	cluster_ids_pos = assign_min_size_nearest_to_centers(
 		Z_pos,
 		centers_idx,

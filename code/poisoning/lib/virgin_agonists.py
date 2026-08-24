@@ -30,7 +30,7 @@ def _source_phase(path: Path) -> str:
 
 def _configured_tau_label() -> str:
     """Return the shared CHA tau in the same compact form used in paths."""
-    raw = os.environ.get("CHA_TAU", os.environ.get("POISONING_CHA_TAU", "0.3")).strip()
+    raw = os.environ.get("CHA_TAU", "0.3").strip()
     try:
         return f"{float(raw):g}"
     except ValueError:

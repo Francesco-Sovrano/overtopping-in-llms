@@ -235,7 +235,6 @@ def get_cached_values(value_list, cache, fetch_fn, cache_name=None, key_fn=lambd
 		if key_fn(q) not in cache or (empty_is_missing and _is_missing_cached_value(cache[key_fn(q)]))
 	)
 
-	# print('get_cached_values', list(cache.keys()[0], indent=2))
 	if len(missing_values) > 0:
 		for q, v in fetch_fn(missing_values):
 			cache[key_fn(q)] = v
@@ -249,14 +248,6 @@ def get_cached_values(value_list, cache, fetch_fn, cache_name=None, key_fn=lambd
 		cached_values = list(map(transform_fn, cached_values))
 	return cached_values
 
-def _is_reasoning_model(model_name):
-	n = (model_name or "").lower()
-	return (
-		n.startswith('o1') or n.startswith('o3') or n.startswith('o4') or  # OpenAI o-family
-		('deepseek' in n and 'r1' in n) or                                 # DeepSeek R1 / R1-distill
-		('qwen3' in n) or                                                  # Qwen3 family
-		('reason' in n)                                                    # generic catch-all
-	)
 
 def get_document_list(directory):
 	doc_list = []
@@ -557,7 +548,6 @@ def instruct_openai_model(prompts, system_instructions=None, api_key=None, base_
 			adjust_max_tokens = False
 		elif model.startswith('o1') or model.startswith('o3') or model.startswith('o4'):
 			adjust_max_tokens = False
-	# print('max_tokens', max_tokens)
 	def fetch_fn(instruction_prompt):
 		system_instruction, missing_prompt = instruction_prompt
 		if system_instruction:
@@ -599,7 +589,6 @@ def instruct_openai_model(prompts, system_instructions=None, api_key=None, base_
 					presence_penalty=presence_penalty,
 					timeout=timeout
 				)
-			# print(response.choices)
 			result = [
 				r.message.content.strip() 
 				for r in response.choices 
@@ -617,7 +606,7 @@ def instruct_openai_model(prompts, system_instructions=None, api_key=None, base_
 			# Using ThreadPoolExecutor to run queries in parallel with tqdm for progress tracking
 			with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,n_processes)) as executor:
 				futures = [executor.submit(fetch_fn, prompt) for prompt in missing_prompt_list]
-				for e,future in enumerate(_tqdm(concurrent.futures.as_completed(futures), total=len(missing_prompt_list), desc="Sending prompts to OpenAI", leave=False)):
+				for future in _tqdm(concurrent.futures.as_completed(futures), total=len(missing_prompt_list), desc="Sending prompts to OpenAI", leave=False):
 					i,o=future.result()
 					yield i,o
 		else:
@@ -635,7 +624,6 @@ def instruct_openai_model(prompts, system_instructions=None, api_key=None, base_
 		list(zip(system_instructions if system_instructions else [None]*len(prompts), prompts)), 
 		__openai_cache, 
 		parallel_fetch_fn, 
-		# key_fn=lambda x: (x,model,n,temperature,top_p,frequency_penalty,presence_penalty), 
 		key_fn=lambda x: (x,model,temperature,top_p,frequency_penalty,presence_penalty,n), 
 		empty_is_missing=True,
 		cache_name=openai_cache_name,
@@ -677,8 +665,6 @@ def instruct_groq_model(
 	# default output cap if caller didn't specify
 	if max_tokens is None:
 		max_tokens = 4096
-	adjust_max_tokens = True
-
 	# Only forward kwargs that Groq actually understands (avoid 400s)
 	_allowed_kwargs = {
 		"stop",

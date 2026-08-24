@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from lib.project_paths import PROJECT_ROOT
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import pandas as pd
 import torch
@@ -28,8 +28,6 @@ DEFAULT_DATASET_PATH = Path(
     )
 )
 
-YES_WORDS = {"yes", "acceptable", "grammatical", "correct"}
-NO_WORDS = {"no", "unacceptable", "ungrammatical", "incorrect"}
 
 
 def _normalize_text(text: str) -> str:
@@ -39,14 +37,6 @@ def _normalize_text(text: str) -> str:
 def _tokenize_words(text: str) -> List[str]:
     return re.findall(r"[A-Za-z']+", str(text or "").lower())
 
-
-def _contains_any(text: str, patterns: List[str]) -> bool:
-    low = _normalize_text(text).lower()
-    return any(p in low for p in patterns)
-
-
-
-_extract_binary_prediction = extract_binary_prediction
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -261,7 +251,7 @@ class GrammarAcceptabilityTaskSpec(FeatureTaskSpec):
     def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
         out: List[bool] = []
         for prompt_data, response in zip(prompt_batch, response_texts):
-            pred = _extract_binary_prediction(response)
+            pred = extract_binary_prediction(response)
             gold = prompt_data.get("is_acceptable", None)
             if pd.isna(gold) or gold is None:
                 raise ValueError("Missing is_acceptable in prompt row during scoring.")
@@ -308,7 +298,7 @@ class GrammarAcceptabilityTaskSpec(FeatureTaskSpec):
             gold = bool(gold)
 
             item[self.DEFAULT_OUTPUT] = out
-            item["predicted_label"] = _extract_binary_prediction(out)
+            item["predicted_label"] = extract_binary_prediction(out)
             item["is_correct"] = bool(item["predicted_label"] == gold)
 
             meta = _sentence_metadata(item.get("sentence", ""))

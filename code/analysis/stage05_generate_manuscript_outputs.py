@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Build manuscript-ready tables and plots from experiment outputs.
+"""Build manuscript-ready tables and plots from current experiment outputs.
 
 The manuscript interaction columns are the unconditional simultaneous effect
-``E(J)`` and the paired conditional marginal contribution (CMC).  GCCR is
-obsolete and is intentionally ignored even if older result directories still
-contain v3 GCCR files.
+``E(J)`` and the paired conditional marginal contribution (CMC). Inputs must use
+the current held-out singleton and conditional-marginal schemas.
 """
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from lib.heldout_set_metrics import derive_legacy_aggregate_metrics
 from lib.project_paths import PROJECT_ROOT
 from analysis.lib.primary_matrix import (
     PRIMARY_PROFILE_CHOICES,
@@ -29,14 +27,13 @@ from analysis.lib.primary_matrix import (
 )
 
 CURRENT_INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
-LEGACY_EJ_SCHEMA = "interaction-validation-v3"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--primary_table", required=True)
     parser.add_argument("--data_root", default=None)
-    parser.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "manuscript"))
+    parser.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "manuscript" / "tables_and_macros"))
     parser.add_argument("--primary_profile", required=True, choices=PRIMARY_PROFILE_CHOICES)
     return parser.parse_args()
 
@@ -99,46 +96,29 @@ def augment_row(row: pd.Series, stats_dir: Path) -> dict:
     summary_csv_path = interaction_dir / "interaction_validation_summary.csv"
 
     global_payload = load_json(global_path) if global_path.exists() else {}
-    by_path = stats_dir / "flip_stats_by_neuron.csv"
-    by_neuron = pd.read_csv(by_path) if by_path.exists() else pd.DataFrame()
     singleton = load_json(singleton_path) if singleton_path.exists() else {}
-    legacy_exact = (
-        derive_legacy_aggregate_metrics(global_payload=global_payload, candidate_stats=by_neuron)
-        if not singleton and global_payload and not by_neuron.empty else {}
-    )
     interaction = load_json(interaction_path) if interaction_path.exists() else {}
     schema = interaction.get("definition_version")
     interaction_current = schema == CURRENT_INTERACTION_SCHEMA
-    interaction_legacy_ej = schema == LEGACY_EJ_SCHEMA
     summary_rows = interaction_summary_rows(summary_csv_path)
 
     output.update({
-        "J": _pick(singleton.get("J"), legacy_exact.get("J"), global_payload.get("n_neurons"), output.get("J")),
-        "U_J": _pick(singleton.get("U_J"), legacy_exact.get("U_J"), global_payload.get("union_flip_any_unique_rate"), output.get("U")),
-        "s_1": _pick(singleton.get("s_1"), legacy_exact.get("s_1"), output.get("Top")),
-        "R_ov": _pick(singleton.get("R_ov"), legacy_exact.get("R_ov")),
-        "R_ov_status": _pick(singleton.get("R_ov_status"), legacy_exact.get("R_ov_status")),
-        "N_eff": _pick(singleton.get("N_eff"), legacy_exact.get("N_eff")),
-        "N_eff_status": _pick(singleton.get("N_eff_status"), legacy_exact.get("N_eff_status")),
+        "J": _pick(singleton.get("J"), global_payload.get("n_neurons"), output.get("J")),
+        "U_J": _pick(singleton.get("U_J"), global_payload.get("union_flip_any_unique_rate"), output.get("U")),
+        "s_1": _pick(singleton.get("s_1"), output.get("Top")),
+        "R_ov": _pick(singleton.get("R_ov")),
+        "R_ov_status": _pick(singleton.get("R_ov_status")),
+        "N_eff": _pick(singleton.get("N_eff")),
+        "N_eff_status": _pick(singleton.get("N_eff_status")),
         "OCC_0": _pick(singleton.get("OCC_0")),
-        "OCC_0_status": _pick(singleton.get("OCC_0_status"), legacy_exact.get("OCC_0_status")),
+        "OCC_0_status": _pick(singleton.get("OCC_0_status")),
         "OCC_1": _pick(singleton.get("OCC_1")),
-        "OCC_1_status": _pick(singleton.get("OCC_1_status"), legacy_exact.get("OCC_1_status")),
-        "singleton_metrics_status": (
-            "exact_event_sidecar" if singleton_path.exists()
-            else ("legacy_aggregate_partial" if legacy_exact else "missing")
-        ),
-        "interaction_metrics_status": (
-            "conditional_v1" if interaction_current
-            else ("legacy_v3_EJ_only" if interaction_legacy_ej else "missing")
-        ),
+        "OCC_1_status": _pick(singleton.get("OCC_1_status")),
+        "singleton_metrics_status": "heldout_v2" if singleton.get("definition_version") == "heldout-set-metrics-v2" else "missing_or_incompatible",
+        "interaction_metrics_status": "conditional_v1" if interaction_current else "missing_or_incompatible",
     })
 
-    toc_map = singleton.get("TOC_m") or (
-        global_payload.get("TOC_m")
-        if global_payload.get("heldout_set_metrics_definition_version") == "heldout-set-metrics-v2"
-        else {}
-    ) or {}
+    toc_map = singleton.get("TOC_m") or {}
     for raw_m, payload in toc_map.items():
         try:
             m = int(raw_m)
@@ -152,17 +132,11 @@ def augment_row(row: pd.Series, stats_dir: Path) -> dict:
         "unavailable_requires_discovery_frozen_ranking_and_per_example_flip_events" if not toc_map else None,
     )
 
-    thresholds = singleton.get("N_t") or legacy_exact.get("N_t") or (
-        global_payload.get("N_t")
-        if global_payload.get("heldout_set_metrics_definition_version") == "heldout-set-metrics-v2"
-        else {}
-    ) or {}
+    thresholds = singleton.get("N_t") or {}
     for threshold, count in thresholds.items():
         output[f"N_t_{threshold}"] = count
 
-    # E(J) remains valid in both the current conditional schema and historical
-    # v3 simultaneous-intervention caches. GCCR fields from v3 are ignored.
-    candidate_effect = interaction.get("candidate_E_J") if schema in {CURRENT_INTERACTION_SCHEMA, LEGACY_EJ_SCHEMA} else {}
+    candidate_effect = interaction.get("candidate_E_J") if schema == CURRENT_INTERACTION_SCHEMA else {}
     candidate_effect = candidate_effect if isinstance(candidate_effect, dict) else {}
     output["E_J"] = _pick(candidate_effect.get("effect"), global_payload.get("E_J"))
     output["E_J_status"] = _pick(candidate_effect.get("status"), global_payload.get("E_J_status"))
@@ -373,7 +347,6 @@ def main() -> None:
                 "No R_ov, E(J), or conditional marginal value is clipped.",
                 "TOC_m uses discovery-frozen H_m when singleton_set_metrics.json is available.",
                 "E(J) and conditional marginals require genuine simultaneous-intervention outputs.",
-                "Historical GCCR values are ignored and are not included in manuscript outputs.",
             ],
         }, indent=2, allow_nan=True, default=str), encoding="utf-8",
     )

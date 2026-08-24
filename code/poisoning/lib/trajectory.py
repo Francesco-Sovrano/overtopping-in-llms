@@ -12,10 +12,19 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
+
+from poisoning.lib.run_paths import (
+    metadata_path,
+    resolve_manifest_checkpoint_dir,
+    training_condition_dir,
+)
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from poisoning.lib.io import write_json
+from poisoning.lib.markers import validate_marker
+from poisoning.lib.checkpoint_manifest import repair_condition_manifest
 
 
 def _as_float(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -68,8 +77,6 @@ def select_manifest_indices(
     clean-vs-poisoned behavioral comparison available as soon as each poisoned
     checkpoint finishes instead of waiting for the complete clean trajectory.
     """
-    import re
-
     text = str(spec or "all").strip()
     if text.lower() in {"", "all"}:
         indices = list(range(len(rows)))
@@ -126,14 +133,21 @@ def configuration_mismatches(
     current: Dict[str, Any],
     keys: Sequence[str],
 ) -> Dict[str, Dict[str, Any]]:
-    """Return declared configuration changes, normalizing empty optionals."""
-    def normalized(value: Any) -> Any:
+    """Return declared configuration changes without normalizing marker values."""
+    marker_keys = {"control_marker", "trigger_marker", "sham_marker"}
+
+    def normalized(key: str, value: Any) -> Any:
+        # Empty strings and whitespace are valid marker identities and must not
+        # be conflated with missing/None values. Other optional config fields
+        # retain the historical empty-to-None comparison behavior.
+        if key in marker_keys:
+            return value
         return None if value in (None, "") else value
 
     out: Dict[str, Dict[str, Any]] = {}
     for key in keys:
-        old = normalized(previous.get(key))
-        new = normalized(current.get(key))
+        old = normalized(key, previous.get(key))
+        new = normalized(key, current.get(key))
         if old != new:
             out[str(key)] = {"existing": old, "requested": new}
     return out
@@ -154,7 +168,7 @@ def validate_resume_training_identity(
     are handled by their own cache/preflight validity checks.
     """
     run_dir = Path(run_dir)
-    config_path = run_dir / "run_config.json"
+    config_path = metadata_path(run_dir, "run_config.json")
     if not config_path.is_file():
         return None
     try:
@@ -164,8 +178,15 @@ def validate_resume_training_identity(
     if not isinstance(previous, dict):
         raise RuntimeError(f"Existing run configuration is not a JSON object: {config_path}")
 
+    # Existing physical checkpoints are training identity too, even if an older
+    # run hit the historical crash window before checkpoint_manifest.csv was
+    # persisted.  Do not let a missing index weaken resume-identity validation.
     has_training_manifest = any(
-        (run_dir / str(condition) / "checkpoint_manifest.csv").is_file()
+        (training_condition_dir(run_dir, str(condition)) / "checkpoint_manifest.csv").is_file()
+        or any(
+            p.is_dir()
+            for p in (training_condition_dir(run_dir, str(condition)) / "checkpoints").glob("frac_*_step_*")
+        )
         for condition in condition_names
     )
     mismatches = configuration_mismatches(previous, current_config, training_keys)
@@ -210,46 +231,138 @@ def _derive_trigger_change_metrics(details_path: Path) -> Dict[str, Any]:
         "conditional_conversion_success": lift,
         "conditional_conversion_n": conditional_n,
         "conditional_conversion_rate": conditional_rate,
-        "conditional_asr_success": lift,
-        "conditional_asr_n": conditional_n,
-        "conditional_asr_rate": conditional_rate,
     }
 
 
 def load_completed_condition_manifest(
     condition_dir: Path,
     expected_fractions: Sequence[float],
+    *,
+    allow_incomplete_physical: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Load a completed checkpoint trajectory, or return ``None``.
+    """Load a completed checkpoint trajectory, repairing index-only damage.
 
-    Completion is defined by the requested checkpoint fractions and the saved
-    checkpoint directories.  Post-training causal behaviour is measured later
-    with TransformerLens, so Hugging Face prediction-detail files are optional
-    and are never required for resuming training.
+    Physical checkpoints are never silently retrained.  A missing *or partial*
+    condition manifest is repaired only when the physical checkpoint fractions
+    exactly match ``expected_fractions`` and the missing bookkeeping can be
+    recovered from durable run metadata / aggregate rows.  If the physical
+    trajectory itself is incomplete, this raises with the exact missing
+    fractions instead of pretending the problem is merely a CSV file.
     """
     condition_dir = Path(condition_dir)
     manifest_path = condition_dir / "checkpoint_manifest.csv"
-    if not manifest_path.is_file() or manifest_path.stat().st_size == 0:
-        return None
-    try:
-        with manifest_path.open(newline="", encoding="utf-8") as handle:
-            rows = [dict(r) for r in csv.DictReader(handle)]
-    except Exception:
-        return None
-    if not rows:
-        return None
+    checkpoints_root = condition_dir / "checkpoints"
+    checkpoint_dirs = (
+        [p for p in checkpoints_root.glob("frac_*_step_*") if p.is_dir()]
+        if checkpoints_root.is_dir()
+        else []
+    )
 
     expected = {_fraction_key(v) for v in expected_fractions}
+    physical = set()
+    for checkpoint_dir in checkpoint_dirs:
+        match = re.match(r"^frac_(\d{4})_step_\d+$", checkpoint_dir.name)
+        if match:
+            physical.add(_fraction_key(int(match.group(1)) / 1000.0))
+
+    if checkpoint_dirs:
+        unexpected_physical = sorted(physical - expected)
+        missing_physical = sorted(expected - physical)
+        if unexpected_physical:
+            raise RuntimeError(
+                f"Physical checkpoint trajectory contains unexpected fractions at {checkpoints_root}: "
+                f"expected={sorted(expected)} observed={sorted(physical)} "
+                f"unexpected={unexpected_physical}. Refusing automatic recovery."
+            )
+        if missing_physical and allow_incomplete_physical:
+            print(
+                f"[resume] incomplete physical trajectory at {checkpoints_root}: "
+                f"missing={missing_physical}; scheduling runtime recovery "
+                "(native Trainer resume when available, verified replay only for historical snapshots without state)",
+                flush=True,
+            )
+            return None
+
+    def _read_rows() -> List[Dict[str, Any]]:
+        if not manifest_path.is_file() or manifest_path.stat().st_size == 0:
+            return []
+        with manifest_path.open(newline="", encoding="utf-8") as handle:
+            return [dict(r) for r in csv.DictReader(handle)]
+
+    try:
+        rows = _read_rows()
+    except Exception as exc:
+        if not checkpoint_dirs:
+            return None
+        rows = []
+        read_error = exc
+    else:
+        read_error = None
+
     observed = {_fraction_key(r.get("fraction", -1)) for r in rows}
-    if not expected.issubset(observed):
+    needs_repair = bool(checkpoint_dirs) and (
+        not rows
+        or not expected.issubset(observed)
+    )
+
+    if needs_repair:
+        training_dir = condition_dir.parent
+        run_dir = training_dir.parent
+        repaired, detail = repair_condition_manifest(
+            run_dir,
+            condition_dir.name,
+            training_dirname=training_dir.name,
+            expected_fractions=expected_fractions,
+            apply=True,
+        )
+        if repaired:
+            print(f"[resume] {detail}", flush=True)
+            rows = _read_rows()
+            observed = {_fraction_key(r.get("fraction", -1)) for r in rows}
+        else:
+            prefix = (
+                f"Cannot read checkpoint manifest {manifest_path}: {read_error}. "
+                if read_error is not None else
+                f"Checkpoint manifest is missing/incomplete at {manifest_path}. "
+            )
+            raise RuntimeError(
+                prefix
+                + f"Automatic conservative repair failed: {detail}. "
+                + "Refusing to retrain over existing checkpoints."
+            )
+
+    if not rows:
+        if checkpoint_dirs:
+            raise RuntimeError(
+                f"Checkpoint directories exist but the manifest has no rows: {manifest_path}. "
+                "Refusing to retrain over existing checkpoints."
+            )
         return None
 
+    observed = {_fraction_key(r.get("fraction", -1)) for r in rows}
+    if not expected.issubset(observed):
+        # This should normally have been handled by the repair path above.  Keep
+        # the explicit guard so a malformed repair can never trigger retraining.
+        raise RuntimeError(
+            f"Checkpoint manifest is incomplete for the requested fractions at {manifest_path}: "
+            f"expected={sorted(expected)} observed={sorted(observed)}. "
+            "Refusing to silently retrain; repair the physical trajectory or use a new run name."
+        )
+
+    # A manifest must describe checkpoints owned by this condition directory.
+    # Never trust a serialized absolute path for resume: repository/run moves
+    # must not cause valid checkpoints to be silently retrained.
+    run_dir = condition_dir.parent.parent
+    condition = condition_dir.name
     for row in rows:
-        checkpoint_dir = Path(str(row.get("checkpoint_dir", ""))).expanduser()
-        if not checkpoint_dir.is_dir():
-            return None
-        # Older runs may contain optional HF prediction details. Preserve any
-        # recoverable directional metrics, but do not make them a dependency.
+        row["condition"] = str(row.get("condition") or condition)
+        try:
+            checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
+        except (FileNotFoundError, ValueError) as exc:
+            raise RuntimeError(
+                f"Manifest/checkpoint mismatch in {manifest_path}; refusing to retrain an existing trajectory."
+            ) from exc
+        row["checkpoint_dir"] = f"checkpoints/{checkpoint_dir.name}"
         details_dir = condition_dir / "eval_details" / checkpoint_dir.name
         triggered_details = details_dir / "triggered_predictions.jsonl"
         if triggered_details.is_file():
@@ -331,10 +444,12 @@ def record_clean_trigger_control(
         }
         for r in rows
     ]
+    control_marker = validate_marker(control_marker, role="control marker")
+    marker = validate_marker(marker, role="evaluated marker")
     summary = {
         "task": str(task),
-        "control_marker": str(control_marker),
-        "evaluated_marker": str(marker),
+        "control_marker": control_marker,
+        "evaluated_marker": marker,
         "trigger_format": "matched_raw_id_prefix",
         "control_role": str(control_role),
         "guard_scope": "pretraining_checkpoint_only",
@@ -355,7 +470,7 @@ def record_clean_trigger_control(
     }
     if Path(output_filename).name != output_filename:
         raise ValueError("output_filename must be a plain filename")
-    write_json(Path(run_dir) / output_filename, summary)
+    write_json(metadata_path(run_dir, output_filename), summary)
 
     if not guard_passed:
         failed = ", ".join(
@@ -363,10 +478,10 @@ def record_clean_trigger_control(
             for name in limits
             if not component_pass[name]
         )
-        print(
-            f"The configured marker ID is not behaviorally neutral relative to the matched "
-            f"control ID before {task} fine-tuning ({failed}). Choose a different preregistered "
-            "five-digit ID set before training either trajectory."
+        raise RuntimeError(
+            f"The configured trigger marker is not behaviorally neutral relative to the matched "
+            f"control marker before {task} fine-tuning ({failed}). Choose a different marker "
+            "set before training either trajectory."
         )
     return summary
 
@@ -427,7 +542,7 @@ def write_matched_control_comparison(run_dir: Path, all_rows: Iterable[Dict[str,
             "poisoned_minus_clean_accuracy": p_acc - c_acc,
         })
 
-    path = Path(run_dir) / "checkpoint_control_comparison.csv"
+    path = metadata_path(run_dir, "checkpoint_control_comparison.csv")
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(out_rows[0].keys()))
         writer.writeheader()

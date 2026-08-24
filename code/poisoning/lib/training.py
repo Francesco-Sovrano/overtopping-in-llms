@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import inspect
+import json
 import os
 import re
+import shutil
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import torch
 from transformers import (
@@ -18,7 +22,7 @@ from transformers import (
     TrainingArguments,
 )
 
-from poisoning.lib.completion_data import CausalCompletionDataset, CausalLMCollator
+from poisoning.lib.checkpoint_manifest import checkpoint_dirs, write_checkpoint_manifest
 from torch.utils.data import Sampler
 from poisoning.lib.model_loading import configure_greedy_generation
 
@@ -124,7 +128,74 @@ class MatchedExposureTrainer(Trainer):
         return FixedOrderSampler(self._matched_sample_order)
 
 
+def native_resume_checkpoint_dir(training_args: TrainingArguments, global_step: int) -> Path:
+    """Return the Hugging Face Trainer checkpoint path for one optimizer step."""
+    return Path(str(training_args.output_dir)) / f"checkpoint-{int(global_step)}"
+
+
+def native_resume_checkpoint_status(
+    checkpoint_dir: Path,
+    *,
+    expected_step: int | None = None,
+) -> tuple[bool, str]:
+    """Validate that a Trainer checkpoint contains exact-resume state.
+
+    Scientific ``frac_*`` snapshots are intentionally separate from these
+    execution checkpoints.  Exact continuation requires model/adapter weights,
+    optimizer moments, LR scheduler state, Trainer state, and RNG state.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.is_dir():
+        return False, "directory is missing"
+
+    required = ["trainer_state.json", "optimizer.pt", "scheduler.pt"]
+    missing = [name for name in required if not (checkpoint_dir / name).is_file()]
+    if missing:
+        return False, f"missing exact-resume files: {missing}"
+
+    rng_files = sorted(checkpoint_dir.glob("rng_state*.pth"))
+    if not rng_files:
+        return False, "missing RNG state (rng_state*.pth)"
+
+    model_files = []
+    for pattern in (
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "model-*.safetensors",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "pytorch_model-*.bin",
+    ):
+        model_files.extend(checkpoint_dir.glob(pattern))
+    if not any(path.is_file() for path in model_files):
+        return False, "missing model/adapter weights"
+
+    try:
+        state_payload = json.loads((checkpoint_dir / "trainer_state.json").read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"cannot read trainer_state.json: {exc}"
+    if expected_step is not None:
+        try:
+            recorded_step = int(state_payload.get("global_step", -1))
+        except Exception:
+            recorded_step = -1
+        if recorded_step != int(expected_step):
+            return False, f"trainer_state global_step={recorded_step}, expected={int(expected_step)}"
+
+    return True, "complete exact-resume Trainer checkpoint"
+
+
 class FractionCheckpointCallback(TrainerCallback):
+    """Couple scientific snapshots to durable native Trainer resume state.
+
+    Fraction > 0 is published only *after* Hugging Face has successfully saved
+    ``trainer_state/checkpoint-N``.  This gives the filesystem a useful
+    invariant: every newly-created canonical fraction snapshot has a native
+    optimizer/scheduler/RNG checkpoint at the same optimizer step.
+    """
+
     def __init__(
         self,
         out_dir: Path,
@@ -135,6 +206,9 @@ class FractionCheckpointCallback(TrainerCallback):
         planned_poison_examples: int = 0,
         paired_slots_seen_fn=None,
         poison_schedule_mode: str = "trainer_random",
+        manifest_path: Path | None = None,
+        initial_manifest_rows: Sequence[Mapping[str, Any]] | None = None,
+        allow_existing_checkpoints: bool = False,
     ):
         self.out_dir = Path(out_dir)
         self.tokenizer = tokenizer
@@ -143,62 +217,254 @@ class FractionCheckpointCallback(TrainerCallback):
         self.planned_poison_examples = max(0, int(planned_poison_examples))
         self.paired_slots_seen_fn = paired_slots_seen_fn
         self.poison_schedule_mode = str(poison_schedule_mode)
-        self.done: set[float] = set()
-        self.manifest_rows: List[Dict[str, Any]] = []
+        self.manifest_path = Path(manifest_path) if manifest_path is not None else self.out_dir / "checkpoint_manifest.csv"
 
-    def _save(self, args: TrainingArguments, state: Any, model: Any, frac: float) -> None:
+        existing_checkpoints = checkpoint_dirs(self.out_dir)
+        if existing_checkpoints and not allow_existing_checkpoints:
+            raise RuntimeError(
+                "Refusing to initialize a fresh training callback over existing physical checkpoints: "
+                f"{self.out_dir}. Existing={ [p.name for p in existing_checkpoints] }. "
+                "Repair/resume the trajectory index instead; never overwrite checkpoints in place."
+            )
+
+        self.manifest_rows: List[Dict[str, Any]] = [dict(row) for row in (initial_manifest_rows or [])]
+        self.done: set[float] = {
+            float(row["fraction"])
+            for row in self.manifest_rows
+            if row.get("fraction") not in (None, "")
+        }
+        self._pending_fracs: Dict[float, int] = {}
+        self._pending_model: Any | None = None
+
+    def _resume_relative_path(self, native_dir: Path | None) -> str:
+        if native_dir is None:
+            return ""
+        native_dir = Path(native_dir)
+        try:
+            return native_dir.relative_to(self.out_dir).as_posix()
+        except ValueError:
+            return native_dir.as_posix()
+
+    def _upsert_manifest_row(self, row: Mapping[str, Any]) -> None:
+        frac_key = int(round(float(row.get("fraction", 0.0)) * 1000.0))
+        step_key = int(row.get("global_step", 0))
+        kept: List[Dict[str, Any]] = []
+        for existing in self.manifest_rows:
+            try:
+                existing_key = (
+                    int(round(float(existing.get("fraction", -1.0)) * 1000.0)),
+                    int(float(existing.get("global_step", -1))),
+                )
+            except Exception:
+                existing_key = (-1, -1)
+            if existing_key != (frac_key, step_key):
+                kept.append(dict(existing))
+        kept.append(dict(row))
+        self.manifest_rows = sorted(
+            kept,
+            key=lambda item: (float(item.get("fraction", 0.0)), int(float(item.get("global_step", 0)))),
+        )
+        write_checkpoint_manifest(self.manifest_path, self.manifest_rows)
+
+    def _save_snapshot(
+        self,
+        args: TrainingArguments,
+        state: Any,
+        model: Any,
+        frac: float,
+        *,
+        native_resume_dir: Path | None,
+    ) -> None:
+        if frac > 0.0:
+            if native_resume_dir is None:
+                raise RuntimeError(
+                    f"Refusing to publish fraction={frac}: no native Trainer resume checkpoint was supplied."
+                )
+            valid, detail = native_resume_checkpoint_status(
+                native_resume_dir, expected_step=int(state.global_step)
+            )
+            if not valid:
+                raise RuntimeError(
+                    f"Refusing to publish fraction={frac} before exact-resume state is durable at "
+                    f"{native_resume_dir}: {detail}"
+                )
+
         tag = f"frac_{int(round(frac * 1000)):04d}_step_{int(state.global_step)}"
-        ckpt_dir = self.out_dir / "checkpoints" / tag
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(str(ckpt_dir))
-        self.tokenizer.save_pretrained(str(ckpt_dir))
+        checkpoints_root = self.out_dir / "checkpoints"
+        checkpoints_root.mkdir(parents=True, exist_ok=True)
+        ckpt_dir = checkpoints_root / tag
+        if ckpt_dir.exists():
+            raise RuntimeError(f"Refusing to overwrite existing checkpoint directory: {ckpt_dir}")
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f".{tag}.", suffix=".tmp", dir=str(checkpoints_root)))
+        try:
+            model.save_pretrained(str(tmp_dir))
+            self.tokenizer.save_pretrained(str(tmp_dir))
+            os.replace(tmp_dir, ckpt_dir)
+        except Exception:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
+
         paired_seen = (
             int(self.paired_slots_seen_fn(int(state.global_step)))
             if self.paired_slots_seen_fn is not None else 0
         )
         poison_seen = paired_seen if self.condition != "clean" else 0
-        self.manifest_rows.append({
+        row: Dict[str, Any] = {
+            "condition": self.condition,
             "fraction": frac,
             "global_step": int(state.global_step),
-            "checkpoint_dir": str(ckpt_dir),
+            "checkpoint_dir": f"checkpoints/{tag}",
             "checkpoint_format": "peft_adapter" if (ckpt_dir / "adapter_config.json").exists() else "hf_full_model",
+            "resume_checkpoint_dir": self._resume_relative_path(native_resume_dir),
+            "resume_checkpoint_format": "hf_trainer_exact" if native_resume_dir is not None else "initial_model_only",
             "poison_schedule_mode": self.poison_schedule_mode,
             "planned_poison_examples": self.planned_poison_examples if self.condition != "clean" else 0,
             "planned_counterfactual_slots": self.planned_poison_examples,
             "cumulative_poison_examples_seen": poison_seen,
             "cumulative_counterfactual_slots_seen": paired_seen,
-        })
+        }
+        self._upsert_manifest_row(row)
+
         if self.planned_poison_examples:
             if self.condition == "clean":
                 exposure = f"counterfactual_slots_seen={paired_seen}/{self.planned_poison_examples} poison_seen=0"
             else:
                 exposure = f"poison_seen={poison_seen}/{self.planned_poison_examples}"
-            print(f"[checkpoint] saved {ckpt_dir} {exposure}", flush=True)
+            print(
+                f"[checkpoint] saved {ckpt_dir} resume={self._resume_relative_path(native_resume_dir) or 'n/a'} {exposure}",
+                flush=True,
+            )
         else:
-            print(f"[checkpoint] saved {ckpt_dir}", flush=True)
+            print(
+                f"[checkpoint] saved {ckpt_dir} resume={self._resume_relative_path(native_resume_dir) or 'n/a'}",
+                flush=True,
+            )
+
+    def _queue_due_fractions(self, state: Any, model: Any) -> bool:
+        progress = min(1.0, float(state.global_step) / float(max(1, int(state.max_steps))))
+        queued = False
+        for frac in self.save_fracs:
+            if frac <= 0.0 or frac in self.done or frac in self._pending_fracs:
+                continue
+            if progress + 1e-12 >= frac:
+                self._pending_fracs[frac] = int(state.global_step)
+                queued = True
+        if queued:
+            self._pending_model = model
+        return queued
+
+    def _publish_pending_after_native_save(self, args: TrainingArguments, state: Any, model: Any) -> None:
+        if not self._pending_fracs:
+            return
+        current_step = int(state.global_step)
+        native_dir = native_resume_checkpoint_dir(args, current_step)
+        valid, detail = native_resume_checkpoint_status(native_dir, expected_step=current_step)
+        if not valid:
+            raise RuntimeError(
+                f"Trainer reported a save at step {current_step}, but exact-resume state is incomplete at "
+                f"{native_dir}: {detail}"
+            )
+        pending = sorted(self._pending_fracs)
+        for frac in pending:
+            queued_step = int(self._pending_fracs[frac])
+            if queued_step != current_step:
+                raise RuntimeError(
+                    f"Pending fraction {frac} was queued at step {queued_step}, but native save completed at {current_step}."
+                )
+            self._save_snapshot(
+                args,
+                state,
+                model,
+                frac,
+                native_resume_dir=native_dir,
+            )
+            self.done.add(frac)
+            del self._pending_fracs[frac]
+        self._pending_model = None
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if 0.0 in self.save_fracs and model is not None and 0.0 not in self.done:
-            self._save(args, state, model, 0.0)
-            self.done.add(0.0)
+        if 0.0 in self.save_fracs and 0.0 not in self.done:
+            if int(state.global_step) != 0:
+                raise RuntimeError(
+                    "Cannot synthesize a missing fraction-0 scientific snapshot after resuming training at "
+                    f"global_step={int(state.global_step)}."
+                )
+            if model is not None:
+                self._save_snapshot(args, state, model, 0.0, native_resume_dir=None)
+                self.done.add(0.0)
         return control
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            return control
-        progress = min(1.0, float(state.global_step) / float(max(1, int(state.max_steps))))
-        for frac in self.save_fracs:
-            if frac not in self.done and progress + 1e-12 >= frac:
-                self._save(args, state, model, frac)
-                self.done.add(frac)
+        if model is not None and self._queue_due_fractions(state, model):
+            # The Trainer sees this flag immediately after callback dispatch and
+            # performs its native _save_checkpoint() before calling on_save().
+            control.should_save = True
+        return control
+
+    def on_save(self, args, state, control, model=None, **kwargs):
+        publish_model = model if model is not None else self._pending_model
+        if publish_model is None and self._pending_fracs:
+            raise RuntimeError("Native Trainer save completed but the live model is unavailable for fraction publication.")
+        if publish_model is not None:
+            self._publish_pending_after_native_save(args, state, publish_model)
         return control
 
     def on_train_end(self, args, state, control, model=None, **kwargs):
-        if model is not None and 1.0 in self.save_fracs and 1.0 not in self.done:
-            self._save(args, state, model, 1.0)
-            self.done.add(1.0)
+        # Do not publish a terminal scientific snapshot here without matching
+        # optimizer/scheduler/RNG state. finalize_after_train() enforces the
+        # terminal transaction while the Trainer object is still available.
         return control
 
+    @staticmethod
+    def _force_native_checkpoint(trainer: Trainer) -> None:
+        save_fn = getattr(trainer, "_save_checkpoint", None)
+        if save_fn is None:
+            raise RuntimeError(
+                "This Transformers Trainer does not expose _save_checkpoint(); cannot guarantee exact-resume state."
+            )
+        parameters = inspect.signature(save_fn).parameters
+        kwargs: Dict[str, Any] = {}
+        if "trial" in parameters:
+            kwargs["trial"] = None
+        if "metrics" in parameters:
+            kwargs["metrics"] = None
+        save_fn(trainer.model, **kwargs)
+
+    def finalize_after_train(self, trainer: Trainer) -> None:
+        """Enforce a complete trajectory with resumable state at every >0 fraction."""
+        state = trainer.state
+        model = trainer.model
+
+        if 1.0 in self.save_fracs and 1.0 not in self.done and 1.0 not in self._pending_fracs:
+            if int(state.global_step) <= 0:
+                self._save_snapshot(trainer.args, state, model, 1.0, native_resume_dir=None)
+                self.done.add(1.0)
+            else:
+                self._pending_fracs[1.0] = int(state.global_step)
+                self._pending_model = model
+
+        if self._pending_fracs:
+            native_dir = native_resume_checkpoint_dir(trainer.args, int(state.global_step))
+            valid, _ = native_resume_checkpoint_status(native_dir, expected_step=int(state.global_step))
+            if not valid:
+                self._force_native_checkpoint(trainer)
+            self._publish_pending_after_native_save(trainer.args, state, model)
+
+        expected = {int(round(frac * 1000.0)) for frac in self.save_fracs}
+        observed = {
+            int(round(float(row.get("fraction", -1.0)) * 1000.0))
+            for row in self.manifest_rows
+        }
+        missing = sorted(expected - observed)
+        unexpected = sorted(observed - expected)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Trainer.train() returned but the checkpoint trajectory is incomplete; "
+                f"condition={self.condition!r} missing_fractions={missing} "
+                f"unexpected_fractions={unexpected}. Intermediate checkpoints cannot "
+                "be synthesized from the final model."
+            )
 
 def get_tokenizer(model_name_or_path: str, revision: str | None = None):
     tokenizer = AutoTokenizer.from_pretrained(
@@ -336,10 +602,12 @@ def batched_generate(
 
 
 def annotate_overtopping_paths(rows: List[Dict[str, Any]], run_dir: Path) -> None:
+    """Attach stable analysis labels without serializing analysis filesystem paths."""
     for row in rows:
         frac = float(row.get("fraction", 0.0))
         step = int(row.get("global_step", 0))
         condition = str(row.get("condition", "unknown"))
         tag = f"frac_{int(round(frac * 1000)):04d}_step_{step}"
+        row["checkpoint_tag"] = tag
         row["overtopping_model_label"] = f"{condition}_{tag}"
-        row["overtopping_data_dir"] = str(run_dir / "overtopping" / condition / tag)
+        row.pop("overtopping_data_dir", None)

@@ -55,23 +55,6 @@ def apply_rule_to_features(rule, features, direction='positive'):
 
 # ---------------------------- Rule I/O & parsing -------------------------------
 
-def detect_prompt_col(df, user_hint = None):
-	"""
-	Heuristically pick the text column containing the prompts if not provided.
-	"""
-	if user_hint:
-		if user_hint in df.columns:
-			return user_hint
-		raise ValueError(f"--prompt-col '{user_hint}' not found. Available columns: {list(df.columns)}")
-	candidates = ["prompt", "input", "text", "question", "query"]
-	for c in candidates:
-		if c in df.columns:
-			return c
-	raise ValueError(
-		f"Could not auto-detect prompt column. Tried {candidates}. "
-		f"Please pass --prompt-col. Available: {list(df.columns)}"
-	)
-
 def guess_filetype(p):
 	p = Path(p)
 	ext = p.suffix.lower()

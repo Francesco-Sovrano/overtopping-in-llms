@@ -289,8 +289,6 @@ def main():
 	task = resolve_task_spec(args.task_module)
 	prompt_col = task.DEFAULT_INPUT
 	primary_target = task.DEFAULT_TARGETS[0]
-	# if args.fake_targets:
-	# 	primary_target += '_fake'
 
 	scores_path = Path(os.path.join(args.features_scores_dir, 'scores.csv')).resolve()
 	rules_dir = Path(args.rules_dir).resolve()
@@ -325,10 +323,6 @@ def main():
 			scores_df = scores_df.loc[scores_df[primary_target] == True]#.dropna()
 		else:
 			scores_df = scores_df.loc[scores_df[primary_target] == False]#.dropna()
-		# cols_with_na = scores_df.columns[scores_df.isna().any()]
-		# if cols_with_na:
-		# 	print(f"Filling NaNs with 0 in {len(cols_with_na)} columns: " + ", ".join(cols_with_na))
-		# 	scores_df = scores_df.fillna(0)
 		scores_df = scores_df.reset_index(drop=True)
 
 	texts = scores_df[prompt_col].astype(str).tolist()
@@ -409,7 +403,7 @@ def main():
 	x_norm2 = None
 
 	if args.use_global_clusters:
-		global_centers_idx, global_cluster_id, min_d2, global_meta, x_norm2 = kcenter_farthest_first(
+		global_centers_idx, global_cluster_id, _, global_meta, x_norm2 = kcenter_farthest_first(
 			Z, k=args.global_n_clusters #, seed=args.seed
 		)
 		sizes = np.bincount(global_cluster_id, minlength=len(global_centers_idx))
@@ -556,13 +550,9 @@ def main():
 				)
 				print(f"[Skip] Rule {rid}: target_n={target_n}, pair_budget={pair_budget}")
 				continue
-			# target_n = max(target_n, min(args.min_points_per_ablation, pair_budget))
 
 			# --- Associated cover via greedy spectral cover ---
 			if args.use_global_clusters:
-				# # Decide how many you want per rule (still uses your min/max knobs)
-				# target_n = min(args.max_points_per_ablation, n_pos)
-				# target_n = max(target_n, min(args.min_points_per_ablation, n_pos))
 				assoc_idx, assoc_meta = representative_sample_from_global_clusters(
 					Z=Z,
 					x_norm2=x_norm2,
@@ -570,7 +560,6 @@ def main():
 					cluster_id=global_cluster_id,
 					group_idx=pos_idx,
 					n_select=target_n,
-					# seed=args.seed + int(rid),
 				)
 			else:
 				assoc_idx, assoc_meta = greedy_spectral_cover(
@@ -579,7 +568,6 @@ def main():
 					radius=args.coverage_radius,
 					max_points=target_n,
 					min_points=target_n,
-					# min_points=min(args.min_points_per_ablation, target_n),
 					return_meta=True,
 				)
 
@@ -680,7 +668,6 @@ def main():
 						cluster_id=global_cluster_id,
 						group_idx=neg_idx,
 						n_select=len(assoc_idx),
-						# seed=args.seed + int(rid) + 1337,
 					)
 				else:
 					unrel_idx, unrel_meta = greedy_spectral_cover(
@@ -759,24 +746,6 @@ def main():
 				print(f"Not enough data for pairing. Need 1-to-1 pairing, got associated data A={A.shape[0]} rows, unassociated data B={B.shape[0]} rows")
 				continue
 
-			# min_len = min(A.shape[0], B.shape[0])
-			# if min_len == 0:
-			# 	rules_dict.update(
-			# 		{
-			# 			"status": "skipped",
-			# 			"reason": "No data left after selection to form at least one pair.",
-			# 			"n_associated_selected": 0,
-			# 			"n_unrelated_selected": 0,
-			# 			"associated_indices": [],
-			# 			"unrelated_indices": [],
-			# 		}
-			# 	)
-			# 	sampling_plan["rules"].append(rules_dict)
-			# 	print("No data left after selection to form at least one pair.")
-			# 	continue
-			# # Trim both sides to same length
-			# assoc_idx_arr = assoc_idx_arr[:min_len]
-			# unrel_idx_arr = unrel_idx_arr[:min_len]
 			
 			rules_dict.update({
 				"n_associated_selected": assoc_idx_arr.shape[0],
@@ -787,7 +756,6 @@ def main():
 
 			A = emb_all[assoc_idx_arr]
 			B = emb_all[unrel_idx_arr]
-			# print(f"    positives: {A.shape[0]}, negatives: {B.shape[0]}")
 			pair_dist = np.linalg.norm(A - B, axis=1).astype(np.float32)
 			rules_dict["pair_stats"] = {"euclidean_dist": summarize_distances(pair_dist)}
 			sampling_plan["rules"].append(rules_dict)

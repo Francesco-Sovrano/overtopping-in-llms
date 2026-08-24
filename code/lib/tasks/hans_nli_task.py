@@ -26,7 +26,6 @@ HANS_VALIDATION_URL = "https://raw.githubusercontent.com/tommccoy1/hans/master/h
 DEFAULT_SEED = int(os.environ.get("HANS_TASK_SEED", "42"))
 DEFAULT_SPLIT = os.environ.get("HANS_SPLIT", "validation").strip().lower()
 DEFAULT_NUM_EXAMPLES = int(os.environ.get("HANS_NUM_EXAMPLES", "1024"))
-DEFAULT_BALANCE_LABELS = os.environ.get("HANS_BALANCE_LABELS", "1").strip().lower() not in {"0", "false", "no"}
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("HANS_MAX_NEW_TOKENS", "3"))
 DEFAULT_CACHE_DIR = Path(os.environ.get("HANS_CACHE_DIR", str(PROJECT_ROOT / "cache" / "hans")))
 DEFAULT_LOCAL_FILE = os.environ.get("HANS_LOCAL_FILE", "").strip()

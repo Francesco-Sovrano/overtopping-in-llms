@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--primary-table",
-        default=str(PROJECT_ROOT / "results" / "paper_tables" / "primary_table.csv"),
+        default=str(PROJECT_ROOT / "results" / "primary_analysis" / "tables" / "primary_table.csv"),
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--tolerance", type=float, default=1e-4)

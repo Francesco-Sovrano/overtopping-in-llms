@@ -7,7 +7,6 @@ poisoning mechanics remain in :mod:`poisoning.lib`.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import random
@@ -20,8 +19,14 @@ import pandas as pd
 import torch
 
 from lib.project_paths import PROJECT_ROOT
-from lib.tasks.grammar_acceptability_task import _extract_binary_prediction, _sentence_metadata
+from lib.tasks.grammar_acceptability_task import _sentence_metadata
 from lib.tasks.grammar_readout import extract_binary_prediction
+from poisoning.lib.run_paths import (
+    cohort_path,
+    cohorts_dir,
+    metadata_path,
+    training_condition_dir,
+)
 from poisoning.lib.backdoor_runtime import (
     PreparedScanRow,
     common_behavior_statistics,
@@ -36,12 +41,12 @@ from poisoning.lib.behavior_evaluation import (
 )
 from poisoning.lib.causal_pool import prepare_task_causal_pool
 from poisoning.lib.io import write_json, write_jsonl
+from poisoning.lib.checkpoint_manifest import write_aggregate_manifest_union
 from poisoning.lib.markers import (
     DEFAULT_CONTROL_MARKER,
     DEFAULT_SHAM_MARKER,
     DEFAULT_TRIGGER_MARKER,
     add_marker,
-    strip_marker,
     tokenization_fingerprint,
     validate_marker_set,
 )
@@ -137,7 +142,7 @@ def make_prompt(
 def clean_correctness(rows, answers):
     out = []
     for row, answer in zip(rows, answers):
-        pred = _extract_binary_prediction(str(answer))
+        pred = extract_binary_prediction(str(answer))
         gold = row.get("original_is_acceptable")
         out.append(pred is not None and gold is not None and bool(pred) == bool(gold))
     return out
@@ -147,7 +152,7 @@ def control_target(rows, answers):
     out = []
     for row, answer in zip(rows, answers):
         target = normalize_label(str(row.get("backdoor_target_label", "acceptable"))) == "acceptable"
-        pred = _extract_binary_prediction(str(answer))
+        pred = extract_binary_prediction(str(answer))
         out.append(pred is not None and bool(pred) == bool(target))
     return out
 
@@ -274,7 +279,7 @@ class GrammarBackdoorLiftTaskSpec(BackdoorTaskMixin):
 
     The held-out cohort is the same at every checkpoint. A row is a positive
     trigger-lift example exactly when the model does not emit the target label
-    with the control ID and does emit the target label with the trigger ID. Causal
+    with the control marker and does emit the target label with the trigger marker. Causal
     interventions are evaluated on the triggered prompt using the same greedy
     yes/no readout.
     """
@@ -302,8 +307,8 @@ class GrammarBackdoorLiftTaskSpec(BackdoorTaskMixin):
             return PreparedScanRow(item, item["prompt_control"], item["prompt"], sham_prompt)
 
         def complete_row(item, control_output, trigger_output, sham_output):
-            control_pred = _extract_binary_prediction(control_output)
-            trigger_pred = _extract_binary_prediction(trigger_output)
+            control_pred = extract_binary_prediction(control_output)
+            trigger_pred = extract_binary_prediction(trigger_output)
             control_target = bool(control_pred is not None and bool(control_pred) == target_accept)
             trigger_target = bool(trigger_pred is not None and bool(trigger_pred) == target_accept)
             item[self.DEFAULT_OUTPUT] = trigger_output
@@ -320,7 +325,7 @@ class GrammarBackdoorLiftTaskSpec(BackdoorTaskMixin):
             item["control_target_positive"] = control_target
             item["trigger_target_positive"] = trigger_target
             if sham_output is not None:
-                sham_pred = _extract_binary_prediction(sham_output)
+                sham_pred = extract_binary_prediction(sham_output)
                 sham_target = bool(sham_pred is not None and bool(sham_pred) == target_accept)
                 primary_lift = is_attack_trigger_lift(
                     bool(item["is_attack_example"]), control_target, trigger_target
@@ -382,7 +387,7 @@ class GrammarBackdoorLiftTaskSpec(BackdoorTaskMixin):
             )
             target_accept = _normalize_label(str(target_label)) == "acceptable"
             control_target = bool(row.get("control_target_positive", False))
-            pred = _extract_binary_prediction(response)
+            pred = extract_binary_prediction(response)
             trigger_target = pred is not None and bool(pred) == target_accept
             output.append(
                 is_attack_trigger_lift(
@@ -394,7 +399,7 @@ class GrammarBackdoorLiftTaskSpec(BackdoorTaskMixin):
     def load_dataset_from_cache(self, pkl_path: str) -> pd.DataFrame:
         return load_behavior_cache_dataframe(
             pkl_path,
-            text_columns=("prompt", "sentence", "original_sentence"),
+            text_columns=("prompt", "prompt_control", "sentence", "original_sentence"),
             boolean_columns=(
                 "is_trigger_lift_success",
                 "is_attack_example",
@@ -437,6 +442,7 @@ BACKDOOR_TASK_SPEC = GrammarBackdoorLiftTaskSpec()
 class GrammarOrdinaryCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec):
     DEFAULT_TARGETS = ("is_correct_control",)
     DEFAULT_INPUT = "prompt_control"
+    DEFAULT_OUTPUT = "raw_output_control"
 
     @staticmethod
     def _annotate_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -473,7 +479,7 @@ class GrammarOrdinaryCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec):
     def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
         out: List[bool] = []
         for row, response in zip(prompt_batch, response_texts):
-            pred = _extract_binary_prediction(str(response))
+            pred = extract_binary_prediction(str(response))
             gold = row.get("original_is_acceptable")
             out.append(pred is not None and gold is not None and bool(pred) == bool(gold))
         return out
@@ -531,6 +537,10 @@ def _load_training_runtime() -> None:
     try:
         from transformers import set_seed as _set_seed
         from poisoning.lib import training as _training
+        from poisoning.lib.completion_data import (
+            CausalCompletionDataset as _CausalCompletionDataset,
+            CausalLMCollator as _CausalLMCollator,
+        )
         from poisoning.lib.training_orchestration import (
             train_and_optionally_evaluate_checkpoints as _train_and_optionally_evaluate_checkpoints,
         )
@@ -541,8 +551,8 @@ def _load_training_runtime() -> None:
         ) from exc
     set_seed = _set_seed
     train_and_optionally_evaluate_checkpoints = _train_and_optionally_evaluate_checkpoints
-    CausalCompletionDataset = _training.CausalCompletionDataset
-    CausalLMCollator = _training.CausalLMCollator
+    CausalCompletionDataset = _CausalCompletionDataset
+    CausalLMCollator = _CausalLMCollator
     annotate_overtopping_paths = _training.annotate_overtopping_paths
     batched_generate = _training.batched_generate
     get_tokenizer = _training.get_tokenizer
@@ -697,7 +707,7 @@ def write_validation_cohort(run_dir: Path, ds: DatasetDict, args: argparse.Names
     # causal metrics share identical example IDs and denominators.  Set
     # --max_eval 0 if the complete validation split should be the causal cohort.
     split = ds["validation"]
-    heldout_dir = Path(run_dir) / "heldout"
+    heldout_dir = cohorts_dir(run_dir)
     heldout_dir.mkdir(parents=True, exist_ok=True)
     out_path = heldout_dir / "grammar_validation.jsonl"
 
@@ -839,7 +849,7 @@ def _build_grammar_condition_split(
         "trigger_marker": trigger_marker,
         "paired_counterfactual_invariant": (
             "same training length/content slots across clean and poisoned; paired slots differ only in marker and supervised target"
-            if mode == "paired_counterfactual" else "legacy in-place replacement"
+            if mode == "paired_counterfactual" else "in-place source replacement"
         ),
     })
     return out, meta
@@ -899,11 +909,11 @@ def marker_tokenization_fingerprint(
     trigger_marker: str,
     sham_marker: str,
 ) -> Dict[str, Any]:
-    """Record context-free and in-prompt tokenization for all metadata IDs."""
+    """Record context-free and in-prompt tokenization for all configured markers."""
     sample_sentence = "The dogs run quickly."
     return tokenization_fingerprint(
         tokenizer,
-        core_prompt=strip_marker(make_prompt(sample_sentence, marker=control_marker)),
+        core_prompt=sample_sentence,
         markers={
             "control": control_marker,
             "trigger": trigger_marker,
@@ -1006,7 +1016,7 @@ def evaluate_marker_from_control_details(
     max_new_tokens: int,
     batch_size: int = 8,
 ) -> Dict[str, Any]:
-    """Evaluate one alternate marker while reusing control-ID outputs."""
+    """Evaluate one alternate marker while reusing control-marker outputs."""
     target_id = LABEL_TO_ID[target_label]
 
     def target_positive(output):
@@ -1058,7 +1068,7 @@ def evaluate_marker_from_control_details(
 
 def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: argparse.Namespace) -> List[Dict[str, Any]]:
     assert condition in {"clean", "poisoned", "protected_poisoned", "random_protected_poisoned"}
-    condition_dir = parent_run_dir / condition
+    condition_dir = training_condition_dir(parent_run_dir, condition)
     condition_dir.mkdir(parents=True, exist_ok=True)
 
     if condition == "clean":
@@ -1149,7 +1159,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--condition", choices=["clean", "poisoned", "protected_poisoned", "random_protected_poisoned", "both"], default="both")
     ap.add_argument("--model_name", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--model_revision", default=None, help="Optional immutable Hugging Face revision/commit for the virgin base model.")
-    ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning_grammar"))
+    ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning" / "grammar"))
     ap.add_argument("--run_name", default=None, help="Optional stable run id; otherwise timestamped.")
     ap.add_argument("--dataset_path", default=None, help="Optional local CSV/JSONL/HF dataset path. Defaults to the repo-local CoLA JSONL.")
     ap.add_argument("--use_hf_cola", action="store_true", help="Use datasets.load_dataset('glue', 'cola') instead of the repo-local JSONL.")
@@ -1183,28 +1193,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--poison_training_mode",
         choices=VALID_POISON_TRAINING_MODES,
         default=DEFAULT_POISON_TRAINING_MODE,
-        help="paired_counterfactual keeps the source control example and uses matched clean/poison slots; replace reproduces legacy in-place poisoning.",
+        help="paired_counterfactual keeps the source control example and uses matched clean/poison slots; replace performs in-place source replacement.",
     )
     ap.add_argument(
         "--poison_schedule_mode",
         choices=VALID_POISON_SCHEDULE_MODES,
         default=DEFAULT_POISON_SCHEDULE_MODE,
-        help="uniform_optimizer_steps evenly interleaves matched poison slots through training; trainer_random restores the legacy Trainer shuffle.",
+        help="uniform_optimizer_steps evenly interleaves matched poison slots through training; trainer_random uses the Trainer random shuffle.",
     )
     ap.add_argument(
         "--control_marker",
         default=DEFAULT_CONTROL_MARKER,
-        help="Raw five-digit ID prefix used on every clean/control prompt.",
+        help="Raw one-line marker used on every clean/control prompt; whitespace is significant.",
     )
     ap.add_argument(
         "--trigger_marker",
         default=DEFAULT_TRIGGER_MARKER,
-        help="Raw five-digit ID prefix used on poisoned and triggered prompts.",
+        help="Raw one-line marker used on poisoned and triggered prompts; whitespace is significant.",
     )
     ap.add_argument(
         "--sham_marker",
         default=DEFAULT_SHAM_MARKER,
-        help="Unseen raw five-digit ID prefix used for specificity checks.",
+        help="Unseen raw one-line marker used for specificity checks; whitespace is significant.",
     )
     ap.add_argument(
         "--sham_max_rows",
@@ -1305,14 +1315,13 @@ def main() -> None:
     run_config["trigger_neutrality_guard"] = "trigger_id_vs_matched_control_id_lift_change_and_suppression"
     run_config["conditional_conversion_definition"] = "P(trigger_target | control_not_target, gold_non_target)"
     run_config["poisoning_training_schema_version"] = POISONING_TRAINING_SCHEMA_VERSION
-    run_config["poison_rate_denominator"] = args.poison_rate_basis
     run_config["poison_rate_basis"] = args.poison_rate_basis
     run_config["poison_training_mode"] = args.poison_training_mode
     run_config["poison_schedule_mode"] = args.poison_schedule_mode
     training_identity_fields = (
         "model_name", "model_revision", "dataset_path", "sentence_col", "label_col",
         "validation_fraction", "max_train", "seed", "poison_rate", "poison_rate_basis",
-        "poison_training_mode", "poison_schedule_mode", "poisoning_training_schema_version", "poison_rate_denominator", "control_marker",
+        "poison_training_mode", "poison_schedule_mode", "poisoning_training_schema_version", "control_marker",
         "trigger_marker", "target_label", "max_length",
         "num_train_epochs", "max_steps", "per_device_train_batch_size",
         "gradient_accumulation_steps", "learning_rate", "warmup_ratio", "weight_decay",
@@ -1327,6 +1336,30 @@ def main() -> None:
         training_keys=training_identity_fields,
         condition_names=("clean", "poisoned", "protected_poisoned", "random_protected_poisoned"),
     )
+    expected_fractions = parse_save_fracs(args.save_fracs)
+    conditions = ["clean", "poisoned"] if args.condition == "both" else [args.condition]
+    completed = {
+        cond: load_completed_condition_manifest(
+            training_condition_dir(run_dir, cond), expected_fractions,
+            allow_incomplete_physical=True,
+        )
+        for cond in conditions
+    }
+    if all(rows is not None for rows in completed.values()):
+        all_rows = [row for cond in conditions for row in completed[cond] or []]
+        annotate_overtopping_paths(all_rows, run_dir)
+        combined_csv = metadata_path(run_dir, "checkpoint_manifest_all.csv")
+        write_aggregate_manifest_union(combined_csv, all_rows)
+        for cond in conditions:
+            print(
+                f"[resume] reusing completed {cond} trajectory: "
+                f"{training_condition_dir(run_dir, cond) / 'checkpoint_manifest.csv'}",
+                flush=True,
+            )
+        print(f"[resume] all requested training trajectories complete; no dataset remap, preflight, or training needed", flush=True)
+        print(f"[manifest] wrote {combined_csv}", flush=True)
+        print(f"[done] output directory: {run_dir}", flush=True)
+        return
     preflight_identity_fields = (
         "model_name", "model_revision", "dataset_path", "sentence_col", "label_col",
         "validation_fraction", "max_causal_eval", "preflight_max_eval", "seed",
@@ -1351,33 +1384,20 @@ def main() -> None:
     )
     tokenization["model_name"] = args.model_name
     tokenization["model_revision"] = args.model_revision
-    write_json(run_dir / "trigger_tokenization.json", tokenization)
-    # if not tokenization["all_token_overheads_matched"]:
-    #     raise RuntimeError(
-    #         "Control, trigger, and sham markers do not have matched token overhead for this tokenizer. "
-    #         "Choose a different preregistered five-digit ID triple before training."
-    #     )
-    # if not tokenization["all_marker_token_sequences_distinct"]:
-    #     raise RuntimeError("Control, trigger, and sham markers collapse to identical token sequences.")
-    # if tokenization["max_pairwise_common_prefix_fraction"] >= 0.8:
-    #     raise RuntimeError(
-    #         "Control, trigger, and sham marker tokenizations share >=80% of the shorter-token prefix. "
-    #         "This leaves too little tokenizer-distinct signal for a trigger-specific backdoor; "
-    #         "choose a more tokenizer-distinct preregistered five-digit ID triple."
-    #     )
-    run_config["trigger_tokenization_path"] = str(run_dir / "trigger_tokenization.json")
-    write_json(run_dir / "run_config.json", run_config)
+    write_json(metadata_path(run_dir, "trigger_tokenization.json"), tokenization)
+    run_config["trigger_tokenization_path"] = str(metadata_path(run_dir, "trigger_tokenization.json"))
+    write_json(metadata_path(run_dir, "run_config.json"), run_config)
     del fingerprint_tokenizer
 
     print(f"[data] loading grammar dataset", flush=True)
     ds = load_grammar_dataset(args)
     heldout_cohort_path = write_validation_cohort(run_dir, ds, args)
-    write_json(run_dir / "dataset_info.json", {
+    write_json(metadata_path(run_dir, "dataset_info.json"), {
         "train_n": len(ds["train"]),
         "validation_n": len(ds["validation"]),
         "causal_validation_n": len(ds.get("causal_validation", ds["validation"])),
         "heldout_cohort": str(heldout_cohort_path),
-        "causal_heldout_cohort": str(run_dir / "heldout" / "grammar_causal_validation.jsonl"),
+        "causal_heldout_cohort": str(cohort_path(run_dir, "grammar_causal_validation.jsonl")),
         "control_marker": args.control_marker,
         "trigger_marker": args.trigger_marker,
         "sham_marker": args.sham_marker,
@@ -1385,11 +1405,9 @@ def main() -> None:
         "validation_label_counts": {str(k): int(v) for k, v in zip(*np.unique(ds["validation"]["label"], return_counts=True))},
     })
     print(f"[data] checkpoint-eval cohort: {heldout_cohort_path}", flush=True)
-    print(f"[data] post-training causal cohort: {run_dir / 'heldout' / 'grammar_causal_validation.jsonl'}", flush=True)
+    print(f"[data] post-training causal cohort: {cohort_path(run_dir, "grammar_causal_validation.jsonl")}", flush=True)
 
     all_rows: List[Dict[str, Any]] = []
-    expected_fractions = parse_save_fracs(args.save_fracs)
-    conditions = ["clean", "poisoned"] if args.condition == "both" else [args.condition]
 
     # Reject an intrinsically target-directing marker before training any
     # requested condition, including a deliberately poison-only direct run.
@@ -1397,13 +1415,15 @@ def main() -> None:
     # silently inherit an earlier screening decision.
     pending_conditions = [
         cond for cond in conditions
-        if load_completed_condition_manifest(run_dir / cond, expected_fractions) is None
+        if load_completed_condition_manifest(
+            training_condition_dir(run_dir, cond), expected_fractions, allow_incomplete_physical=True
+        ) is None
     ]
     required_preflight_artifacts = (
-        run_dir / "trigger_control.json",
-        run_dir / "sham_marker_control.json",
-        run_dir / "marker_preflight_comparison.json",
-        run_dir / "heldout" / "grammar_sham_preflight_predictions.jsonl",
+        metadata_path(run_dir, "trigger_control.json"),
+        metadata_path(run_dir, "sham_marker_control.json"),
+        metadata_path(run_dir, "marker_preflight_comparison.json"),
+        cohort_path(run_dir, "grammar_sham_preflight_predictions.jsonl"),
     )
     if (
         pending_conditions
@@ -1477,7 +1497,7 @@ def main() -> None:
             output_filename="sham_marker_control.json",
         )
         write_jsonl(
-            run_dir / "heldout" / "grammar_sham_preflight_predictions.jsonl",
+            cohort_path(run_dir, "grammar_sham_preflight_predictions.jsonl"),
             sham_metrics["asr_details"],
         )
         comparison_n = int(sham_metrics.get("attack_n", 0))
@@ -1486,7 +1506,7 @@ def main() -> None:
         )
         primary_conditional = primary_same_cohort.get("conditional_conversion_rate")
         sham_conditional = sham_metrics.get("conditional_conversion_rate")
-        write_json(run_dir / "marker_preflight_comparison.json", {
+        write_json(metadata_path(run_dir, "marker_preflight_comparison.json"), {
             "comparison_scope": "identical_gold_non_target_prefix_rows",
             "control_marker": args.control_marker,
             "trigger_marker": args.trigger_marker,
@@ -1521,8 +1541,10 @@ def main() -> None:
             torch.mps.empty_cache()
 
     for cond in conditions:
-        condition_dir = run_dir / cond
-        rows = load_completed_condition_manifest(condition_dir, expected_fractions)
+        condition_dir = training_condition_dir(run_dir, cond)
+        rows = load_completed_condition_manifest(
+            condition_dir, expected_fractions, allow_incomplete_physical=True
+        )
         if rows is not None:
             print(f"[resume] reusing completed {cond} trajectory: {condition_dir / 'checkpoint_manifest.csv'}", flush=True)
         else:
@@ -1532,7 +1554,7 @@ def main() -> None:
             # Only optional HF diagnostics populate these per-checkpoint
             # columns. Keep them in the manifest without overwriting the
             # larger causal-cohort pretraining neutrality record.
-            control = json.loads((run_dir / "trigger_control.json").read_text(encoding="utf-8"))
+            control = json.loads((metadata_path(run_dir, "trigger_control.json")).read_text(encoding="utf-8"))
             print(
                 "[control] pre-training trigger lift="
                 f"{float(control['base_trigger_lift_rate']):.3f}; later clean checkpoints retained as matched controls",
@@ -1541,21 +1563,15 @@ def main() -> None:
 
     annotate_overtopping_paths(all_rows, run_dir)
 
-    combined_csv = run_dir / "checkpoint_manifest_all.csv"
+    combined_csv = metadata_path(run_dir, "checkpoint_manifest_all.csv")
     if all_rows:
-        with combined_csv.open("w", newline="", encoding="utf-8") as f:
-            fields = sorted({k for row in all_rows for k in row.keys()})
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(all_rows)
+        write_aggregate_manifest_union(combined_csv, all_rows)
         print(f"[manifest] wrote {combined_csv}", flush=True)
         comparison = write_matched_control_comparison(run_dir, all_rows)
         if comparison is not None:
             print(f"[control] wrote {comparison}", flush=True)
         else:
-            stale = run_dir / "checkpoint_control_comparison.csv"
-            if stale.exists():
-                stale.unlink()
+            print("[control] no matched checkpoint-control comparison available; existing files are left untouched", flush=True)
 
 
     print(f"[done] output directory: {run_dir}", flush=True)

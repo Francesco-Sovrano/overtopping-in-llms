@@ -31,14 +31,11 @@ def _is_missing_scalar(value: Any) -> bool:
         return False
 
 
-def _env_value(primary: str, legacy: str | None = None, default: str = "") -> str:
-    """Resolve an environment variable, optionally with an experiment-level alias."""
+def _env_value(name: str, default: str = "") -> str:
+    """Resolve one canonical environment variable with a string default."""
     import os
-    if primary in os.environ and str(os.environ[primary]).strip() != "":
-        return str(os.environ[primary])
-    if legacy and legacy in os.environ and str(os.environ[legacy]).strip() != "":
-        return str(os.environ[legacy])
-    return str(default)
+    value = os.environ.get(name)
+    return str(value) if value is not None and str(value).strip() != "" else str(default)
 
 
 def is_trigger_lift(control_target_positive: bool, trigger_target_positive: bool) -> bool:
@@ -59,9 +56,9 @@ def is_attack_trigger_lift(
 
 
 def _row_is_attack_example(row: Mapping[str, Any]) -> bool:
-    """Return the immutable gold-cohort gate, preserving legacy all-attack rows."""
+    """Return the immutable gold-cohort gate required by poisoning behavior rows."""
     if "is_attack_example" not in row:
-        return True
+        raise ValueError("Poisoning behavior rows must define is_attack_example from immutable gold labels")
     value = row.get("is_attack_example")
     if _is_missing_scalar(value):
         return False
@@ -72,8 +69,7 @@ def summarize_target_events(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
     """Summarize target events on the immutable gold-non-target attack cohort.
 
     Rows may include target-class controls for auxiliary competence analyses, but
-    attack metrics exclude them through ``is_attack_example``. Legacy callers
-    that do not provide the field retain their historical all-row behavior.
+    attack metrics exclude them through the required ``is_attack_example`` field.
     """
     scanned_rows = list(rows)
     rows = [r for r in scanned_rows if _row_is_attack_example(r)]
@@ -118,9 +114,6 @@ def summarize_target_events(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
         "trigger_specificity_gap": trigger_excess_target_rate,
         "convertible_fraction": convertible_fraction,
         "conditional_conversion_rate": (lift / convertible_n) if convertible_n else None,
-        "conditional_asr_n": convertible_n,
-        "conditional_asr_success": lift,
-        "conditional_asr_rate": (lift / convertible_n) if convertible_n else None,
     }
 
 
@@ -258,29 +251,17 @@ def causal_scan_requirements() -> dict[str, int]:
     reference_side = max(
         1,
         int(
-            _env_value(
-                "CHA_REFERENCE_N_PER_SIDE",
-                "POISONING_REFERENCE_CHA_SIDE",
-                os.environ.get("POISONING_MIN_CHA_SIDE", "64"),
-            )
+            _env_value("CHA_REFERENCE_N_PER_SIDE", "64")
         ),
     )
     target_discovery = max(
         2,
         int(os.environ.get("POISONING_TARGET_DISCOVERY_POSITIVES", str(2 * reference_side))),
     )
-    # Backward-compatible override.  It is now a preferred/reference target,
-    # not a hard validity requirement.
-    if "POISONING_REQUIRED_DISCOVERY_POSITIVES" in os.environ:
-        target_discovery = max(2, int(os.environ["POISONING_REQUIRED_DISCOVERY_POSITIVES"]))
-
-    target_test = os.environ.get(
-        "POISONING_TARGET_TEST_POSITIVES",
-        os.environ.get("POISONING_REQUIRED_TEST_POSITIVES", "32"),
-    )
+    target_test = os.environ.get("POISONING_TARGET_TEST_POSITIVES", "32")
     minimum_discovery = max(2, int(os.environ.get("POISONING_MIN_DISCOVERY_POSITIVES", "2")))
-    minimum_actual_side = max(1, int(_env_value("CHA_MIN_ACTUAL_N_PER_SIDE", "POISONING_MIN_ACTUAL_CHA_SIDE", "16")))
-    low_data_policy = _env_value("CHA_LOW_DATA_POLICY", "POISONING_LOW_DATA_POLICY", "skip").strip().lower()
+    minimum_actual_side = max(1, int(_env_value("CHA_MIN_ACTUAL_N_PER_SIDE", "16")))
+    low_data_policy = _env_value("CHA_LOW_DATA_POLICY", "skip").strip().lower()
     if low_data_policy not in {"adapt", "skip", "fail"}:
         raise ValueError("CHA_LOW_DATA_POLICY must be adapt, skip, or fail")
     return {
@@ -288,15 +269,12 @@ def causal_scan_requirements() -> dict[str, int]:
         "minimum_actual_cha_side": minimum_actual_side,
         "low_data_policy": low_data_policy,
         "target_discovery_positives": target_discovery,
-        # Compatibility key used by older callers/log formatting.
-        "required_discovery_positives": target_discovery,
         "minimum_discovery_positives": minimum_discovery,
         "target_test_positives": max(0, int(target_test)),
-        "scan_chunk_rows": max(1, int(_env_value("TRIGGER_LIFT_SCAN_CHUNK", "POISONING_CAUSAL_SCAN_CHUNK", "2048"))),
-        "minimum_rows": max(0, int(_env_value("TRIGGER_LIFT_SCAN_MIN_ROWS", "POISONING_CAUSAL_MIN_ROWS", "0"))),
+        "scan_chunk_rows": max(1, int(_env_value("TRIGGER_LIFT_SCAN_CHUNK", "2048"))),
+        "minimum_rows": max(0, int(_env_value("TRIGGER_LIFT_SCAN_MIN_ROWS", "0"))),
         "scan_max_rows": max(0, int(_env_value(
             "TRIGGER_LIFT_SCAN_MAX_ROWS",
-            "POISONING_CAUSAL_SCAN_MAX_ROWS",
             os.environ.get("REFINE_SAMPLING_MAX_POINTS", "10000"),
         ))),
         "scan_early_stop": str(os.environ.get("TRIGGER_LIFT_SCAN_EARLY_STOP", "0")).strip().lower() in {"1", "true", "yes", "on"},

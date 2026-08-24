@@ -141,12 +141,12 @@ def plan_cha(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--discovery_positives", type=int, required=True)
-    env_reference_side = int(os.environ.get("CHA_REFERENCE_N_PER_SIDE", os.environ.get("POISONING_REFERENCE_CHA_SIDE", "64")))
-    env_reference_tau = float(os.environ.get("CHA_TAU", os.environ.get("POISONING_CHA_TAU", "0.3")))
-    env_max_side = os.environ.get("CHA_MAX_N_PER_SIDE", os.environ.get("POISONING_MAX_DISCOVERY_SIDE"))
-    env_min_actual_side = int(os.environ.get("CHA_MIN_ACTUAL_N_PER_SIDE", os.environ.get("POISONING_MIN_ACTUAL_CHA_SIDE", "16")))
-    env_low_data_policy = os.environ.get("CHA_LOW_DATA_POLICY", os.environ.get("POISONING_LOW_DATA_POLICY", "skip")).strip().lower()
-    env_prune_alpha = float(os.environ.get("CHA_PRUNE_ALPHA", os.environ.get("POISONING_CHA_PRUNE_ALPHA", "0.05")))
+    env_reference_side = int(os.environ.get("CHA_REFERENCE_N_PER_SIDE", "64"))
+    env_reference_tau = float(os.environ.get("CHA_TAU", "0.3"))
+    env_max_side = os.environ.get("CHA_MAX_N_PER_SIDE")
+    env_min_actual_side = int(os.environ.get("CHA_MIN_ACTUAL_N_PER_SIDE", "16"))
+    env_low_data_policy = os.environ.get("CHA_LOW_DATA_POLICY", "skip").strip().lower()
+    env_prune_alpha = float(os.environ.get("CHA_PRUNE_ALPHA", "0.05"))
     env_max_pairs = int(os.environ.get("POISONING_MAX_DISCOVERY_PAIRS", "128"))
 
     ap.add_argument("--reference_side", type=int, default=env_reference_side)

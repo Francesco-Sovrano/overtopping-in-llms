@@ -20,10 +20,6 @@ and replacement baseline are fixed globally.  Candidate/null/background sets
 are always evaluated by genuine simultaneous interventions; singleton unions
 are never substituted.
 
-The script can reuse useful ``interaction-validation-v3`` results: exact E(J),
-direct matched-null E values and matched-null memberships are accepted when the
-recorded candidate/evaluation configuration agrees. Historical GCCR fields are
-ignored and are never read as current statistics.
 """
 from __future__ import annotations
 
@@ -54,7 +50,6 @@ from lib.modeling_and_ablation import LMWrapper, get_device
 
 LOG_PREFIX = "[conditional-validation]"
 SCHEMA = "conditional-marginal-validation-v1"
-LEGACY_GCCR_SCHEMA = "interaction-validation-v3"
 GROUP_CACHE_SCHEMA = "simultaneous-group-eval-v2"
 
 
@@ -109,15 +104,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--seed", type=int, default=None,
-        help=(
-            "Random seed for replacement-reference sampling and matched sets. "
-            "When migrating a compatible v3 cache and no seed is supplied, its recorded seed is reused; "
-            "otherwise the default is 42."
-        ),
+        help="Random seed for replacement-reference sampling and matched sets. Default: 42.",
     )
-    # Backward CLI compatibility only. GCCR is no longer computed.
-    parser.add_argument("--m_values", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--denominator_epsilon", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -178,8 +166,8 @@ def _effect_for_group(group: GroupSpec, *, baseline: np.ndarray, post_by_key: di
             "denominator": n,
             "effect": 0.0 if n else math.nan,
             "status": "empty_intervention" if n else "undefined_zero_denominator",
-            "effect_B0": 0.0,
-            "effect_B1": 0.0,
+            "effect_0to1": 0.0,
+            "effect_1to0": 0.0,
         }
     return simultaneous_effect(baseline, post_by_key[group.key])
 
@@ -247,91 +235,6 @@ def _latex_table(summary: pd.DataFrame) -> str:
         )
     lines.extend([r"\bottomrule", r"\end{tabular}"])
     return "\n".join(lines) + "\n"
-
-
-def _legacy_v3_payload(out_dir: Path) -> tuple[dict, dict, pd.DataFrame, pd.DataFrame]:
-    summary_path = out_dir / "interaction_validation_summary.json"
-    config_path = out_dir / "interaction_configuration.json"
-    draws_path = out_dir / "matched_null_draws.csv"
-    membership_path = out_dir / "matched_random_set_membership.csv"
-    try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
-    except Exception:
-        summary = {}
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
-    except Exception:
-        config = {}
-    draws = pd.read_csv(draws_path) if draws_path.exists() else pd.DataFrame()
-    membership = pd.read_csv(membership_path) if membership_path.exists() else pd.DataFrame()
-    if summary.get("definition_version") != LEGACY_GCCR_SCHEMA:
-        return {}, {}, pd.DataFrame(), pd.DataFrame()
-    return summary, config, draws, membership
-
-
-def _legacy_v3_compatible(
-    summary: dict,
-    config: dict,
-    *,
-    candidate_keys: list[str],
-    evaluation_rows_fingerprint: str,
-    evaluation_split: str,
-    intervention: str,
-    decode_only: bool,
-    ai_model: str,
-) -> bool:
-    if not summary:
-        return False
-    if sorted(map(str, summary.get("candidate_set", []))) != sorted(candidate_keys):
-        return False
-    if str(summary.get("evaluation_rows_fingerprint", "")) != evaluation_rows_fingerprint:
-        return False
-    if str(summary.get("evaluation_split", "")) != evaluation_split:
-        return False
-    if str(summary.get("replacement_baseline", "")) != intervention:
-        return False
-    expected_phase = "decode_only" if decode_only else "prefill_decode"
-    if str(summary.get("intervention_phase", "")) != expected_phase:
-        return False
-    if config and str(config.get("ai_model", ai_model)) != ai_model:
-        return False
-    return True
-
-
-def _membership_to_groups(
-    frame: pd.DataFrame,
-    *,
-    population_by_key: dict[str, UnitSpec],
-    null_draws: int,
-    candidate_strata: dict[tuple[int, str, str], list[UnitSpec]],
-    candidate_keys: set[str],
-) -> dict[int, GroupSpec]:
-    if frame.empty or "draw" not in frame.columns:
-        return {}
-    output: dict[int, GroupSpec] = {}
-    for draw in range(null_draws):
-        part = frame.loc[pd.to_numeric(frame["draw"], errors="coerce") == draw]
-        if part.empty:
-            continue
-        units: list[UnitSpec] = []
-        for row in part.to_dict("records"):
-            key = str(row.get("unit_key", ""))
-            if not key and row.get("stage5_locus") is not None and row.get("neuron_id") is not None:
-                key = f"{row['stage5_locus']}:{int(row['neuron_id'])}"
-            unit = population_by_key.get(key)
-            if unit is None or unit.unit_key in candidate_keys:
-                units = []
-                break
-            units.append(unit)
-        if not units:
-            continue
-        grouped = group_units_by_matching_stratum(units)
-        if set(grouped) != set(candidate_strata):
-            continue
-        if any(len(grouped[key]) != len(candidate_strata[key]) for key in candidate_strata):
-            continue
-        output[draw] = _group(units, f"random_J_{draw}")
-    return output
 
 
 def _draw_matched_null_group(
@@ -437,7 +340,6 @@ def main() -> None:
 
     locus_population = load_stage5_locus_population(manifest_path)
     all_population_units = dedupe_units(unit for units in locus_population.values() for unit in units)
-    population_by_key = {unit.unit_key: unit for unit in all_population_units}
     population_strata = group_units_by_matching_stratum(all_population_units)
     candidate_strata = group_units_by_matching_stratum(candidates)
     for stratum, stratum_candidates in candidate_strata.items():
@@ -467,21 +369,7 @@ def main() -> None:
         "dataset_info": _file_fingerprint(dataset_info_path),
         "train_scores": _file_fingerprint(train_scores_path),
     }
-    legacy_summary, legacy_config, legacy_draws, legacy_membership = _legacy_v3_payload(out_dir)
-    legacy_compatible = _legacy_v3_compatible(
-        legacy_summary,
-        legacy_config,
-        candidate_keys=candidate_keys_list,
-        evaluation_rows_fingerprint=evaluation_rows_fingerprint,
-        evaluation_split=str(args.evaluation_split),
-        intervention=str(args.intervention),
-        decode_only=bool(args.decode_only),
-        ai_model=ai_model,
-    )
-    effective_seed = int(
-        args.seed if args.seed is not None
-        else (legacy_config.get("seed") if legacy_compatible and legacy_config.get("seed") is not None else 42)
-    )
+    effective_seed = int(args.seed if args.seed is not None else 42)
     set_deterministic(effective_seed)
 
     cache_identity = {
@@ -534,45 +422,10 @@ def main() -> None:
         except Exception:
             pass
 
-    # Reuse compatible direct-set results from the prior interaction schema when available.
-    legacy_candidate_effect: dict | None = None
-    legacy_e_null_by_draw: dict[int, float] = {}
-    legacy_null_groups: dict[int, GroupSpec] = {}
-    if legacy_compatible:
-        candidate_effect = legacy_summary.get("candidate_E_J")
-        if isinstance(candidate_effect, dict) and np.isfinite(float(candidate_effect.get("effect", math.nan))):
-            legacy_candidate_effect = dict(candidate_effect)
-        if not legacy_draws.empty and "metric" in legacy_draws.columns:
-            part = legacy_draws.loc[legacy_draws["metric"].astype(str) == "E_J"]
-            for row in part.to_dict("records"):
-                try:
-                    draw = int(row["draw"])
-                    value = float(row["value"])
-                except Exception:
-                    continue
-                if 0 <= draw < int(args.null_draws) and np.isfinite(value):
-                    legacy_e_null_by_draw[draw] = value
-        legacy_null_groups = _membership_to_groups(
-            legacy_membership,
-            population_by_key=population_by_key,
-            null_draws=int(args.null_draws),
-            candidate_strata=candidate_strata,
-            candidate_keys=candidate_keys,
-        )
-        legacy_e_null_by_draw = {
-            draw: value for draw, value in legacy_e_null_by_draw.items()
-            if draw in legacy_null_groups
-        }
-        print(
-            f"{LOG_PREFIX} reusing compatible v3 direct-set results: "
-            f"E(J)={'yes' if legacy_candidate_effect else 'no'} "
-            f"direct_null_values={len(legacy_e_null_by_draw)} matched_sets={len(legacy_null_groups)}"
-        )
-
-    # Build/reuse structurally matched K_b sets.
+    # Build structurally matched K_b sets.
     random_full_groups: dict[int, GroupSpec] = {}
     for draw in range(int(args.null_draws)):
-        random_full_groups[draw] = legacy_null_groups.get(draw) or _draw_matched_null_group(
+        random_full_groups[draw] = _draw_matched_null_group(
             draw=draw,
             candidate_strata=candidate_strata,
             population_strata=population_strata,
@@ -666,12 +519,7 @@ def main() -> None:
     ranking.to_csv(out_dir / "frozen_candidate_ranking.csv", index=False)
 
     candidate_full = _group(candidates, "candidate_J")
-    all_groups: list[GroupSpec] = []
-    if legacy_candidate_effect is None:
-        all_groups.append(candidate_full)
-    for draw, group in random_full_groups.items():
-        if draw not in legacy_e_null_by_draw:
-            all_groups.append(group)
+    all_groups: list[GroupSpec] = [candidate_full, *random_full_groups.values()]
     for key in sorted(background_groups):
         all_groups.extend([
             background_groups[key], candidate_context_groups[key], null_context_groups[key]
@@ -694,9 +542,7 @@ def main() -> None:
         f"{LOG_PREFIX} split={args.evaluation_split} rows={len(scores_df)} candidates={len(candidates)} "
         f"matching_strata={len(candidate_strata)} cmc={'on' if compute_cmc else 'off'} "
         f"backgrounds={background_multipliers if compute_cmc else 'disabled'} "
-        f"groups_to_evaluate={len(groups_to_evaluate)} null_draws={args.null_draws} "
-        f"reused_E_J={'yes' if legacy_candidate_effect else 'no'} "
-        f"reused_E_null={len(legacy_e_null_by_draw)}"
+        f"groups_to_evaluate={len(groups_to_evaluate)} null_draws={args.null_draws}"
     )
 
     post_by_key: dict[str, np.ndarray] = {}
@@ -751,19 +597,15 @@ def main() -> None:
             force=bool(args.force),
         )
 
-    candidate_effect = legacy_candidate_effect or _effect_for_group(
+    candidate_effect = _effect_for_group(
         candidate_full, baseline=baseline, post_by_key=post_by_key
     )
     e_null_values: list[float] = []
     direct_null_rows: list[dict] = []
     for draw in range(int(args.null_draws)):
-        if draw in legacy_e_null_by_draw:
-            value = float(legacy_e_null_by_draw[draw])
-            status = "ok_reused_v3"
-        else:
-            effect = _effect_for_group(random_full_groups[draw], baseline=baseline, post_by_key=post_by_key)
-            value = float(effect["effect"])
-            status = str(effect["status"])
+        effect = _effect_for_group(random_full_groups[draw], baseline=baseline, post_by_key=post_by_key)
+        value = float(effect["effect"])
+        status = str(effect["status"])
         e_null_values.append(value)
         direct_null_rows.append({
             "draw": draw,
@@ -883,8 +725,6 @@ def main() -> None:
         "frozen_ranking_path": str(ranking_path),
         "points_to_use_for_mean_ablation": int(args.points_to_use_for_mean_ablation),
         "seed": effective_seed,
-        "legacy_v3_E_J_reused": bool(legacy_candidate_effect is not None),
-        "legacy_v3_direct_null_draws_reused": len(legacy_e_null_by_draw),
         "notes": [
             "No effect is clipped.",
             "Every E value is obtained from a genuine simultaneous intervention on the named set.",
@@ -898,7 +738,6 @@ def main() -> None:
                 if compute_cmc
                 else ["CMC was disabled; no conditional-background interventions were evaluated."]
             ),
-            "GCCR is obsolete and is not computed or exported by this schema.",
         ],
     }
     summary_path.write_text(json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8")
@@ -925,7 +764,6 @@ def main() -> None:
             ["- Candidate and matched null use the same background S_b in each paired draw."]
             if compute_cmc else []
         ),
-        "- GCCR is not part of this validation schema.",
         "",
         "| Metric | Background | Candidate | Null median | Delta | P | p_MC | Status |",
         "|:--|:--|--:|--:|--:|--:|--:|:--|",
@@ -960,8 +798,8 @@ def main() -> None:
             "E_J_count": candidate_effect.get("count"),
             "E_J_denominator": candidate_effect.get("denominator"),
             "E_J_status": candidate_effect.get("status"),
-            "E_J_OCC_0": candidate_effect.get("effect_B0"),
-            "E_J_OCC_1": candidate_effect.get("effect_B1"),
+            "E_J_0to1": candidate_effect.get("effect_0to1"),
+            "E_J_1to0": candidate_effect.get("effect_1to0"),
             "conditional_marginal": {
                 str(row["background_multiplier"]): {
                     "value": row["candidate"],

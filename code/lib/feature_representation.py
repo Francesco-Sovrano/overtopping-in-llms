@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import numpy as np
 import math
 import pandas as pd
-from pandas.api.types import is_numeric_dtype
 from typing import *
 
 from lib.caching_and_prompting import instruct_model
@@ -43,9 +42,6 @@ def _validate_feature_ast(src):
 		if isinstance(node, ast.Call):
 			if isinstance(node.func, ast.Name) and node.func.id in {"eval","exec","open","compile","__import__"}:
 				raise ValueError("Forbidden call detected")
-			# if isinstance(node.func, ast.Attribute):
-			# 	if not isinstance(node.func.value, ast.Name) or node.func.value.id not in {"math","re"}:
-			# 		raise ValueError("Forbidden attribute call (only math.* and re.* allowed)")
 	fn_nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
 	if not fn_nodes:
 		raise ValueError("No function defined in python_src")
@@ -68,15 +64,6 @@ def compile_feature_function(python_src):
 		if callable(obj):
 			return name, obj
 	raise ValueError("No callable function found after compilation.")
-
-# def clamp01(x):
-# 	if x is None: return None
-# 	try:
-# 		if isinstance(x, bool): return 1.0 if x else 0.0
-# 		v = float(x); 
-# 		return 0.0 if v < 0 else (1.0 if v > 1 else v)
-# 	except Exception:
-# 		return None
 
 # ---------------------------
 # JSON helpers
@@ -159,7 +146,6 @@ Return ONLY a JSON list of items.
 		cache_path=cache_path,
 	)[0]
 	assert raw
-	# print('Feature-proposing agent says:', raw)
 	data = extract_json_block(raw) or []
 	out = []
 	for item in data:
@@ -179,34 +165,6 @@ Return ONLY a JSON list of items.
 
 	return [f for f in out if f.label or f.description]
 
-def _default_embedder():
-	try:
-		from sentence_transformers import SentenceTransformer
-		return SentenceTransformer("all-MiniLM-L6-v2")  # fast, small, good enough for dedupe
-	except Exception as e:
-		raise RuntimeError(
-			"sentence-transformers is required for semantic deduping. "
-			"Install with: pip install sentence-transformers"
-		) from e
-
-def remove_similar_labels(tuple_list, threshold=0.9, key=None, get_embedding_fn=None, get_similarity_fn=None):
-	if key is None:
-		key = lambda x: x[0] if isinstance(x, (list,tuple)) else x
-	if get_embedding_fn is None:
-		get_embedding_fn = _default_embedder()
-	if get_similarity_fn is None:
-		get_similarity_fn = cosine_similarity
-	value_list = tuple(map(key,tuple_list))
-	embedding_list = get_embedding_fn.encode(value_list)
-	similarity_vec = get_similarity_fn(embedding_list, embedding_list)
-	
-	result_list = []
-	for i,v in enumerate(tuple_list):
-		if not np.any(similarity_vec[i][:i] >= threshold):
-			result_list.append(v)
-		else: # ignore this element in next comparisons
-			similarity_vec[:,i] = 0
-	return result_list
 
 def drop_near_duplicates_by_corr(X_df, thresh=0.9999):
 	corr = X_df.corr().abs()
@@ -217,22 +175,6 @@ def drop_near_duplicates_by_corr(X_df, thresh=0.9999):
 # ---------------------------
 # Reporting helpers
 # ---------------------------
-def save_markdown(text, out_md):
-	Path(out_md).parent.mkdir(parents=True, exist_ok=True)
-	with open(out_md, "w", encoding="utf-8") as f:
-		f.write(text)
-	print("Markdown saved:", out_md)
-
-def render_feature_catalog(features):
-	lines = []
-	lines.append("## Feature Catalog\n")
-	for f in features:
-		lines.append(f"### {f.label}\n")
-		lines.append(f"{f.description}\n")
-		lines.append("```python")
-		lines.append(f.python_src.strip())
-		lines.append("```\n")
-	return "\n".join(lines)
 
 def drop_high_variance_mad(
 	wide: pd.DataFrame,
@@ -283,7 +225,6 @@ def drop_high_variance_mad(
 	robust_z = (lv - med) / denom
 
 	dropped = robust_z[robust_z > z_thresh].index
-	wide_filt = wide.drop(columns=dropped)
 
 	if not return_stats:
 		return dropped
@@ -297,56 +238,6 @@ def drop_high_variance_mad(
 	}).sort_values("robust_z", ascending=False)
 
 	return dropped, stats
-
-def drop_features_highly_correlated_with_index_columns(
-	df: pd.DataFrame,
-	feature_cols,
-	index_cols,
-	thresh: float = 0.9999,
-):
-	"""
-	Return a list of feature names whose absolute Pearson correlation with
-	ANY (numeric) column in index_cols is >= thresh.
-
-	Non-numeric index columns are ignored; bool is treated as numeric.
-	"""
-	targets = {}
-
-	for col in index_cols:
-		if col not in df.columns:
-			continue
-		s = df[col]
-
-		if s.dtype == bool:
-			s_num = s.astype(float)
-		elif is_numeric_dtype(s):
-			s_num = s.astype(float)
-		else:
-			s_num = pd.to_numeric(s, errors="coerce")
-
-		s_num = s_num.replace([np.inf, -np.inf], np.nan)
-		nz = s_num.dropna()
-		if nz.nunique() < 2:
-			continue
-
-		targets[col] = s_num
-
-	drop_cols = set()
-
-	for feat in feature_cols:
-		x = pd.to_numeric(df[feat], errors="coerce").replace([np.inf, -np.inf], np.nan)
-		for t_name, t_series in targets.items():
-			mask = x.notna() & t_series.notna()
-			if mask.sum() < 2:
-				continue
-			corr = x[mask].corr(t_series[mask])
-			if pd.isna(corr):
-				continue
-			if abs(corr) >= thresh:
-				drop_cols.add(feat)
-				break
-
-	return list(drop_cols)
 
 def safe_features_fillna(scores_df, fill_number=0, fill_bool=False, cols_not_to_fill=None):
 	cols_not_to_fill = set(cols_not_to_fill or [])

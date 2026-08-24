@@ -1,10 +1,3 @@
-# import os
-# # Force single-threaded usage in BLAS/OpenBLAS/MKL/NumExpr
-# os.environ["OMP_NUM_THREADS"] = "1"
-# os.environ["MKL_NUM_THREADS"] = "1"
-# os.environ["OPENBLAS_NUM_THREADS"] = "1"
-# os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
 import json
 from more_itertools import unique_everseen
 import pandas as pd
@@ -21,8 +14,6 @@ from sklearn.utils import check_array
 from sklearn.utils.validation import validate_data, _check_sample_weight
 from sklearn.linear_model import enet_path as _enet_path_base
 from sklearn.linear_model._coordinate_descent import _pre_fit, _set_order
-# from scipy import sparse
-
 from scipy import sparse
 
 from rulefit.rulefit import Winsorizer, FriedScale
@@ -501,60 +492,6 @@ class SHAPLassoCV(LassoCV):
 			selection=self.selection,
 		)
 
-# class Winsorizer():
-#   """Performs Winsorization 1->1*
-
-#   Warning: this class should not be used directly.
-#   """    
-#   def __init__(self,trim_quantile=0.0):
-#       self.trim_quantile=trim_quantile
-#       self.winsor_lims=None
-		
-#   def train(self,X):
-#       # get winsor limits
-#       self.winsor_lims=np.ones([2,X.shape[1]])*np.inf
-#       self.winsor_lims[0,:]=-np.inf
-#       if self.trim_quantile>0:
-#           for i_col in np.arange(X.shape[1]):
-#               lower=np.percentile(X[:,i_col],self.trim_quantile*100)
-#               upper=np.percentile(X[:,i_col],100-self.trim_quantile*100)
-#               self.winsor_lims[:,i_col]=[lower,upper]
-		
-#   def trim(self,X):
-#       X_=X.copy()
-#       X_=np.where(X>self.winsor_lims[1,:],np.tile(self.winsor_lims[1,:],[X.shape[0],1]),np.where(X<self.winsor_lims[0,:],np.tile(self.winsor_lims[0,:],[X.shape[0],1]),X))
-#       return X_
-
-# class FriedScale():
-#   """Performs scaling of linear variables according to Friedman et al. 2005 Sec 5
-
-#   Each variable is first Winsorized l->l*, then standardised as 0.4 x l* / std(l*)
-#   Warning: this class should not be used directly.
-#   """    
-#   def __init__(self, winsorizer = None):
-#       self.scale_multipliers=None
-#       self.winsorizer = winsorizer
-		
-#   def train(self,X):
-#       # get multipliers
-#       if self.winsorizer != None:
-#           X_trimmed= self.winsorizer.trim(X)
-#       else:
-#           X_trimmed = X
-
-#       scale_multipliers=np.ones(X.shape[1])
-#       for i_col in np.arange(X.shape[1]):
-#           num_uniq_vals=len(np.unique(X[:,i_col]))
-#           if num_uniq_vals>2: # don't scale binary variables which are effectively already rules
-#               scale_multipliers[i_col]=0.4/(1.0e-12 + np.std(X_trimmed[:,i_col]))
-#       self.scale_multipliers=scale_multipliers
-		
-#   def scale(self,X):
-#       if self.winsorizer != None:
-#           return self.winsorizer.trim(X)*self.scale_multipliers
-#       else:
-#           return X*self.scale_multipliers
-
 # Define the data types for Numba jitclass
 type_spec_rule_condition = [
 	('feature_index', int32),
@@ -830,7 +767,6 @@ class RuleEnsemble():
 			gain = node['gain']
 			yes_child = node['yes']
 			no_child = node['no']
-			missing_child = node['missing']
 
 			# Condition for the left child (<= threshold)
 			left_condition = RuleCondition(feature_index=feature_index,
@@ -886,7 +822,7 @@ class RuleEnsemble():
 		filtered_conditions = []
 
 		# Apply filtering logic
-		for (feature_index, operator), group in grouped_conditions.items():
+		for (_, operator), group in grouped_conditions.items():
 			if operator == '>':
 				# Keep condition with the highest threshold
 				best_condition = max(group, key=lambda x: (x.threshold, 0 if x.operator.endswith('=') else 1))
@@ -958,7 +894,6 @@ class RuleSHAP(BaseEstimator, TransformerMixin):
 			assert np.all(np.isfinite(shap_weights)), "Feature weights must be finite numbers!"
 			shap_weights = shap_weights/np.sum(shap_weights) # SHAP weights normalized in (0,1]
 
-		N = X.shape[0]
 		if feature_names is None:
 			self.feature_names = ['feature_' + str(x) for x in range(0, X.shape[1])]
 		else:
@@ -1151,7 +1086,7 @@ class RuleSHAP(BaseEstimator, TransformerMixin):
 		lin_fire_q = 0.75
 
 		if have_data:
-			n, r = Z.shape
+			n, _ = Z.shape
 			sums = Z.sum(axis=0).astype(np.float64)
 			not_sums = (n - sums).astype(np.float64)
 
@@ -1165,7 +1100,7 @@ class RuleSHAP(BaseEstimator, TransformerMixin):
 			else:
 				yhat_cont = yhat.astype(np.float64)
 		else:
-			n = r = 0
+			n = 0
 			sums = not_sums = None
 			yhatb = None
 			yhat_cont = None
@@ -1579,19 +1514,15 @@ class RuleSHAP(BaseEstimator, TransformerMixin):
 				if importance_all.shape[0] != m_all:
 					importance_all = None
 
-			# weighted importance has a few possible column names historically
-			w_cols = [
-				"importance_weighted_by_gain",
-				"weighted_importance",
-				"weightedimportance",
-			]
-			for c in w_cols:
-				if c in rdf_rules.columns:
-					try:
-						weighted_importance_all = pd.to_numeric(rdf_rules[c], errors="coerce").to_numpy(dtype=np.float64)
-					except Exception:
-						weighted_importance_all = np.asarray(rdf_rules[c], dtype=np.float64)
-					break
+			if "importance_weighted_by_gain" in rdf_rules.columns:
+				try:
+					weighted_importance_all = pd.to_numeric(
+						rdf_rules["importance_weighted_by_gain"], errors="coerce"
+					).to_numpy(dtype=np.float64)
+				except Exception:
+					weighted_importance_all = np.asarray(
+						rdf_rules["importance_weighted_by_gain"], dtype=np.float64
+					)
 			if weighted_importance_all is not None and weighted_importance_all.shape[0] != m_all:
 				weighted_importance_all = None
 		# ---- MCC helper (vectorized for screening) ----
@@ -1665,37 +1596,24 @@ class RuleSHAP(BaseEstimator, TransformerMixin):
 		def _norm_metric_name(name):
 			if name is None:
 				return ""
-			s = str(name).strip().lower()
-			s = s.replace(" ", "").replace("_", "")
-			if s in ("mcc",):
-				return "MCC"
-			if s in ("f1", "f1target=1|fire", "f1target1|fire"):
-				return "F1"
-			if s in ("lift", "lifttarget=1|fire", "lifttarget1|fire"):
-				return "Lift"
-			if s in ("balancedacc", "balancedaccuracy", "balacc"):
-				return "BalancedAcc"
-			if s in ("acc", "accuracy"):
-				return "Acc"
-			if s in ("precision", "p", "pre", "ptarget=1|fire", "ptarget1|fire"):
-				return "Precision"
-			if s in ("recall", "r", "rec", "rfire|target=1", "rfire|target1", "recallfire|target=1"):
-				return "Recall"
-			if s in ("coverage", "datasetcoverage", "fire", "fire_rate", "firingrate"):
-				return "Coverage"
-			if s in ("tpr", "sensitivity", "recallpos"):
-				return "TPR"
-			if s in ("tnr", "specificity"):
-				return "TNR"
-			if s in ("fpr", "falsepositive_rate", "falsepositiverate"):
-				return "FPR"
-			if s in ("fnr", "falsenegative_rate", "falsenegativerate"):
-				return "FNR"
-			if s in ("importance", "imp", "abscoef", "abscoefficient"):
-				return "Importance"
-			if s in ("weightedimportance", "importanceweightedbygain", "importanceweighted", "impweighted", "weightedimp", "gainweightedimportance", "importancegainweighted"):
-				return "WeightedImportance"
-			return str(name)
+			canonical = {
+				"mcc": "MCC",
+				"f1": "F1",
+				"lift": "Lift",
+				"balancedacc": "BalancedAcc",
+				"acc": "Acc",
+				"precision": "Precision",
+				"recall": "Recall",
+				"coverage": "Coverage",
+				"tpr": "TPR",
+				"tnr": "TNR",
+				"fpr": "FPR",
+				"fnr": "FNR",
+				"importance": "Importance",
+				"weightedimportance": "WeightedImportance",
+			}
+			key = str(name).strip().replace("_", "").replace(" ", "").lower()
+			return canonical.get(key, str(name))
 
 		def _direction_is_asc(metric_name):
 			if greedy_seed_metric_directions is None:

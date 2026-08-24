@@ -48,15 +48,6 @@ from lib.text_and_rules import apply_rule_to_features
 from lib.threshold_event_shared import activation_hook_spec as shared_activation_hook_spec, collect_reference_activations, safe_layer_label
 
 
-def _int_or_zero(value):
-    if value is None or str(value).strip() == "":
-        return 0
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"expected integer or empty value, got {value!r}") from exc
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="Run flip-conditioned spiking diagnostics for rule-derived candidate neurons.")
     p.add_argument("--input_data_dir", required=True, help="Circuit-discovery neural_circuits directory containing dataset_info.json and manifest.json.")
@@ -105,15 +96,6 @@ def parse_args():
     p.add_argument("--nonagonist_min_candidate_pool_per_layer", type=int, default=4)
     p.add_argument("--nonagonist_random_controls_per_agonist", type=int, default=1)
 
-    # Compatibility no-ops accepted by existing runners.
-    p.add_argument("--output_data_dir", default=None, help=argparse.SUPPRESS)
-    p.add_argument("--spiking_max_units_per_population", type=int, default=0, help=argparse.SUPPRESS)
-    p.add_argument("--spiking_control_match_ratio", type=float, default=1.0, help=argparse.SUPPRESS)
-    p.add_argument("--spiking_include_manifest_controls", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--threshold_event_overtopping_min_strength", type=float, default=0.20, help=argparse.SUPPRESS)
-    p.add_argument("--threshold_event_weak_min_strength", type=float, default=0.05, help=argparse.SUPPRESS)
-    p.add_argument("--threshold_event_control_max_strength", type=float, default=0.01, help=argparse.SUPPRESS)
-
     # threshold test knobs
     p.add_argument("--threshold_event_min_examples", type=int, default=8)
     p.add_argument("--threshold_event_repeats", type=int, default=20)
@@ -130,8 +112,6 @@ def parse_args():
     p.add_argument("--rules_stats_dirname", default="")
     p.add_argument("--rule_conditioned_max_units", type=int, default=96)
     p.add_argument("--rule_conditioned_max_rules_per_unit", type=int, default=1)
-    p.add_argument("--rule_hq_metric", default=None, help=argparse.SUPPRESS)
-    p.add_argument("--rule_hq_threshold", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--rule_match_points_per_rule", type=int, default=64)
     p.add_argument("--rule_min_match_examples", type=int, default=16)
     p.add_argument("--rule_nonmatch_match_ratio", type=int, default=3)
@@ -160,16 +140,6 @@ def parse_args():
     p.add_argument("--spectral_cache_dir", default=None)
     p.add_argument("--max_seq_len", type=int, default=None)
 
-    # Compatibility no-ops accepted by existing runners.
-    p.add_argument("--n_associated", type=int, default=64)
-    p.add_argument("--n_unrelated", type=int, default=64)
-    p.add_argument("--search_epsilon", type=float, default=0.2)
-    p.add_argument("--threshold_event_clamp_topk", type=_int_or_zero, default=0)
-    p.add_argument("--force_posthoc_stats", action="store_true")
-    p.add_argument("--force_population_stats", action="store_true")
-    p.add_argument("--cluster_by_spectral", action="store_true")
-    p.add_argument("--global_n_clusters", type=int, default=32)
-    p.add_argument("--mlp_neurons_only", action="store_true")
     return p.parse_args()
 
 
@@ -517,7 +487,7 @@ def _spectral_sampling_config(args) -> dict:
         "rep_pooling": str(getattr(args, "rep_pooling", "mean")),
         "spectral_dim": int(getattr(args, "spectral_dim", 32)),
         "max_seq_len": getattr(args, "max_seq_len", None),
-        "global_n_clusters": int(getattr(args, "spiking_global_n_clusters", getattr(args, "global_n_clusters", 64))),
+        "global_n_clusters": int(args.spiking_global_n_clusters),
     }
 
 
@@ -572,12 +542,10 @@ def _resolve_rule_metrics_path(args, *, input_data_dir: Path) -> Path | None:
             seen_roots.append(rr)
     for rroot in seen_roots:
         if stats_name:
-            candidates.extend([
-                rroot / "stats" / stats_name / "rule_combo_metrics_best_per_neuron.csv",
-                rroot / "stats" / stats_name / "rule_combo_metrics_all.csv",
-            ])
-        candidates.extend(sorted(rroot.glob("stats/*/rule_combo_metrics_best_per_neuron.csv")))
-        candidates.extend(sorted(rroot.glob("stats/*/rule_combo_metrics_all.csv")))
+            candidates.append(
+                rroot / "stats" / stats_name / "rule_combo_metrics_test_selected_best_per_neuron.csv"
+            )
+        candidates.extend(sorted(rroot.glob("stats/*/rule_combo_metrics_test_selected_best_per_neuron.csv")))
     seen = set()
     for c in candidates:
         try:
@@ -747,7 +715,7 @@ def _rule_feature_columns(dataset_info: dict, scores_df: pd.DataFrame, task_targ
                 return cols
         except Exception as e:
             tqdm.write(f"{LOG_PREFIX} warning: cannot read features.json: {e}")
-    excluded = set(task_targets) | {"original_idx", "_orig_row", "_evaluated", "_sampled"}
+    excluded = set(task_targets) | {"original_idx", "_orig_row", "_evaluated"}
     excluded |= {c for c in scores_df.columns if str(c).startswith("flip_")}
     return [c for c in scores_df.columns if c not in excluded and (pd.api.types.is_numeric_dtype(scores_df[c]) or pd.api.types.is_bool_dtype(scores_df[c]))]
 
@@ -1095,13 +1063,10 @@ def _proxy_rows_requested_set(requested_features):
 
 
 def proxy_rows_for_unit(unit: UnitSpec, layer_payload: dict, *, model, intervention, mean_activations, baseline: str, requested_features=None):
-    """Build proxy rows for one unit, computing only requested proxy columns.
+    """Build proxy rows for one unit while caching layer-wide proxy statistics.
 
-    The old implementation recomputed layer-wide abs/product/WANDA pools, row-wise
-    means/stds, and O(n_examples * layer_width) percentile comparisons for every
-    unit.  This version stores a small cache inside layer_payload and uses sorted
-    row-wise pools for percentile ranks, so each expensive layer-wide object is
-    computed once per layer/baseline rather than once per unit.
+    Layer-wide abs/product/WANDA pools, row-wise moments, and sorted pools for
+    percentile ranks are computed once per layer/baseline and reused across units.
     """
     spec = shared_activation_hook_spec(unit.layer_label)
     if spec is None or layer_payload is None:
@@ -1425,9 +1390,8 @@ def _mcc_from_counts(tp, fp, tn, fn):
 def _fit_threshold(x, y, min_examples):
     """Fit the best one-dimensional threshold using vectorized counts.
 
-    The previous version looped over up to ~1k thresholds and called
-    sklearn.metrics.matthews_corrcoef for each direction.  Here we sort once and
-    derive TP/FP/TN/FN for all thresholds with searchsorted + prefix sums.
+    The implementation sorts once and derives TP/FP/TN/FN for all thresholds
+    with searchsorted and prefix sums.
     """
     x, y = _finite_xy(x, y)
     if len(y) < 2 * min_examples or y.sum() < min_examples or (len(y) - y.sum()) < min_examples:
@@ -1625,7 +1589,7 @@ def _make_binned_rows(udf, feature, target, population, unit_key, direction, n_b
         return []
     tmp = pd.DataFrame({"oriented_score": oriented, "target": y, "bin": bins})
     rows = []
-    for idx, (b, g) in enumerate(tmp.groupby("bin", observed=False, sort=True)):
+    for idx, (_, g) in enumerate(tmp.groupby("bin", observed=False, sort=True)):
         rows.append({"population": population, "unit_key": unit_key, "feature": feature, "target": target, "bin_index": int(idx), "n": int(len(g)), "flip_rate": float(g["target"].mean()), "mean_oriented_score": float(g["oriented_score"].mean())})
     return rows
 

@@ -3,12 +3,12 @@
 
 Looks under:
 
-  <run_dir>/backdoor_lift_overtopping/<condition>/<frac_step_tag>/<phase>/checkpoint_discovery/eval_<intervention>
+  <run_dir>/03_checkpoint_causal_discovery/<condition>/<progress_pct_step>/<phase>/trigger_lift/eval_<intervention>
 
 This is task-agnostic across registered poisoning trigger-lift tasks.
 Each checkpoint is evaluated on a deterministic causal candidate stream with a
 prefix-stable discovery/test assignment. ``is_trigger_lift_success`` is defined
-on the immutable gold-non-target cohort: the control-ID response is not the
+on the immutable gold-non-target cohort: the control-marker response is not the
 attacker target and the triggered response is the attacker target. The scanner expands the candidate prefix toward the declared reference CHA sample and preferred held-out precision target. If a finite corpus ends below the reference discovery target, the configured low-data policy either uses a permitted balanced sample with a sample-size-adjusted UCB threshold, records a circuit-analysis skip, or fails. Singleton effects are conditioned on baseline
 trigger-lift-positive rows. Held-out metrics remain primary; when the held-out
 target is missed, a separate all-trigger-lift-positive post-selection estimate is
@@ -21,6 +21,8 @@ import json
 import math
 import re
 from pathlib import Path
+
+from poisoning.lib.run_paths import causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
 from typing import Any, Dict, List
 
 import numpy as np
@@ -45,15 +47,14 @@ def phase_label(decode_only: bool) -> str:
     return "output_only" if bool(decode_only) else "input_output"
 
 
-def stats_base_for(run_dir: Path, row: pd.Series, eval_intervention: str, decode_only: bool) -> Path:
-    tag = Path(str(row["overtopping_data_dir"])).name
+def stats_base_for(run_stage_root: Path, row: pd.Series, eval_intervention: str, decode_only: bool) -> Path:
+    stage_label = checkpoint_progress_label(row)
     return (
-        run_dir
-        / "backdoor_lift_overtopping"
+        causal_dir(run_stage_root)
         / str(row["condition"])
-        / tag
-        / phase_label(decode_only)
-        / "checkpoint_discovery"
+        / stage_label
+        / phase_dirname(phase_label(decode_only))
+        / "trigger_lift"
         / f"eval_{sanitize_label(eval_intervention)}"
     )
 
@@ -140,39 +141,27 @@ def find_stats_dirs(base: Path, required_tau: float | None = None) -> List[Path]
 
 
 def stats_evaluation_split(stats_dir: Path) -> str:
-    """Return the row population used for final singleton statistics."""
+    """Return the declared row population used for final singleton statistics."""
     scope_path = stats_dir / "evaluation_scope.json"
-    if scope_path.exists():
-        try:
-            value = str(read_json(scope_path).get("final_statistics_split", "")).strip().lower()
-            if value in {"test", "train", "all"}:
-                return value
-        except Exception:
-            pass
-    name = stats_dir.name.lower()
-    if "heldout_test" in name:
-        return "test"
-    if "eval_train" in name:
-        return "train"
-    return "unknown"
+    if not scope_path.exists():
+        return "unknown"
+    try:
+        value = str(read_json(scope_path).get("final_statistics_split", "")).strip().lower()
+    except Exception:
+        return "unknown"
+    return value if value in {"test", "train", "all"} else "unknown"
 
 
 def stats_evaluation_baseline_subset(stats_dir: Path) -> str:
-    """Return baseline-predicate conditioning used by stage-7 statistics."""
+    """Return the declared baseline-predicate conditioning for stage-7 statistics."""
     scope_path = stats_dir / "evaluation_scope.json"
-    if scope_path.exists():
-        try:
-            value = str(read_json(scope_path).get("evaluation_baseline_subset", "all")).strip().lower()
-            if value in {"all", "positive", "negative"}:
-                return value
-        except Exception:
-            pass
-    name = stats_dir.name.lower()
-    if "baseline_positive" in name:
-        return "positive"
-    if "baseline_negative" in name:
-        return "negative"
-    return "all"
+    if not scope_path.exists():
+        return "unknown"
+    try:
+        value = str(read_json(scope_path).get("evaluation_baseline_subset", "")).strip().lower()
+    except Exception:
+        return "unknown"
+    return value if value in {"all", "positive", "negative"} else "unknown"
 
 
 def summarize_all_points(stats_dir: Path) -> Dict[str, Any]:
@@ -210,11 +199,9 @@ def maybe_behavior_stats(base: Path) -> Dict[str, Any]:
         return {}
     n_examples = s.get("n_examples", math.nan)
     lift_success = s.get("n_trigger_lift_success", math.nan)
-    conditional_n = s.get("conditional_conversion_n", s.get("conditional_asr_n", math.nan))
-    conditional_success = s.get(
-        "conditional_conversion_success", s.get("conditional_asr_success", lift_success)
-    )
-    conditional_rate = s.get("conditional_conversion_rate", s.get("conditional_asr_rate", math.nan))
+    conditional_n = s.get("conditional_conversion_n", math.nan)
+    conditional_success = s.get("conditional_conversion_success", lift_success)
+    conditional_rate = s.get("conditional_conversion_rate", math.nan)
     def finite(value: Any) -> bool:
         try:
             return bool(np.isfinite(float(value)))
@@ -242,9 +229,6 @@ def maybe_behavior_stats(base: Path) -> Dict[str, Any]:
         "conditional_conversion_rate": conditional_rate,
         "conditional_conversion_success": conditional_success,
         "conditional_conversion_n": conditional_n,
-        "conditional_asr_rate": conditional_rate,
-        "conditional_asr_success": conditional_success,
-        "conditional_asr_n": conditional_n,
         "convertible_fraction": s.get("convertible_fraction", math.nan),
         "trigger_excess_target_rate": s.get("trigger_excess_target_rate", math.nan),
         "trigger_specificity_gap": s.get("trigger_specificity_gap", math.nan),
@@ -427,7 +411,7 @@ def maybe_ordinary_correctness_control(
     required_tau: float | None,
 ) -> Dict[str, Any]:
     """Merge the checkpoint's companion ordinary-correctness circuit summary."""
-    ordinary_base = trigger_base.parent / f"ordinary_correctness_{trigger_base.name}"
+    ordinary_base = trigger_base.parent.parent / "ordinary_correctness" / trigger_base.name
     out: Dict[str, Any] = {
         "ordinary_correctness_control_dir": str(ordinary_base),
         "ordinary_correctness_control_present": bool(ordinary_base.exists()),
@@ -438,6 +422,14 @@ def maybe_ordinary_correctness_control(
             status = read_json(status_path)
             for key, value in status.items():
                 out[f"ordinary_correctness_{key}"] = value
+            try:
+                _n_rows = int(status.get("n_rows", 0))
+                _n_correct = int(status.get("n_correct_total", 0))
+                out["ordinary_correctness_accuracy"] = (
+                    float(_n_correct) / float(_n_rows) if _n_rows > 0 else math.nan
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                out["ordinary_correctness_accuracy"] = math.nan
         except Exception:
             pass
     stats_dirs = [
@@ -468,6 +460,7 @@ def maybe_ordinary_correctness_control(
 
 def build_trajectory(
     run_dir: Path,
+    run_stage_root: Path,
     eval_intervention: str,
     *,
     required_tau: float | None = None,
@@ -475,13 +468,13 @@ def build_trajectory(
     decode_only: bool = False,
     min_lift_positives: int = 0,
 ) -> pd.DataFrame:
-    manifest_path = run_dir / "checkpoint_manifest_all.csv"
+    manifest_path = metadata_path(run_dir, "checkpoint_manifest_all.csv")
     if not manifest_path.exists():
         raise FileNotFoundError(f"Missing manifest: {manifest_path}")
     manifest = pd.read_csv(manifest_path)
     rows: List[Dict[str, Any]] = []
     for _, row in manifest.iterrows():
-        base = stats_base_for(run_dir, row, eval_intervention, decode_only)
+        base = stats_base_for(run_stage_root, row, eval_intervention, decode_only)
         stats_dirs = find_stats_dirs(base, required_tau=required_tau)
         stats_by_scope: Dict[tuple[str, str], List[Path]] = {}
         for stats_dir in stats_dirs:
@@ -491,8 +484,6 @@ def build_trajectory(
         # baseline-positive stage-7 outputs are eligible for trajectory metrics.
         primary_stats_dirs = stats_by_scope.get(("test", "positive"), [])
         all_points_dirs = stats_by_scope.get(("all", "positive"), [])
-        # Unsuffixed historical directories may not carry evaluation_scope.json.
-        # They are not silently promoted to confirmatory held-out estimates.
         base_stats = maybe_behavior_stats(base)
         discovery_status = maybe_discovery_status(base)
         ordinary_control = maybe_ordinary_correctness_control(
@@ -677,7 +668,7 @@ def plot_dashboard(df: pd.DataFrame, out_path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run_dir", required=True)
+    ap.add_argument("--run_dir", required=True, help="Immutable poisoning data/training run directory.")
     ap.add_argument("--eval_intervention", default="mean-donor")
     ap.add_argument(
         "--required_tau",
@@ -692,14 +683,17 @@ def main() -> None:
     )
     ap.add_argument("--decode_only", action="store_true", help="Aggregate output-only causal-intervention runs instead of input+output runs.")
     ap.add_argument("--min_lift_positives", type=int, default=8, help="Mark checkpoints below this baseline lift-success count as insufficient rather than missing.")
+    ap.add_argument("--no_plots", action="store_true", help="Write trajectory tables/checks only; final paper figures are generated under results/.")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).expanduser()
-    out_dir = run_dir / "backdoor_lift_trajectory_summary" / phase_label(args.decode_only)
+    run_stage_root = run_dir
+    out_dir = trajectories_dir(run_stage_root) / phase_dirname(phase_label(args.decode_only))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     df = build_trajectory(
         run_dir,
+        run_stage_root,
         args.eval_intervention,
         required_tau=args.required_tau,
         strict_one_run_per_checkpoint=bool(args.strict_one_run_per_checkpoint),
@@ -715,19 +709,23 @@ def main() -> None:
         json.dumps(checks, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    plot_dual_axis(ok, "lift_U(J)", out_dir / "trigger_lift_vs_UJ.pdf")
-    plot_dual_axis(ok, "lift_N.10", out_dir / "trigger_lift_vs_N10.pdf")
-    plot_dual_axis(
-        ok,
-        "lift_U(J)",
-        out_dir / "conditional_conversion_vs_UJ.pdf",
-        y_left="conditional_conversion_rate",
-        y_left_label="Conditional conversion / ASR",
-    )
-    plot_dashboard(df, out_dir / "backdoor_lift_overtopping_dashboard.pdf")
+    if not args.no_plots:
+        plot_dual_axis(ok, "lift_U(J)", out_dir / "trigger_lift_vs_UJ.pdf")
+        plot_dual_axis(ok, "lift_N.10", out_dir / "trigger_lift_vs_N10.pdf")
+        plot_dual_axis(
+            ok,
+            "lift_U(J)",
+            out_dir / "conditional_conversion_vs_UJ.pdf",
+            y_left="conditional_conversion_rate",
+            y_left_label="Conditional conversion / ASR",
+        )
+        plot_dashboard(df, out_dir / "backdoor_lift_overtopping_dashboard.pdf")
 
     print(f"Wrote {out_csv}")
-    print(f"Wrote plots under {out_dir}")
+    if args.no_plots:
+        print("Skipped per-run trajectory plots by explicit request.")
+    else:
+        print(f"Wrote plots under {out_dir}")
 
 
 if __name__ == "__main__":

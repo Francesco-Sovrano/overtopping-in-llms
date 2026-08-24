@@ -13,12 +13,13 @@ The behavioural endpoint is trigger lift:
     B(x) != T and B(x+t) == T
 
 where ``T`` is the configured backdoor target.  Causal interventions are
-applied to the trigger-ID prompt. Ordinary task accuracy and control-ID target induction are
+applied to the trigger-marker prompt. Ordinary task accuracy and control-marker target induction are
 measured on ``x`` as collateral-damage controls.
 """
 
 from __future__ import annotations
 
+from poisoning.tasks.registry import infer_task_from_run
 from poisoning.lib.units import unit_key as _unit_key
 import argparse
 import hashlib
@@ -27,6 +28,8 @@ import json
 import math
 from collections import Counter
 from pathlib import Path
+
+from poisoning.lib.run_paths import resolve_manifest_checkpoint_dir, trajectories_dir, phase_dirname
 from typing import Any, Dict, Iterable, List, Sequence
 
 import matplotlib
@@ -291,7 +294,7 @@ def _find_rows_for_run(
     decode_only: bool,
 ) -> pd.DataFrame:
     phase = "output_only" if decode_only else "input_output"
-    summary_csv = run_dir / "backdoor_lift_trajectory_summary" / phase / "backdoor_lift_overtopping_trajectory.csv"
+    summary_csv = trajectories_dir(run_dir) / phase_dirname(phase) / "backdoor_lift_overtopping_trajectory.csv"
     if not summary_csv.exists():
         raise FileNotFoundError(f"Missing trigger-lift summary: {summary_csv}")
     df = pd.read_csv(summary_csv)
@@ -738,7 +741,7 @@ def _run_one(
     task_name = task_definition.name
     fraction = float(row["fraction"])
     condition = str(row["condition"])
-    checkpoint_dir = str(row["checkpoint_dir"])
+    checkpoint_dir = str(resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True))
     stats_dir = Path(str(row["lift_overtopping_stats_dir"]))
     base_dir = Path(str(row["lift_overtopping_base_dir"]))
     scores_path = base_dir / "feature_report" / "scores.csv"
@@ -1257,7 +1260,7 @@ def _write_summary(df: pd.DataFrame, interaction: pd.DataFrame, out_dir: Path) -
     lines = [
         "# Trigger-lift defence summary",
         "",
-        "Cumulative coalitions are ordered by the discovery-frozen ranking. Candidate and matched-random groups are evaluated on the same held-out test rows. The poisoned J is also applied to correct ordinary target-positive examples exactly matched by task type; a large trigger-minus-ordinary destruction gap supports trigger-mechanism specificity, while similar rates indicate generic target/task channels. Exact binomial intervals are reported for both destruction rates; paired bootstrap intervals are reported for ordinary control-ID accuracy changes.",
+        "Cumulative coalitions are ordered by the discovery-frozen ranking. Candidate and matched-random groups are evaluated on the same held-out test rows. The poisoned J is also applied to correct ordinary target-positive examples exactly matched by task type; a large trigger-minus-ordinary destruction gap supports trigger-mechanism specificity, while similar rates indicate generic target/task channels. Exact binomial intervals are reported for both destruction rates; paired bootstrap intervals are reported for ordinary control-marker accuracy changes.",
         "",
         "| Task | Checkpoint | Best cumulative k | Trigger-lift removal (95% CI) | Ordinary target removal | Specificity gap | Matched-random mean | Empirical p | Clean accuracy drop |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -1312,7 +1315,7 @@ def main() -> None:
     p.add_argument("--top_ks", default="1,2,4,6,8,16,32,64")
     p.add_argument("--max_pos", type=int, default=0, help="0 uses every held-out trigger-lift success.")
     p.add_argument("--max_neg", type=int, default=0, help="0 uses every held-out non-lift row.")
-    p.add_argument("--max_clean", type=int, default=0, help="0 uses every held-out control-ID row for collateral controls.")
+    p.add_argument("--max_clean", type=int, default=0, help="0 uses every held-out control-marker row for collateral controls.")
     p.add_argument(
         "--max_task_specificity", type=int, default=0,
         help="Maximum ordinary correct target-positive rows matched by task type for the poisoned-J specificity control; 0 uses every available exact match up to n_pos.",
@@ -1332,7 +1335,7 @@ def main() -> None:
     p.add_argument("--interaction_pair_scan", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--interaction_random_draws_per_k", type=int, default=6)
     p.add_argument("--ai_model_cache_dir", default=None)
-    p.add_argument("--output_dir", default=str(PROJECT_ROOT / "data" / "poisoning_mechanism_summary"))
+    p.add_argument("--output_dir", default=str(PROJECT_ROOT / "data" / "poisoning" / "summary" / "mechanism"))
     args = p.parse_args()
 
     if args.random_groups < 1:

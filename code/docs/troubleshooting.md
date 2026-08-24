@@ -10,8 +10,8 @@ From `code/`:
 python3 -m compileall -q analysis experiments lib pipeline poisoning
 python3 -m experiments.run_experiments --suite all --list
 python3 -m analysis.generate_final_results --help
-python3 -m poisoning.stage01_train_grammar --help
-python3 -m poisoning.stage01_train_arithmetic --help
+python3 -m poisoning.tasks.grammar --help
+python3 -m poisoning.tasks.arithmetic --help
 bash -n pipeline/_run_pipeline.sh
 find poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 ```
@@ -49,11 +49,7 @@ find poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
 ### Trigger guard fails
 
-Inspect `trigger_control.json` and confirm that `control_marker` matches the value configured for the run
-and `evaluated_marker` is `[id=74291]`. The guard must compare two marked prompts,
-not a marked prompt against an omitted line. Replace the preregistered ID triple
-if lift, suppression, or total change still exceeds its limit. Do not disable
-the guard merely to retain a preferred candidate.
+Inspect `trigger_control.json` and confirm that `control_marker` and `evaluated_marker` exactly match the control and trigger values configured for that run. The guard must compare two prompts that differ only in their first marker line, not a marked prompt against an omitted line. Choose a different marker set if lift, suppression, or total change still exceeds its limit. Do not disable the guard merely to retain a preferred candidate.
 
 ### Transformers warns that `top_p` or `top_k` is invalid
 

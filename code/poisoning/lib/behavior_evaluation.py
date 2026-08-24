@@ -103,8 +103,8 @@ def evaluate_checkpoint_behavior(
     event_rows: List[Dict[str, Any]] = []
     attack_details: List[Dict[str, Any]] = []
     attack_parsed: List[bool] = []
-    for local_index, (row_index, trigger_prompt, trigger_output) in enumerate(
-        zip(attack_indices, trigger_prompts, trigger_outputs)
+    for row_index, trigger_prompt, trigger_output in zip(
+        attack_indices, trigger_prompts, trigger_outputs
     ):
         row = selected[row_index]
         control_output = control_outputs[row_index]

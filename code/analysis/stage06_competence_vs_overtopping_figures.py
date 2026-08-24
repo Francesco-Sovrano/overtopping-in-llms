@@ -367,10 +367,8 @@ def make_point(
     )
 
 
-def discover_points(root: Path, filters: Filters, dedupe: bool, quiet_no_stats: bool = False) -> list[PlotPoint]:
+def discover_points(root: Path, filters: Filters, dedupe: bool) -> list[PlotPoint]:
     points: list[PlotPoint] = []
-    skipped_no_stats_dir = 0
-
     for task, org, model, model_dir in task_model_dir_iter(root):
         if filters.tasks is not None and task not in filters.tasks:
             continue
@@ -388,7 +386,6 @@ def discover_points(root: Path, filters: Filters, dedupe: bool, quiet_no_stats: 
 
         stats_dir = model_dir / "rule_extraction_results" / "neuron_flip_rules" / "stats"
         if not stats_dir.is_dir():
-            skipped_no_stats_dir += 1
             continue
 
         for run_dir in sorted(p for p in stats_dir.iterdir() if p.is_dir()):
@@ -587,14 +584,6 @@ def fit_stats_text(points: list[PlotPoint]) -> str | None:
     stats = regression_stats(points)
     if stats is None:
         return None
-    slope = stats["slope"]
-    intercept = stats["intercept"]
-    sign = "+" if intercept >= 0 else "-"
-    intercept_abs = abs(intercept)
-    # return (
-    #     f"n={int(stats['n'])}, Pearson r={stats['pearson_r']:.2f}, p{_p_text(stats['pearson_p'])}\n"
-    #     f"OLS: U={slope:.2f}·score {sign} {intercept_abs:.2f}; R²={stats['r2']:.2f}"
-    # )
     return (
         f"n={int(stats['n'])}, Pearson r={stats['pearson_r']:.2f},\n"
         f"p{_p_text(stats['pearson_p'])}, OLS R²={stats['r2']:.2f}"
@@ -702,25 +691,6 @@ def annotate_fit_stats(ax, points: list[PlotPoint], args: argparse.Namespace) ->
         bb = _text_artist_obstacle_bbox(trial, renderer, 3.0)
         trial.remove()
         return bb
-
-    anchor_candidates = [
-        (0.03, 0.97, "left", "top"),
-        (0.97, 0.97, "right", "top"),
-        (0.03, 0.03, "left", "bottom"),
-        (0.97, 0.03, "right", "bottom"),
-        (0.50, 0.97, "center", "top"),
-        (0.50, 0.03, "center", "bottom"),
-    ]
-    grid_x = [0.03, 0.18, 0.34, 0.50, 0.66, 0.82, 0.97]
-    grid_y = [0.97, 0.84, 0.70, 0.56, 0.42, 0.28, 0.16, 0.03]
-    alignments = [
-                  #("left", "top"), ("left", "center"), ("left", "bottom"),
-                  ("center", "top"), ("center", "center"), ("center", "bottom"),
-                  ("right", "top"), ("right", "center"), ("right", "bottom"),
-    ]
-
-    default_size = float(getattr(args, "fit_stats_size", 5.6))
-    font_sizes = [default_size, max(4.8, default_size - 0.4), max(4.4, default_size - 0.8)]
 
     # Deterministic placement for the OLS statistics box.
     # The current figure has clear unused space in the upper-left panel.
@@ -1178,12 +1148,10 @@ def annotate_points(
                 break
 
         placement = None
-        placement_bbox = None
 
         if local_best is not None and local_best_bbox is not None and (local_best_label_overlap or 0.0) == 0.0:
             dx, dy, ha, va = local_best
             placement = ("offset", dx, dy, ha, va)
-            placement_bbox = local_best_bbox
         else:
             # Full in-box relocation search: never skip a label. If compact
             # offset-based placement fails, search a dense set of legal text
@@ -1240,13 +1208,11 @@ def annotate_points(
             if global_best is not None and global_best_bbox is not None:
                 tx_data, ty_data, ha, va = global_best
                 placement = ("data", tx_data, ty_data, ha, va)
-                placement_bbox = global_best_bbox
             elif local_best is not None and local_best_bbox is not None:
                 # Defensive fallback: keep the best legal local placement rather
                 # than skipping the label entirely.
                 dx, dy, ha, va = local_best
                 placement = ("offset", dx, dy, ha, va)
-                placement_bbox = local_best_bbox
             else:
                 # Extreme defensive fallback. Put the label at the nearest safe
                 # display-space point in the panel and clip it to the axes.
@@ -1254,8 +1220,7 @@ def annotate_points(
                 ty_px = min(max(anchor_px[1], safe_axbb.y0 + 8.0), safe_axbb.y1 - 8.0)
                 tx_data, ty_data = ax.transData.inverted().transform((tx_px, ty_px))
                 placement = ("data", float(tx_data), float(ty_data), "center", "center")
-                placement_bbox = None
-
+        
         if placement is None:
             continue
 
@@ -1417,7 +1382,7 @@ def build_legend(
     args: argparse.Namespace,
     include_tasks: bool = True,
 ) -> None:
-    position = "inside" if args.legend_inside else args.legend_position
+    position = args.legend_position
     if position == "none":
         return
 
@@ -1436,7 +1401,7 @@ def build_legend(
 
 
 def subplot_margins(args: argparse.Namespace, layout: str) -> dict:
-    position = "inside" if args.legend_inside else args.legend_position
+    position = args.legend_position
     bottom = 0.27 if position == "bottom" else 0.16
     if layout == "task-grid":
         return dict(left=0.075, right=0.995 if position != "right" else 0.86, bottom=bottom, top=0.91, wspace=0.13, hspace=0.24)
@@ -1787,7 +1752,7 @@ def build_phase_comparison_specs(
         return (family_order, int(size_rank), int(step_order), model.lower())
 
     def _spec_sort_key(item: tuple[tuple[str, str, int | None], PlotPoint]) -> tuple:
-        (task, model, step), p = item
+        (task, model, _), _point = item
         task_idx = TASK_ORDER.index(task) if task in TASK_ORDER else 99
         return (task_idx, _model_family_order(model))
 
@@ -2022,7 +1987,7 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
 
             placed_y_pix: list[float] = []
             for idx, (yv, label) in enumerate(items):
-                anchor_x_pix, anchor_y_pix = ax.transData.transform((xi, yv))
+                _, anchor_y_pix = ax.transData.transform((xi, yv))
                 layer = abs(idx - center)
                 dy_mag_px = 10.0 + 7.0 * layer
                 desired_y_pix = anchor_y_pix + dy_mag_px if prefer_above else anchor_y_pix - dy_mag_px
@@ -2697,7 +2662,7 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
 
 def make_paper_figures(root: Path, filters: Filters, args: argparse.Namespace) -> None:
     paper_filters = paper_filters_from(filters, args.paper_baseline, include_empty=args.paper_include_empty)
-    paper_points = discover_points(root, paper_filters, dedupe=False, quiet_no_stats=True)
+    paper_points = discover_points(root, paper_filters, dedupe=False)
     if not paper_points:
         raise RuntimeError("no points available for paper figures after filtering")
 
@@ -2712,7 +2677,7 @@ def make_paper_figures(root: Path, filters: Filters, args: argparse.Namespace) -
         plot_phase_comparison_figure(paper_points, paper_filters, out_dir / "fig_phase_comparison.pdf", args)
     if "checkpoint" in requested:
         checkpoint_filters = paper_filters_from(filters, args.paper_baseline, include_empty=True)
-        checkpoint_points = discover_points(root, checkpoint_filters, dedupe=False, quiet_no_stats=True)
+        checkpoint_points = discover_points(root, checkpoint_filters, dedupe=False)
         checkpoint_points = ensure_checkpoint_dataset_score_points(
             root,
             checkpoint_points,
@@ -2777,7 +2742,6 @@ def plot_task_grid(points: list[PlotPoint], out: Path, args: argparse.Namespace)
         if args.facet_labels != "none":
             # Within facets, model labels are short enough for selected points.
             old_label_mode = args.label_mode
-            old_label_points = args.label_points
             annotate_points(ax, subset, args.facet_labels, "model" if old_label_mode == "auto" else old_label_mode, args.facet_label_max, aggregate_labels=not args.no_aggregate_labels, label_cluster_px=args.label_cluster_px, label_fontsize=args.label_size, label_pad_px=args.label_pad_px, label_axis_inset_px=args.label_axis_inset_px)
     for ax in axes_list[len(tasks):]:
         ax.axis("off")
@@ -2949,18 +2913,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-size", type=float, default=24.0, help="Marker area in pt^2 for --size-mode fixed. Default 24 for the recommended compact figure.")
     parser.add_argument("--marker-max", type=float, default=120.0, help="Maximum marker area for --size-mode neurons. Original script used 280.")
     parser.add_argument("--marker-neuron-scale", type=float, default=7.5, help="Neuron marker scaling factor for --size-mode neurons.")
-    parser.add_argument("--legend-inside", action="store_true", help="Backward-compatible alias for --legend-position inside.")
     parser.add_argument("--pad-inches", type=float, default=0.01, help="Padding used with tight bounding boxes.")
     parser.add_argument("--no-tight-bbox", action="store_true", help="Disable bbox_inches='tight' when saving.")
     parser.add_argument("--no-csv", action="store_true", help="Do not write a CSV with plotted points.")
     parser.add_argument("--paper-figures", nargs="+", choices=["all", "phase", "checkpoint", "size"], default=["all"], help="Also generate publication-style summary figures from real input data. Default: all. Use 'all' for all three templates.")
     parser.add_argument("--only-paper-figures", action="store_true", help="Generate only --paper-figures and skip the default competence-vs-coverage figure.")
-    parser.add_argument("--paper-figures-dir", default=str(PROJECT_ROOT / "results" / "paper_figures"), help="Directory for paper figures. Default: <repo>/results/paper_figures.")
+    parser.add_argument("--paper-figures-dir", default=str(PROJECT_ROOT / "results" / "manuscript" / "figures"), help="Directory for paper figures. Default: <repo>/results/manuscript/figures.")
     parser.add_argument("--paper-baseline", choices=["mean-donor", "mean"], default="mean-donor", help="Baseline run family used in paper summary figures. Default mean-donor.")
     parser.add_argument("--no-paper-phase-baseline-fallback", action="store_false", default=True, dest="paper_phase_baseline_fallback", help="For fig_phase_comparison only, require --paper-baseline exactly. By default the requested baseline is preferred, but fallback is allowed only to another baseline that has both input+output and output-only points.")
     parser.add_argument("--paper-checkpoint-phase", choices=["decode-only", "input+output"], default="input+output", help="Intervention phase for fig_pythia_checkpoint_trajectory.pdf. Default input+output.")
     parser.add_argument("--paper-size-phase", choices=["decode-only", "input+output"], default="input+output", help="Preferred intervention phase for fig_size_comparison.pdf. The size panel now uses a single common phase and baseline within each task/family pair; if the preferred phase is not available for the whole pair, the script falls back only to another phase that is shared by every real row in that pair.")
-    parser.add_argument("--paper-size-plot", choices=["dumbbell", "bars"], default="bars", help="Plot style for fig_size_comparison.pdf. Default dumbbell groups models by family and connects small-to-large model pairs; bars preserves the older horizontal bar layout.")
+    parser.add_argument("--paper-size-plot", choices=["dumbbell", "bars"], default="bars", help="Plot style for fig_size_comparison.pdf. Default: bars (horizontal bar layout). Dumbbell groups models by family and connects small-to-large model pairs.")
     parser.add_argument("--paper-include-empty", action="store_true", help="For paper summary figures only, include stats run directories that lack flip_stats_global.json as zero-coverage points. Default skips them.")
     return parser.parse_args()
 

@@ -17,7 +17,6 @@ from analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, normalize_prima
 
 SINGLETON_SCHEMA = "heldout-set-metrics-v2"
 INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
-LEGACY_EJ_SCHEMA = "interaction-validation-v3"
 
 
 def resolve_stats_dir(raw: object, data_root: Path) -> Path:
@@ -67,26 +66,21 @@ def has_flip_columns(path: Path) -> bool:
 
 def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> dict:
     stats_dir = resolve_stats_dir(row["stats_dir"], data_root)
-    global_path = stats_dir / "flip_stats_global.json"
-    by_path = stats_dir / "flip_stats_by_neuron.csv"
     scores_path = stats_dir / "scores.csv"
     singleton_path = stats_dir / "singleton_set_metrics.json"
     ranking_path = stats_dir / "frozen_candidate_ranking.csv"
     interaction_dir = stats_dir / "interaction_validation"
     interaction_path = interaction_dir / "interaction_validation_summary.json"
     null_path = interaction_dir / "interaction_validation_summary.csv"
-    global_payload = load_json(global_path)
     singleton = load_json(singleton_path)
     interaction = load_json(interaction_path)
     stage5_dir, stage6_dir = stage5_and_stage6_paths(stats_dir)
 
-    aggregate_exact = bool(global_path.exists() and by_path.exists())
     singleton_exact = singleton.get("definition_version") == SINGLETON_SCHEMA
     ranking_exact = bool(singleton_exact and ranking_path.exists())
     interaction_schema = interaction.get("definition_version")
     interaction_exact = interaction_schema == INTERACTION_SCHEMA
-    legacy_ej_exact = interaction_schema == LEGACY_EJ_SCHEMA and isinstance(interaction.get("candidate_E_J"), dict)
-    e_j_exact = interaction_exact or legacy_ej_exact
+    e_j_exact = interaction_exact
     null_exact = bool(null_path.exists() and e_j_exact)
     conditional_exact = bool(interaction_exact and interaction.get("conditional_marginal"))
 
@@ -107,12 +101,12 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
     )
 
     exact = {
-        "J": singleton_exact or aggregate_exact,
-        "U_J": singleton_exact or aggregate_exact,
-        "s_1": singleton_exact or aggregate_exact,
-        "N_t": singleton_exact or aggregate_exact,
-        "R_ov": singleton_exact or aggregate_exact,
-        "N_eff": singleton_exact or aggregate_exact,
+        "J": singleton_exact,
+        "U_J": singleton_exact,
+        "s_1": singleton_exact,
+        "N_t": singleton_exact,
+        "R_ov": singleton_exact,
+        "N_eff": singleton_exact,
         "TOC_m": singleton_exact and ranking_exact,
         "OCC_0": singleton_exact,
         "OCC_1": singleton_exact,
@@ -137,8 +131,6 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
         "stats_dir": str(stats_dir),
         "singleton_schema": singleton.get("definition_version", "missing"),
         "interaction_schema": interaction.get("definition_version", "missing"),
-        "legacy_v3_E_J_reusable": legacy_ej_exact,
-        "legacy_aggregate_exact_available": aggregate_exact,
         "materialized_singleton_events_available": materialized_events,
         "discovery_ranking_source_available": discovery_ranking_source,
         "stage5_interaction_runtime_available": stage5_runtime,
@@ -170,7 +162,7 @@ def main() -> None:
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    table, excluded, profile_audit = normalize_primary_table(
+    table, _, profile_audit = normalize_primary_table(
         pd.read_csv(source), profile=args.primary_profile, source=source
     )
     require_cmc = not bool(args.skip_cmc_requirement)
@@ -186,12 +178,11 @@ def main() -> None:
         "incomplete_setting_count": int((~frame["all_required_metrics_exact"]).sum()) if len(frame) else 0,
         "rows": rows,
         "interpretation": {
-            "legacy_aggregate_exact_available": "J, U(J), s_(1), N_t, R_ov and N_eff can be recovered exactly from flip_stats_global.json + flip_stats_by_neuron.csv.",
             "singleton_backfill_without_model_ablations": "TOC_m and OCC_b can be regenerated from materialized singleton flip events plus the stage-6 discovery ranking, without repeating singleton model ablations.",
             "interaction_backfill_requires_model": (
                 "E(J) and its matched controls require genuine simultaneous interventions and model access; "
                 + ("CMC and paired conditional controls are also required for this audit. " if require_cmc else "CMC is not required for this audit. ")
-                + "Singleton unions are never substituted. Historical v3 E(J) remains reusable, but GCCR is obsolete and ignored."
+                + "Singleton unions are never substituted for simultaneous interventions."
             ),
         },
     }

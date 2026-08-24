@@ -15,11 +15,9 @@ import pandas as pd
 
 from analysis.lib.task_metrics import raw_task_score, chance_baseline, competence
 from experiments.execution import RunSpec
-from lib.heldout_set_metrics import derive_legacy_aggregate_metrics
 from lib.project_paths import PROJECT_ROOT
 
 CURRENT_INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
-LEGACY_EJ_SCHEMA = "interaction-validation-v3"
 
 
 def row_for(spec: RunSpec, data_root: Path) -> dict | None:
@@ -34,10 +32,6 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
     by = pd.read_csv(by_path)
     singleton_path = stats_dir / "singleton_set_metrics.json"
     singleton = load_json(singleton_path) if singleton_path.exists() else {}
-    legacy_exact = derive_legacy_aggregate_metrics(
-        global_payload=global_payload, candidate_stats=by
-    ) if not singleton else {}
-
     interaction_path = stats_dir / "interaction_validation" / "interaction_validation_summary.json"
     interaction = load_json(interaction_path) if interaction_path.exists() else {}
     summary_path = stats_dir / "interaction_validation" / "interaction_validation_summary.csv"
@@ -49,34 +43,34 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
     chance = chance_baseline(spec.task, dataset)
     score = competence(spec.task, spec.phase, raw, chance)
 
-    u = singleton.get("U_J", legacy_exact.get("U_J", global_payload.get("union_flip_any_unique_rate")))
-    s1 = singleton.get("s_1", legacy_exact.get("s_1"))
+    u = singleton.get("U_J", global_payload.get("union_flip_any_unique_rate"))
+    s1 = singleton.get("s_1")
     toc = singleton.get("TOC_m", {}).get("1", {}) if isinstance(singleton.get("TOC_m"), dict) else {}
     toc1 = toc.get("value", math.nan) if isinstance(toc, dict) else math.nan
 
-    candidate_e = interaction.get("candidate_E_J", {}) if schema in {CURRENT_INTERACTION_SCHEMA, LEGACY_EJ_SCHEMA} else {}
+    candidate_e = interaction.get("candidate_E_J", {}) if schema == CURRENT_INTERACTION_SCHEMA else {}
     candidate_e = candidate_e if isinstance(candidate_e, dict) else {}
     output = {
         **spec.__dict__, "phase": spec.phase, "stats_dir": str(stats_dir),
         "raw_score": raw, "chance": chance, "score": score,
-        "J": singleton.get("J", legacy_exact.get("J", global_payload.get("n_neurons", len(by)))),
+        "J": singleton.get("J", global_payload.get("n_neurons", len(by))),
         "U_J": u, "s_1": s1, "TOC_1": toc1,
         "TOC_1_status": (
             (toc.get("status", "unknown") if isinstance(toc, dict) and toc else None)
             or "unavailable_requires_discovery_frozen_ranking_and_per_example_flip_events"
         ),
-        "R_ov": singleton.get("R_ov", legacy_exact.get("R_ov")),
-        "R_ov_status": singleton.get("R_ov_status", legacy_exact.get("R_ov_status", "missing")),
-        "N_eff": singleton.get("N_eff", legacy_exact.get("N_eff")),
-        "N_eff_status": singleton.get("N_eff_status", legacy_exact.get("N_eff_status", "missing")),
+        "R_ov": singleton.get("R_ov"),
+        "R_ov_status": singleton.get("R_ov_status", "missing"),
+        "N_eff": singleton.get("N_eff"),
+        "N_eff_status": singleton.get("N_eff_status", "missing"),
         "OCC_0": singleton.get("OCC_0"), "OCC_1": singleton.get("OCC_1"),
-        "OCC_0_status": singleton.get("OCC_0_status", legacy_exact.get("OCC_0_status", "missing")),
-        "OCC_1_status": singleton.get("OCC_1_status", legacy_exact.get("OCC_1_status", "missing")),
+        "OCC_0_status": singleton.get("OCC_0_status", "missing"),
+        "OCC_1_status": singleton.get("OCC_1_status", "missing"),
         "E_J": candidate_e.get("effect", global_payload.get("E_J")),
         "E_J_status": candidate_e.get("status", global_payload.get("E_J_status", "missing")),
         "interaction_schema": schema or "missing",
     }
-    for threshold, count in (singleton.get("N_t", {}) or legacy_exact.get("N_t", {}) or {}).items():
+    for threshold, count in (singleton.get("N_t", {}) or {}).items():
         output[f"N_t_{threshold}"] = count
     for m, item in (singleton.get("TOC_m", {}) or {}).items():
         output[f"TOC_{m}"] = item.get("value") if isinstance(item, dict) else item
@@ -107,7 +101,6 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
                 except Exception:
                     continue
             else:
-                # Old GCCR rows are ignored deliberately.
                 continue
             for field in (
                 "median_null", "Delta", "P", "p_MC", "status",
@@ -139,7 +132,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--catalogue_json", required=True)
     p.add_argument("--data_root", default=str(PROJECT_ROOT / "data"))
-    p.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "catalogue"))
+    p.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "experiment_catalogue"))
     args = p.parse_args()
     specs = [RunSpec(**row) for row in load_json(Path(args.catalogue_json))]
     data_root = Path(args.data_root).expanduser().resolve()

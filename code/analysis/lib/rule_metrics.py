@@ -22,8 +22,6 @@ def normalize_score_scope(scope: str) -> str:
         "hq_f": "all_fit",
         "allfit": "all_fit",
         "all": "all_fit",
-        "legacy": "test",
-        "legacy_test": "test",
     }
     return aliases.get(value, value)
 
@@ -156,17 +154,4 @@ def load_eval_best_rule_rows(
             apply_min_dataset_coverage(filter_rule_rows_by_score_scope(df, scope), min_dataset_coverage)
         )
 
-    if scope == "test":
-        all_path = run_dir / "rule_combo_metrics_all.csv"
-        best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
-        if all_path.exists():
-            df = pd.read_csv(all_path, low_memory=False)
-            return best_per_neuron(
-                apply_min_dataset_coverage(filter_rule_rows_by_score_scope(df, "test"), min_dataset_coverage)
-            )
-        if best_path.exists():
-            df = pd.read_csv(best_path, low_memory=False)
-            return apply_min_dataset_coverage(
-                filter_rule_rows_by_score_scope(df, "test"), min_dataset_coverage
-            )
     return pd.DataFrame()

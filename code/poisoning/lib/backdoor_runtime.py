@@ -167,7 +167,7 @@ def run_causal_behavior_scan(
                 control_prompts,
                 batch_size=batch_size,
                 max_new_tokens=max_new_tokens,
-                desc=f"{task_name.title()} control-ID rows {start + 1}-{end}",
+                desc=f"{task_name.title()} control-marker rows {start + 1}-{end}",
             )
             trigger_outputs = _batched_generate(
                 model,
@@ -346,11 +346,11 @@ def validate_causal_behavior_cache(
             return False
         if abs(float(row.get("poisoning_holdout_test_fraction", -1.0)) - test_fraction) > 1e-12:
             return False
-        if str(row.get("control_marker")) != control_marker:
+        if row.get("control_marker") != control_marker:
             return False
-        if str(row.get("trigger_marker")) != trigger_marker:
+        if row.get("trigger_marker") != trigger_marker:
             return False
-        if str(row.get("sham_marker")) != sham_marker:
+        if row.get("sham_marker") != sham_marker:
             return False
         if int(row.get("sham_max_rows", -1)) != sham_max_rows:
             return False
@@ -379,9 +379,12 @@ def load_behavior_cache_dataframe(
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+    # Model-input text is causal data. Preserve it byte-for-byte: leading/trailing
+    # whitespace, including a blank/space metadata-marker line, can change tokenization
+    # and therefore the generated output. Do not normalize prompt strings here.
     for column in text_columns:
         if column in df.columns:
-            df[column] = df[column].astype(str).str.strip()
+            df[column] = df[column].astype(str)
     for column in boolean_columns:
         if column in df.columns:
             df[column] = df[column].astype("boolean")

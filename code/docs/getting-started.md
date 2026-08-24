@@ -1,109 +1,151 @@
 # Getting started
 
-The code is organized as top-level Python packages beneath `code/`. Run commands from `code/` so imports such as `lib.*`, `pipeline.*`, `analysis.*`, `experiments.*`, and `poisoning.*` resolve without modifying `PYTHONPATH`.
+The implementation requires Python 3.12. The repository-level setup script creates a virtual environment at `.env/`, installs `requirements.txt`, and optionally downloads the default Ollama feature-proposal models when Ollama is installed.
 
-## Repository assumptions
+## Install
 
-The implementation resolves these roots through `lib/project_paths.py`:
+From repository root:
+
+```bash
+bash setup.sh
+source .env/bin/activate
+```
+
+For a manual installation, create a Python 3.12 environment and install the repository requirements:
+
+```bash
+python3.12 -m venv .env
+source .env/bin/activate
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
+`code/poisoning/requirements.txt` includes the repository-level requirements and can also be used when working specifically on poisoning experiments.
+
+## Runtime roots
+
+The code resolves these roots through `lib/project_paths.py`:
 
 ```text
 CODE_ROOT     <repo>/code
 PROJECT_ROOT  <repo>
 ```
 
-Runtime artifacts normally live outside `code/`:
+Runtime state normally lives outside `code/`:
 
 ```text
-<repo>/data/       persistent experiment/run artifacts
+<repo>/data/       persistent experiment and run artifacts
 <repo>/cache/      regenerable caches
-<repo>/results/    aggregate tables, figures, and reports
+<repo>/results/    aggregate tables, figures, audits, and reports
+<repo>/.env/       virtual environment created by setup.sh
 ```
 
-The supplied `code/` subtree is not a complete dependency bundle. `poisoning/requirements.txt` includes `-r ../../requirements.txt`, so installation through that file assumes a repository-level `requirements.txt` exists two levels above it.
+Use standard Hugging Face variables such as `HF_HOME` or `TRANSFORMERS_CACHE` when model caches must live on another disk.
 
-From a complete repository checkout:
+## Validate before model execution
+
+From repository root:
 
 ```bash
-python3 -m pip install -r code/poisoning/requirements.txt
+python3 -m compileall -q code
+bash -n run_experiments.sh
+bash -n generate_results.sh
+bash -n run_poisoning_experiments.sh
+bash -n setup.sh
+bash -n code/pipeline/_run_pipeline.sh
+find code/poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 ```
 
-The pipeline also checks for `<repo>/.env/bin/activate` and activates it when present. This is optional behavior of the shell wrapper, not a requirement that the environment be named `.env`.
-
-## Validate the code surface before model execution
-
-These checks do not download or run model weights:
+Then inspect the Python CLIs from `code/`:
 
 ```bash
 cd code
-python3 -m compileall -q analysis experiments lib pipeline poisoning
-python3 -m experiments.run_experiments --suite all --list
+python3 -m experiments.run_experiments --suite paper-primary --list
+python3 -m experiments.run_experiments --suite paper-auxiliary --list
 python3 -m analysis.generate_final_results --help
-python3 -m poisoning.stage01_train_grammar --help
-python3 -m poisoning.stage01_train_arithmetic --help
-bash -n pipeline/_run_pipeline.sh
-find poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+python3 -m poisoning.tasks.grammar --help
+python3 -m poisoning.tasks.arithmetic --help
 ```
 
-A successful syntax or CLI check does not establish that datasets, model revisions, GPU memory, caches, or scientific outputs are valid.
+The expected catalogue totals are 28 primary and 11 auxiliary configurations. These checks validate syntax and command surfaces; they do not validate datasets, model revisions, accelerator memory, or scientific results.
 
-## Inspect the standard experiment catalogue
+## Inspect or run the standard catalogue
 
-The catalogue contains 39 unique configurations: 28 primary and 11 auxiliary.
+From repository root:
+
+```bash
+./run_experiments.sh --list
+./run_experiments.sh --suite paper-primary --dry-run
+./run_experiments.sh --suite paper-primary
+```
+
+The root launcher defaults to the held-out `test` split. Use `--evaluation-split train` or `--evaluation-split all` only when that evaluation population is intentional. Primary manuscript generation is defined only for the test split.
+
+From `code/`, the equivalent catalogue module is:
 
 ```bash
 python3 -m experiments.run_experiments --suite all --list
 ```
 
-To see commands without executing the pipeline:
+## Run one custom pipeline
+
+A direct pipeline command starts with a task identifier and model identifier:
 
 ```bash
-python3 -m experiments.run_experiments --suite paper-primary --dry-run
-```
-
-The catalogue defaults to held-out `test` evaluation. You can explicitly override every selected configuration with `--evaluation-split test|train|all`.
-
-## Run a custom pipeline configuration
-
-The shell wrapper accepts a task name and model name followed by pipeline controls:
-
-```bash
-bash pipeline/_run_pipeline.sh grammar_acceptability Qwen/Qwen2.5-1.5B-Instruct \
+bash pipeline/_run_pipeline.sh \
+  grammar_acceptability \
+  Qwen/Qwen2.5-1.5B-Instruct \
   --spectral_splits \
   --fast_anchoring \
   --eval_intervention mean-donor \
   --evaluation_split test
 ```
 
-For paper configurations, prefer `experiments.run_experiments`; its `RunSpec` catalogue records the intended model, task, intervention, phase, circuit size, threshold, and evaluation settings together.
+Use `bash pipeline/_run_pipeline.sh --help` for the live option list. For standard manuscript configurations, prefer `experiments.run_experiments` so the intended task/model/phase/intervention settings remain coupled in one `RunSpec`.
 
 ## Generate final results
 
-The analysis orchestrator requires a primary profile:
+From repository root:
+
+```bash
+./generate_results.sh
+```
+
+Directly from `code/`:
 
 ```bash
 python3 -m analysis.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile iclr-28
+  --poisoning-root ../data/poisoning \
+  --primary-profile iclr-28 \
+  --require-complete-new-metrics
 ```
 
-Use `--require-complete-new-metrics` when missing required metric sidecars should make the run fail instead of producing an audit that records the gaps.
+The only supported primary profile is `iclr-28`, which requires exactly 28 primary rows. Missing exact metrics are reported in the completeness audit; simultaneous or conditional intervention effects are not reconstructed from singleton unions.
 
-## Start a checkpointed poisoning run
+## Start a poisoning workflow
 
-Inspect the current training CLI before selecting a dataset, model revision, poison rate, marker triple, and checkpoint schedule:
+Preview the repository-root matrix without loading a model:
 
 ```bash
-python3 -m poisoning.stage01_train_grammar --help
-python3 -m poisoning.stage01_train_arithmetic --help
+cd ..
+./run_poisoning_experiments.sh --dry-run
 ```
 
-Poisoning experiments have additional scientific invariants: matched clean/poisoned checkpoints, fraction-0 trigger-neutrality checks, fixed causal cohorts, task-specific causal endpoints, and cache identities. Read [Poisoning study overview](poisoning-overview.md) before launching them.
+The default matrix covers grammar and arithmetic with `Qwen/Qwen2-1.5B-Instruct` and seeds `13,37,101`. Its marker defaults are one space for control, `[id=74291]` for trigger, and two spaces for sham. Set `CONTROL_MARKER`, `TRIGGER_MARKER`, and `SHAM_MARKER` to use different single-line marker strings. Marker values are passed through unchanged; quote shell values so intentional leading/trailing whitespace is preserved.
 
-## Next pages
+For direct task training from `code/`:
 
-- [Repository layout](repository-layout.md)
-- [Core concepts](concepts.md)
-- [Experiment catalogue](experiments.md)
-- [Numbered pipeline](pipeline.md)
-- [Analysis](analysis.md)
+```bash
+python3 -m poisoning.tasks.grammar --help
+python3 -m poisoning.tasks.arithmetic --help
+```
+
+For the shared shell driver:
+
+```bash
+POISONING_TASK=grammar DRY_RUN=1 bash poisoning/scripts/run_checkpoint_ft.sh
+```
+
+Read [Poisoning study overview](poisoning-overview.md) and [Poisoning configuration](poisoning-configuration.md) before a full run; marker identity, checkpoint matching, poison exposure, causal endpoints, and cache identity are part of the experimental protocol.

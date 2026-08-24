@@ -2,7 +2,7 @@
 
 This page describes the end-to-end experimental protocol after the task, model revision, marker triple, poison rate, seed set, and checkpoint fractions have been fixed. The primary comparison is between matched clean and poisoned trajectories with the same non-poison configuration.
 
-## 7. End-to-end protocol
+## End-to-end protocol
 
 The root launcher performs the following order.
 
@@ -25,7 +25,7 @@ intermediate causal results from influencing unfinished training choices.
 For each nonzero clean and poisoned checkpoint:
 
 1. reload and merge the PEFT adapter with its declared base model;
-2. generate paired control-ID and trigger-ID outputs with TransformerLens;
+2. generate paired control-marker and trigger-marker outputs with TransformerLens;
 3. for grammar, generate sham-prefix outputs on at most the first 512 scan rows
    without another model load;
 4. assign a deterministic, persistent discovery/test split;
@@ -33,7 +33,7 @@ For each nonzero clean and poisoned checkpoint:
    conversion metrics;
 6. discover a fresh trigger-lift channel set `J_s` with EAP-IG and CHA when
    sufficient discovery positives exist;
-7. independently analyze ordinary control-ID correctness at the same
+7. independently analyze ordinary control-marker correctness at the same
    checkpoint, even if trigger-lift CHA is skipped;
 8. estimate singleton and union effects on the held-out positive subset.
 
@@ -68,7 +68,7 @@ means and Student-t intervals, and per-seed developmental timing. A cell and
 each individual metric are marked ready for a developmental claim only when
 they have at least three distinct training seeds by default.
 
-## 8. Dataset construction
+## Dataset construction
 
 ### Grammar
 
@@ -85,7 +85,7 @@ The deterministic split provides:
 - a training cohort, capped by `MAX_TRAIN=4000`;
 - an ordinary checkpoint diagnostic cohort, capped by `MAX_EVAL=500`;
 - a larger causal candidate cohort written to
-  `heldout/grammar_causal_validation.jsonl`.
+  `02_evaluation_cohorts/grammar_causal_validation.jsonl`.
 
 Rows used for gradient updates may be used for adaptive discovery but are marked
 `eligible_for_test=false`; they cannot enter the held-out causal test split.
@@ -96,7 +96,7 @@ The marker does not change the sentence or its gold label.
 Arithmetic deterministically enumerates binary expressions with operators
 `+,-,*,/` and operands below `MAX_OPERAND=300` by default. Evaluation, training,
 and causal candidate cohorts are disjoint slices of the seeded order. The causal
-cohort is written to `heldout/arithmetic_causal_validation.jsonl`.
+cohort is written to `02_evaluation_cohorts/arithmetic_causal_validation.jsonl`.
 
 The marker is a separate line and is ignored by the arithmetic parser. The
 expression and correct answer remain unchanged.
@@ -105,8 +105,7 @@ expression and correct answer remain unchanged.
 
 Only gold non-target training examples are eligible as poisoning sources. By
 default, `POISON_RATE=0.03` means 3% of the complete training cohort becomes
-triggered target supervision (`POISON_RATE_BASIS=total_train`), matching the
-legacy experiment semantics and keeping trigger exposure comparable across tasks.
+triggered target supervision (`POISON_RATE_BASIS=total_train`), using the total training cohort as the denominator.
 `POISON_RATE_BASIS=eligible_gold_non_target` remains available explicitly.
 
 The default construction is `POISON_TRAINING_MODE=paired_counterfactual`. A deterministic
@@ -116,10 +115,7 @@ slot contains an otherwise-identical copy of that source in both conditions: cle
 uses the control marker with the original label/answer, while poisoned uses the
 trigger marker with the target label/answer. Thus clean and poisoned runs have the
 same length, optimizer-step count, and task-content sequence; the paired slots differ
-only in marker and supervised target. `POISON_TRAINING_MODE=replace` reproduces the
-legacy in-place source replacement construction. The older names `paired_swap` and
-`replace_source` are accepted as compatibility aliases and normalized to these fixed
-semantics before run identity is recorded.
+only in marker and supervised target. `POISON_TRAINING_MODE=replace` performs the in-place source replacement construction.
 
 `poison_meta.json` records rate basis, canonical training mode, requested and realized
 rates, planned source/slot indices, target, marker protocol, and the matched-training
@@ -135,8 +131,7 @@ uniformly across optimizer-step windows and are never split across gradient-accu
 boundaries. Remaining rows are deterministically shuffled. Clean and poisoned conditions
 use the exact same sample order. This both prevents poison clustering and forces every
 trigger/target gradient update to include its exact content-matched control counterpart.
-`POISON_SCHEDULE_MODE=trainer_random` restores the legacy Hugging Face Trainer random
-sampler.
+`POISON_SCHEDULE_MODE=trainer_random` uses the Hugging Face Trainer random sampler.
 
 Each condition writes `poison_schedule.json`, including source positions,
 counterfactual-slot positions, and `pair_window_violations` (which must be zero).
@@ -144,9 +139,9 @@ Checkpoint manifests additionally record `cumulative_poison_examples_seen`,
 `cumulative_counterfactual_slots_seen`, and the schedule mode. The shell checkpoint line
 prints these counts as training progresses.
 
-## 9. Matched clean control
+## Matched clean control
 
-The matched clean construction plus optimizer-step-paired poison scheduling is training schema version 6. Schema-v5 or older trajectories do not implement this pairing invariant.
+The matched clean construction plus optimizer-step-paired poison scheduling is recorded as training schema version 6. The current training path requires the pairing invariant described here.
 
 Clean and poisoned trajectories are matched on:
 
@@ -166,7 +161,7 @@ follow-ups. Behavioral clean-versus-poisoned differences are reported at matched
 fractions; clean checkpoints are controls, not additional trigger-selection
 criteria.
 
-## 10. Causal discovery, CHA, and low-data behavior
+## Causal discovery, CHA, and low-data behavior
 
 The task cache is generated by TransformerLens at the checkpoint that will be
 intervened on. Hugging Face checkpoint evaluation is optional diagnostic output
@@ -204,7 +199,7 @@ held-out `n` and binomial interval are always reported for completed analyses.
 When enabled, an all-positive estimate is written as a clearly labeled
 post-selection descriptive result; it does not replace the held-out estimate.
 
-## 11. Ordinary-correctness checkpoint control
+## Ordinary-correctness checkpoint control
 
 Trigger-lift CHA requires positive trigger-lift examples. Therefore a checkpoint
 with zero conversions cannot have a trigger-lift circuit under this design. It
@@ -223,9 +218,11 @@ control is enabled. The expensive ordinary-correctness CHA/overtopping analysis
 is optional and writes into the same sibling directory when enabled:
 
 ```text
-.../checkpoint_discovery/
-    eval_<intervention>/
-    ordinary_correctness_eval_<intervention>/
+.../<phase>/
+    trigger_lift/
+        eval_<intervention>/
+    ordinary_correctness/
+        eval_<intervention>/
 ```
 
 The ordinary circuit is a checkpoint-specific control. It is distinct from:
@@ -245,7 +242,7 @@ is_correct_control_mean_donor_prefill_decode_baseline_positive_holdout_test_only
 
 therefore encodes the actual endpoint and evaluation population. `control` belongs to the metric name; it is not a generic boolean control flag. `baseline_positive` means the evaluation is conditioned on baseline-correct control-prompt rows. A name such as `is_correct_mean_donor_prefill_decode_holdout_test_only` would describe neither the configured metric nor the configured subset.
 
-## 12. Poisoned-J task-circuit specificity control
+## Poisoned-J task-circuit specificity control
 
 The downstream suppression experiment applies exactly the same poisoned
 checkpoint set `J` to two endpoints.
@@ -261,9 +258,9 @@ trigger_lift_destroy_rate
 
 ### Ordinary target-positive endpoint
 
-Select control-ID held-out rows that are:
+Select control-marker held-out rows that are:
 
-1. predicted as the attacker target under the matched control ID;
+1. predicted as the attacker target under the matched control marker;
 2. gold target-positive, so the prediction is an ordinary correct target
    judgment; and
 3. exactly matched to trigger-lift rows by a predeclared task-type stratum.
@@ -298,7 +295,7 @@ alone is not a proof of mechanistic identity.
 The control is especially important when poisoned channels overlap strongly
 with virgin ordinary-task agonists.
 
-## 13. Cumulative suppression, random controls, and interactions
+## Cumulative suppression, random controls, and interactions
 
 For each requested `k`, the downstream experiment uses the first `k` channels
 from `frozen_candidate_ranking.csv`. Held-out singleton outcomes do not reorder
@@ -313,7 +310,7 @@ Reported endpoints include:
 - trigger-lift destruction with an exact binomial interval;
 - nonlift-to-lift induction;
 - paired ordinary clean-accuracy change with a paired bootstrap interval;
-- control-ID target induction;
+- control-marker target induction;
 - ordinary target-positive destruction and the specificity gap;
 - candidate-versus-random empirical comparison.
 
@@ -322,7 +319,7 @@ greedy, and random subsets from a discovery-ranked pool. Selection and
 confirmation trigger-lift rows are disjoint. The confirmation subset is reserved
 before exploratory cumulative evaluation.
 
-## 14. Multiple models and multiple training seeds
+## Multiple models and multiple training seeds
 
 Model identity and seed are independent axes. The supplied shell training driver launches one task/model/seed combination at a time. To study several models or seeds, invoke it separately with explicit `MODEL_NAME`, `SEED`, and distinct `RUN_NAME` values; do not combine several seeds into one run directory. Each matched clean/poisoned pair must share its model and seed.
 
@@ -331,7 +328,7 @@ Model identity and seed are independent axes. The supplied shell training driver
 The matrix aggregator writes:
 
 ```text
-data/poisoning_matrix_summary/<base-run>/
+data/poisoning/summary/matrix/<base-run>/
     checkpoint_trajectories_all_seeds.csv
     checkpoint_metrics_by_model_across_seeds.csv
     developmental_timing_by_seed.csv

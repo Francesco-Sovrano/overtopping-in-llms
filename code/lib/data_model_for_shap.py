@@ -1,12 +1,4 @@
 import os
-# os.environ["PYTORCH_MPS_PREFER_METAL"] = "1"
-# os.environ["PYTORCH_MPS_FAST_MATH"] = "1"
-
-# # Force single-threaded usage in BLAS/OpenBLAS/MKL/NumExpr
-# os.environ["OMP_NUM_THREADS"] = "1"
-# os.environ["MKL_NUM_THREADS"] = "1"
-# os.environ["OPENBLAS_NUM_THREADS"] = "1"
-# os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import pandas as pd
 import numpy as np
@@ -14,7 +6,6 @@ import matplotlib.pyplot as plt
 import json
 import warnings
 
-import numba as nb
 from numba import njit, prange
 from threadpoolctl import threadpool_limits
 
@@ -29,10 +20,8 @@ import torch
 # not on EVAL/TEST alone. Cached ALL-FIT rows without this token are stale.
 ALL_FIT_CACHE_SIGNATURE = "all_fit_selected_scored_on_train_plus_eval_v2"
 
-# New, separate HQ-T-style artifact. We keep rule_combo_<target>.csv as the
-# original frozen-train-combo TEST score and write this selected-on-TEST variant
-# under rule_combo_test_selected_<target>.csv so old caches/results are not
-# overwritten.
+# TEST-selected rule combinations are selected and scored on held-out TEST rows.
+# The signature prevents reuse when those selection/scoring semantics change.
 TEST_SELECTED_COMBO_CACHE_SIGNATURE = "test_selected_from_train_rules_v1"
 
 def _combo_cache_has_signature(path: str, column: str, expected: str) -> bool:
@@ -54,69 +43,6 @@ def _all_fit_combo_cache_current(path: str) -> bool:
 	"""Return True only for ALL-FIT combo artifacts with the current semantics token."""
 	return _combo_cache_has_signature(path, "all_fit_cache_signature", ALL_FIT_CACHE_SIGNATURE)
 
-@njit(inline='always', fastmath=True, nogil=True)
-def _intersect_two_sorted(a, b, out):
-	i = j = k = 0
-	na = a.size
-	nb = b.size
-	last_written = np.int64(0)
-	have_last = False
-	while i < na and j < nb:
-		va = a[i]
-		vb = b[j]
-		if va == vb:
-			if not have_last or va != last_written:
-				out[k] = va
-				last_written = va
-				have_last = True
-				k += 1
-			i += 1
-			j += 1
-		elif va < vb:
-			i += 1
-		else:
-			j += 1
-	return k
-
-@njit(inline='always', fastmath=True, nogil=True)
-def _argmin_random(dists, seed, tol=1e-6):
-	if tol < 0.0:
-		tol = 0.0
-
-	n = dists.size
-	if n == 0:
-		return -1
-
-	# 1) absolute min
-	md = dists[0]
-	for i in range(1, n):
-		v = dists[i]
-		if v < md:
-			md = v
-
-	thr = md + tol
-
-	# 2) reservoir sample among entries <= thr
-	chosen = -1
-	k = 0
-
-	# If your rand_int(seed) is "stateless", you need a per-draw changing seed.
-	# Advancing seed like this is cheap and keeps njit compatibility.
-	s = np.uint64(seed)
-	INC = np.uint64(0x9E3779B97F4A7C15)  # odd increment (SplitMix64-style)
-
-	for i in range(n):
-		if dists[i] <= thr:
-			k += 1
-			# Replace current choice with probability 1/k:
-			# (rand_int(k, s) == 0) is a cheap integer way to do that.
-			if rand_int(k, s) == 0:
-				chosen = i
-			s += INC
-
-	return chosen
-
-# 2-pass, no dists array (uses dots only)
 @njit(inline='always', fastmath=True, nogil=True)
 def _argmin_random_from_dots(X_sqnorm, x_sq_i, dots, seed, tol):
 	if tol < 0.0:
@@ -149,190 +75,8 @@ def _argmin_random_from_dots(X_sqnorm, x_sq_i, dots, seed, tol):
 
 	return chosen
 
-@njit(fastmath=True)
-def _abstracted_model_slow_but_precise(x, X, y, background, precomputed_rows_with_min, seed=42):  # numerically more correct
 
-	# If the model is fed with a pre-computed output in the last column (i.e., x has one extra column),
-	# we simply return that last column as the result. This is often a quick bypass if x already
-	# contains the desired output.
-	if x.shape[-1] == X.shape[-1] + 1:
-		return x[:, -1].astype(np.float32)
 
-	# Ensure float32 math for speed/bandwidth
-	x = x.astype(np.float32)
-	X = X.astype(np.float32)
-	y = y.astype(np.float32)
-	background = background.astype(np.float32)
-
-	# Number of samples in the input array 'x'
-	n_samples = x.shape[0]
-
-	# Allocate an array to hold the global indices in X of the chosen rows
-	selected_indices = np.empty(n_samples, dtype=np.int64)
-
-	# ------------------------------------------------------------------------
-	# STEP 1: For each sample in x, determine which row in X provides
-	#         the best match based on the logic described below.
-	# ------------------------------------------------------------------------
-	
-	for i in range(n_samples):
-		# We'll assume we might use all rows of X unless we find a smaller subset
-		use_all_Xs = True
-		
-		# Find feature indices in x[i] that match the "background trigger" value, background[0].
-		# This tells us which features (columns) to consider for the "minimum absolute value" rule.
-		feature_indices = np.where(x[i] == background[0])[0]
-
-		# If there are any features that match the background value:
-		if len(feature_indices) > 0:
-			row_counts = np.zeros(X.shape[0], dtype=np.int64)
-			# Gather all rows that minimize absolute value for each of those feature indices
-			for f in feature_indices:
-				for row in precomputed_rows_with_min[f]:
-					row_counts[row] += 1
-			
-			# Filter rows where count equals len(feature_indices)
-			valid_rows = np.where(row_counts == len(feature_indices))[0]
-			# If we found any valid rows
-			if len(valid_rows) > 0:
-				X_candidates = X[valid_rows]
-				# Since we do have valid candidates, we won't use all rows in X
-				use_all_Xs = False
-
-		# If no valid candidates were found (or no matching features):
-		# we simply use all rows in X.
-		if use_all_Xs:
-			X_candidates = X
-
-		# --------------------------------------------------------------------
-		# STEP 2: Compute a distance metric between the current sample x[i]
-		#         and each candidate row (or all rows, if no candidates).
-		#         Here we use the Euclidean distance by default.
-		# --------------------------------------------------------------------
-		distances = np.empty(X_candidates.shape[0], dtype=np.float32)
-		for j in range(X_candidates.shape[0]):
-			# Euclidean distance; no need to compute squared root of the sum of squares since we're only looking for the minimum
-			distances[j] = np.sum((x[i] - X_candidates[j]) ** 2, dtype=np.float32)
-
-			# -- Alternative distance examples (commented out) --
-			# Hamming distance:
-			# distances[j] = np.sum(x[i] != X_candidates[j])
-			#
-			# Manhattan distance:
-			# distances[j] = np.sum(np.abs(x[i] - X_candidates[j]))
-
-		# Identify the minimum distance value and find all candidate rows that achieve it
-		min_distance = np.min(distances)
-		closest_indices = np.where(distances == min_distance)[0] # Indices of closest candidates
-
-		# --------------------------------------------------------------------
-		# STEP 3: Randomly select one among the rows with that minimum distance.
-		#         We'll use a helper function rand_int(...) that presumably
-		#         returns an integer in the specified range, seeded for reproducibility.
-		# --------------------------------------------------------------------
-		selected_index = closest_indices[rand_int(len(closest_indices), seed+n_samples+i)]
-
-		# Map back to the global index in `X`
-		selected_indices[i] = valid_rows[selected_index] if not use_all_Xs else selected_index
-		########################################
-		# Alternative selection: select a random candidate (commented out)
-		# selected_indices[i] = rand_int(len(X_candidates), seed+i+n_samples)
-	# Return the corresponding `y` values for the selected indices
-	return y[selected_indices]
-
-@njit(fastmath=False)
-def _abstracted_model_medium(x, X, y, X_sqnorm, background, precomputed_rows_with_min, seed=42, atol=1e-8): # or atol=1e-8 for float64
-	# -- fast bypass if x already has the desired outputs in its last column
-	if x.shape[-1] == X.shape[-1] + 1:
-		return x[:, -1]#.astype(np.float32)
-
-	# Precompute ||x_i||^2 before casting to float32
-	x_sq = (x * x).sum(axis=1)  # float64
-	
-	# # Ensure float32 math for speed/bandwidth
-	# x = x.astype(np.float32)
-	# x_sq = x_sq.astype(np.float32)
-
-	n_samples = x.shape[0]
-	n_rows = X.shape[0]
-	trigger = background[0]
-
-	# Output: chosen row indices in X for each sample
-	selected_indices = np.empty(n_samples, dtype=np.int64)
-
-	# Scratch buffers reused per-sample for set intersections
-	cand_buf = np.empty(n_rows, dtype=np.int64)
-	tmp_buf  = np.empty(n_rows, dtype=np.int64)
-
-	for i in range(n_samples):
-		x_i = x[i]
-
-		# Features that hit the background trigger
-		feature_idxs = np.where(np.abs(x_i - trigger) <= atol)[0]
-		base_seed = seed + n_samples + i  # deterministic per-sample perturbation
-
-		# ---- Intersect sorted candidate row lists across triggered features
-		have_candidates = False
-		if feature_idxs.size > 0:
-			candidates  = np.empty(0, dtype=np.int64)
-			rows0 = precomputed_rows_with_min[feature_idxs[0]]
-			src = rows0
-			m = rows0.size
-			for t in range(1, feature_idxs.size):
-				dst = cand_buf if (t & 1) else tmp_buf  # alternate buffers
-				m = _intersect_two_sorted(src[:m], precomputed_rows_with_min[feature_idxs[t]], dst)
-				if m == 0:
-					break
-				src = dst  # next round reads from what we just wrote
-			if m > 0:
-				have_candidates = True
-				candidates = src[:m]
-
-		# ||X_j - x_i||^2 = ||X_j||^2 + ||x_i||^2 - 2 X_j·x_i
-		dists = X_sqnorm + x_sq[i] - 2.0 * (X @ x_i)
-		# dists = np.maximum(dists, 0.0)#.astype(np.float32)
-		if have_candidates:
-			# Restricted search over candidate rows only
-			pick_c  = _argmin_random(dists[candidates], base_seed, tol=atol)
-			assert pick_c >= 0
-			selected_indices[i] = candidates[pick_c]
-		else:
-			# Full search over all rows
-			pick = _argmin_random(dists, base_seed, tol=atol)
-			assert pick >= 0
-			selected_indices[i] = pick
-
-	return y[selected_indices]
-
-@njit(parallel=True, fastmath=False)
-def _abstracted_model(x, X, y, X_sqnorm, seed=42, atol=1e-8): # or atol=1e-8 for float64
-	# -- fast bypass if x already has the desired outputs in its last column
-	if x.shape[-1] == X.shape[-1] + 1:
-		return x[:, -1]#.astype(np.float32)
-
-	# Precompute ||x_i||^2 before casting to float32
-	x_sq = (x * x).sum(axis=1)  # float64
-	
-	# Ensure float32 math for speed/bandwidth
-	# x = x.astype(np.float32)
-	# x_sq = x_sq.astype(np.float32)
-
-	n_samples = x.shape[0]
-	n_rows = X.shape[0]
-
-	# Output: chosen row indices in X for each sample
-	selected_indices = np.empty(n_samples, dtype=np.int64)
-	for i in prange(n_samples):
-		x_i = x[i]
-		base_seed = seed + n_samples + i  # deterministic per-sample perturbation
-
-		# ||X_j - x_i||^2 = ||X_j||^2 + ||x_i||^2 - 2 X_j·x_i
-		dists = X_sqnorm + x_sq[i] - 2.0 * (X @ x_i)
-		# Full search over all rows
-		selected_indices[i] = _argmin_random(dists, base_seed, tol=atol)
-		# assert selected_indices[i] >= 0
-
-	return y[selected_indices]
 
 @njit(parallel=True, fastmath=False)
 def _abstracted_model_fast(x, X, y, X_sqnorm, seed=42, atol=1e-8):
@@ -340,7 +84,6 @@ def _abstracted_model_fast(x, X, y, X_sqnorm, seed=42, atol=1e-8):
 		return x[:, -1]
 
 	n_samples = x.shape[0]
-	n_rows = X.shape[0]
 
 	# compute x_sq without making an (x*x) temporary
 	x_sq = np.empty(n_samples, dtype=np.float64)
@@ -363,10 +106,6 @@ def _abstracted_model_fast(x, X, y, X_sqnorm, seed=42, atol=1e-8):
 		out[i] = y[j]
 
 	return out
-
-# def abstracted_model(*args, **kwargs):
-# 	with threadpool_limits(limits=1, user_api="blas"):
-# 		return _abstracted_model_fast(*args, **kwargs)
 
 # ---- optional: tiny cache so X doesn't get re-uploaded to GPU every call ----
 # Assumes X is not mutated between calls when cache=True.
@@ -391,7 +130,7 @@ def _mps_prepare(X, X_sqnorm, device="mps", dtype=torch.float32, cache=True):
 	return tX, tX_sq
 
 
-@torch.inference_mode()  # disable autograd + extra bookkeeping for faster inference :contentReference[oaicite:0]{index=0}
+@torch.inference_mode()
 def _abstracted_model_mps(x, X, y, X_sqnorm=None, seed=42, atol=1e-8, chunk_size=2048, cache=True):
 	# If x has an extra last column, return it directly.
 	if x.shape[-1] == X.shape[-1] + 1:
@@ -426,12 +165,10 @@ def _abstracted_model_mps(x, X, y, X_sqnorm=None, seed=42, atol=1e-8, chunk_size
 		# Each chunk builds a (n_rows x c) matrix (scores, mask, r), so chunk_size
 		# limits how big that intermediate gets.
 		n_samples = tx.shape[0]
-		# n_rows = tX.shape[0]
 		out = np.empty(n_samples, dtype=y.dtype)
 
 		for start in range(0, n_samples, chunk_size):
 			end = min(start + chunk_size, n_samples)
-			# c = end - start
 
 			# x_chunk: (c, d)
 			x_chunk = tx[start:end]
@@ -530,7 +267,7 @@ def get_global_feature_stats_from_shap_values(shap_values, features, target):
 	# Compute correlation between each feature's SHAP values and the target variable
 	correlation_with_target = {}
 	for col in features:
-		corr, p_value = spearmanr(shap_df[col], shap_df["target"])
+		corr, _ = spearmanr(shap_df[col], shap_df["target"])
 		correlation_with_target[col] = corr
 	# Calculates the feature importance (mean absolute shap value) for each feature
 	feature_details = {
@@ -653,28 +390,12 @@ def compute_shap_values(X_with_y, fast_shap_estimate=True, npermutations=10, onl
 		shap_values = explainer(X).values
 	return shap_values, (X, y)
 
-def infer_input_features(scores_df: pd.DataFrame, prompt_cols, target_cols):
-	"""Infer numeric input features by excluding prompt/metadata and targets."""
-	exclude = {"prompt", "operator_group", "raw_output", "numerical_output"}
-	if prompt_cols:
-		exclude |= set(prompt_cols)
-	exclude |= set(target_cols)
-
-	input_features = []
-	for c in scores_df.columns:
-		if c in exclude:
-			continue
-		# we only want numeric features for RuleSHAP / SHAP computation
-		if pd.api.types.is_numeric_dtype(scores_df[c]):
-			input_features.append(c)
-	return input_features
 
 def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode='regress', use_lasso_regression = True, df_eval=None, greedy_seed_metrics = None, greedy_seed_topk = 20):
 	"""Rule extraction procedure mirroring 3_extract_arithmetic_rules.py."""
 
 	if not greedy_seed_metrics:
 		greedy_seed_metrics = ["MCC"]
-		# greedy_seed_metrics = ["MCC", "Importance", "WeightedImportance"]
 
 	use_shap_in_xgb, use_shap_in_lasso = args.use_shap_in_xgb, args.use_shap_in_lasso
 	out_dir = args.rules_dir
@@ -814,8 +535,7 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 	force_all_fit_recompute = bool(getattr(args, "force_all_fit_recompute", False))
 
 	for metric in metrics_list:
-		# Historical rule_combo_train_test_* files are not consumed here. TRAIN+TEST
-		# reporting is reconstructed from the current train/test confusion counts.
+		# TRAIN+TEST reporting is reconstructed from train/test confusion counts.
 		train_combo_path = os.path.join(out_dir, f"rule_combo_train_{metric}.csv")
 		test_combo_path = os.path.join(out_dir, f"rule_combo_{metric}.csv")
 		test_selected_combo_path = os.path.join(out_dir, f"rule_combo_test_selected_{metric}.csv")
@@ -1154,8 +874,7 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 
 				# Separate HQ-T-style artifact: candidate rules are emitted from TRAIN,
 				# but the OR-subset is selected and scored on held-out TEST rows.
-				# Keep this out of rule_combo_<target>.csv so legacy frozen-combo TEST
-				# results remain available and cached.
+				# Store this under its TEST-selected filename so score scopes stay explicit.
 				best_combo_test_selected_raw = rf_model.find_best_or_combo(
 					rules,
 					X=eval_X,
