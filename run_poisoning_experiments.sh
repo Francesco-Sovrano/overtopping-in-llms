@@ -244,7 +244,8 @@ for cell in "${CELLS[@]}"; do
   [[ -z "$MATRIX_RUN_DIRS" ]] || MATRIX_RUN_DIRS+=","
   MATRIX_RUN_DIRS+="$output_root/$run_name"
 done
-run python3 "$CODE_ROOT/poisoning/stage07_aggregate_matrix.py" \
+run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m poisoning.stage07_aggregate_matrix \
   --run_dirs "$MATRIX_RUN_DIRS" \
   --output_dir "$POISONING_SUMMARY_ROOT/matrix/$MATRIX_SLUG" \
   --min_seeds "${MIN_SEEDS_FOR_DEVELOPMENTAL_CLAIM:-3}"
