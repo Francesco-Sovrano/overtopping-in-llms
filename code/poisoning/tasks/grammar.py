@@ -1347,7 +1347,7 @@ def main() -> None:
     }
     if all(rows is not None for rows in completed.values()):
         all_rows = [row for cond in conditions for row in completed[cond] or []]
-        annotate_overtopping_paths(all_rows, run_dir)
+        annotate_overtopping_paths(all_rows)
         combined_csv = metadata_path(run_dir, "checkpoint_manifest_all.csv")
         write_aggregate_manifest_union(combined_csv, all_rows)
         for cond in conditions:
@@ -1561,7 +1561,7 @@ def main() -> None:
                 flush=True,
             )
 
-    annotate_overtopping_paths(all_rows, run_dir)
+    annotate_overtopping_paths(all_rows)
 
     combined_csv = metadata_path(run_dir, "checkpoint_manifest_all.csv")
     if all_rows:

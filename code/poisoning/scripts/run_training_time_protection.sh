@@ -83,13 +83,11 @@ if [[ "$DRY_RUN" != "1" ]]; then
     --protected_run "$GRAMMAR_OUTPUT_ROOT/$GRAMMAR_PROTECTED_NAME" \
     --random_protected_run "$GRAMMAR_OUTPUT_ROOT/$GRAMMAR_RANDOM_NAME" \
     --phase input_output \
-    --task grammar \
     --output_dir "$POISONING_SUMMARY_ROOT/protection/grammar"
   python3 -m poisoning.protection02_compare_training_protection \
     --baseline_run "$ARITHMETIC_OUTPUT_ROOT/$BASE_RUN_NAME" \
     --protected_run "$ARITHMETIC_OUTPUT_ROOT/$ARITH_PROTECTED_NAME" \
     --random_protected_run "$ARITHMETIC_OUTPUT_ROOT/$ARITH_RANDOM_NAME" \
     --phase output_only \
-    --task arithmetic \
     --output_dir "$POISONING_SUMMARY_ROOT/protection/arithmetic"
 fi

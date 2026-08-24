@@ -3,7 +3,6 @@ import torch
 from tqdm import tqdm
 import random
 
-import math
 
 from lib.modeling_and_ablation import build_ablation_hooks
 from lib.binomial_statistics import (
@@ -31,8 +30,7 @@ def dichotomic_search_layer(
 	batch_ranges=None,
 	max_new_tokens=10,
 	# statistical safety knobs
-	prune_alpha=0.05, # global failure prob budget (e.g. 0.01 => 99% overall guarantee)
-	bonferroni=False, # distribute alpha across tested groups (global guarantee mode)
+	prune_alpha=0.05,
 	# optional: signed importance scores for this layer (neuron_id -> float)
 	importance_scores=None,
 	first_split_by_importance_sign=False,
@@ -53,7 +51,7 @@ def dichotomic_search_layer(
 		return []
 	print(
 		f"Layer {layer_label}: starting dichotomic search over {len(neuron_ids)} neurons "
-		f"(epsilon={search_epsilon:.4f}, prune_alpha={prune_alpha}, bonferroni={bonferroni})."
+		f"(epsilon={search_epsilon:.4f}, prune_alpha={prune_alpha})."
 	)
 
 	# Upper bound if we fully split to singletons: 2N - 1 group evaluations
@@ -65,22 +63,14 @@ def dichotomic_search_layer(
 		unit="group",
 	)
 
-	# ---- multiple-testing control ----
-	# Option A (recommended): depth-based alpha spending (still a union-bound guarantee).
-	# Option B (simpler): uniform Bonferroni across INTERNAL nodes only (no budget wasted on leaves).
-	# Worst-case internal nodes in a full binary tree with N leaves is N-1.
-
-	
-	def recurse(group, depth=0, nodes_tested=0):
+	def recurse(group, depth=0):
 		group = list(group)
 		if not group:
 			return []
 
 		# Depth-specific alpha (recorded per node)
-		alpha_node = get_alpha_node(prune_alpha, depth, nodes_tested, bonferroni=bonferroni)
+		alpha_node = get_alpha_node(prune_alpha)
 		alpha_slice = None if (alpha_node is None) else (alpha_node / 2.0)
-		nodes_tested += 1
-
 		# Evaluate this group
 		record = ablate_neurons(
 			model,
@@ -174,8 +164,8 @@ def dichotomic_search_layer(
 			left = group[:mid]
 			right = group[mid:]
 		results = [record]
-		results += recurse(left, depth + 1, nodes_tested)
-		results += recurse(right, depth + 1, nodes_tested)
+		results += recurse(left, depth + 1)
+		results += recurse(right, depth + 1)
 		return results
 
 	try:
@@ -216,7 +206,7 @@ def decode_only_hooks(hooks):
 		out.append((name, wrapped))
 	return out
 
-def get_correctness_cached_by_prefix_batches(model, examples, is_answer_positive_fn, prompt_col, prefix_batches, batch_ranges, hooks=None, return_answers=False):
+def get_correctness_cached_by_prefix_batches(model, examples, is_answer_positive_fn, prefix_batches, batch_ranges, hooks=None, return_answers=False):
 	# Cached evaluation reuses prefix (prefill) computation across prompts.
 	if hooks is not None:
 		hooks = decode_only_hooks(hooks)
@@ -289,7 +279,6 @@ def get_correctness(model, examples, is_answer_positive_fn, prompt_col, max_new_
 			max_new_tokens=max_new_tokens,
 			do_sample=False,
 			fwd_hooks=hooks,
-			# use_kv_cache=False
 		)
 
 		acc[start : start + len(batch)] = is_answer_positive_fn(batch, answers)
@@ -331,7 +320,6 @@ def ablate_neurons(model, pos_examples, neg_examples, is_answer_positive_fn, pro
 				model,
 				all_examples,
 				is_answer_positive_fn,
-				prompt_col,
 				prefix_batches,
 				batch_ranges,
 				hooks=hooks,
@@ -342,7 +330,6 @@ def ablate_neurons(model, pos_examples, neg_examples, is_answer_positive_fn, pro
 				model,
 				all_examples,
 				is_answer_positive_fn,
-				prompt_col,
 				prefix_batches,
 				batch_ranges,
 				hooks=hooks,
@@ -517,13 +504,7 @@ def equivalent_search_epsilon(n, search_epsilon_ref = 0.2, n_ref = 100, prune_al
 		n, search_epsilon_ref=search_epsilon_ref, n_ref=n_ref, prune_alpha=prune_alpha, rounding=rounding
 	)
 
-def get_alpha_node(prune_alpha, depth=0, nodes_tested=0, bonferroni=False):
+def get_alpha_node(prune_alpha):
 	if prune_alpha is None or prune_alpha <= 0:
 		return None
-	if not bonferroni:
-		return float(prune_alpha)
-
-	# Anytime alpha-spending (union bound) ; Use alpha spending instead of fixed Bonferroni over N−1
-	c = 6.0 / (math.pi ** 2)  # ~0.6079
-	return float(prune_alpha * c / (nodes_tested ** 2))
-	# # fallback: uniform across internal nodes only
+	return float(prune_alpha)

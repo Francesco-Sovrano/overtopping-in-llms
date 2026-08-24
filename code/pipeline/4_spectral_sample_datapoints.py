@@ -3,7 +3,6 @@ from pathlib import Path
 import os
 import json
 import argparse
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -130,12 +129,6 @@ def parse_args():
 		type=int,
 		default=32,
 		help="Minimum number of representatives per rule when enough data is available.",
-	)
-	p.add_argument(
-		"--batch_size",
-		type=int,
-		default=16,
-		help="Batch size for LLM forward passes.",
 	)
 	p.add_argument("--seed", type=int, default=0)
 	p.add_argument(

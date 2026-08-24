@@ -63,7 +63,6 @@ def main() -> None:
     ap.add_argument("--protected_run", required=True)
     ap.add_argument("--random_protected_run", required=True)
     ap.add_argument("--phase", choices=["input_output", "output_only"], required=True)
-    ap.add_argument("--task", choices=["grammar", "arithmetic"], required=True)
     ap.add_argument("--output_dir", required=True)
     args = ap.parse_args()
     frames = [

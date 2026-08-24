@@ -8,9 +8,7 @@ import re
 import json
 import random
 import argparse
-from pathlib import Path
 
-from lib.project_paths import PROJECT_ROOT
 from typing import Optional
 
 from functools import partial
@@ -83,19 +81,6 @@ def parse_args():
 		required=True,
 		help="CSV/Parquet with prompt text + feature columns (same as script 5).",
 	)
-	p.add_argument(
-		"--max_answer_tokens",
-		type=int,
-		default=16,
-		help="Max tokens to roll out per example when target_col is not provided.",
-	)
-	p.add_argument(
-		"--stop_regex",
-		type=str,
-		default=r"\n{2,}|</s>|<\|endoftext\|>",
-		help="Regex; if matched in the growing continuation, we stop early.",
-	)
-
 	p.add_argument("--intervention", type=str, default="zero")
 	p.add_argument("--eval_intervention", type=str, default="mean-positional")
 	p.add_argument("--absolute_value_attributions", action="store_true")
@@ -515,7 +500,7 @@ def _serialize_full_network_metadata(graph, *, level: str, absolute: bool = True
 		meta["empty_reason"] = "no scored neurons"
 	return meta
 
-def _make_full_network_result(*, graph, output_dir, loader, global_mean_loader, model, eval_intervention, sampling_strategy, pair_meta, extra_results, debug_label, reason):
+def _make_full_network_result(*, graph, output_dir, loader, sampling_strategy, pair_meta, extra_results, debug_label, reason):
 	graph.reset(empty=False)
 	if graph.nodes_scores is not None:
 		graph.nodes_scores[:] = 1.0
@@ -523,7 +508,6 @@ def _make_full_network_result(*, graph, output_dir, loader, global_mean_loader, 
 		graph.neurons_scores[:] = 1.0
 	graph.scores = graph.real_edge_mask.to(dtype=torch.float32)
 
-	# 	graph.zero_out_attention_neuron_scores()
 
 	meta = _serialize_full_network_metadata(
 		graph,

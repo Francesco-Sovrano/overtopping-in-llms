@@ -60,6 +60,8 @@ SAVE_FRACS             0,0.1,0.25,0.5,0.75,1.0
 
 ## Direct checkpoint driver
 
+Run direct poisoning commands from `code/`. Python stages are package modules and should be invoked with `python3 -m poisoning.<module>`, not by executing `code/poisoning/<module>.py` as a file. The root `run_poisoning_experiments.sh` launcher configures this package path automatically.
+
 ```bash
 POISONING_TASK=grammar DRY_RUN=1 bash poisoning/scripts/run_checkpoint_ft.sh
 ```

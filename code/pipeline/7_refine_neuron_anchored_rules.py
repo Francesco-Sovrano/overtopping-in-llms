@@ -8,7 +8,6 @@ import textwrap
 import json
 import argparse
 import zipfile
-from pathlib import Path
 from collections import defaultdict
 from more_itertools import unique_everseen
 
@@ -158,7 +157,6 @@ def parse_args():
 	ap.add_argument("--stats_dirname", default=None, type=str)
 
 	ap.add_argument("--stats_only", action="store_true", help="Skip ablations; only compute aggregate statistics from existing flip columns (requires a scores_*.csv with flip_ columns).")
-	ap.add_argument("--range_quantiles", type=str, default="0.1,0.9", help="Quantiles (lo,hi) used to report conditional success reduction ranges, e.g. 0.1,0.9.")
 	ap.add_argument(
 		"--skip_agonist_metric_stats",
 		action="store_true",
@@ -374,15 +372,6 @@ def parse_args():
 		help=(
 			"Comma-separated list of target columns to extract rules for. "
 			"Default: all columns starting with --rule_target_prefix."
-		),
-	)
-	ap.add_argument(
-		"--max_rule_targets",
-		type=int,
-		default=None,
-		help=(
-			"Optional cap on number of targets to extract rules for. If set, targets are "
-			"sorted by decreasing positive rate before truncation."
 		),
 	)
 
@@ -1843,7 +1832,7 @@ def _compute_metric_global_summary(metric_df):
 	return g.reset_index(drop=True)
 
 
-def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
+def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir):
 	if metric_df is None or metric_df.empty:
 		return []
 	from matplotlib.backends.backend_pdf import PdfPages
@@ -2016,7 +2005,7 @@ def write_agonist_metric_final_stats(circuit_agonists_path, out_dir, stats_dirna
 		best_df.to_csv(best_path, index=False)
 	else:
 		best_df = pd.DataFrame()
-	plot_paths = _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=topk)
+	plot_paths = _save_metric_plots(metric_df, delta_df, corr_df, stats_dir)
 	headlines = {}
 	if corr_df is not None and not corr_df.empty:
 		for target in ["flip_any_rate", "abs_max_effect", "accuracy_gap", "c2i_rate", "i2c_rate"]:
@@ -2409,7 +2398,6 @@ def write_rule_metrics_stats(
 	quality_thresholds_by_scope: dict = None,
 	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	neurons_sorted=None,  # <-- NEW
-	scores_df: pd.DataFrame = None,
 ):
 	"""
 	Writes paper-ready rule statistics/figures from RuleSHAP artifacts.
@@ -2760,7 +2748,6 @@ def _load_scope_best_rule_metrics(
 	rules_dir: str,
 	stats_dirname: str,
 	scope: str,
-	scores_df: pd.DataFrame = None,
 	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	quality_metric: str = "mcc",
 ) -> pd.DataFrame:
@@ -3502,7 +3489,6 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 		quality_thresholds_by_scope=qual_thresholds_by_scope,
 		min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 		neurons_sorted=neurons_sorted,
-		scores_df=scores_df,
 	)
 
 	if rule_best_df is not None:
@@ -3511,7 +3497,6 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 			args.rules_dir,
 			stats_dirname,
 			"all_fit",
-			scores_df=scores_df,
 			min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 			quality_metric=qual_metric,
 		)
@@ -4775,7 +4760,6 @@ def main():
 								_model,
 								batch_prompt,
 								is_answer_positive_fn,
-								prompt_col,
 								prefix_batches,
 								batch_ranges,
 								hooks=hooks,

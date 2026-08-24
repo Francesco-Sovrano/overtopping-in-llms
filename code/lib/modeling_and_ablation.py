@@ -310,7 +310,6 @@ def build_ablation_hooks(
 	intervention="zero",
 	mean_activations=None,
 	device=None,
-	attn_hook_point: str = "z",
 ):
 	"""
 	Build TransformerLens forward hooks for ablation.

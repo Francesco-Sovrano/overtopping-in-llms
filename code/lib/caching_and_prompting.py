@@ -228,7 +228,7 @@ def _is_missing_cached_value(v):
 		pass
 	return False
 
-def get_cached_values(value_list, cache, fetch_fn, cache_name=None, key_fn=lambda x:x, empty_is_missing=True, transform_fn=None, **args):
+def get_cached_values(value_list, cache, fetch_fn, cache_name=None, key_fn=lambda x:x, empty_is_missing=True, transform_fn=None):
 	missing_values = tuple(
 		q 
 		for q in unique_everseen(filter(lambda x:x, value_list), key=key_fn) 

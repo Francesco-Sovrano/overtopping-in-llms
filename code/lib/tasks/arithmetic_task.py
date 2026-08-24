@@ -100,7 +100,7 @@ def to_number(s):
 		except:
 			return None
 
-def is_number(s, is_int=False):
+def is_number(s):
 	return to_number(s) is not None
 
 # ---------------------------

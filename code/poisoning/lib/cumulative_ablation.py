@@ -19,7 +19,6 @@ measured on ``x`` as collateral-damage controls.
 
 from __future__ import annotations
 
-from poisoning.tasks.registry import infer_task_from_run
 from poisoning.lib.units import unit_key as _unit_key
 import argparse
 import hashlib

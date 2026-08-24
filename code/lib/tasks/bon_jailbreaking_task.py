@@ -382,7 +382,7 @@ def f_sigma(prompt, info):
 
 		return final_dataset
 
-	def rerun_dataset_load(self, final_dataset, temperature = 0.0, chunk_size = 256, response_key = "answer", behavior_key = "original_prompt", classifier_output_key = "classifier_output"):
+	def rerun_dataset_load(self, final_dataset, temperature = 0.0, response_key = "answer", behavior_key = "original_prompt", classifier_output_key = "classifier_output"):
 		"""
 		Re-run the jailbreak label on the *output of generate_cache*.
 

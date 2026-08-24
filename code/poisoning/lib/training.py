@@ -601,7 +601,7 @@ def batched_generate(
     return outputs
 
 
-def annotate_overtopping_paths(rows: List[Dict[str, Any]], run_dir: Path) -> None:
+def annotate_overtopping_paths(rows: List[Dict[str, Any]]) -> None:
     """Attach stable analysis labels without serializing analysis filesystem paths."""
     for row in rows:
         frac = float(row.get("fraction", 0.0))

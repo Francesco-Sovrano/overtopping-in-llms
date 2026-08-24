@@ -678,7 +678,6 @@ else
 			--pair_len_tolerance "$SPECTRAL_PAIR_LEN_TOLERANCE" \
 			--use_global_clusters \
 			--global_n_clusters "$((MAX_POINTS_PER_CIRCUIT / 4))" \
-			--batch_size "$BATCH_SIZE" \
 			--output_dir "$DISCOVERY_OUT_DIR" \
 			--plan_role circuit_discovery \
 			--skip_existing \
@@ -705,7 +704,6 @@ else
 			--pair_len_tolerance "$SPECTRAL_PAIR_LEN_TOLERANCE" \
 			--use_global_clusters \
 			--global_n_clusters "$((MAX_POINTS_PER_ABLATION / 4))" \
-			--batch_size "$BATCH_SIZE" \
 			--output_dir "$DISCOVERY_OUT_DIR" \
 			--plan_role neuron_ablation_positive \
 			--skip_existing \
@@ -730,7 +728,6 @@ else
 			--pair_len_tolerance "$SPECTRAL_PAIR_LEN_TOLERANCE" \
 			--use_global_clusters \
 			--global_n_clusters "$((MAX_POINTS_PER_ABLATION / 4))" \
-			--batch_size "$BATCH_SIZE" \
 			--output_dir "$DISCOVERY_OUT_DIR" \
 			--plan_role neuron_ablation_negative \
 			--skip_existing \

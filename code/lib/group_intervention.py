@@ -437,7 +437,6 @@ def evaluate_groups(
                     model,
                     batch,
                     is_answer_positive_fn,
-                    prompt_col,
                     prefix_batches,
                     batch_ranges,
                     hooks=hooks,

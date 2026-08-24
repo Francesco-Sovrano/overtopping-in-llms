@@ -8,7 +8,6 @@ import re
 import gc
 import json
 import argparse
-from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
@@ -1372,7 +1371,6 @@ def compute_and_save_agonist_activation_stats(
 	rule_json_path,
 	*,
 	circuit_id,
-	circuit_label,
 	prompt_col,
 	associated_examples,
 	unrelated_examples,
@@ -1630,7 +1628,7 @@ def _plot_agonist_margin_stats(raw_df, out_path, title):
 	plt.close(fig)
 
 
-def compute_and_save_agonist_margin_stats(model, task, rule_json_path, *, circuit_id, circuit_label, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, intervention, mean_activations):
+def compute_and_save_agonist_margin_stats(model, task, rule_json_path, *, circuit_id, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, intervention, mean_activations):
 	agonists = _extract_singleton_agonists_from_records(ablation_records, baseline_subset)
 	if not agonists:
 		return None
@@ -2086,7 +2084,7 @@ def _plot_agonist_saliency_stats(raw_df, out_path, title):
 	plt.close(fig)
 
 
-def compute_and_save_agonist_saliency_stats(model, task, rule_json_path, *, circuit_id, circuit_label, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, metrics):
+def compute_and_save_agonist_saliency_stats(model, task, rule_json_path, *, circuit_id, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, metrics):
 	metrics = _parse_saliency_metrics(metrics)
 	if not metrics:
 		return None

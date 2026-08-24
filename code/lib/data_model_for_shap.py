@@ -131,7 +131,7 @@ def _mps_prepare(X, X_sqnorm, device="mps", dtype=torch.float32, cache=True):
 
 
 @torch.inference_mode()
-def _abstracted_model_mps(x, X, y, X_sqnorm=None, seed=42, atol=1e-8, chunk_size=2048, cache=True):
+def _abstracted_model_mps(x, X, y, X_sqnorm=None, atol=1e-8, chunk_size=2048, cache=True):
 	# If x has an extra last column, return it directly.
 	if x.shape[-1] == X.shape[-1] + 1:
 		return x[:, -1]

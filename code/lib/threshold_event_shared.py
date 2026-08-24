@@ -325,7 +325,7 @@ def saliency_objective_from_last_logits(task, prompt_batch, logits_last, tokeniz
 
 
 def collect_reference_margin_tensors(model, task, examples, prompt_col, layer_labels, batch_size, *,
-                                     allow_fallback_score=False, desc=None, decode_only=False, max_new_tokens=10):
+                                     allow_fallback_score=False, desc=None, decode_only=False):
     """Collect last-position activation/gradient tensors for proxy metrics.
 
     This is the shared script-6/script-12 gradient path.  It does not call
