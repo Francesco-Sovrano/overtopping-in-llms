@@ -41,7 +41,7 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
     dataset = load_json(dataset_path)
     raw = raw_task_score(spec.task, dataset)
     chance = chance_baseline(spec.task, dataset)
-    score = competence(spec.task, spec.phase, raw, chance)
+    score = competence(spec.phase, raw, chance)
 
     u = singleton.get("U_J", global_payload.get("union_flip_any_unique_rate"))
     s1 = singleton.get("s_1")

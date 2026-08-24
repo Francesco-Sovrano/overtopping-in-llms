@@ -894,7 +894,7 @@ def _saliency_objective_from_last_logits(task, prompt_batch, logits_last, tokeni
     return torch.nan_to_num(objective, nan=0.0, posinf=0.0, neginf=0.0), name
 
 
-def collect_reference_proxy_tensors(model, task, examples, prompt_col, layer_labels, batch_size, *, allow_fallback_score=False, decode_only=False, max_new_tokens=10):
+def collect_reference_proxy_tensors(model, task, examples, prompt_col, layer_labels, batch_size, *, allow_fallback_score=False, decode_only=False):
     # Gradients from the prompt-token forward pass are not comparable to
     # decode-step singleton interventions.  When decode_only is requested, the
     # caller should use decode-step activation collection instead of returning
@@ -1566,7 +1566,7 @@ def repeated_holdout(x, y, *, min_examples, repeats, holdout_fraction, seed):
     return out
 
 
-def _assign_population_from_high_n(row, args):
+def _assign_population_from_high_n(row):
     """Coarse descriptive bucket from observed high-N flip rate.
 
     This is metadata only; candidate units come from script-7 rules and labels
@@ -1595,8 +1595,7 @@ def _make_binned_rows(udf, feature, target, population, unit_key, direction, n_b
 
 
 def _rule_conditioned_threshold_tests(args, *, baseline: str, baseline_out: Path, rule_df: pd.DataFrame,
-                                      scores_out: pd.DataFrame, raw_df: pd.DataFrame, dataset_info: dict,
-                                      task_targets, feature_list: list[str]) -> dict:
+                                      scores_out: pd.DataFrame, raw_df: pd.DataFrame, feature_list: list[str]) -> dict:
     """Flip-conditioned proxy diagnostics.
 
     Script-7 rules are used only to select candidate units / optionally enrich the
@@ -1830,7 +1829,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
     candidate_unit_keys = {u.unit_key for u in agonist_units}
     pop_rows = []
     for r in tqdm(flip_stats.to_dict("records"), desc=f"{LOG_PREFIX} {baseline} assign populations", unit="unit", leave=False):
-        pop, strength = _assign_population_from_high_n(r, args)
+        pop, strength = _assign_population_from_high_n(r)
         unit_key = str(r.get("unit_key"))
         if unit_key in candidate_unit_keys or str(r.get("source", "")) == "flip_rule_candidate":
             pop = "flip_rule_candidate"
@@ -1856,7 +1855,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         activation_only_proxy = True
     else:
         _log(args, f"{LOG_PREFIX} {baseline}: collecting proxy tensors rows={len(high_n_examples)} layers={len(layer_labels)}", "normal")
-        layer_proxy = collect_reference_proxy_tensors(model, task, high_n_examples, prompt_col, layer_labels, int(args.batch_size), allow_fallback_score=bool(args.proxy_allow_fallback_score), decode_only=False, max_new_tokens=int(task.MAX_NEW_TOKENS))
+        layer_proxy = collect_reference_proxy_tensors(model, task, high_n_examples, prompt_col, layer_labels, int(args.batch_size), allow_fallback_score=bool(args.proxy_allow_fallback_score), decode_only=False)
         if not layer_proxy:
             _result(f"{LOG_PREFIX} {baseline}: gradient proxies unavailable; using activation-only fallback")
             layer_acts = collect_reference_activations(model, high_n_examples, prompt_col, layer_labels, batch_size=int(args.batch_size), decode_only=False, max_new_tokens=int(task.MAX_NEW_TOKENS))
@@ -1922,7 +1921,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
 
     rule_payload = None
     if bool(getattr(args, "rule_conditioned_diagnostics", False)):
-        rule_payload = _rule_conditioned_threshold_tests(args, baseline=baseline, baseline_out=baseline_out, rule_df=rule_df, scores_out=scores_out, raw_df=raw_df, dataset_info=dataset_info, task_targets=task.DEFAULT_TARGETS, feature_list=feature_list)
+        rule_payload = _rule_conditioned_threshold_tests(args, baseline=baseline, baseline_out=baseline_out, rule_df=rule_df, scores_out=scores_out, raw_df=raw_df, feature_list=feature_list)
 
     payload = {"baseline": baseline, "status": "ok", "evaluation_split": str(args.evaluation_split), "candidate_source": candidate_source, "candidate_flip_stats_path": str(args.candidate_flip_stats_path) if args.candidate_flip_stats_path else None, "mean_replacement_reference_split": "train", "n_scores_available": int(len(scores_df)), "n_high_n_rows": int(len(scores_out)), "n_units": int(len(analysis_units)), "n_eval_units": int(len(eval_units)), "n_rules": int(len(rule_df)), "rule_metrics_path": str(rule_path) if rule_path is not None else None, "rule_conditioned_only": bool(rule_conditioned_only), "spectral_sampling_config": (None if rule_conditioned_only else _spectral_sampling_config(args)), "sampling": sample_meta, "same_layer_nonagonist_controls": nonagonist_payload, "population_counts": flip_stats["population"].value_counts().to_dict() if not flip_stats.empty else {}, "rule_conditioned": rule_payload, "files": {"scores_with_flips": "high_n_scores_with_flips.csv", "flip_stats": "high_n_flip_stats_by_unit.csv", "unit_tests": "threshold_unit_tests.csv", "population_summary": "threshold_population_summary.csv", "binned_curves": "threshold_binned_flip_curves.csv", "activation_flip_rows_gz": "threshold_activation_flip_rows.csv.gz", "same_layer_nonagonist_control_pool": "same_layer_nonagonist_control_pool.csv", "same_layer_nonagonist_control_selection": "same_layer_nonagonist_control_selection.csv", "rule_conditioned_sampling_plan": "rule_conditioned_sampling_plan.csv", "flip_conditioned_threshold_summary": "flip_conditioned_threshold_summary.csv"}}
     (baseline_out / "threshold_spiking_experiment.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
@@ -1930,7 +1929,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
     return payload
 
 
-def _plot_aggregate_visualizations(out_root: Path, files: dict):
+def _plot_aggregate_visualizations(out_root: Path):
     viz_dir = out_root / "figures"
     viz_dir.mkdir(parents=True, exist_ok=True)
     made = {}
@@ -2077,7 +2076,7 @@ def write_aggregate(out_root: Path, *, make_visualizations: bool = True):
     # Pairwise matched-control summaries were removed with flip-count-matched
     # controls. The remaining same-layer/head baseline is random and is compared
     # at the population level above.
-    figures = _plot_aggregate_visualizations(out_root, files) if make_visualizations else {}
+    figures = _plot_aggregate_visualizations(out_root) if make_visualizations else {}
     if figures:
         files["figures"] = figures
     payload = {"status": "ok", "out_dir": str(out_root), "files": files}

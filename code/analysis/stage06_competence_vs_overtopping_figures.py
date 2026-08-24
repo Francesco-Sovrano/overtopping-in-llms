@@ -458,7 +458,7 @@ def edge_for_baseline(baseline: str) -> str:
     return "black" if baseline == "mean-donor" else "0.55"
 
 
-def phase_label(phase: str, compact: bool = True) -> str:
+def phase_label(phase: str) -> str:
     """Readable figure notation for intervention phase."""
     if phase == "decode-only":
         return "Output-only"
@@ -467,7 +467,7 @@ def phase_label(phase: str, compact: bool = True) -> str:
     return phase
 
 
-def x_axis_label(points: list[PlotPoint], long_labels: bool = False) -> str:
+def x_axis_label(points: list[PlotPoint]) -> str:
     """Short readable x-axis label matching the selected score definition."""
     if SCORE_MODE == "raw":
         return "Raw task score"
@@ -745,7 +745,7 @@ def draw_trend(
         segments = _masked_line_segments(ax, xs, ys, points, args, gap_px=gap_px) if mask_points else [(xs, ys)]
         for seg_xs, seg_ys in segments:
             ax.plot(seg_xs, seg_ys, linestyle=linestyle, color=color, linewidth=0.8, alpha=0.86, zorder=2)
-        legend_label = f"{label} score-coverage fit ($R^2$={r2:.2f})" if show_r2 else ("score-coverage fit" if label == "overall" else f"{phase_label(label, True)} fit")
+        legend_label = f"{label} score-coverage fit ($R^2$={r2:.2f})" if show_r2 else ("score-coverage fit" if label == "overall" else f"{phase_label(label)} fit")
         handles.append(Line2D([0], [0], color=color, linestyle=linestyle, linewidth=0.8, label=legend_label))
 
     if mode == "overall":
@@ -1060,7 +1060,7 @@ def annotate_points(
     groups = sorted(groups, key=lambda g: (g.text.count("\n"), len(g.text)), reverse=True)
     candidate_offsets = _label_candidate_offsets()
 
-    def _score_bbox(bb: Bbox, anchor_px: tuple[float, float], dx: float, dy: float, text: str) -> tuple[float, float, float]:
+    def _score_bbox(bb: Bbox, dx: float, dy: float, text: str) -> tuple[float, float, float]:
         label_overlap = 0.0
         for ob in placed_label_bboxes:
             label_overlap += _bbox_overlap_area(bb, ob)
@@ -1137,7 +1137,7 @@ def annotate_points(
             if any(_bbox_overlap_area(bb, ob) > 0.0 for ob in reserved_obstacles):
                 continue
 
-            score, label_overlap, other_penalty = _score_bbox(bb, anchor_px, dx, dy, text)
+            score, label_overlap, other_penalty = _score_bbox(bb, dx, dy, text)
             if local_best_score is None or score < local_best_score:
                 local_best_score = score
                 local_best = (dx, dy, ha, va)
@@ -1362,7 +1362,7 @@ def paper_figsize(args: argparse.Namespace, layout: str, nrows: int = 1, ncols: 
     return (5.35, 2.25)
 
 
-def legend_common_kwargs(args: argparse.Namespace) -> dict:
+def legend_common_kwargs() -> dict:
     return dict(
         frameon=False,
         borderpad=0.05,
@@ -1390,7 +1390,7 @@ def build_legend(
     if not handles:
         return
     ncol = args.legend_cols or min(len(handles), 5 if args.paper_size == "wide" else 3)
-    common = legend_common_kwargs(args)
+    common = legend_common_kwargs()
 
     if position == "right":
         ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.005, 0.5), ncol=1, **common)
@@ -1447,7 +1447,7 @@ def model_template_and_step_match(model: str, template: str, step: int | None) -
     return model_checkpoint_step(model) == step
 
 
-def paper_filters_from(filters: Filters, baseline: str, include_empty: bool) -> Filters:
+def paper_filters_from(filters: Filters, include_empty: bool) -> Filters:
     # Summary figures name their own tasks/models/phases. They should not be
     # constrained by CLI M/tau preferences because the paper panels need to use
     # whichever real run exists for each requested model/task combination.
@@ -2661,7 +2661,7 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
 
 
 def make_paper_figures(root: Path, filters: Filters, args: argparse.Namespace) -> None:
-    paper_filters = paper_filters_from(filters, args.paper_baseline, include_empty=args.paper_include_empty)
+    paper_filters = paper_filters_from(filters, include_empty=args.paper_include_empty)
     paper_points = discover_points(root, paper_filters, dedupe=False)
     if not paper_points:
         raise RuntimeError("no points available for paper figures after filtering")
@@ -2676,7 +2676,7 @@ def make_paper_figures(root: Path, filters: Filters, args: argparse.Namespace) -
     if "phase" in requested:
         plot_phase_comparison_figure(paper_points, paper_filters, out_dir / "fig_phase_comparison.pdf", args)
     if "checkpoint" in requested:
-        checkpoint_filters = paper_filters_from(filters, args.paper_baseline, include_empty=True)
+        checkpoint_filters = paper_filters_from(filters, include_empty=True)
         checkpoint_points = discover_points(root, checkpoint_filters, dedupe=False)
         checkpoint_points = ensure_checkpoint_dataset_score_points(
             root,
@@ -2710,7 +2710,7 @@ def plot_single(points: list[PlotPoint], out: Path, args: argparse.Namespace) ->
         label_pad_px=args.label_pad_px,
         label_axis_inset_px=args.label_axis_inset_px,
     )
-    ax.set_xlabel(x_axis_label(points, args.long_labels), labelpad=1.0)
+    ax.set_xlabel(x_axis_label(points), labelpad=1.0)
     ax.set_ylabel(r"Overtopping coverage $U(J)$" if not args.long_labels else r"Overtopping coverage $U(J)$: fraction flipped by discovered agonists", labelpad=1.0)
     build_legend(fig, ax, points, colors, trend_handles, args, include_tasks=True)
     fig.subplots_adjust(**subplot_margins(args, "single"))
@@ -2748,7 +2748,7 @@ def plot_task_grid(points: list[PlotPoint], out: Path, args: argparse.Namespace)
 
     for ax in axes_list[-ncols:]:
         if ax.has_data():
-            ax.set_xlabel(x_axis_label(points, args.long_labels), labelpad=1.0)
+            ax.set_xlabel(x_axis_label(points), labelpad=1.0)
     for ax in axes_list[::ncols]:
         ax.set_ylabel(r"Overtopping coverage $U(J)$", labelpad=1.0)
 
@@ -2805,7 +2805,7 @@ def plot_phase_panels(points: list[PlotPoint], out: Path, args: argparse.Namespa
             label_pad_px=args.label_pad_px,
             label_axis_inset_px=args.label_axis_inset_px,
         )
-        ax.set_xlabel(x_axis_label(subset, args.long_labels), labelpad=1.0)
+        ax.set_xlabel(x_axis_label(subset), labelpad=1.0)
     axes_list[0].set_ylabel(r"Overtopping coverage $U(J)$", labelpad=1.0)
 
     trend_for_legend = [Line2D([0], [0], color="0.15", linestyle="--", linewidth=0.8, label="score-coverage fit")] if any_trend else []

@@ -248,7 +248,7 @@ def add_derived_rule_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["balanced_accuracy_x_dataset_coverage"] = (bal_acc * (np.maximum(cov, 1 - cov))).astype(float)
     return out
 
-def write_rule_metrics_summary(df_all: pd.DataFrame, out_csv: Path, rule_len_cap: int = 30):
+def write_rule_metrics_summary(df_all: pd.DataFrame, out_csv: Path):
     rows = []
     for (col, _label) in RULE_METRICS:
         if col not in df_all.columns:
@@ -742,7 +742,7 @@ def rule_metrics_for_stats_dir(stats_root: Path, out_dir: Path, args) -> pd.Data
 
     out_csv = out_dir / "compare_rule_metrics_distributions_summary.csv"
     out_pdf = out_dir / "compare_rule_metrics_distributions_ecdf.pdf"
-    write_rule_metrics_summary(df_rm, out_csv, rule_len_cap=int(args.rule_length_cap))
+    write_rule_metrics_summary(df_rm, out_csv)
     plot_rule_metrics_ecdf_grid(
         df_rm, out_pdf,
         annotate_sig=True, best_mode=args.best_mode,
@@ -858,7 +858,6 @@ def parse_args():
     ap.add_argument("--thr_max", type=float, default=0.99)
     ap.add_argument("--thr_step", type=float, default=0.01)
     ap.add_argument("--best_mode", type=str, default="tail@0.9")
-    ap.add_argument("--rule_length_cap", type=int, default=30)
     ap.add_argument("--min_rule_dataset_coverage", type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
                     help="Minimum held-out dataset_coverage required before a rule contributes to HQ counts/plots. Use 0 to disable.")
     ap.add_argument("--run_name_regex", type=str, default=None,

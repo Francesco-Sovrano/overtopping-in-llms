@@ -869,7 +869,6 @@ class PrefixCacheBatch:
 	input_ids: torch.Tensor          # [B, T_prompt]
 	attention_mask: torch.Tensor     # [B, T_prompt]
 	padding_side: str           # "left" or "right"
-	input_lengths: List[int]         # python ints
 	all_tokens: torch.Tensor         # [B, T_prompt + max_new_tokens]
 	prompt_len: int
 	max_new_tokens: int
@@ -1033,7 +1032,6 @@ def repeat_prefix_cache_batch(prefix, repeats_per_prompt: int):
 		input_ids=prefix.input_ids.index_select(0, row_idx).contiguous(),
 		attention_mask=prefix.attention_mask.index_select(0, row_idx).contiguous(),
 		padding_side=prefix.padding_side,
-		input_lengths=[prefix.input_lengths[i] for i in row_idx.tolist()],
 		all_tokens=prefix.all_tokens.index_select(0, row_idx).contiguous(),
 		prompt_len=prefix.prompt_len,
 		max_new_tokens=prefix.max_new_tokens,
@@ -1495,15 +1493,11 @@ class LMWrapper:
 				)
 		self.cleanup_after_generate()
 
-		# Normalize lengths to Python ints
-		input_lengths = [int(l) for l in input_lengths]
-
 		return PrefixCacheBatch(
 			batch_texts=batch_texts,
 			input_ids=input_ids,
 			attention_mask=base_mask,
 			padding_side=padding_side,
-			input_lengths=input_lengths,
 			all_tokens=all_tokens,
 			prompt_len=prompt_len,
 			max_new_tokens=max_new_tokens,

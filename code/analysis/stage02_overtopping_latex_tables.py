@@ -122,7 +122,7 @@ def chance_normalized_score(raw_score: float, chance: float) -> float:
     return _shared_chance_normalized_score(raw_score, chance)
 
 
-def score_for_table(task: str, phase: str, raw: float, chance: float) -> float:
+def score_for_table(phase: str, raw: float, chance: float) -> float:
     """Phase-specific score, matching downstream_score(..., score_mode='phase-specific').
 
     Output-only rows correspond to the figure script's decode-only phase and therefore use
@@ -236,7 +236,7 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
 
         raw = raw_task_score(spec["task"], ds)
         chance = chance_baseline(spec["task"], ds, empirical_fsm_chance)
-        score = score_for_table(spec["task"], spec["phase"], raw, chance)
+        score = score_for_table(spec["phase"], raw, chance)
         n_eval = int(glob.get("n_evaluated_rows", 0))
         j = int(glob.get("n_neurons", len(by)))
         u = float(glob.get("union_flip_any_unique_rate", 0.0))

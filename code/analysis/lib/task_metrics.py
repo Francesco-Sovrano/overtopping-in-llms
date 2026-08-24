@@ -137,7 +137,7 @@ def chance_normalized_score(raw: float, chance: float) -> float:
     return min(1.0, max(0.0, (raw - chance) / (1.0 - chance)))
 
 
-def competence(task: str, phase: str, raw: float, chance: float) -> float:
+def competence(phase: str, raw: float, chance: float) -> float:
     """Use raw score for input+output and chance-normalized score for output-only."""
     if phase not in {"Out", "decode-only"}:
         return float(raw)
