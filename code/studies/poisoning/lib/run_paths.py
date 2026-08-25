@@ -116,7 +116,6 @@ def defence_cache_dir(
 
 
 _PROGRESS_CHECKPOINT_RE = re.compile(r"^progress_(\d{3})(?:p(\d))?pct__step_(\d+)$")
-_LEGACY_CHECKPOINT_RE = re.compile(r"^frac_(\d{4})_step_(\d+)$")
 
 
 def _fraction_millis(row: Mapping[str, Any]) -> int:
@@ -142,24 +141,15 @@ def checkpoint_tag(row: Mapping[str, Any]) -> str:
     return checkpoint_progress_label(row)
 
 
-def legacy_checkpoint_tag(row: Mapping[str, Any]) -> str:
-    """Historical physical checkpoint name retained only for migration/resume."""
-    step = int(float(row.get("global_step", 0)))
-    return f"frac_{_fraction_millis(row):04d}_step_{step}"
-
-
 def parse_checkpoint_dirname(name: str) -> tuple[int, int] | None:
-    """Return ``(fraction_millis, global_step)`` for canonical or legacy names."""
+    """Return ``(fraction_millis, global_step)`` for a canonical checkpoint name."""
     value = Path(str(name)).name
     match = _PROGRESS_CHECKPOINT_RE.match(value)
-    if match:
-        whole_pct = int(match.group(1))
-        tenth_pct = int(match.group(2) or 0)
-        return whole_pct * 10 + tenth_pct, int(match.group(3))
-    match = _LEGACY_CHECKPOINT_RE.match(value)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    return None
+    if not match:
+        return None
+    whole_pct = int(match.group(1))
+    tenth_pct = int(match.group(2) or 0)
+    return whole_pct * 10 + tenth_pct, int(match.group(3))
 
 
 def checkpoint_cache_key(row: Mapping[str, Any]) -> str:
@@ -183,7 +173,7 @@ def resolve_manifest_checkpoint_dir(
     names = []
     if raw:
         names.append(Path(raw).name)
-    names.extend([checkpoint_tag(row), legacy_checkpoint_tag(row)])
+    names.append(checkpoint_tag(row))
     deduped = list(dict.fromkeys(name for name in names if name))
     for name in deduped:
         candidate = root / name

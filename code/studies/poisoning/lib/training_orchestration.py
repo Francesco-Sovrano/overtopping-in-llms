@@ -446,7 +446,7 @@ def build_matched_exposure_schedule(
                 "seed": int(args.seed),
                 "n_train": int(train_size),
                 "planned_counterfactual_slots": len(paired_slots),
-                "note": "Legacy Trainer random sampler; exact poison exposure by checkpoint is not precomputed.",
+                "note": "Trainer random sampler; exact poison exposure by checkpoint is not precomputed.",
             },
         )
         return None, None
@@ -661,7 +661,7 @@ def train_and_optionally_evaluate_checkpoints(
             flush=True,
         )
         print(
-            f"[resume] historical trajectory fallback: replaying {condition} from the registered seed "
+            f"[resume] verified replay: replaying {condition} from the registered seed "
             f"into {work_dir} and requiring exact equality at every existing checkpoint before promotion",
             flush=True,
         )

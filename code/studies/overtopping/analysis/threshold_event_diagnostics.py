@@ -45,7 +45,12 @@ from core.high_n_singleton_eval import (
 )
 from core.modeling_and_ablation import LMWrapper, get_device
 from core.text_and_rules import apply_rule_to_features
-from core.threshold_event_shared import activation_hook_spec as shared_activation_hook_spec, collect_reference_activations, safe_layer_label
+from core.threshold_event_shared import (
+    _next_token_id_for_completion,
+    activation_hook_spec as shared_activation_hook_spec,
+    collect_reference_activations,
+    safe_layer_label,
+)
 
 
 def parse_args():
@@ -776,22 +781,6 @@ def _select_rule_conditioned_eval_indices(args, *, baseline: str, scores_df: pd.
     return eval_indices, meta, plan_df
 
 
-def _next_token_id_for_completion(tokenizer, prompt_text: str, completion_text: str):
-    def _ids(text, add_special_tokens):
-        try:
-            return tokenizer(text, add_special_tokens=add_special_tokens)["input_ids"]
-        except Exception:
-            return None
-    for add_special_tokens in (True, False):
-        prompt_ids = _ids(prompt_text, add_special_tokens)
-        full_ids = _ids(f"{prompt_text}{completion_text}", add_special_tokens)
-        if prompt_ids and full_ids and len(full_ids) > len(prompt_ids) and full_ids[:len(prompt_ids)] == prompt_ids:
-            return int(full_ids[len(prompt_ids)])
-    for candidate in (completion_text, f" {completion_text}"):
-        ids = _ids(candidate, False)
-        if ids:
-            return int(ids[0])
-    return None
 
 
 def _completion_text_from_row_for_saliency(task, row, prompt_col):

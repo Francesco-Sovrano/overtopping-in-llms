@@ -28,8 +28,13 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from studies.poisoning.lib.run_paths import defence_cache_dir, resolve_manifest_checkpoint_dir, trajectories_dir, phase_dirname
-from typing import Any, Dict, Iterable, List, Sequence
+from studies.poisoning.lib.run_paths import (
+    defence_cache_dir,
+    phase_dirname,
+    resolve_manifest_checkpoint_dir,
+    trajectories_dir,
+)
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import matplotlib
 
@@ -51,63 +56,90 @@ from studies.poisoning.tasks.registry import get_task_definition, infer_task_fro
 
 
 
-DEFENCE_CACHE_SCHEMA_VERSION = 1
+# Stage-07 cache persistence is intentionally local to this module because no
+# other workflow consumes these files.  Shared path construction remains in
+# run_paths.py.
+DEFENCE_CACHE_SCHEMA_VERSION = 2
+
 
 def _file_signature(path: Path) -> dict[str, Any]:
+    """Return a path-independent content signature."""
     path = Path(path)
     st = path.stat()
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
-    return {"path": str(path.resolve()), "size": int(st.st_size), "sha256": h.hexdigest()}
+    return {"size": int(st.st_size), "sha256": h.hexdigest()}
 
 
-def _checkpoint_signature(checkpoint_dir: str) -> dict[str, Any]:
+def _checkpoint_signature(checkpoint_dir: str | Path) -> dict[str, Any]:
+    """Return a content signature for files that define a checkpoint."""
     root = Path(checkpoint_dir)
     files = []
-    for name in ("adapter_model.safetensors", "adapter_model.bin", "adapter_config.json", "config.json"):
+    for name in (
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+        "adapter_config.json",
+        "config.json",
+    ):
         path = root / name
         if path.is_file():
-            st = path.stat()
-            files.append({"name": name, "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)})
-    return {"path": str(root.resolve()), "files": files}
+            files.append({"name": name, **_file_signature(path)})
+    return {"name": root.name, "files": files}
 
-def _slug(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("_") or "run"
 
-def _defence_cache_identity(*, run_dir: Path, task_name: str, fraction: float, checkpoint_dir: str,
-                            source_fraction: float, source_stats_dir: Path, scores_path: Path,
-                            manifest_path: Path, args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+def _fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _defence_cache_identity(
+    *,
+    run_dir: Path,
+    task_name: str,
+    fraction: float,
+    checkpoint_dir: str,
+    source_fraction: float,
+    source_stats_dir: Path,
+    scores_path: Path,
+    manifest_path: Path,
+    args: Any,
+) -> tuple[str, dict[str, Any]]:
+    """Build the scientific identity of one Stage-07 intervention cache.
+
+    Only parameters that can change the cached model-backed results belong here.
+    ``top_ks`` and ``random_groups`` are deliberately excluded because a cache
+    can be a subset or superset of a later request and can resume missing rows.
+    ``batch_size`` is execution metadata and must never invalidate scientific
+    results.
+    """
     payload = {
         "schema_version": DEFENCE_CACHE_SCHEMA_VERSION,
-        "run_dir": str(run_dir.resolve()),
-        "task": task_name,
+        "run_name": Path(run_dir).name,
+        "task": str(task_name),
         "fraction": float(fraction),
         "checkpoint": _checkpoint_signature(checkpoint_dir),
         "ranking_source_fraction": float(source_fraction),
         "ranking": _file_signature(source_stats_dir / "frozen_candidate_ranking.csv"),
         "scores": _file_signature(scores_path),
         "population_manifest": _file_signature(manifest_path),
-        "intervention": args.intervention,
-        "eval_intervention": args.eval_intervention,
+        "intervention": str(args.intervention),
+        "eval_intervention": str(args.eval_intervention),
         "decode_only": bool(args.decode_only),
-        "top_ks": [int(x) for x in args.top_ks],
         "max_pos": int(args.max_pos),
         "max_neg": int(args.max_neg),
         "max_clean": int(args.max_clean),
         "max_task_specificity": int(args.max_task_specificity),
-        "random_groups": int(args.random_groups),
         "mean_points": int(args.mean_points),
-        "batch_size": int(args.batch_size),
         "seed": int(args.seed),
         "ci_level": float(args.ci_level),
         "bootstrap": int(args.bootstrap),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest(), payload
+    return _fingerprint(payload), payload
 
-def _cache_files(args: argparse.Namespace, run_dir: Path, task_name: str, fraction: float) -> tuple[Path, Path, Path]:
+
+def _cache_files(args: Any, run_dir: Path, task_name: str, fraction: float) -> tuple[Path, Path, Path]:
     phase = "output_only" if args.decode_only else "input_output"
     d = defence_cache_dir(
         args.cache_dir,
@@ -118,26 +150,204 @@ def _cache_files(args: argparse.Namespace, run_dir: Path, task_name: str, fracti
     )
     return d / "candidate_rows.csv", d / "matched_random_rows.csv", d / "cache_manifest.json"
 
-def _load_defence_cache(candidate_path: Path, random_path: Path, manifest_path: Path, fingerprint: str):
-    if not manifest_path.is_file() or not candidate_path.is_file() or not random_path.is_file():
-        return [], []
+
+def _read_cache_csv(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    try:
+        return pd.read_csv(path).to_dict("records")
+    except pd.errors.EmptyDataError:
+        return []
+
+
+def _basename(value: Any) -> str:
+    text = str(value or "")
+    return Path(text).name if text else ""
+
+
+def _number_equal(a: Any, b: Any, tol: float = 1e-12) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= tol
+    except (TypeError, ValueError):
+        return False
+
+
+def _signature_matches(observed: Any, expected: Any) -> bool:
+    if not isinstance(observed, Mapping) or not isinstance(expected, Mapping):
+        return False
+    observed_sha = str(observed.get("sha256", ""))
+    expected_sha = str(expected.get("sha256", ""))
+    if observed_sha and expected_sha:
+        return observed_sha == expected_sha
+    try:
+        return int(observed.get("size", -1)) == int(expected.get("size", -2))
+    except (TypeError, ValueError):
+        return False
+
+
+def _checkpoint_matches(observed: Any, expected: Any) -> bool:
+    if not isinstance(observed, Mapping) or not isinstance(expected, Mapping):
+        return False
+
+    observed_name = str(observed.get("name", "")) or _basename(observed.get("path"))
+    expected_name = str(expected.get("name", "")) or _basename(expected.get("path"))
+    if observed_name and expected_name and observed_name != expected_name:
+        return False
+
+    observed_files = {
+        str(row.get("name")): row
+        for row in observed.get("files", [])
+        if isinstance(row, Mapping) and row.get("name")
+    }
+    expected_files = {
+        str(row.get("name")): row
+        for row in expected.get("files", [])
+        if isinstance(row, Mapping) and row.get("name")
+    }
+    if set(observed_files) != set(expected_files):
+        return False
+    return all(_signature_matches(observed_files[name], expected_files[name]) for name in expected_files)
+
+
+def _canonical_identity_mismatches(observed: Mapping[str, Any], expected: Mapping[str, Any]) -> list[str]:
+    """Return scientific identity fields that make a canonical cache unusable.
+
+    This intentionally ignores path-only/execution-only manifest fields. It also
+    understands the manifest shape already present in canonical caches, where a
+    run may be recorded as ``run_dir`` rather than ``run_name`` and checkpoint
+    files may contain size/mtime instead of a content hash.
+    """
+    changed: list[str] = []
+
+    observed_run = str(observed.get("run_name", "")) or _basename(observed.get("run_dir"))
+    if observed_run != str(expected.get("run_name", "")):
+        changed.append("run_name")
+
+    exact_fields = (
+        "task",
+        "intervention",
+        "eval_intervention",
+        "decode_only",
+        "max_pos",
+        "max_neg",
+        "max_clean",
+        "max_task_specificity",
+        "mean_points",
+        "seed",
+        "bootstrap",
+    )
+    for key in exact_fields:
+        if observed.get(key) != expected.get(key):
+            changed.append(key)
+
+    for key in ("fraction", "ranking_source_fraction", "ci_level"):
+        if not _number_equal(observed.get(key), expected.get(key)):
+            changed.append(key)
+
+    if not _checkpoint_matches(observed.get("checkpoint"), expected.get("checkpoint")):
+        changed.append("checkpoint")
+
+    for key in ("ranking", "scores", "population_manifest"):
+        if not _signature_matches(observed.get(key), expected.get(key)):
+            changed.append(key)
+
+    return changed
+
+
+def _load_defence_cache(
+    candidate_path: Path,
+    random_path: Path,
+    manifest_path: Path,
+    fingerprint: str,
+    *,
+    expected_identity: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Load one canonical cache leaf and explain misses explicitly."""
+    cache_dir = manifest_path.parent
+    if not manifest_path.is_file():
+        print(f"[defence-cache] miss {cache_dir}: missing cache_manifest.json", flush=True)
+        return [], [], "missing_manifest"
+
     try:
         meta = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if meta.get("fingerprint") != fingerprint:
-            return [], []
-        cdf = pd.read_csv(candidate_path)
-        rdf = pd.read_csv(random_path)
-        return cdf.to_dict("records"), rdf.to_dict("records")
     except Exception as exc:
-        print(f"[defence-cache] ignoring unreadable cache {manifest_path.parent}: {exc}", flush=True)
-        return [], []
+        print(f"[defence-cache] miss {cache_dir}: unreadable cache_manifest.json: {exc}", flush=True)
+        return [], [], "unreadable_manifest"
 
-def _save_defence_cache(candidate_path: Path, random_path: Path, manifest_path: Path, *, fingerprint: str,
-                        identity: dict[str, Any], rows: Sequence[dict[str, Any]], random_rows: Sequence[dict[str, Any]]) -> None:
+    observed_fingerprint = str(meta.get("fingerprint", ""))
+    observed_identity = meta.get("identity") if isinstance(meta.get("identity"), Mapping) else {}
+
+    if observed_fingerprint != fingerprint:
+        changed = _canonical_identity_mismatches(observed_identity, expected_identity)
+        if changed:
+            print(
+                f"[defence-cache] miss {cache_dir}: scientific identity mismatch: {', '.join(changed)}",
+                flush=True,
+            )
+            return [], [], "identity_mismatch"
+        print(
+            f"[defence-cache] hit {cache_dir}: manifest fingerprint differed only in non-scientific/execution metadata; normalizing manifest",
+            flush=True,
+        )
+        # Same canonical cache and same scientific inputs. Normalize the manifest
+        # so subsequent runs are an exact fingerprint hit.
+        manifest_path.write_text(
+            json.dumps({"fingerprint": fingerprint, "identity": dict(expected_identity)}, indent=2),
+            encoding="utf-8",
+        )
+
+    rows = _read_cache_csv(candidate_path)
+    random_rows = _read_cache_csv(random_path)
+    if not rows and not random_rows:
+        missing = [p.name for p in (candidate_path, random_path) if not p.is_file()]
+        detail = f"missing {', '.join(missing)}" if missing else "cache row files contain no completed evaluations"
+        print(f"[defence-cache] empty {cache_dir}: {detail}", flush=True)
+        return [], [], "empty"
+
+    return rows, random_rows, "hit"
+
+
+def _load_canonical_defence_cache(
+    *,
+    args: Any,
+    run_dir: Path,
+    task_name: str,
+    fraction: float,
+    fingerprint: str,
+    identity: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Path]:
+    """Load only the canonical task/run defence cache path."""
+    candidate_path, random_path, manifest_path = _cache_files(args, run_dir, task_name, fraction)
+    rows, random_rows, _ = _load_defence_cache(
+        candidate_path,
+        random_path,
+        manifest_path,
+        fingerprint,
+        expected_identity=identity,
+    )
+    return rows, random_rows, manifest_path
+
+
+def _save_defence_cache(
+    candidate_path: Path,
+    random_path: Path,
+    manifest_path: Path,
+    *,
+    fingerprint: str,
+    identity: Mapping[str, Any],
+    rows: Sequence[dict[str, Any]],
+    random_rows: Sequence[dict[str, Any]],
+) -> None:
+    """Persist cache progress in the canonical leaf."""
     candidate_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(list(rows)).to_csv(candidate_path, index=False)
     pd.DataFrame(list(random_rows)).to_csv(random_path, index=False)
-    manifest_path.write_text(json.dumps({"fingerprint": fingerprint, "identity": identity}, indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps({"fingerprint": fingerprint, "identity": dict(identity)}, indent=2),
+        encoding="utf-8",
+    )
+
+
 
 def _parse_csv_list(s: str) -> List[str]:
     return [x.strip() for x in str(s).split(",") if x.strip()]
@@ -679,24 +889,46 @@ def _run_one(
     cache_candidate_path, cache_random_path, cache_manifest_path = _cache_files(
         args, run_dir, task_name, fraction
     )
-    cached_rows, cached_random_rows = _load_defence_cache(
-        cache_candidate_path, cache_random_path, cache_manifest_path, cache_fingerprint
+    cached_rows, cached_random_rows, cache_manifest_path = _load_canonical_defence_cache(
+        args=args,
+        run_dir=run_dir,
+        task_name=task_name,
+        fraction=fraction,
+        fingerprint=cache_fingerprint,
+        identity=cache_identity,
     )
-    if cached_rows:
+
+    # A canonical cache may contain a superset of a later request. Filter it to
+    # the current top-k/random-draw request instead of invalidating or returning
+    # stale extra rows. Conversely, if the request asks for more rows, the
+    # existing subset is retained and only missing work is evaluated.
+    ranking_len = len(_load_frozen_ranking(source_stats_dir))
+    expected_ks = {min(int(k), ranking_len) for k in args.top_ks if int(k) > 0}
+    expected_ks.discard(0)
+    cached_rows = [r for r in cached_rows if int(r.get("k", -1)) in expected_ks]
+    cached_random_rows = [
+        r for r in cached_random_rows
+        if int(r.get("k", -1)) in expected_ks
+        and 0 <= int(r.get("draw", -1)) < int(args.random_groups)
+    ]
+
+    if cached_rows or cached_random_rows:
         cached_ks = {int(r["k"]) for r in cached_rows}
-        expected_ks = {min(int(k), len(_load_frozen_ranking(source_stats_dir))) for k in args.top_ks if int(k) > 0}
-        expected_ks.discard(0)
         random_counts = Counter(int(r["k"]) for r in cached_random_rows)
-        complete = expected_ks.issubset(cached_ks) and all(random_counts[k] >= int(args.random_groups) for k in expected_ks)
+        complete = expected_ks.issubset(cached_ks) and all(
+            random_counts[k] >= int(args.random_groups) for k in expected_ks
+        )
         if complete:
             print(
-                f"[defence-cache] hit {task_name} frac={fraction:g}: reused {len(cached_rows)} coalition rows and "
+                f"[defence-cache] complete hit {task_name} frac={fraction:g}: reused {len(cached_rows)} coalition rows and "
                 f"{len(cached_random_rows)} matched-random rows from {cache_manifest_path.parent}",
                 flush=True,
             )
             return cached_rows, cached_random_rows
         print(
-            f"[defence-cache] partial hit {task_name} frac={fraction:g}: resuming missing coalition/random evaluations",
+            f"[defence-cache] partial hit {task_name} frac={fraction:g}: "
+            f"cached k={sorted(cached_ks)} random_counts={dict(sorted(random_counts.items()))}; "
+            "loading model only for missing evaluations",
             flush=True,
         )
 
@@ -879,6 +1111,9 @@ def _run_one(
         unit="group",
     ):
         existing_candidate = next((r for r in rows if int(r["k"]) == int(k)), None)
+        existing_random = [r for r in raw_random_rows if int(r["k"]) == int(k)]
+        random_rates: List[float] = [float(r["trigger_lift_destroy_rate"]) for r in existing_random]
+
         if existing_candidate is None:
             candidate = _evaluate_group(
                 model=model, task=task, group=group, pos_examples=pos_examples, neg_examples=neg_examples,
@@ -887,12 +1122,74 @@ def _run_one(
                 args=args, mean_activations=mean_activations, baseline_pos_vec=baseline_pos_vec,
                 clean_baseline_vec=clean_baseline_vec, ordinary_target_baseline_vec=ordinary_target_baseline_vec,
             )
+            random_stats = _random_summary(
+                float(candidate["destroy_rate"]), random_rates, args,
+                args.seed + _stable_int(task_name, fraction, "random_summary", k),
+            )
+            existing_candidate = {
+                "task": task_name,
+                "run_dir": str(run_dir),
+                "condition": condition,
+                "fraction": fraction,
+                "global_step": int(row.get("global_step", -1)),
+                "checkpoint_dir": checkpoint_dir,
+                "stats_dir": str(stats_dir),
+                "population_manifest": str(manifest_path),
+                "ranking_source": "prior_checkpoint_frozen_discovery_ranking",
+                "ranking_source_fraction": source_fraction,
+                "ranking_source_stats_dir": str(source_stats_dir),
+                "ranking_source_policy": "latest_strictly_prior_completed_checkpoint",
+                "k": int(k),
+                "n_available_candidates": int(len(ranking)),
+                "n_pos": int(len(pos_examples)),
+                "n_neg": int(len(neg_examples)),
+                "n_clean": int(len(clean_examples)),
+                "n_ordinary_target_positive": int(len(ordinary_target_examples)),
+                **specificity_meta,
+                "baseline_reproduction_rate_on_cached_lift_successes": float(baseline_pos_vec.mean()),
+                "trigger_lift_destroy_count": candidate["destroy_count"],
+                "trigger_lift_destroy_denominator": candidate["destroy_denominator"],
+                "trigger_lift_destroy_rate": candidate["destroy_rate"],
+                "trigger_lift_destroy_ci_low": candidate["destroy_ci_low"],
+                "trigger_lift_destroy_ci_high": candidate["destroy_ci_high"],
+                "nonlift_to_lift_count": candidate["nonlift_to_lift_count"],
+                "nonlift_to_lift_rate": candidate["nonlift_to_lift_rate"],
+                "nonlift_to_lift_ci_low": candidate["nonlift_to_lift_ci_low"],
+                "nonlift_to_lift_ci_high": candidate["nonlift_to_lift_ci_high"],
+                "paired_clean_baseline_accuracy": candidate["paired_clean_baseline_accuracy"],
+                "paired_clean_accuracy_after_topk": candidate["paired_clean_accuracy_after"],
+                "paired_clean_accuracy_ci_low": candidate["paired_clean_accuracy_ci_low"],
+                "paired_clean_accuracy_ci_high": candidate["paired_clean_accuracy_ci_high"],
+                "paired_clean_accuracy_drop": candidate["paired_clean_accuracy_drop"],
+                "paired_clean_accuracy_drop_ci_low": candidate["paired_clean_accuracy_drop_ci_low"],
+                "paired_clean_accuracy_drop_ci_high": candidate["paired_clean_accuracy_drop_ci_high"],
+                "control_target_induction_count": candidate["control_target_induction_count"],
+                "control_target_induction_denominator": candidate["control_target_induction_denominator"],
+                "control_target_induction_rate": candidate["control_target_induction_rate"],
+                "control_target_induction_ci_low": candidate["control_target_induction_ci_low"],
+                "control_target_induction_ci_high": candidate["control_target_induction_ci_high"],
+                "ordinary_target_destroy_count": candidate["ordinary_target_destroy_count"],
+                "ordinary_target_destroy_denominator": candidate["ordinary_target_destroy_denominator"],
+                "ordinary_target_destroy_rate": candidate["ordinary_target_destroy_rate"],
+                "ordinary_target_destroy_ci_low": candidate["ordinary_target_destroy_ci_low"],
+                "ordinary_target_destroy_ci_high": candidate["ordinary_target_destroy_ci_high"],
+                "trigger_specificity_gap": candidate["trigger_specificity_gap"],
+                **random_stats,
+                "group": json.dumps(group, sort_keys=True),
+            }
+            rows.append(existing_candidate)
+            # Persist the candidate immediately.  If the process stops during
+            # matched-random evaluation, the expensive candidate result survives.
+            _save_defence_cache(
+                cache_candidate_path, cache_random_path, cache_manifest_path,
+                fingerprint=cache_fingerprint, identity=cache_identity,
+                rows=rows, random_rows=raw_random_rows,
+            )
         else:
             candidate = {
                 "destroy_rate": float(existing_candidate["trigger_lift_destroy_rate"]),
             }
-        existing_random = [r for r in raw_random_rows if int(r["k"]) == int(k)]
-        random_rates: List[float] = [float(r["trigger_lift_destroy_rate"]) for r in existing_random]
+
         start_draw = len(existing_random)
         for draw, random_group in enumerate(
             tqdm(
@@ -941,67 +1238,28 @@ def _run_one(
                 "control_target_induction_rate": rnd["control_target_induction_rate"],
                 "group": json.dumps(random_group, sort_keys=True),
             })
+            # Save after every matched-random draw so an interrupted long run
+            # resumes at draw N+1 instead of repeating draws 0..N.
+            random_stats = _random_summary(
+                float(candidate["destroy_rate"]), random_rates, args,
+                args.seed + _stable_int(task_name, fraction, "random_summary", k),
+            )
+            existing_candidate.update(random_stats)
+            _save_defence_cache(
+                cache_candidate_path, cache_random_path, cache_manifest_path,
+                fingerprint=cache_fingerprint, identity=cache_identity,
+                rows=rows, random_rows=raw_random_rows,
+            )
+
         random_stats = _random_summary(
             float(candidate["destroy_rate"]), random_rates, args,
             args.seed + _stable_int(task_name, fraction, "random_summary", k),
         )
-        if existing_candidate is not None:
-            existing_candidate.update(random_stats)
-        if existing_candidate is None:
-            rows.append({
-            "task": task_name,
-            "run_dir": str(run_dir),
-            "condition": condition,
-            "fraction": fraction,
-            "global_step": int(row.get("global_step", -1)),
-            "checkpoint_dir": checkpoint_dir,
-            "stats_dir": str(stats_dir),
-            "population_manifest": str(manifest_path),
-            "ranking_source": "prior_checkpoint_frozen_discovery_ranking",
-            "ranking_source_fraction": source_fraction,
-            "ranking_source_stats_dir": str(source_stats_dir),
-            "ranking_source_policy": "latest_strictly_prior_completed_checkpoint",
-            "k": int(k),
-            "n_available_candidates": int(len(ranking)),
-            "n_pos": int(len(pos_examples)),
-            "n_neg": int(len(neg_examples)),
-            "n_clean": int(len(clean_examples)),
-            "n_ordinary_target_positive": int(len(ordinary_target_examples)),
-            **specificity_meta,
-            "baseline_reproduction_rate_on_cached_lift_successes": float(baseline_pos_vec.mean()),
-            "trigger_lift_destroy_count": candidate["destroy_count"],
-            "trigger_lift_destroy_denominator": candidate["destroy_denominator"],
-            "trigger_lift_destroy_rate": candidate["destroy_rate"],
-            "trigger_lift_destroy_ci_low": candidate["destroy_ci_low"],
-            "trigger_lift_destroy_ci_high": candidate["destroy_ci_high"],
-            "nonlift_to_lift_count": candidate["nonlift_to_lift_count"],
-            "nonlift_to_lift_rate": candidate["nonlift_to_lift_rate"],
-            "nonlift_to_lift_ci_low": candidate["nonlift_to_lift_ci_low"],
-            "nonlift_to_lift_ci_high": candidate["nonlift_to_lift_ci_high"],
-            "paired_clean_baseline_accuracy": candidate["paired_clean_baseline_accuracy"],
-            "paired_clean_accuracy_after_topk": candidate["paired_clean_accuracy_after"],
-            "paired_clean_accuracy_ci_low": candidate["paired_clean_accuracy_ci_low"],
-            "paired_clean_accuracy_ci_high": candidate["paired_clean_accuracy_ci_high"],
-            "paired_clean_accuracy_drop": candidate["paired_clean_accuracy_drop"],
-            "paired_clean_accuracy_drop_ci_low": candidate["paired_clean_accuracy_drop_ci_low"],
-            "paired_clean_accuracy_drop_ci_high": candidate["paired_clean_accuracy_drop_ci_high"],
-            "control_target_induction_count": candidate["control_target_induction_count"],
-            "control_target_induction_denominator": candidate["control_target_induction_denominator"],
-            "control_target_induction_rate": candidate["control_target_induction_rate"],
-            "control_target_induction_ci_low": candidate["control_target_induction_ci_low"],
-            "control_target_induction_ci_high": candidate["control_target_induction_ci_high"],
-            "ordinary_target_destroy_count": candidate["ordinary_target_destroy_count"],
-            "ordinary_target_destroy_denominator": candidate["ordinary_target_destroy_denominator"],
-            "ordinary_target_destroy_rate": candidate["ordinary_target_destroy_rate"],
-            "ordinary_target_destroy_ci_low": candidate["ordinary_target_destroy_ci_low"],
-            "ordinary_target_destroy_ci_high": candidate["ordinary_target_destroy_ci_high"],
-            "trigger_specificity_gap": candidate["trigger_specificity_gap"],
-            **random_stats,
-            "group": json.dumps(group, sort_keys=True),
-            })
+        existing_candidate.update(random_stats)
         _save_defence_cache(
-            cache_candidate_path, cache_random_path, cache_manifest_path, fingerprint=cache_fingerprint,
-            identity=cache_identity, rows=rows, random_rows=raw_random_rows,
+            cache_candidate_path, cache_random_path, cache_manifest_path,
+            fingerprint=cache_fingerprint, identity=cache_identity,
+            rows=rows, random_rows=raw_random_rows,
         )
         print(
             f"[topk] {task_name} frac={fraction:g} k={k}: "

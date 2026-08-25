@@ -308,4 +308,6 @@ For each defended run, inference-defence cache entries are written to:
 POISONING_CACHE_ROOT/<task>/<run>/defence/<input_output|output_only>/fraction_<fraction>/
 ```
 
+The inference-defence loader uses only this canonical location. Cache validity is based on the scientific inputs that determine the intervention result: checkpoint contents, frozen ranking, evaluation scores, population manifest, intervention mode, sampling limits, seed, and statistical settings. Execution-only settings such as batch size, the requested top-k list, and the requested number of matched-random draws do not invalidate existing model evaluations. Stage 07 writes progress after the candidate coalition and after every matched-random draw, so rerunning an interrupted job resumes partial work.
+
 The `<run>` component is the basename of the actual poisoning run directory. Complete matching cache entries are reused before loading the defended checkpoint model.

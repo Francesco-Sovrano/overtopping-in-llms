@@ -1,14 +1,22 @@
-# Poisoning outputs and filesystem policy
+# Poisoning outputs and cache layout
 
-Poisoning experiments keep four kinds of artifacts separate: per-run scientific data, regenerable caches, final defence/reporting outputs, and manuscript figures.
+Each poisoning task/model/seed run has one persistent run directory under `data/poisoning/<task>/`. The root launcher constructs run IDs from the study name, model slug, and seed.
 
-## Per-run scientific data
-
-Each baseline, protected, or random-protected training run has the same stage layout:
+Example:
 
 ```text
-data/poisoning/<task>/<run>/
+data/poisoning/grammar/
+└── confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
+```
+
+## Run-local stages
+
+```text
+<run_dir>/
 ├── 01_training_checkpoints/
+│   ├── metadata/
+│   ├── clean/
+│   └── poisoned/
 ├── 02_evaluation_cohorts/
 ├── 03_checkpoint_causal_discovery/
 ├── 04_condition_comparisons/
@@ -16,120 +24,91 @@ data/poisoning/<task>/<run>/
 └── 06_circuit_overlap_analysis/
 ```
 
-`01_training_checkpoints/metadata/run_config.json` and `checkpoint_manifest_all.csv` define run identity and checkpoint provenance. Evaluation cohorts are persistent scientific inputs because changing them changes the estimand. Checkpoint causal-discovery outputs are also persistent inputs to later defence analyses.
+### Stage 01 — training checkpoints
 
-The root launcher creates the ordinary baseline run plus, when `RUN_TRAINING_PROTECTION=1` (the default), two matched training-protection runs whose names end in `__protected` and `__random_protected`.
-
-## Final poisoning stages
-
-The per-run pipeline ends at stage 06. Study-level outputs continue that numbering instead of switching to an unrelated `summary/` tree:
+Contains clean and poisoned checkpoint trajectories plus metadata such as run configuration and checkpoint manifests. Canonical checkpoint directories use labels such as:
 
 ```text
-data/poisoning/final/<study>/
-├── 07_defence_evaluation/
-│   └── <task>/
-│       └── <model>/
-│           └── seed_<seed>/
-│               └── <phase>/
-│                   ├── defence_overview.md
-│                   ├── defence_overview.json
-│                   ├── inference_time/
-│                   │   ├── backdoor_lift_cumulative_topk_ablation.csv
-│                   │   ├── matched_random_group_results.csv
-│                   │   ├── backdoor_lift_cumulative_topk_ablation.pdf
-│                   │   ├── defence_summary.md
-│                   │   └── defence_configuration.json
-│                   └── training_time/
-│                       ├── matched_training_identity.json
-│                       ├── training_protection_trajectory.csv
-│                       ├── training_protection_key_metrics.csv
-│                       ├── training_protection.pdf
-│                       └── training_protection_summary.md
-└── 08_cross_seed_aggregation/
-    ├── tables/
-    │   ├── checkpoint_trajectories_all_seeds.csv
-    │   ├── checkpoint_metrics_by_model_across_seeds.csv
-    │   ├── developmental_timing_by_seed.csv
-    │   ├── developmental_timing_across_seeds.csv
-    │   └── aggregation_config.json
-    └── figures/
-        ├── poisoning_primary_trajectories.pdf
-        ├── poisoning_specificity_checks.pdf
-        ├── poisoning_inference_time_defence.pdf
-        └── poisoning_training_time_defence.pdf
+progress_025pct__step_0063
 ```
 
-`defence_overview.md` is the first file to open for a task/model/seed/phase. It explicitly reports both defence mechanisms and whether either one is missing. The root launcher runs training-time protection by default; set `RUN_TRAINING_PROTECTION=0` only when intentionally omitting that mechanism.
+The checkpoint manifest is the authoritative mapping from condition/fraction/step to checkpoint directory.
 
-### Prospective inference-time defence
+### Stage 02 — evaluation cohorts
 
-For checkpoint `t`, channel identities and their order come only from the latest strictly earlier checkpoint with a completed frozen discovery ranking. The checkpoint being defended is evaluation-only and cannot select its own coalition. Candidate coalitions are compared with structurally matched random noncandidate coalitions and with ordinary-task collateral-damage controls.
+Contains deterministic rows used by downstream checkpoint evaluation. Cohorts are fixed before causal comparisons so candidate and control analyses use the intended paired populations.
 
-### Training-time protection
+### Stage 03 — checkpoint causal discovery
 
-The protected training arm freezes direct writes to overtopping channels selected from the pre-poisoning virgin-model ordinary-task analysis. The matched-random arm protects the same type/number of channels selected randomly. The comparison uses exactly the `poisoned`, `protected_poisoned`, and `random_protected_poisoned` trajectory rows.
+Contains per-checkpoint outputs from the shared causal pipeline. Trigger-lift discovery and ordinary-correctness controls use separate endpoint-specific downstream artifacts while reusing appropriate model-I/O caches.
 
-## Defence caches
+### Stage 04 — condition comparisons
 
-Regenerable inference-defence caches live inside the same task/run namespace as the checkpoint-discovery cache. The run directory name is reused verbatim as the cache run identity, so all regenerable artifacts for one poisoning run remain together:
+Contains clean-versus-poisoned behavioral comparison tables and associated checkpoint-level summaries.
+
+### Stage 05 — behavior trajectories
+
+Contains checkpoint trajectories derived from paired behavior and causal outputs, including CSV summaries and plots. Phase-specific subdirectories use presentation labels such as `prompt_and_generation` and `generation_only`.
+
+### Stage 06 — circuit overlap
+
+Contains checkpoint circuit-comparison tables, including overlap against the configured virgin-model agonist population where available.
+
+## Stage 07 — defence evaluation
+
+Study-level Stage 07 outputs are written under:
 
 ```text
-cache/poisoning/<task>/<run>/
-├── checkpoint_causal_discovery/
-│   └── <phase>/adaptive_circuit_discovery/
-└── defence/
-    └── <input_output|output_only>/
-        └── fraction_<fraction>/
-            ├── candidate_rows.csv
-            ├── matched_random_rows.csv
-            └── cache_manifest.json
+data/poisoning/final/<study_name>/07_defence_evaluation/
+  <task>/<model_slug>/seed_<seed>/<phase>/
 ```
 
-For example, the grammar run `confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13` at fraction `0.25` uses:
+`<phase>` is `prompt_and_generation` or `generation_only` in result directories.
+
+Inference-time outputs live under `inference_time/`; training-time protection outputs live under `training_time/`.
+
+### Inference-defence cache
+
+The expensive model-backed cumulative-ablation evaluations are cached at exactly one location:
 
 ```text
-cache/poisoning/grammar/confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/defence/input_output/fraction_0.250000/
+cache/poisoning/<task>/<run_id>/defence/<phase>/fraction_<fraction>/
 ```
 
-Grammar and arithmetic therefore remain separated immediately below `cache/poisoning/`, and defence is a property of a specific run rather than a parallel top-level cache branch. Training-time protection reuses the normal training/checkpoint and causal-discovery resume mechanisms.
+where cache `<phase>` is `input_output` or `output_only`.
 
-## Final manuscript results
-
-`generate_results.sh` no longer creates `data/poisoning/summary/paper_inputs` or a figure-less `summary/matrix` directory. Derived cross-seed reporting tables and figures are placed together under:
+For grammar, seed 13, input/output intervention, and the 25% checkpoint:
 
 ```text
-results/poisoning/
-├── 01_cross_seed_tables/
-└── 02_figures/
-    ├── poisoning_primary_trajectories.pdf
-    ├── poisoning_specificity_checks.pdf
-    ├── poisoning_inference_time_defence.pdf
-    └── poisoning_training_time_defence.pdf
+cache/poisoning/grammar/
+  confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
+  defence/input_output/fraction_0.250000/
 ```
 
-The defence figures are rendered from all available `07_defence_evaluation` study directories.
+A cache leaf contains:
 
-## Resume and collision policy
-
-The code does not silently repurpose a nonempty run directory with incompatible metadata. Training resumes only when the saved run configuration identifies the same experiment. Defence caches are separately provenance-keyed as described above. If a cache is incompatible, the code recomputes it rather than requiring manual deletion.
-
-## Legacy checkpoint-label migration
-
-New training snapshots, checkpoint analysis directories, and cache labels use
-`progress_010pct__step_0025` style names.  Existing `frac_0100_step_25`
-directories are readable for resume compatibility but are legacy names.
-Preserve expensive model snapshots by migrating them rather than deleting them:
-
-```bash
-cd code
-python3 -m studies.poisoning.migrate_legacy_checkpoint_labels \
-  --run_dirs ../data/poisoning/grammar/<run>,../data/poisoning/arithmetic/<run>
-python3 -m studies.poisoning.migrate_legacy_checkpoint_labels \
-  --run_dirs ../data/poisoning/grammar/<run>,../data/poisoning/arithmetic/<run> \
-  --apply
+```text
+candidate_rows.csv
+matched_random_rows.csv
+cache_manifest.json
 ```
 
-The first command is a dry run.  The migration renames exact legacy checkpoint
-or checkpoint-result directory names and rewrites authoritative checkpoint
-manifests.  Regenerable caches and aggregate reports should be deleted and
-recomputed instead of moved.
+`candidate_rows.csv` stores completed cumulative candidate-coalition evaluations. `matched_random_rows.csv` stores completed matched-random draws. `cache_manifest.json` records the scientific identity used to determine whether those rows apply to the requested evaluation.
+
+The cache is resumable. Candidate results are persisted when completed, and matched-random results are persisted after each draw. A rerun reuses completed rows and evaluates only missing requested work when the manifest identity is compatible.
+
+Changing execution-only settings such as batch size does not change the scientific result represented by a completed cached row. Changes to scientific inputs such as checkpoint content, frozen ranking, cohort/score inputs, intervention semantics, sample limits, or seed make the cache inapplicable and are reported as an explicit cache miss.
+
+## Stage 08 — cross-seed aggregation
+
+Cross-seed tables and figures are written under:
+
+```text
+data/poisoning/final/<study_name>/08_cross_seed_aggregation/
+```
+
+Stage 08 combines matched task/model/seed cells only after the required per-seed stages are available.
+
+## `cache/` versus `data/`
+
+Delete `cache/` only when the corresponding expensive computations can be regenerated. Do not treat `data/` as disposable: training manifests, checkpoints, fixed cohorts, and completed scientific outputs are persistent experiment artifacts.

@@ -36,8 +36,6 @@ studies/overtopping/analysis/
     rule_metrics.py
     task_metrics.py
 
-  tools/
-    recover_primary_directional.py
 ```
 
 The numbered scripts form the standard final-results sequence. Utilities without
@@ -376,7 +374,7 @@ At minimum, validate the package after code changes with:
 
 ```bash
 cd code
-python3 -m compileall -q analysis
+python3 -m compileall -q studies/overtopping/analysis
 python3 -m reporting.generate_final_results --help
 python3 -m studies.overtopping.analysis.stage02_overtopping_latex_tables --help
 python3 -m studies.overtopping.analysis.stage06_competence_vs_overtopping_figures --help

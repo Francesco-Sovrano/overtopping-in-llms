@@ -1,51 +1,46 @@
-# Documentation
+# Documentation guide
 
-This documentation is written for first-time readers. The repository contains two study-specific workflows that reuse one causal-intervention engine.
+This repository studies causal intervention channels in language models through two experimental programmes: overtopping analysis and poisoning/backdoor analysis. Both studies use the same causal-intervention pipeline and reusable model/task primitives.
 
-Unless a command explicitly starts from repository root, Python module commands assume:
+A first-time reader should use the documentation in this order:
 
-```bash
-cd code
+1. [Getting started](getting-started.md) — environment, installation, validation, and entry points.
+2. [Repository layout](repository-layout.md) — source ownership, persistent data, caches, and results.
+3. [Core concepts](concepts.md) — tasks, features, rules, channels, interventions, held-out evaluation, and terminology.
+4. [Shared causal pipeline](pipeline.md) — Stages 01–08 and their artifacts.
+5. [Overtopping experiments](overtopping-experiments.md) — experiment catalogue and execution.
+6. [Overtopping analysis](overtopping-analysis.md) — paper-facing metrics, figures, and ordered analysis stages.
+7. [Poisoning overview](poisoning-overview.md) — complete poisoning workflow and stage map.
+8. [Poisoning protocol](poisoning-protocol.md) — experimental design and confirmatory comparisons.
+9. [Poisoning configuration](poisoning-configuration.md) — environment variables and runtime controls.
+10. [Poisoning outputs](poisoning-outputs.md) — run directory, cache directory, and final outputs.
+11. [Interpretation and limitations](interpretation-and-limitations.md) — what the measurements support and what they do not establish.
+12. [Troubleshooting](troubleshooting.md) — validation, cache diagnosis, missing artifacts, and common runtime failures.
+
+[EAP / EAP-IG](eap.md) documents the edge-attribution implementation used where EAP-based circuit discovery is configured.
+
+## Source packages
+
+The Python import root is `code/`:
+
+```text
+code/
+├── core/                    reusable task/model/intervention primitives
+├── pipeline/                shared causal pipeline
+├── reporting/               aggregate/final-result orchestration
+├── studies/
+│   ├── overtopping/         overtopping experiment and analysis code
+│   └── poisoning/           poisoning training, causal analysis, and defence
+└── docs/                    documentation
 ```
 
-## Read first
+The repository root contains the main shell entry points:
 
-1. [Getting started](getting-started.md) — install, validate, and preview both studies.
-2. [Repository layout](repository-layout.md) — understand where shared code, study code, artifacts, caches, and reports live.
-3. [Architecture](architecture.md) — understand package ownership and dependency direction.
-4. [Core concepts](concepts.md) — intervention, phase, evaluation, candidate-set, and provenance terminology.
+```text
+run_overtopping_experiments.sh
+run_poisoning_experiments.sh
+generate_results.sh
+setup.sh
+```
 
-## Overtopping study
-
-1. [Overtopping experiment catalogue](overtopping-experiments.md) — 28 primary and 11 auxiliary configurations.
-2. [Shared numbered pipeline](pipeline.md) — causal stages 01–08 and task overrides.
-3. [Overtopping analysis](overtopping-analysis.md) — analysis stages, audits, statistics, tables, figures, and diagnostics.
-4. [Interpretation and limitations](interpretation-and-limitations.md) — causal/statistical interpretation boundaries.
-
-## Poisoning study
-
-1. [Poisoning overview](poisoning-overview.md) — research questions, marker semantics, and workflow.
-2. [Poisoning protocol](poisoning-protocol.md) — matched training, checkpoint cohorts, discovery, trajectories, and defence.
-3. [Poisoning configuration](poisoning-configuration.md) — launcher defaults and environment controls.
-4. [Poisoning outputs](poisoning-outputs.md) — stage-organized run directories, caches, manifests, and resume policy.
-
-## Shared implementation reference
-
-- [EAP / EAP-IG](eap.md)
-- [Troubleshooting and validation](troubleshooting.md)
-
-## Main entry points
-
-| Goal | Command |
-|---|---|
-| List overtopping configurations | `python3 -m studies.overtopping.experiments.run_experiments --suite all --list` |
-| Run one shared-pipeline configuration | `bash pipeline/run_pipeline.sh <task> <model> ...` |
-| Generate cross-study final outputs | `python3 -m reporting.generate_final_results ...` |
-| Validate simultaneous/conditional candidate-set effects | `python3 -m pipeline.stage08_validate_interactions ...` |
-| Train grammar poisoning runs directly | `python3 -m studies.poisoning.tasks.grammar ...` |
-| Train arithmetic poisoning runs directly | `python3 -m studies.poisoning.tasks.arithmetic ...` |
-| Run poisoning checkpoint training driver | `bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh` |
-| Run poisoning Stages 02–06 | `bash studies/poisoning/scripts/run_checkpoint_causal_workflow.sh` |
-| Run Stage 07 inference defence | `bash studies/poisoning/scripts/stage07_run_inference_defence.sh` |
-
-From repository root, use `./run_overtopping_experiments.sh`, `./run_poisoning_experiments.sh`, and `./generate_results.sh`.
+All Python module commands in this documentation assume either that the current directory is `code/` or that `code/` is present on `PYTHONPATH`.

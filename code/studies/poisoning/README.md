@@ -1,45 +1,30 @@
-# Poisoning study package
+# Poisoning study
 
-This package implements the checkpointed poisoning study. It trains matched clean and poisoned trajectories, evaluates marker-triggered behavior, localizes checkpoint-specific causal channels through the shared pipeline, aggregates checkpoint trajectories, tests inference-time suppression and specificity, and supports training-time protection controls.
+`studies.poisoning` implements checkpointed clean/poisoned training, marker-triggered behavioral evaluation, checkpoint causal discovery, trajectory analysis, circuit comparison, and defence experiments.
 
-Install the poisoning runtime dependencies from repository root after activating the environment:
+## Workflow
 
-```bash
-python -m pip install -r code/studies/poisoning/requirements.txt
-```
-
-## Stage naming
-
-A `stageNN_` prefix is used only when a file belongs to one numbered scientific/output stage. The number matches the persistent poisoning stage directory or study-level output stage. Orchestrators and helpers that span several stages remain unnumbered.
-
-The poisoning workflow is:
-
-| Stage | Persistent purpose | Main implementation |
+| Stage | Purpose | Entry point |
 |---|---|---|
-| 01 | checkpoint training | `scripts/stage01_run_checkpoint_training.sh` |
-| 02 | deterministic evaluation cohorts | `stage02_prepare_evaluation_cohorts.py` |
-| 03 | checkpoint causal discovery | shared `pipeline/run_pipeline.sh`, invoked by `scripts/run_checkpoint_causal_workflow.sh` |
-| 04 | clean/poisoned condition comparisons | `stage04_compare_condition_behavior.py` |
-| 05 | behavior trajectories | `stage05_aggregate_backdoor_trajectory.py` |
-| 06 | checkpoint circuit overlap | `stage06_compare_checkpoint_circuits.py` |
-| 07 | inference- and training-time defence evaluation | `stage07_*.py` plus `scripts/stage07_*.sh` |
-| 08 | cross-seed aggregation and figures | `stage08_aggregate_cross_seed.py`, `stage08_plot_cross_seed.py` |
+| 01 | train clean and poisoned checkpoint trajectories | `scripts/stage01_run_checkpoint_training.sh` |
+| 02 | prepare deterministic evaluation cohorts | `stage02_prepare_evaluation_cohorts.py` |
+| 03 | run checkpoint causal discovery | shared `pipeline/run_pipeline.sh`, coordinated by `scripts/run_checkpoint_causal_workflow.sh` |
+| 04 | compare clean and poisoned behavior | `stage04_compare_condition_behavior.py` |
+| 05 | aggregate checkpoint behavior trajectories | `stage05_aggregate_backdoor_trajectory.py` |
+| 06 | compare checkpoint circuits | `stage06_compare_checkpoint_circuits.py` |
+| 07 | evaluate inference-time defence and training-time protection | `stage07_*.py`, `scripts/stage07_*.sh` |
+| 08 | aggregate and plot across seeds | `stage08_aggregate_cross_seed.py`, `stage08_plot_cross_seed.py` |
 
-`run_checkpoint_causal_workflow.sh` is deliberately unnumbered: it coordinates Stages 02–06 and invokes the shared pipeline for Stage 03. `run_ordinary_correctness_control.sh` and `poisoning_runtime_config.sh` are helpers rather than standalone scientific stages.
+There is no poisoning-local `stage03_*.py` because causal discovery is implemented by the shared pipeline. `run_checkpoint_causal_workflow.sh` is unnumbered because it coordinates several poisoning stages.
 
 ## Package structure
 
 ```text
 studies/poisoning/
-├── tasks/       grammar/arithmetic task definitions and task registry
-├── lib/         shared training, marker, checkpoint, trajectory, and defence logic
-├── scripts/
-│   ├── poisoning_runtime_config.sh
-│   ├── stage01_run_checkpoint_training.sh
-│   ├── run_checkpoint_causal_workflow.sh
-│   ├── run_ordinary_correctness_control.sh
-│   ├── stage07_run_inference_defence.sh
-│   └── stage07_run_training_defence.sh
+├── tasks/                       grammar/arithmetic definitions and registry
+├── lib/                         poisoning mechanics shared by multiple stages
+├── scripts/                     shell entry points and runtime configuration
+├── tests/                       filesystem/path regression tests
 ├── stage02_prepare_evaluation_cohorts.py
 ├── stage04_compare_condition_behavior.py
 ├── stage05_aggregate_backdoor_trajectory.py
@@ -52,40 +37,49 @@ studies/poisoning/
 └── stage08_plot_cross_seed.py
 ```
 
-There is intentionally no poisoning-local `stage03_*.py`: Stage 03 is implemented by the shared causal pipeline. Multiple Stage 07 files are intentional because the stage contains two distinct defence mechanisms and their common summary.
+`lib/run_paths.py` defines shared poisoning filesystem names. Inference-defence cache persistence is owned directly by `lib/cumulative_ablation.py`, the only component that reads and writes those cache rows.
 
-Task modules own dataset construction, target semantics, output parsing, behavioral statistics, and the task specs passed to `pipeline/`. Shared poisoning mechanics belong in `studies/poisoning/lib/`.
+## Installation
 
-## Main entry points
-
-Run task CLIs from `code/`:
+From repository root after activating the project environment:
 
 ```bash
-python3 -m studies.poisoning.tasks.grammar --help
-python3 -m studies.poisoning.tasks.arithmetic --help
+python -m pip install -r code/studies/poisoning/requirements.txt
 ```
 
-Preview checkpoint training:
+## Running the study
+
+Preview the default task/seed grid from repository root:
 
 ```bash
-POISONING_TASK=grammar DRY_RUN=1 bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh
+./run_poisoning_experiments.sh --dry-run
 ```
 
-For a completed run, the checkpoint-analysis workflow is driven by:
+The default grid is grammar and arithmetic across seeds 13, 37, and 101 using the configured task model lists.
+
+Run a completed checkpoint trajectory through causal analysis from `code/`:
 
 ```bash
 POISONING_TASK=grammar \
-RUN_DIR=../data/poisoning/grammar/<run-name> \
+RUN_DIR=../data/poisoning/grammar/<run_id> \
 bash studies/poisoning/scripts/run_checkpoint_causal_workflow.sh
 ```
 
-That orchestrator prepares the Stage 02 cohort, runs Stage 03 causal discovery through the shared pipeline, and writes the Stage 04–06 poisoning summaries.
+Run inference-time defence for one completed run:
+
+```bash
+POISONING_TASK=grammar \
+RUN_DIR=../data/poisoning/grammar/<run_id> \
+POISONING_CACHE_ROOT=../cache/poisoning \
+bash studies/poisoning/scripts/stage07_run_inference_defence.sh
+```
+
+The canonical inference-defence cache is:
+
+```text
+cache/poisoning/<task>/<run_id>/defence/<input_output|output_only>/fraction_<fraction>/
+```
 
 ## Documentation
 
-Read the canonical poisoning documentation in this order:
-
-1. [`../../docs/poisoning-overview.md`](../../docs/poisoning-overview.md)
-2. [`../../docs/poisoning-protocol.md`](../../docs/poisoning-protocol.md)
-3. [`../../docs/poisoning-configuration.md`](../../docs/poisoning-configuration.md)
-4. [`../../docs/poisoning-outputs.md`](../../docs/poisoning-outputs.md)
+Read [poisoning overview](../../docs/poisoning-overview.md), [protocol](../../docs/poisoning-protocol.md), [configuration](../../docs/poisoning-configuration.md), and [outputs/cache layout](../../docs/poisoning-outputs.md).

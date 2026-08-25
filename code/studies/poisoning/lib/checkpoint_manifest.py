@@ -390,7 +390,7 @@ def write_aggregate_manifest_union(
 
     # Drop stale aggregate rows for conditions that have a local manifest: the
     # local manifest defines membership for that condition.  Keep aggregate-only
-    # rows only for legacy conditions that genuinely have no local manifest yet.
+    # rows only for conditions that do not have a local condition manifest.
     conditions_with_local = {key[0] for key in local_keys}
     for key in list(merged):
         if key[0] in conditions_with_local and key not in local_keys:

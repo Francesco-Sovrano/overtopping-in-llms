@@ -4,7 +4,7 @@ The clean trajectory is a matched negative control for the poisoned trajectory.
 Training manifests identify saved checkpoints; post-training behavior and causal
 metrics are measured separately with TransformerLens.  The only required
 training-side behavioral gate is the fraction-zero trigger-neutrality preflight.
-Optional Hugging Face checkpoint diagnostics may still populate legacy metric
+Optional Hugging Face checkpoint diagnostics may populate additional metric
 columns, but they are not required for resume or causal analysis.
 """
 

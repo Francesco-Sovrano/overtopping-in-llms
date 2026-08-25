@@ -292,7 +292,7 @@ cache/poisoning/<task>/<run>/
 └── defence/<input_output|output_only>/fraction_<fraction>/
 ```
 
-`POISONING_CACHE_ROOT` changes the top-level poisoning cache. `DISCOVERY_CACHE_ROOT` overrides only the per-discovery cache location; relative values are resolved from the repository root. Trigger-lift model-I/O is cached once per checkpoint. Ordinary-correctness reuses that same paired model-I/O pickle and keeps only its downstream endpoint-specific pipeline caches separate. Inference-defence caches use the basename of the actual run directory, which keeps grammar and arithmetic caches isolated and keeps each run's regenerable artifacts together.
+`POISONING_CACHE_ROOT` sets the top-level poisoning cache. `DISCOVERY_CACHE_ROOT` overrides only a checkpoint-discovery cache location; relative values are resolved from the repository root. Trigger-lift model-I/O is cached once per checkpoint. Ordinary-correctness reuses the same paired model-I/O pickle while keeping endpoint-specific downstream pipeline caches separate. Inference-defence caches are stored only under `cache/poisoning/<task>/<run_id>/defence/<phase>/fraction_<fraction>/`. The run ID is the basename of the poisoning run directory, so grammar and arithmetic remain isolated. Candidate coalition results are persisted when completed and matched-random results are persisted after every completed draw, allowing interrupted Stage-07 evaluations to resume from the canonical cache leaf.
 
 A nonempty run directory that lacks the canonical training metadata is never moved, deleted, or rewritten automatically. Use a new run name or explicitly relocate the conflicting directory.
 

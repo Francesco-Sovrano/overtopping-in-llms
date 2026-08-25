@@ -426,7 +426,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_dir", type=Path, required=True, help="Immutable poisoning data/training run directory.")
     parser.add_argument("--condition", required=True)
-    parser.add_argument("--checkpoint_tag", required=True, help="Canonical checkpoint tag (progress_*pct__step_*). Legacy frac_* names remain readable for migration/resume.")
+    parser.add_argument("--checkpoint_tag", required=True, help="Canonical checkpoint tag (progress_*pct__step_*).")
     parser.add_argument("--checkpoint_label", default=None, help="Readable result-directory label; defaults to checkpoint_tag.")
     parser.add_argument("--phase", required=True)
     parser.add_argument("--eval_intervention", default="mean-donor")

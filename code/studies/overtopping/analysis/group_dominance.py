@@ -18,7 +18,6 @@ from studies.overtopping.analysis.lib.progress import tqdm
 
 
 import argparse
-import hashlib
 import itertools
 import json
 import math
@@ -47,7 +46,14 @@ from core.neuron_intervention import (
     get_correctness,
     get_correctness_cached_by_prefix_batches,
 )
-from core.text_and_rules import guess_filetype
+from core.group_intervention import (
+    dedupe_units,
+    group_layer_map,
+    hash_payload,
+    read_table,
+    resolve_dataset_path,
+    rows_fingerprint,
+)
 from core.threshold_event_shared import safe_layer_label
 
 
@@ -133,23 +139,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _read_table(path: Path) -> pd.DataFrame:
-    filetype = guess_filetype(path)
-    return pd.read_parquet(path) if filetype == "parquet" else pd.read_csv(path)
 
 
-def _resolve_dataset_path(raw: str | Path, info_dir: Path) -> Path:
-    path = Path(raw).expanduser()
-    candidates = [path]
-    if not path.is_absolute():
-        candidates.extend([info_dir / path, Path.cwd() / path])
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    raise FileNotFoundError(
-        f"Could not resolve dataset path {raw!r}; tried: "
-        + ", ".join(str(p) for p in candidates)
-    )
 
 
 def _load_dataset_info(input_data_dir: Path) -> dict:
@@ -159,19 +150,10 @@ def _load_dataset_info(input_data_dir: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _dedupe_units(units: Iterable[UnitSpec]) -> list[UnitSpec]:
-    seen: set[tuple[str, int]] = set()
-    out: list[UnitSpec] = []
-    for unit in units:
-        key = (str(unit.layer_label), int(unit.neuron_id))
-        if key not in seen:
-            seen.add(key)
-            out.append(unit)
-    return sorted(out, key=lambda u: (str(u.layer_label), int(u.neuron_id)))
 
 
 def load_candidate_units(path: Path) -> list[UnitSpec]:
-    df = _read_table(path)
+    df = read_table(path)
     layer_col = "layer_label" if "layer_label" in df.columns else "layer_key"
     if layer_col not in df.columns or "neuron_id" not in df.columns:
         raise ValueError(
@@ -191,7 +173,7 @@ def load_candidate_units(path: Path) -> list[UnitSpec]:
         )
         for row in df.dropna(subset=[layer_col, "neuron_id"]).to_dict("records")
     ]
-    units = _dedupe_units(units)
+    units = dedupe_units(units)
     if not units:
         raise ValueError(f"No candidate units found in {path}")
     return units
@@ -204,7 +186,7 @@ def _evaluation_frame(
     prompt_col: str,
     target_col: str,
 ) -> pd.DataFrame:
-    df = _read_table(singleton_scores_path)
+    df = read_table(singleton_scores_path)
     missing = [c for c in [prompt_col, target_col] if c not in df.columns]
     if missing:
         raise ValueError(
@@ -330,27 +312,10 @@ def _proper_subsets(units: Sequence[UnitSpec], m: int) -> list[GroupSpec]:
     return out
 
 
-def _group_layer_map(group: GroupSpec) -> dict[str, list[int]]:
-    out: dict[str, list[int]] = {}
-    for unit in group.units:
-        out.setdefault(str(unit.layer_label), []).append(int(unit.neuron_id))
-    return {layer: sorted(set(ids)) for layer, ids in out.items()}
 
 
-def _hash_payload(payload: dict) -> str:
-    text = json.dumps(payload, sort_keys=True, default=str)
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:20]
 
 
-def _rows_fingerprint(scores_df: pd.DataFrame, prompt_col: str) -> str:
-    cols = [prompt_col]
-    for col in ["_orig_row", "original_idx", "is_test"]:
-        if col in scores_df.columns:
-            cols.append(col)
-    hashed = pd.util.hash_pandas_object(
-        scores_df[cols].astype(str), index=False
-    ).to_numpy(dtype=np.uint64)
-    return hashlib.sha1(hashed.tobytes()).hexdigest()[:20]
 
 
 def evaluate_groups(
@@ -401,7 +366,7 @@ def evaluate_groups(
             unit="group",
             leave=False,
         ):
-            cache_key = _hash_payload(
+            cache_key = hash_payload(
                 {
                     **cache_context,
                     "group": group.keys,
@@ -421,7 +386,7 @@ def evaluate_groups(
                     post = None
             if post is None:
                 hooks = build_ablation_hooks(
-                    _group_layer_map(group),
+                    group_layer_map(group),
                     last_pos_only=bool(decode_only),
                     intervention=intervention,
                     mean_activations=mean_activations,
@@ -770,7 +735,7 @@ def main() -> None:
     unique_gpu: dict[str, GroupSpec] = {group.key: group for group in needs_gpu}
     needs_gpu = list(unique_gpu.values())
 
-    scores_path = _resolve_dataset_path(dataset_info["scores_path"], input_data_dir)
+    scores_path = resolve_dataset_path(dataset_info["scores_path"], input_data_dir)
     train_scores = load_scores_for_baseline(
         scores_path=scores_path,
         target_col=target_col,
@@ -807,7 +772,7 @@ def main() -> None:
             seed=int(args.seed),
         )
         cache_context = {
-            "rows": _rows_fingerprint(scores_df, prompt_col),
+            "rows": rows_fingerprint(scores_df, prompt_col),
             "model": ai_model,
             "task_module": args.task_module,
             "evaluation_split": args.evaluation_split,
@@ -836,7 +801,7 @@ def main() -> None:
     group_score_df = scores_df.copy()
     for group in needs_gpu:
         post = gpu_outputs[group.key]
-        col = f"post_group_{_hash_payload({'group': group.keys})}"
+        col = f"post_group_{hash_payload({'group': group.keys})}"
         group_score_df[col] = post.astype(bool)
         rows = _effect_rows(
             group=group,

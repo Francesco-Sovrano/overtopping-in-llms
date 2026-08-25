@@ -949,20 +949,10 @@ if (( REFINE_SAMPLING_MAX_POINTS != 10000 )); then
 	CIRCUIT_BAG_LABEL+="-cap${REFINE_SAMPLING_MAX_POINTS}"
 fi
 EVALUATION_SPLIT_FLAG=(--evaluation_split "$EVALUATION_SPLIT" --evaluation_baseline_subset "$EVALUATION_BASELINE_SUBSET")
-LEGACY_STAGE7_COMPLETE=false
-LEGACY_STAGE7_HAS_SPLIT_COLUMN=false
 SINGLETON_SCHEMA_OK=false
 UNCERTAINTY_SCHEMA_OK=false
 STAGE7_COMPLETE=false
 STATS_DIR="$RULES_DIR/neuron_flip_rules/stats/$CIRCUIT_BAG_LABEL"
-if [[ -s "$STATS_DIR/flip_stats_global.json" \
-   && -s "$STATS_DIR/flip_stats_by_neuron.csv" \
-   && -s "$STATS_DIR/scores.csv" ]]; then
-	LEGACY_STAGE7_COMPLETE=true
-	if [[ "$EVALUATION_SPLIT" == "all" || "$(head -n 1 "$STATS_DIR/scores.csv")" == *"is_test"* ]]; then
-		LEGACY_STAGE7_HAS_SPLIT_COLUMN=true
-	fi
-fi
 if [[ -s "$STATS_DIR/flip_stats_global.json" ]]; then
 	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); need=("n_evaluated_rows","union_flip_any_unique_ci_low","union_flip_any_unique_ci_high","confidence_level"); raise SystemExit(0 if all(k in p for k in need) else 1)' "$STATS_DIR/flip_stats_global.json"; then
 		UNCERTAINTY_SCHEMA_OK=true
@@ -979,7 +969,9 @@ if [[ -s "$STATS_DIR/evaluation_scope.json" ]]; then
 		SCOPE_SPLIT_OK=true
 	fi
 fi
-if [[ "$LEGACY_STAGE7_COMPLETE" == "true" \
+if [[ -s "$STATS_DIR/flip_stats_global.json" \
+   && -s "$STATS_DIR/flip_stats_by_neuron.csv" \
+   && -s "$STATS_DIR/scores.csv" \
    && "$SINGLETON_SCHEMA_OK" == "true" \
    && "$UNCERTAINTY_SCHEMA_OK" == "true" \
    && "$SCOPE_SPLIT_OK" == "true" \
@@ -1031,11 +1023,6 @@ if [[ "$RUN_REFINE_NEURON_RULES" == "true" || "$RUN_REFINE_NEURON_RULES" == "1" 
 
 	if [[ "$STAGE7_COMPLETE" == "true" && "$FORCE_STAGE7" != "true" && "$FORCE_STAGE7" != "1" ]]; then
 		echo "Step 7: complete singleton artifacts for split=$EVALUATION_SPLIT found -> reusing $STATS_DIR"
-	elif [[ "$LEGACY_STAGE7_COMPLETE" == "true" \
-	     && "$LEGACY_STAGE7_HAS_SPLIT_COLUMN" == "true" \
-	     && "$FORCE_STAGE7" != "true" && "$FORCE_STAGE7" != "1" ]]; then
-		echo "Step 7: materialized singleton events found -> regenerating split=$EVALUATION_SPLIT metric sidecars without model ablations"
-		python3 -m pipeline.stage07_refine_neuron_anchored_rules "${REFINE_FLAGS[@]}" --stats_only
 	else
 		python3 -m pipeline.stage07_refine_neuron_anchored_rules "${REFINE_FLAGS[@]}"
 	fi

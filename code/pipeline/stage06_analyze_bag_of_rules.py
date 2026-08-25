@@ -47,7 +47,7 @@ from core.neuron_intervention import (
 	get_adjusted_search_epsilon,
 	get_alpha_node,
 )
-from core.threshold_event_shared import collect_reference_margin_tensors
+from core.threshold_event_shared import _next_token_id_for_completion, collect_reference_margin_tensors
 
 """
 Bag-of-rules analysis / ablation runner.
@@ -851,24 +851,6 @@ def _bucket_counts(buckets):
 	}
 
 
-def _next_token_id_for_completion(tokenizer, prompt_text: str, completion_text: str):
-	def _ids(text, add_special_tokens):
-		try:
-			return tokenizer(text, add_special_tokens=add_special_tokens)["input_ids"]
-		except Exception:
-			return None
-
-	for add_special_tokens in (True, False):
-		prompt_ids = _ids(prompt_text, add_special_tokens)
-		full_ids = _ids(f"{prompt_text}{completion_text}", add_special_tokens)
-		if prompt_ids and full_ids and len(full_ids) > len(prompt_ids) and full_ids[:len(prompt_ids)] == prompt_ids:
-			return int(full_ids[len(prompt_ids)])
-
-	for candidate in (completion_text, f" {completion_text}"):
-		ids = _ids(candidate, False)
-		if ids:
-			return int(ids[0])
-	return None
 
 
 def _arithmetic_margin_from_last_logits(task, prompt_batch, logits_last, tokenizer, prompt_col):
