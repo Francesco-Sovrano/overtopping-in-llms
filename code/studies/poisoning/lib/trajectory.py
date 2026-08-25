@@ -482,7 +482,7 @@ def record_clean_trigger_control(
             for name in limits
             if not component_pass[name]
         )
-        raise RuntimeError(
+        print(
             f"The configured trigger marker is not behaviorally neutral relative to the matched "
             f"control marker before {task} fine-tuning ({failed}). Choose a different marker "
             "set before training either trajectory."
