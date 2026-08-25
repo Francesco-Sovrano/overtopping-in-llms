@@ -2,7 +2,7 @@
 
 The intervention results in this repository are conditional on the selected model, task, dataset cohort, causal endpoint, intervention operator, checkpoint, candidate-selection procedure, and evaluation universe. This page records the principal interpretation constraints for the poisoning study.
 
-## 20. Interpretation and limitations
+## Interpretation and limitations
 
 The following boundaries apply to every report.
 

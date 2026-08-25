@@ -81,10 +81,7 @@ TXT
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; shift; fi
 if [[ $# -ne 0 ]]; then usage >&2; exit 2; fi
-if [[ "${RUN_TRAINING_PROTECTION:-0}" == "1" || "${RUN_TRAINING_PROTECTION:-0}" == "true" ]]; then
-  echo "Run code/poisoning/scripts/run_training_time_protection.sh separately for protected trajectories." >&2
-  exit 2
-fi
+RUN_TRAINING_PROTECTION="${RUN_TRAINING_PROTECTION:-1}"
 
 BASE_RUN_NAME="${POISONING_RUN_NAME:-confirmatory}"
 POISONING_TASKS="${POISONING_TASKS:-grammar,arithmetic}"
@@ -101,14 +98,14 @@ POISON_RATE_BASIS="${POISON_RATE_BASIS:-eligible_gold_non_target}"
 POISON_TRAINING_MODE="${POISON_TRAINING_MODE:-paired_counterfactual}"
 POISON_SCHEDULE_MODE="${POISON_SCHEDULE_MODE:-uniform_optimizer_steps}"
 POISONING_DATA_ROOT="${POISONING_DATA_ROOT:-$PROJECT_ROOT/data/poisoning}"
-POISONING_SUMMARY_ROOT="${POISONING_SUMMARY_ROOT:-$POISONING_DATA_ROOT/summary}"
 GRAMMAR_OUTPUT_ROOT="${GRAMMAR_OUTPUT_ROOT:-$POISONING_DATA_ROOT/grammar}"
 ARITHMETIC_OUTPUT_ROOT="${ARITHMETIC_OUTPUT_ROOT:-$POISONING_DATA_ROOT/arithmetic}"
 POISONING_CACHE_ROOT="${POISONING_CACHE_ROOT:-$PROJECT_ROOT/cache/poisoning}"
+POISONING_FINAL_ROOT="${POISONING_FINAL_ROOT:-$POISONING_DATA_ROOT/final}"
 [[ "$GRAMMAR_OUTPUT_ROOT" = /* ]] || GRAMMAR_OUTPUT_ROOT="$PROJECT_ROOT/$GRAMMAR_OUTPUT_ROOT"
 [[ "$ARITHMETIC_OUTPUT_ROOT" = /* ]] || ARITHMETIC_OUTPUT_ROOT="$PROJECT_ROOT/$ARITHMETIC_OUTPUT_ROOT"
 [[ "$POISONING_CACHE_ROOT" = /* ]] || POISONING_CACHE_ROOT="$PROJECT_ROOT/$POISONING_CACHE_ROOT"
-export POISONING_CACHE_ROOT POISONING_DATA_ROOT POISONING_SUMMARY_ROOT
+export POISONING_CACHE_ROOT POISONING_DATA_ROOT POISONING_FINAL_ROOT
 
 csv_array() {
   local value="$1" destination="$2" item quoted
@@ -134,7 +131,10 @@ slugify() {
   printf '%s' "${value:-model}"
 }
 
-MATRIX_SLUG="$(slugify "$BASE_RUN_NAME")"
+STUDY_SLUG="$(slugify "$BASE_RUN_NAME")"
+STUDY_FINAL_ROOT="$POISONING_FINAL_ROOT/$STUDY_SLUG"
+DEFENCE_STAGE_ROOT="$STUDY_FINAL_ROOT/07_defence_evaluation"
+AGGREGATE_STAGE_ROOT="$STUDY_FINAL_ROOT/08_cross_seed_aggregation"
 run() {
   printf '[cmd]'; printf ' %q' "$@"; printf '\n'
   if [[ "$DRY_RUN" != "1" ]]; then "$@"; fi
@@ -157,7 +157,7 @@ fine_tune() {
     SHAM_MARKER="$SHAM_MARKER" SHAM_MAX_ROWS="$SHAM_MAX_ROWS" \
     MAX_TRAIN="${MAX_TRAIN:-4000}" MAX_EVAL="${MAX_EVAL:-500}" PREFLIGHT_MAX_EVAL="${PREFLIGHT_MAX_EVAL:-2048}" \
     MAX_CAUSAL_EVAL="${MAX_CAUSAL_EVAL:-}" SAVE_FRACS="${SAVE_FRACS:-0,0.1,0.25,0.5,0.75,1.0}" DRY_RUN=0 \
-    bash "$CODE_ROOT/poisoning/scripts/run_checkpoint_ft.sh"
+    bash "$CODE_ROOT/studies/poisoning/scripts/stage01_run_checkpoint_training.sh"
 }
 
 discover() {
@@ -165,18 +165,58 @@ discover() {
   run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$task" RUN_DIR="$run_dir" \
     POISONING_CACHE_ROOT="$POISONING_CACHE_ROOT" \
     LIFT_INDICES="${LIFT_INDICES:-all}" PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 \
-    bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_overtopping.sh"
+    bash "$CODE_ROOT/studies/poisoning/scripts/run_checkpoint_causal_workflow.sh"
+}
+
+final_cell_root() {
+  local task="$1" model="$2" seed="$3" decode_only="$4" model_slug phase
+  model_slug="$(slugify "$model")"
+  if [[ "$decode_only" == "1" ]]; then phase="generation_only"; else phase="prompt_and_generation"; fi
+  printf '%s' "$DEFENCE_STAGE_ROOT/$task/$model_slug/seed_$seed/$phase"
 }
 
 defend() {
   local task="$1" model="$2" seed="$3" run_dir="$4" decode_only="$5"
-  local model_slug phase out
-  model_slug="$(slugify "$model")"
-  if [[ "$decode_only" == "1" ]]; then phase="output_only"; else phase="input_output"; fi
-  out="$POISONING_SUMMARY_ROOT/mechanism/$MATRIX_SLUG/$task/$model_slug/seed_$seed/$phase"
+  local out
+  out="$(final_cell_root "$task" "$model" "$seed" "$decode_only")/inference_time"
   run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" RUN_DIR="$run_dir" \
-    PIPELINE_DECODE_ONLY="$decode_only" OUTPUT_DIR="$out" DRY_RUN=0 \
-    bash "$CODE_ROOT/poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh"
+    POISONING_CACHE_ROOT="$POISONING_CACHE_ROOT" PIPELINE_DECODE_ONLY="$decode_only" \
+    OUTPUT_DIR="$out" DRY_RUN=0 \
+    bash "$CODE_ROOT/studies/poisoning/scripts/stage07_run_inference_defence.sh"
+}
+
+train_protection_condition() {
+  local task="$1" model="$2" seed="$3" output_root="$4" run_name="$5" condition="$6"
+  local agonists=""
+  if [[ "$task" == "grammar" ]]; then
+    agonists="${POISONING_GRAMMAR_VIRGIN_AGONISTS_PATH:-}"
+  else
+    agonists="${POISONING_ARITHMETIC_VIRGIN_AGONISTS_PATH:-}"
+  fi
+  local cmd=(env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$task"
+    CONDITION="$condition" OUTPUT_ROOT="$output_root" RUN_NAME="$run_name" MODEL_NAME="$model"
+    SEED="$seed" POISON_RATE="$POISON_RATE" POISON_RATE_BASIS="$POISON_RATE_BASIS"
+    POISON_TRAINING_MODE="$POISON_TRAINING_MODE" POISON_SCHEDULE_MODE="$POISON_SCHEDULE_MODE"
+    CONTROL_MARKER="$CONTROL_MARKER" TRIGGER_MARKER="$TRIGGER_MARKER" SHAM_MARKER="$SHAM_MARKER"
+    SHAM_MAX_ROWS="$SHAM_MAX_ROWS" MAX_TRAIN="${MAX_TRAIN:-4000}" MAX_EVAL="${MAX_EVAL:-500}"
+    PREFLIGHT_MAX_EVAL="${PREFLIGHT_MAX_EVAL:-2048}" MAX_CAUSAL_EVAL="${MAX_CAUSAL_EVAL:-}"
+    SAVE_FRACS="${SAVE_FRACS:-0,0.1,0.25,0.5,0.75,1.0}" DRY_RUN=0)
+  [[ -z "$agonists" ]] || cmd+=(PROTECTION_AGONISTS_PATH="$agonists")
+  run "${cmd[@]}" bash "$CODE_ROOT/studies/poisoning/scripts/stage01_run_checkpoint_training.sh"
+}
+
+compare_training_defence() {
+  local task="$1" model="$2" seed="$3" baseline="$4" protected="$5" random_protected="$6" decode_only="$7"
+  local cell phase out
+  cell="$(final_cell_root "$task" "$model" "$seed" "$decode_only")"
+  out="$cell/training_time"
+  if [[ "$decode_only" == "1" ]]; then phase="output_only"; else phase="input_output"; fi
+  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_training_verify_matched_runs \
+    --task "$task" --runs "$baseline,$protected,$random_protected" --output "$out/matched_training_identity.json"
+  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_training_compare_protection \
+    --baseline_run "$baseline" --protected_run "$protected" --random_protected_run "$random_protected" \
+    --phase "$phase" --output_dir "$out"
+  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_build_defence_overview --root "$cell"
 }
 
 declare -a TASK_LIST SEED_LIST CELLS
@@ -210,10 +250,10 @@ for task in "${TASK_LIST[@]}"; do
   done
 done
 
-echo "=== Poisoning matrix: ${#CELLS[@]} task/model/seed cells ==="
+echo "=== Poisoning study grid: ${#CELLS[@]} task/model/seed cells ==="
 echo "=== Poisoning cache root: $POISONING_CACHE_ROOT ==="
 echo "=== Poisoning data root: $POISONING_DATA_ROOT ==="
-echo "=== Poisoning summary root: $POISONING_SUMMARY_ROOT ==="
+echo "=== Poisoning final study root: $STUDY_FINAL_ROOT ==="
 for cell in "${CELLS[@]}"; do
   IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
   printf '  task=%s model=%s seed=%s run=%s control=%s trigger=%s sham=%s\n' \
@@ -233,21 +273,53 @@ if [[ "$POISONING_FAST_TEST" != "1" && "$POISONING_FAST_TEST" != "true" ]]; then
     IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
     defend "$task" "$model" "$seed" "$output_root/$run_name" "$decode_only"
   done
+
+  if [[ "$RUN_TRAINING_PROTECTION" == "1" || "$RUN_TRAINING_PROTECTION" == "true" ]]; then
+    echo "=== Training-time defence: matched protected trajectories ==="
+    for cell in "${CELLS[@]}"; do
+      IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+      protected_name="${run_name}__protected"
+      random_name="${run_name}__random_protected"
+      train_protection_condition "$task" "$model" "$seed" "$output_root" "$protected_name" protected_poisoned
+      train_protection_condition "$task" "$model" "$seed" "$output_root" "$random_name" random_protected_poisoned
+    done
+    for cell in "${CELLS[@]}"; do
+      IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+      protected_name="${run_name}__protected"
+      random_name="${run_name}__random_protected"
+      discover "$task" "$output_root/$protected_name" "$decode_only"
+      discover "$task" "$output_root/$random_name" "$decode_only"
+      compare_training_defence "$task" "$model" "$seed" \
+        "$output_root/$run_name" "$output_root/$protected_name" "$output_root/$random_name" "$decode_only"
+    done
+  else
+    echo "=== Training-time defence disabled (RUN_TRAINING_PROTECTION=$RUN_TRAINING_PROTECTION) ==="
+    for cell in "${CELLS[@]}"; do
+      IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
+      run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_build_defence_overview \
+        --root "$(final_cell_root "$task" "$model" "$seed" "$decode_only")"
+    done
+  fi
 else
-  echo "=== Fast test: behavior scan complete; skipping circuit defense/aggregation ==="
+  echo "=== Fast test: behavior scan complete; skipping circuit defence/aggregation ==="
   exit 0
 fi
 
-MATRIX_RUN_DIRS=""
+AGGREGATE_RUN_DIRS=""
 for cell in "${CELLS[@]}"; do
   IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
-  [[ -z "$MATRIX_RUN_DIRS" ]] || MATRIX_RUN_DIRS+=","
-  MATRIX_RUN_DIRS+="$output_root/$run_name"
+  [[ -z "$AGGREGATE_RUN_DIRS" ]] || AGGREGATE_RUN_DIRS+=","
+  AGGREGATE_RUN_DIRS+="$output_root/$run_name"
 done
 run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -m poisoning.stage07_aggregate_matrix \
-  --run_dirs "$MATRIX_RUN_DIRS" \
-  --output_dir "$POISONING_SUMMARY_ROOT/matrix/$MATRIX_SLUG" \
+  python3 -m studies.poisoning.stage08_aggregate_cross_seed \
+  --run_dirs "$AGGREGATE_RUN_DIRS" \
+  --output_dir "$AGGREGATE_STAGE_ROOT/tables" \
   --min_seeds "${MIN_SEEDS_FOR_DEVELOPMENTAL_CLAIM:-3}"
+run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m studies.poisoning.stage08_plot_cross_seed \
+  --input_dir "$AGGREGATE_STAGE_ROOT/tables" \
+  --output_dir "$AGGREGATE_STAGE_ROOT/figures" \
+  --defence_root "$DEFENCE_STAGE_ROOT"
 
-echo "=== Poisoning matrix complete ==="
+echo "=== Poisoning study complete: $STUDY_FINAL_ROOT ==="

@@ -12,7 +12,7 @@ A task is not only a dataset name. The pipeline expects a task specification imp
 - how model responses are mapped to the task's binary positive predicate,
 - task metadata such as the system prompt and token dictionary keys.
 
-Generic pipeline tasks normally resolve as `lib.tasks.<task>_task`. The wrapper also supports `--task_module module[:attribute]` so external or multi-endpoint tasks can select a specific task-spec object.
+Generic pipeline tasks normally resolve as `core.tasks.<task>_task`. The wrapper also supports `--task_module module[:attribute]` so external or multi-endpoint tasks can select a specific task-spec object.
 
 ## Standard versus decode-only phase
 

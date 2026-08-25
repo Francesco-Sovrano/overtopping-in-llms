@@ -1,0 +1,1331 @@
+import os
+import atexit
+import signal
+import time
+from core.project_paths import PROJECT_ROOT
+
+try:
+	import resource
+	soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)      # current = (256, 10240) on macOS
+	new_soft = min(hard, 40960)                                  # never exceed hard
+	resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard)) # requires sudo if > hard
+except ImportError:
+	pass
+
+import json
+import pickle
+from tqdm import tqdm
+import multiprocessing
+from more_itertools import unique_everseen
+import concurrent.futures
+import copy
+import random
+try:
+	import ollama
+except ImportError:  # optional: only required for Ollama-backed feature generation
+	ollama = None
+try:
+	import openai
+except ImportError:  # optional: only required for OpenAI-backed feature generation
+	openai = None
+try:
+	from groq import Groq
+except ImportError:  # optional: only required for Groq-backed feature generation
+	Groq = None
+import re
+from pathlib import Path
+
+import numpy as np
+import torch
+
+def _compact_model_cache_id(value, fallback="model"):
+	"""Return a readable cache identifier without embedding filesystem paths.
+
+	Remote model IDs remain human-readable. Local checkpoint paths are reduced
+	to the checkpoint basename, prefixed by the condition when the conventional
+	``<condition>/checkpoints/<checkpoint>`` layout is present. No path hash or
+	absolute-path encoding is used.
+	"""
+	raw = str(value or "").strip()
+	if not raw:
+		return fallback
+
+	is_local = False
+	try:
+		path = Path(raw).expanduser()
+		is_local = path.exists() or path.is_absolute() or raw.startswith(("./", "../", "~"))
+	except Exception:
+		path = None
+
+	if is_local and path is not None:
+		name = path.name or fallback
+		parent = path.parent
+		if parent.name == "checkpoints" and parent.parent.name:
+			name = f"{parent.parent.name}_{name}"
+		return re.sub(r"[^A-Za-z0-9._@-]+", "_", name).strip("_") or fallback
+
+	base = re.sub(r"[^A-Za-z0-9._@-]+", "_", raw).strip("_")
+	return base or fallback
+
+def set_deterministic(seed=1337):
+	if seed is None:
+		return
+	os.environ.setdefault("PYTHONHASHSEED", str(seed))
+	try:
+		import random as _random
+		_random.seed(seed)
+	except Exception:
+		pass
+	try:
+		import numpy as _np
+		_np.random.seed(seed)
+	except Exception:
+		pass
+	try:
+		import torch as _torch  # type: ignore
+		_torch.manual_seed(seed)
+		_torch.cuda.manual_seed_all(seed)
+		try:
+			import torch.backends.cudnn as _cudnn  # type: ignore
+			_cudnn.deterministic = True
+			_cudnn.benchmark = False
+		except Exception:
+			pass
+		_torch.use_deterministic_algorithms(True)
+	except Exception:
+		pass
+	os.environ.setdefault("OMP_NUM_THREADS", "1")
+	os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+def _tqdm(it, visible=True, **args):
+	if isinstance(it, (list,tuple)) and len(it) <= 1:
+		return it
+	total = args.get('total', None)
+	if total is not None and total <= 1:
+		return it
+	if not visible:
+		return it
+	return tqdm(it, **args)
+
+
+def _env_int(name, default, minimum=0):
+	try:
+		return max(minimum, int(os.environ.get(name, default)))
+	except (TypeError, ValueError):
+		return max(minimum, int(default))
+
+
+def _env_float(name, default, minimum=0.0):
+	try:
+		return max(minimum, float(os.environ.get(name, default)))
+	except (TypeError, ValueError):
+		return max(minimum, float(default))
+
+
+def _api_max_workers(n_items):
+	return max(1, min(int(n_items), _env_int("API_MAX_WORKERS", 8, minimum=1)))
+
+
+def _retry_after_seconds(exc):
+	response = getattr(exc, "response", None)
+	headers = getattr(response, "headers", None)
+	if headers is not None:
+		for key in ("retry-after", "Retry-After"):
+			try:
+				raw = headers.get(key)
+			except Exception:
+				raw = None
+			if raw is not None:
+				try:
+					return max(0.0, float(raw))
+				except (TypeError, ValueError):
+					pass
+	return None
+
+
+def _is_transient_api_error(exc):
+	status = getattr(exc, "status_code", None)
+	if status is None:
+		response = getattr(exc, "response", None)
+		status = getattr(response, "status_code", None)
+	try:
+		status = int(status)
+	except (TypeError, ValueError):
+		status = None
+	if status == 429 or (status is not None and 500 <= status < 600):
+		return True
+	name = exc.__class__.__name__.lower()
+	text = str(exc).lower()
+	markers = (
+		"ratelimit", "rate limit", "too many requests", "timeout", "timed out",
+		"connection", "temporarily unavailable", "service unavailable",
+		"overloaded", "try again",
+	)
+	return any(marker in name or marker in text for marker in markers)
+
+
+def _call_api_with_retry(call, *, provider):
+	"""Run one API request with bounded exponential backoff for transient failures."""
+	max_retries = _env_int("API_MAX_RETRIES", 6, minimum=0)
+	base = _env_float("API_RETRY_BASE_SECONDS", 2.0)
+	cap = _env_float("API_RETRY_MAX_SECONDS", 60.0)
+	jitter = _env_float("API_RETRY_JITTER_SECONDS", 1.0)
+	for attempt in range(max_retries + 1):
+		try:
+			return call()
+		except Exception as exc:
+			if attempt >= max_retries or not _is_transient_api_error(exc):
+				raise
+			retry_after = _retry_after_seconds(exc)
+			delay = min(cap, base * (2 ** attempt))
+			if retry_after is not None:
+				delay = max(delay, retry_after)
+			if jitter > 0:
+				delay += random.random() * jitter
+			print(
+				f"[{provider}-retry] transient API error on attempt {attempt + 1}/{max_retries + 1}: "
+				f"{exc}; retrying in {delay:.1f}s",
+				flush=True,
+			)
+			time.sleep(delay)
+
+_CACHE_SAVE_INTERVAL_SECONDS = 300.0
+_CACHE_LAST_SAVE_TIME = {}
+_DEFERRED_CACHE_WRITES = {}
+_DEFERRED_CACHE_FLUSH_REGISTERED = False
+
+def _cache_save_interval_seconds():
+	try:
+		return max(0.0, float(os.environ.get("CACHE_SAVE_INTERVAL_SECONDS", _CACHE_SAVE_INTERVAL_SECONDS)))
+	except (TypeError, ValueError):
+		return _CACHE_SAVE_INTERVAL_SECONDS
+
+def _write_cache_file(file_name, cache, quiet=False):
+	parent_dir = os.path.dirname(file_name)
+	if parent_dir:
+		os.makedirs(parent_dir, exist_ok=True)
+	if not quiet:
+		print(f'Creating cache <{file_name}>..')
+	tmp_name = f"{file_name}.tmp.{os.getpid()}"
+	with open(tmp_name, 'wb') as f:
+		pickle.dump(cache, f)
+	os.replace(tmp_name, file_name)
+	_CACHE_LAST_SAVE_TIME[file_name] = time.time()
+
+
+def flush_deferred_caches(quiet=False):
+	"""Persist all dirty in-memory caches immediately.
+
+	Registered with atexit and signal handlers so long runs do not need to
+	re-write cache files after every fetched instruction, while still flushing
+	progress when the process exits or is interrupted.
+	"""
+	for file_name, (cache, cache_quiet) in list(_DEFERRED_CACHE_WRITES.items()):
+		_write_cache_file(file_name, cache, quiet=(quiet or cache_quiet))
+		_DEFERRED_CACHE_WRITES.pop(file_name, None)
+
+
+def _register_deferred_cache_flush():
+	global _DEFERRED_CACHE_FLUSH_REGISTERED
+	if _DEFERRED_CACHE_FLUSH_REGISTERED:
+		return
+	_DEFERRED_CACHE_FLUSH_REGISTERED = True
+	atexit.register(flush_deferred_caches)
+
+	for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+		if sig is None:
+			continue
+		try:
+			previous_handler = signal.getsignal(sig)
+
+			def _flush_then_delegate(signum, frame, previous_handler=previous_handler):
+				flush_deferred_caches()
+				if callable(previous_handler):
+					previous_handler(signum, frame)
+				elif previous_handler == signal.SIG_IGN:
+					return
+				elif signum == getattr(signal, "SIGINT", None):
+					raise KeyboardInterrupt
+				else:
+					raise SystemExit(128 + signum)
+
+			signal.signal(sig, _flush_then_delegate)
+		except (ValueError, OSError):
+			# Signal handlers can only be installed from the main thread on some platforms.
+			pass
+
+
+def save_cache_throttled(file_name, cache, quiet=False, force=False):
+	_register_deferred_cache_flush()
+	if force:
+		_write_cache_file(file_name, cache, quiet=quiet)
+		_DEFERRED_CACHE_WRITES.pop(file_name, None)
+		return
+
+	_DEFERRED_CACHE_WRITES[file_name] = (cache, quiet)
+	last_save = _CACHE_LAST_SAVE_TIME.get(file_name, time.time())
+	if file_name not in _CACHE_LAST_SAVE_TIME:
+		_CACHE_LAST_SAVE_TIME[file_name] = last_save
+	if time.time() - last_save >= _cache_save_interval_seconds():
+		_write_cache_file(file_name, cache, quiet=quiet)
+		_DEFERRED_CACHE_WRITES.pop(file_name, None)
+
+
+def create_cache(file_name, create_fn, quiet=False):
+	result = create_fn()
+	_write_cache_file(file_name, result, quiet=quiet)
+	return result
+
+def load_cache(file_name, quiet=False):
+	parent_dir = os.path.dirname(file_name)
+	if parent_dir:
+		os.makedirs(parent_dir, exist_ok=True) # Ensure parent directory exists
+
+	if os.path.isfile(file_name):
+		if not quiet:
+			print(f'Loading cache <{file_name}>..')
+		with open(file_name,'rb') as f:
+			result = pickle.load(f)
+		_CACHE_LAST_SAVE_TIME[file_name] = time.time()
+		return result
+	return None
+
+def load_or_create_cache(file_name, create_fn, quiet=False, validate_fn=None):
+	result = load_cache(file_name, quiet=quiet)
+	if result is not None and validate_fn is not None:
+		if not bool(validate_fn(result)):
+			if not quiet:
+				print(f'Cache is incompatible with the requested run; rebuilding <{file_name}>..')
+			result = None
+	if result is None:
+		result = create_cache(file_name, create_fn, quiet=quiet)
+	return result
+
+def _is_missing_cached_value(v):
+	if v is None:
+		return True
+	# Empty string/list/dict/tuple
+	if isinstance(v, (str, list, tuple, dict, set)) and len(v) == 0:
+		return True
+	# NumPy arrays
+	try:
+		import numpy as np
+		if isinstance(v, np.ndarray):
+			return v.size == 0
+	except Exception:
+		pass
+	return False
+
+def get_cached_values(
+	value_list,
+	cache,
+	fetch_fn,
+	cache_name=None,
+	key_fn=lambda x: x,
+	empty_is_missing=True,
+	transform_fn=None,
+	*,
+	recovery_passes=0,
+	recovery_base_seconds=0.0,
+	recovery_max_seconds=60.0,
+	recovery_label=None,
+	allow_incomplete=True,
+):
+	"""Resolve values through a persistent cache, optionally retrying misses in passes.
+
+	Each successful fetched value is registered for incremental persistence as soon
+	as it arrives.  This matters for long external-API batches: if the process is
+	interrupted or a later request exhausts its rate-limit retries, completed
+	responses remain reusable on the next run.
+
+	When ``recovery_passes`` is non-zero, only still-missing values are retried.
+	``allow_incomplete=False`` makes unresolved values a hard error after those
+	passes so callers cannot silently persist a higher-level artifact containing
+	missing external-provider results.
+	"""
+	unique_values = tuple(unique_everseen(filter(lambda x: x, value_list), key=key_fn))
+	recovery_passes = max(0, int(recovery_passes))
+	changed = False
+
+	for pass_index in range(recovery_passes + 1):
+		missing_values = tuple(
+			q
+			for q in unique_values
+			if key_fn(q) not in cache
+			or (empty_is_missing and _is_missing_cached_value(cache[key_fn(q)]))
+		)
+		if not missing_values:
+			break
+
+		if pass_index > 0:
+			delay = min(
+				max(0.0, float(recovery_max_seconds)),
+				max(0.0, float(recovery_base_seconds)) * (2 ** (pass_index - 1)),
+			)
+			label = recovery_label or "cache"
+			print(
+				f"[{label}-recovery] retrying {len(missing_values)} unresolved request(s) "
+				f"in recovery pass {pass_index}/{recovery_passes}"
+				+ (f" after {delay:.1f}s" if delay > 0 else ""),
+				flush=True,
+			)
+			if delay > 0:
+				time.sleep(delay)
+
+		for q, v in fetch_fn(missing_values):
+			cache[key_fn(q)] = v
+			changed = True
+			if cache_name:
+				# Register the dirty cache immediately.  Writes remain throttled,
+				# but SIGINT/SIGTERM/normal exit can now flush completed requests.
+				save_cache_throttled(cache_name, cache)
+
+	remaining = tuple(
+		q
+		for q in unique_values
+		if key_fn(q) not in cache
+		or (empty_is_missing and _is_missing_cached_value(cache[key_fn(q)]))
+	)
+	if remaining and not allow_incomplete:
+		if cache_name and changed:
+			# Force one durable checkpoint before failing the higher-level task.
+			save_cache_throttled(cache_name, cache, force=True)
+		label = recovery_label or "external API"
+		raise RuntimeError(
+			f"{label} left {len(remaining)} unresolved request(s) after "
+			f"{recovery_passes + 1} fetch pass(es). Successful responses were cached; "
+			"rerun the command to resume only the unresolved requests."
+		)
+
+	cached_values = [
+		cache[key_fn(q)] if q else None
+		for q in value_list
+	]
+	if transform_fn:
+		cached_values = list(map(transform_fn, cached_values))
+	return cached_values
+
+
+def get_external_api_cached_values(
+	value_list,
+	cache,
+	fetch_fn,
+	*,
+	cache_name,
+	key_fn,
+	provider,
+	transform_fn=None,
+	allow_incomplete=False,
+):
+	"""Shared persistent recovery policy for all external-provider prompts."""
+	return get_cached_values(
+		value_list,
+		cache,
+		fetch_fn,
+		cache_name=cache_name,
+		key_fn=key_fn,
+		empty_is_missing=True,
+		transform_fn=transform_fn,
+		recovery_passes=_env_int("API_RECOVERY_PASSES", 2, minimum=0),
+		recovery_base_seconds=_env_float("API_RECOVERY_BASE_SECONDS", 15.0),
+		recovery_max_seconds=_env_float("API_RECOVERY_MAX_SECONDS", 60.0),
+		recovery_label=provider,
+		allow_incomplete=allow_incomplete,
+	)
+
+
+def get_document_list(directory):
+	doc_list = []
+	for obj in os.listdir(directory):
+		obj_path = os.path.join(directory, obj)
+		if os.path.isfile(obj_path):
+			doc_list.append(obj_path)
+		elif os.path.isdir(obj_path):
+			doc_list.extend(get_document_list(obj_path))
+	return doc_list
+
+_loaded_caches = {}
+def instruct_model(prompts, model='llama3.1', api_key=None, reasoning_effort='none', **kwargs):
+	if model.startswith('gpt') or model.startswith('o'):
+		api_key = api_key or os.getenv('OPENAI_API_KEY', '')
+		base_url = "https://api.openai.com/v1"
+		parallelise = True
+		return instruct_openai_model(prompts, api_key=api_key, model=model, base_url=base_url, parallelise=parallelise, **kwargs)
+	elif model in ['qwen/qwen3.6-27b', 'qwen/qwen3-32b', 'meta-llama/llama-4-scout-17b-16e-instruct']:
+		api_key = api_key or os.getenv('GROQ_API_KEY', '')
+		# base_url = "https://api.groq.com/openai/v1"
+		parallelise = True
+		return instruct_groq_model(prompts, api_key=api_key, model=model, parallelise=parallelise, reasoning_effort=reasoning_effort, **kwargs)
+	else:
+		return instruct_ollama_model(prompts, model=model, **kwargs)
+			
+def instruct_ollama_model(
+	prompts,
+	system_instructions=None,
+	model='llama3.1',
+	options=None,
+	temperature=0.5,
+	top_p=1,
+	cache_path=str(PROJECT_ROOT / "cache"),
+	max_tokens=None,
+	seed=42,
+	think=False,
+	json_mode=False,
+	debug_ollama=False,
+	num_ctx=32768,
+	**_provider_ignored,
+):
+
+	if ollama is None:
+		raise ImportError("The 'ollama' package is required only for Ollama-backed feature generation. Install it or use a non-Ollama path.")
+	if max_tokens is None:
+		max_tokens = -1 # no limits
+	if options is None:
+		options = {
+			"seed": seed,
+			"num_predict": max_tokens,
+			"top_k": 40,
+			"top_p": 0.95,
+			"temperature": 0.7,
+			"repeat_penalty": 1.1,
+			"tfs_z": 1,
+			"num_ctx": num_ctx,
+			"repeat_last_n": 64,
+		}
+	else:
+		options = copy.deepcopy(options) # required to avoid side-effects
+	options.update({
+		"temperature": temperature,
+		"top_p": top_p,
+		"num_predict": max_tokens,
+		"num_ctx": max(int(options.get("num_ctx", 0) or 0), int(num_ctx)),
+	})
+
+	def clean_text(text):
+		if not text:
+			return ""
+
+		text = re.sub(r"(?s)<think>.*?</think>\s*", "", text).strip()
+
+		if text.startswith("```"):
+			lines = text.splitlines()
+			if lines and lines[0].strip().startswith("```"):
+				lines = lines[1:]
+			if lines and lines[-1].strip() == "```":
+				lines = lines[:-1]
+			text = "\n".join(lines).strip()
+
+		return text
+
+	def collect_ollama_response(response):
+		if hasattr(response, "response"):
+			return response.response or "", {
+				"done": getattr(response, "done", None),
+				"done_reason": getattr(response, "done_reason", None),
+				"eval_count": getattr(response, "eval_count", None),
+				"prompt_eval_count": getattr(response, "prompt_eval_count", None),
+			}
+
+		if isinstance(response, dict):
+			return response.get("response", ""), response
+
+		if hasattr(response, "__iter__"):
+			chunks = []
+			last = {}
+			for chunk in response:
+				if hasattr(chunk, "response"):
+					chunks.append(chunk.response or "")
+					last = {
+						"done": getattr(chunk, "done", None),
+						"done_reason": getattr(chunk, "done_reason", None),
+						"eval_count": getattr(chunk, "eval_count", None),
+						"prompt_eval_count": getattr(chunk, "prompt_eval_count", None),
+					}
+				elif isinstance(chunk, dict):
+					chunks.append(chunk.get("response", ""))
+					last = chunk
+			return "".join(chunks), last
+
+		return str(response), {}
+
+	def fetch_fn(instruction_prompt):
+		system_instruction, missing_prompt = instruction_prompt
+		_options = copy.deepcopy(options)
+
+		model_l = model.lower()
+		is_qwen3 = (
+			"qwen3" in model_l
+			or "qwen-3" in model_l
+			or "qwen3." in model_l
+			or "qwen3:" in model_l
+		)
+
+		if is_qwen3 and think is False:
+			if system_instruction:
+				if "/no_think" not in system_instruction and "/think" not in system_instruction:
+					system_instruction = system_instruction.rstrip() + "\n\n/no_think"
+			else:
+				system_instruction = "/no_think"
+
+			if not missing_prompt.lstrip().startswith("/no_think"):
+				missing_prompt = "/no_think\n\n" + missing_prompt
+
+		generate_kwargs = {
+			"model": model,
+			"prompt": missing_prompt,
+			"stream": False,
+			"options": _options,
+			"keep_alive": "1h",
+			"system": system_instruction,
+		}
+
+		if think is not None:
+			generate_kwargs["think"] = think
+
+		if json_mode:
+			generate_kwargs["format"] = "json"
+
+		try:
+			response = ollama.generate(**generate_kwargs)
+		except TypeError:
+			generate_kwargs.pop("think", None)
+			try:
+				response = ollama.generate(**generate_kwargs)
+			except TypeError:
+				generate_kwargs.pop("format", None)
+				response = ollama.generate(**generate_kwargs)
+
+		text, meta = collect_ollama_response(response)
+		text = clean_text(text)
+
+		if debug_ollama:
+			print("\n[OLLAMA DEBUG]")
+			print("model:", model)
+			print("num_ctx:", _options.get("num_ctx"))
+			print("num_predict:", _options.get("num_predict"))
+			print("think:", think)
+			print("json_mode:", json_mode)
+			print("raw_type:", type(response))
+			print("raw_response_start:", repr(text[:300]))
+			print("response_len_chars:", len(text))
+			print("done:", meta.get("done"))
+			print("done_reason:", meta.get("done_reason"))
+			print("eval_count:", meta.get("eval_count"))
+			print("prompt_eval_count:", meta.get("prompt_eval_count"))
+			print("[/OLLAMA DEBUG]\n")
+
+		prompt_eval_count = meta.get("prompt_eval_count")
+		eval_count = meta.get("eval_count")
+		done_reason = meta.get("done_reason")
+
+		if not text and done_reason == "length":
+			raise RuntimeError(
+				f"Ollama produced empty output because the prompt filled the context. "
+				f"prompt_eval_count={prompt_eval_count}, "
+				f"num_ctx={_options.get('num_ctx')}, "
+				f"eval_count={eval_count}. "
+				f"Increase num_ctx or shorten the feature-proposal prompt."
+			)
+
+		return instruction_prompt, text
+
+	def parallel_fetch_fn(missing_prompt_list):
+		if parallelise:
+			n_processes = multiprocessing.cpu_count()
+			with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, n_processes)) as executor:
+				futures = [
+					executor.submit(fetch_fn, prompt)
+					for prompt in missing_prompt_list
+				]
+
+				for future in _tqdm(
+					concurrent.futures.as_completed(futures),
+					total=len(missing_prompt_list),
+					desc="Sending prompts to Ollama",
+					leave=False,
+				):
+					i, o = future.result()
+					yield i, o
+		else:
+			for p in _tqdm(
+				missing_prompt_list,
+				total=len(missing_prompt_list),
+				desc="Sending prompts to Ollama",
+				leave=False,
+			):
+				i, o = fetch_fn(p)
+				yield i, o
+
+	os.makedirs(cache_path, exist_ok=True)
+
+	safe_model_name = (
+		model.replace("-", "_")
+			 .replace("/", "_")
+			 .replace(":", "_")
+	)
+
+	ollama_cache_name = os.path.join(cache_path, f"_{safe_model_name}_cache.pkl")
+
+	if ollama_cache_name not in _loaded_caches:
+		_loaded_caches[ollama_cache_name] = load_or_create_cache(
+			ollama_cache_name,
+			lambda: {}
+		)
+
+	__ollama_cache = _loaded_caches[ollama_cache_name]
+
+	cache_key = json.dumps(
+		{
+			"options": options,
+			"think": think,
+			"json_mode": json_mode,
+			"max_tokens": max_tokens,
+			"num_ctx": num_ctx,
+		},
+		indent=4,
+		sort_keys=True,
+	)
+
+	return get_cached_values(
+		list(zip(
+			system_instructions if system_instructions else [None] * len(prompts),
+			prompts
+		)),
+		__ollama_cache,
+		parallel_fetch_fn,
+		key_fn=lambda x: (x, model, cache_key),
+		empty_is_missing=True,
+		cache_name=ollama_cache_name,
+		transform_fn=None,
+	)
+
+def instruct_openai_model(prompts, system_instructions=None, api_key=None, base_url=None, model='gpt-4o-mini', n=1, temperature=1, top_p=1, frequency_penalty=0, presence_penalty=0, cache_path=str(PROJECT_ROOT / "cache"), parallelise=True, max_tokens=None, timeout=None, allow_incomplete=False, **kwargs):
+	if openai is None:
+		raise ImportError("The 'openai' package is required only for OpenAI-backed feature generation.")
+	chatgpt_client = openai.OpenAI(api_key=api_key, base_url=base_url)
+	if max_tokens is None:
+		adjust_max_tokens = True
+		if '32k' in model:
+			max_tokens = 32768
+		elif '16k' in model:
+			max_tokens = 16385
+		elif model=='gpt-4o' or 'preview' in model or 'turbo' in model:
+			max_tokens = 4096 #128000
+			adjust_max_tokens = False
+		elif model.startswith('o1') or model.startswith('o3') or model.startswith('o4'):
+			max_tokens = 2**16
+			adjust_max_tokens = False
+		if not max_tokens:
+			if model.startswith('gpt-4'):
+				max_tokens = 8192
+			else:
+				max_tokens = 4096
+				adjust_max_tokens = False
+	else:
+		adjust_max_tokens = True
+		if model=='gpt-4o' or 'preview' in model or 'turbo' in model:
+			adjust_max_tokens = False
+		elif model.startswith('o1') or model.startswith('o3') or model.startswith('o4'):
+			adjust_max_tokens = False
+	def fetch_fn(instruction_prompt):
+		system_instruction, missing_prompt = instruction_prompt
+		if system_instruction:
+			messages = [ 
+				{"role": "system", "content": system_instruction},
+			]
+		else:
+			messages = []
+		messages += [ 
+			{"role": "user", "content": missing_prompt} 
+		]
+		prompt_max_tokens = max_tokens
+		if adjust_max_tokens:
+			prompt_max_tokens -= int(3*len(missing_prompt.split(' \n')))
+		if prompt_max_tokens < 1:
+			return instruction_prompt, None
+		try:
+			def _request():
+				if model.startswith("o") or model.startswith('gpt-5'): # some params not available in reasoning models
+					return chatgpt_client.chat.completions.create(
+					model=model,
+					messages=messages,
+					max_completion_tokens=prompt_max_tokens,
+					n=n,
+					stop=None,
+					frequency_penalty=frequency_penalty, 
+					presence_penalty=presence_penalty,
+					timeout=timeout
+				)
+				else:
+					return chatgpt_client.chat.completions.create(
+					model=model,
+					messages=messages,
+					max_tokens=prompt_max_tokens,
+					n=n,
+					stop=None,
+					temperature=temperature,
+					top_p=top_p,
+					frequency_penalty=frequency_penalty, 
+					presence_penalty=presence_penalty,
+						timeout=timeout
+					)
+			response = _call_api_with_retry(_request, provider="OpenAI")
+			result = [
+				r.message.content.strip() 
+				for r in response.choices 
+				if r.message.content != 'Hello! It seems like your message might have been cut off. How can I assist you today?'
+			]
+			if len(result) == 1:
+				result = result[0]
+			return instruction_prompt, result # return also the missing_prompt otherwise asynchronous prompting will shuffle the outputs
+		except Exception as e:
+			print(f'OpenAI returned this error: {e}')
+			return instruction_prompt, None
+	def parallel_fetch_fn(missing_prompt_list):
+		if parallelise:
+			n_processes = multiprocessing.cpu_count()
+			# Using ThreadPoolExecutor to run queries in parallel with tqdm for progress tracking
+			with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,n_processes)) as executor:
+				futures = [executor.submit(fetch_fn, prompt) for prompt in missing_prompt_list]
+				for future in _tqdm(concurrent.futures.as_completed(futures), total=len(missing_prompt_list), desc="Sending prompts to OpenAI", leave=False):
+					i,o=future.result()
+					yield i,o
+		else:
+			for p in _tqdm(missing_prompt_list, total=len(missing_prompt_list), desc="Sending prompts to OpenAI", leave=False):
+				i,o=fetch_fn(p)
+				yield i,o
+		
+	os.makedirs(cache_path, exist_ok=True)
+	model_id = model.replace("/", "_").replace("\\", "_").replace(":", "_")
+	openai_cache_name = os.path.join(cache_path, f"_{model_id}_cache.pkl")
+	if openai_cache_name not in _loaded_caches:
+		_loaded_caches[openai_cache_name] = load_or_create_cache(openai_cache_name, lambda: {})
+	__openai_cache = _loaded_caches[openai_cache_name]
+	return get_external_api_cached_values(
+		list(zip(system_instructions if system_instructions else [None] * len(prompts), prompts)),
+		__openai_cache,
+		parallel_fetch_fn,
+		cache_name=openai_cache_name,
+		key_fn=lambda x: (x, model, temperature, top_p, frequency_penalty, presence_penalty, n),
+		provider="OpenAI",
+		transform_fn=None if 'deepseek' not in model else (lambda x: x.split('</think>')[-1].strip() if x else None),
+		allow_incomplete=allow_incomplete,
+	)
+
+def instruct_groq_model(
+	prompts,
+	system_instructions=None,
+	api_key=None,
+	model="meta-llama/llama-4-scout-17b-16e-instruct",
+	temperature=1,
+	top_p=1,
+	cache_path=str(PROJECT_ROOT / "cache"),
+	parallelise=True,
+	max_tokens=None,
+	allow_incomplete=False,
+	**kwargs
+):
+
+	if Groq is None:
+		raise ImportError("The 'groq' package is required only for Groq-backed feature generation.")
+
+	# Groq SDK reads GROQ_API_KEY by default; passing is optional
+	if api_key is None:
+		api_key = os.environ.get("GROQ_API_KEY")
+
+	client = Groq(api_key=api_key)
+
+	# Groq note: temperature=0 is converted to 1e-8 (avoid surprises)
+	if temperature == 0:
+		temperature = 1e-8
+
+	# default output cap if caller didn't specify
+	if max_tokens is None:
+		max_tokens = 4096
+	# Only forward kwargs that Groq actually understands (avoid 400s)
+	_allowed_kwargs = {
+		"stop",
+		"stream",
+		"seed",
+		"response_format",
+		"tools",
+		"tool_choice",
+		"parallel_tool_calls",
+		"reasoning_effort",
+		"reasoning_format",
+		"include_reasoning",
+		"service_tier",
+	}
+	_forward = {k: v for k, v in kwargs.items() if k in _allowed_kwargs and v is not None}
+
+	def fetch_fn(instruction_prompt):
+		system_instruction, missing_prompt = instruction_prompt
+
+		messages = []
+		if system_instruction:
+			messages.append({"role": "system", "content": system_instruction})
+		messages.append({"role": "user", "content": missing_prompt})
+
+		try:
+			# NOTE: Groq prefers max_completion_tokens; max_tokens is deprecated.
+			req = dict(
+				model=model,
+				messages=messages,
+				max_completion_tokens=max_tokens,
+				n=1,
+				temperature=temperature,
+				top_p=top_p,
+			)
+
+
+			req.update(_forward)
+
+			def _request():
+				if req.get("stream", False):
+					stream = client.chat.completions.create(**req)
+					out = []
+					for chunk in stream:
+						delta = chunk.choices[0].delta.content
+						if delta:
+							out.append(delta)
+					return "".join(out).strip()
+				response = client.chat.completions.create(**req)
+				result = response.choices[0].message.content
+				return result.strip() if result else None
+
+			result = _call_api_with_retry(_request, provider="Groq")
+
+			return instruction_prompt, result
+
+		except Exception as e:
+			print(f"Groq returned this error: {e}")
+			return instruction_prompt, None
+
+	def parallel_fetch_fn(missing_prompt_list):
+		if parallelise:
+			n_processes = multiprocessing.cpu_count()
+			with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, n_processes)) as executor:
+				futures = [executor.submit(fetch_fn, prompt) for prompt in missing_prompt_list]
+				for future in _tqdm(
+					concurrent.futures.as_completed(futures),
+					total=len(missing_prompt_list),
+					desc="Sending prompts to Groq",
+					leave=False,
+				):
+					i, o = future.result()
+					yield i, o
+		else:
+			for p in _tqdm(missing_prompt_list, total=len(missing_prompt_list), desc="Sending prompts to Groq", leave=False):
+				i, o = fetch_fn(p)
+				yield i, o
+
+	os.makedirs(cache_path, exist_ok=True)
+	model_id = model.replace("/", "_").replace("\\", "_").replace(":", "_")
+	groq_cache_name = os.path.join(cache_path, f"_{model_id}_groq_cache.pkl")
+	if groq_cache_name not in _loaded_caches:
+		_loaded_caches[groq_cache_name] = load_or_create_cache(groq_cache_name, lambda: {})
+	__groq_cache = _loaded_caches[groq_cache_name]
+
+	# Cache key includes model + sampling params + any forwarded options that affect output
+	cache_key_dict = {
+		"model": model,
+		"temperature": temperature,
+		"top_p": top_p,
+		"n": 1,
+		"max_tokens": max_tokens,
+		"forward": _forward,
+	}
+	reasoning_effort = kwargs.get('reasoning_effort','default')
+	if reasoning_effort != 'none':
+		cache_key_dict['reasoning_effort'] = reasoning_effort
+	cache_key = json.dumps(
+		cache_key_dict,
+		sort_keys=True,
+	)
+
+	return get_external_api_cached_values(
+		list(zip(system_instructions if system_instructions else [None] * len(prompts), prompts)),
+		__groq_cache,
+		parallel_fetch_fn,
+		cache_name=groq_cache_name,
+		key_fn=lambda x: (x, cache_key),
+		provider="Groq",
+		transform_fn=None,
+		allow_incomplete=allow_incomplete,
+	)
+
+def instruct_transformer_embedding_model(
+	prompts,
+	model,
+	tokenizer,
+	device,
+	system_instructions=None,
+	batch_size=512,
+	spectral_space="hidden",   # "hidden" or "logits"
+	rep_pooling="mean",        # "last" or "mean"
+	max_seq_len=None,
+	rep_hook_name="ln_final.hook_normalized",
+	use_amp=True,
+	sort_by_length=True,
+	cache_path=str(PROJECT_ROOT / "cache"),
+	model_cache_id=None,
+	**args
+):
+	"""
+	Cached representation extraction for local HF Transformers models.
+
+	Memory-efficient version:
+	  - For HF models and spectral_space="hidden", prefers running the *base model* to get
+		last_hidden_state (avoids output_hidden_states=True and avoids logits).
+	  - For TransformerLens HookedTransformer models, reads the requested hook from
+		run_with_cache(). This is required for TL-only checkpoint loads.
+	  - Builds attention_mask from padding (no arange(T) mask).
+	  - Allocates padded batch directly on target device to reduce peak host/device copies.
+	  - Uses autocast (AMP) when requested.
+
+	Returns: list[np.ndarray] aligned to `prompts`, each element shape [D], dtype float32.
+	"""
+	
+	if spectral_space not in {"hidden", "logits"}:
+		raise ValueError("spectral_space must be 'hidden' or 'logits'")
+	if rep_pooling not in {"last", "mean"}:
+		raise ValueError("rep_pooling must be 'last' or 'mean'")
+
+	dev = torch.device(device)
+
+	if model is None:
+		raise ValueError(
+			"No model was provided for representation extraction. "
+			"For TransformerLens checkpoint loads, pass wrapper.hooked_model because "
+			"wrapper.model is None."
+		)
+
+	# CUDA perf knobs
+	if dev.type == "cuda":
+		torch.backends.cuda.matmul.allow_tf32 = True
+		torch.set_float32_matmul_precision("high")
+
+	def _is_hooked_transformer_model(m):
+		return hasattr(m, "run_with_cache") and hasattr(m, "cfg")
+
+	def _model_id(m):
+		# Prefer an explicit cache id supplied by the caller. This matters for
+		# checkpoint/revision loads such as EleutherAI/pythia-1b@step0: the
+		# underlying HF object reports only the base model name, which would make
+		# step0 representations collide with final-checkpoint representations.
+		if isinstance(model_cache_id, str) and model_cache_id.strip():
+			return model_cache_id.strip()
+		for attr in ("nare_cache_model_id", "name_or_path", "model_name"):
+			v = getattr(m, attr, None)
+			if isinstance(v, str) and v.strip():
+				return v.strip()
+		cfg = getattr(m, "config", None)
+		v = getattr(cfg, "name_or_path", None) if cfg is not None else None
+		if isinstance(v, str) and v.strip():
+			return v.strip()
+		cfg = getattr(m, "cfg", None)
+		for attr in ("model_name", "original_architecture"):
+			v = getattr(cfg, attr, None) if cfg is not None else None
+			if isinstance(v, str) and v.strip():
+				return v.strip()
+		return m.__class__.__name__
+
+	model_id = _compact_model_cache_id(_model_id(model))
+	if _is_hooked_transformer_model(model) and not model_cache_id:
+		checkpoint_value = getattr(getattr(model, "cfg", None), "checkpoint_value", None)
+		if checkpoint_value is not None:
+			model_id = f"{model_id}_step{checkpoint_value}"
+
+	# Cache-key options
+	options = {
+		"spectral_space": spectral_space,
+		"rep_pooling": rep_pooling,
+		"max_seq_len": max_seq_len,
+		"rep_hook_name": rep_hook_name,
+		"model_backend": ("transformer_lens" if _is_hooked_transformer_model(model) else "transformers"),
+	}
+	if not use_amp:
+		options["use_amp"] = False
+	cache_key = json.dumps(options, sort_keys=True, indent=2)
+
+	def _build_input_text(system_instruction, user_prompt):
+		if system_instruction:
+			msgs = [
+				{"role": "system", "content": system_instruction},
+				{"role": "user", "content": user_prompt},
+			]
+			if hasattr(tokenizer, "apply_chat_template"):
+				try:
+					return tokenizer.apply_chat_template(
+						msgs, tokenize=False, add_generation_prompt=False
+					)
+				except Exception:
+					pass
+			return system_instruction + "\n" + user_prompt
+		return user_prompt
+
+	def _pick_amp_dtype():
+		# Conservative choices that tend to work well:
+		if dev.type == "cuda":
+			return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+		if dev.type == "mps":
+			return torch.float16
+		return torch.float32
+
+	def _get_base_model_for_hidden_states(m):
+		"""
+		Try common HF attributes to get the underlying decoder/base model that returns
+		BaseModelOutputWithPast (with last_hidden_state).
+		"""
+		base = getattr(m, "model", None) or getattr(m, "base_model", None)
+		if base is not None:
+			return base
+		if hasattr(m, "get_decoder"):
+			try:
+				return m.get_decoder()
+			except Exception:
+				pass
+		# Some models use get_base_model()
+		if hasattr(m, "get_base_model"):
+			try:
+				return m.get_base_model()
+			except Exception:
+				pass
+		return None
+
+	def parallel_fetch_fn(missing_instruction_prompts):
+		missing_instruction_prompts = list(missing_instruction_prompts)
+		if not missing_instruction_prompts:
+			return
+
+		texts = [_build_input_text(sys, p) for (sys, p) in missing_instruction_prompts]
+
+		# Tokenize once, keep as Python lists (lighter than many per-sample torch tensors)
+		old_trunc_side = getattr(tokenizer, "truncation_side", None)
+		if old_trunc_side is not None:
+			tokenizer.truncation_side = "left"
+		try:
+			enc = tokenizer(
+				texts,
+				padding=False,
+				truncation=True,
+				max_length=max_seq_len,
+				return_attention_mask=False,
+			)
+		finally:
+			if old_trunc_side is not None:
+				tokenizer.truncation_side = old_trunc_side
+		ids_list = enc["input_ids"]  # list[list[int]]
+		lengths = torch.tensor([len(x) for x in ids_list], dtype=torch.long)
+
+		order = torch.argsort(lengths) if sort_by_length else torch.arange(len(texts))
+
+		pad_id = tokenizer.pad_token_id
+		if pad_id is None:
+			pad_id = tokenizer.eos_token_id
+		if pad_id is None:
+			raise ValueError("Tokenizer has no pad_token_id or eos_token_id; set one.")
+
+
+		# Ensure eval (no dropout)
+		try:
+			model.eval()
+		except Exception:
+			pass
+
+		is_hooked_transformer = _is_hooked_transformer_model(model)
+		base_model = None if is_hooked_transformer else _get_base_model_for_hidden_states(model)
+		amp_dtype = _pick_amp_dtype()
+		use_autocast = bool(use_amp) and dev.type in {"cuda", "mps"}
+
+		requested_batch_size = int(batch_size)
+		if requested_batch_size <= 0:
+			raise ValueError("representation batch_size must be > 0")
+
+		def _empty_device_cache():
+			if dev.type == "cuda":
+				try:
+					torch.cuda.empty_cache()
+				except Exception:
+					pass
+			elif dev.type == "mps":
+				try:
+					torch.mps.empty_cache()
+				except Exception:
+					pass
+
+		def _is_device_oom(exc):
+			# CUDA raises torch.cuda.OutOfMemoryError (a RuntimeError subclass).
+			# MPS currently reports OOMs as RuntimeError strings, so keep a
+			# conservative message fallback for accelerator devices only.
+			cuda_oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", ())
+			if cuda_oom_type and isinstance(exc, cuda_oom_type):
+				return True
+			if dev.type not in {"cuda", "mps"}:
+				return False
+			msg = str(exc).lower()
+			return (
+				"out of memory" in msg
+				or "mps backend out of memory" in msg
+				or "not enough memory" in msg
+			)
+
+		def _embed_batch(batch_pos):
+			batch_seqs = [ids_list[i] for i in batch_pos]
+
+			# Compute padded length for this batch.
+			max_len = max((len(seq) for seq in batch_seqs), default=0)
+			B, T = len(batch_seqs), max_len
+
+			# Allocate directly on device to avoid large CPU tensor + transfer.
+			input_ids = torch.full((B, T), pad_id, dtype=torch.long, device=dev)
+			for i, seq in enumerate(batch_seqs):
+				n = len(seq)
+				if n:
+					input_ids[i, :n] = torch.tensor(seq, dtype=torch.long, device=dev)
+
+			attn_mask = (input_ids != pad_id).to(torch.long)
+			lens = attn_mask.sum(dim=1)
+
+			if use_autocast:
+				autocast_ctx = torch.autocast(device_type=dev.type, dtype=amp_dtype)
+			else:
+				autocast_ctx = torch.autocast(device_type="cpu", enabled=False)
+
+			with autocast_ctx:
+				if is_hooked_transformer:
+					if spectral_space == "hidden":
+						try:
+							out, cache = model.run_with_cache(
+								input_ids,
+								names_filter=lambda name: name == rep_hook_name,
+								return_type=None,
+								attention_mask=attn_mask,
+							)
+						except TypeError:
+							out, cache = model.run_with_cache(
+								input_ids,
+								names_filter=lambda name: name == rep_hook_name,
+								return_type=None,
+							)
+						try:
+							x = cache[rep_hook_name]
+						except KeyError as exc:
+							available = [k for k in getattr(cache, "cache_dict", {}).keys()]
+							preview = ", ".join(map(str, available[:20]))
+							raise KeyError(
+								f"Hook {rep_hook_name!r} was not captured from the HookedTransformer. "
+								f"Available cached hooks include: {preview}"
+							) from exc
+					else:
+						try:
+							out = model(input_ids, attention_mask=attn_mask, return_type="logits")
+						except TypeError:
+							out = model(input_ids, return_type="logits")
+						x = out
+				elif spectral_space == "hidden":
+					# Embedding extraction never needs autoregressive KV caches. Keeping
+					# use_cache=False substantially reduces accelerator memory.
+					if base_model is not None:
+						out = base_model(
+							input_ids=input_ids,
+							attention_mask=attn_mask,
+							return_dict=True,
+							use_cache=False,
+						)
+						x = out.last_hidden_state
+					else:
+						out = model(
+							input_ids=input_ids,
+							attention_mask=attn_mask,
+							return_dict=True,
+							output_hidden_states=True,
+							use_cache=False,
+						)
+						x = out.hidden_states[-1]
+				else:
+					out = model(
+						input_ids=input_ids,
+						attention_mask=attn_mask,
+						return_dict=True,
+						use_cache=False,
+					)
+					x = out.logits
+
+				if rep_pooling == "last":
+					idx = (lens - 1).clamp_min(0)
+					b = torch.arange(B, device=dev)
+					vec = x[b, idx, :]
+				else:
+					mask = attn_mask.unsqueeze(-1).to(x.dtype)
+					denom = mask.sum(dim=1).clamp_min(1.0)
+					vec = (x * mask).sum(dim=1) / denom
+
+			vec_np = vec.float().cpu().numpy().astype(np.float32)
+			return [
+				(missing_instruction_prompts[pos], vec_np[j].copy())
+				for j, pos in enumerate(batch_pos)
+			]
+
+		effective_batch_size = requested_batch_size
+		cursor = 0
+		# _tqdm() is an iterable wrapper and requires an iterator; it is not a
+		# manually-updated progress-bar context manager. Use tqdm directly here
+		# because adaptive OOM backoff advances by a variable number of prompts.
+		progress = tqdm(
+			total=len(texts),
+			desc="Computing prompt embeddings with Transformers",
+			unit="prompt",
+			leave=False,
+		)
+		try:
+			with torch.inference_mode():
+				while cursor < len(texts):
+					current_batch_size = min(effective_batch_size, len(texts) - cursor)
+					batch_pos = order[cursor : cursor + current_batch_size].tolist()
+
+					try:
+						batch_results = _embed_batch(batch_pos)
+					except RuntimeError as exc:
+						if not _is_device_oom(exc) or current_batch_size <= 1:
+							raise
+						new_batch_size = max(1, current_batch_size // 2)
+						effective_batch_size = min(effective_batch_size, new_batch_size)
+						_empty_device_cache()
+						progress.write(
+							f"Representation OOM at batch size {current_batch_size}; "
+							f"retrying the same prompts with batch size {effective_batch_size}."
+						)
+						continue
+
+					# Yield each completed batch immediately so the outer cache can persist
+					# progress during long jobs. Batch size is execution-only and is not
+					# included in the representation cache key.
+					for prompt_key, value in batch_results:
+						yield prompt_key, value
+
+					cursor += current_batch_size
+					progress.update(current_batch_size)
+
+					if dev.type == "mps":
+						_empty_device_cache()
+		finally:
+			progress.close()
+
+	os.makedirs(cache_path, exist_ok=True)
+	transformer_cache_name = os.path.join(cache_path, f"_{model_id}_reps_cache.pkl")
+	if transformer_cache_name not in _loaded_caches:
+		_loaded_caches[transformer_cache_name] = load_or_create_cache(
+			transformer_cache_name, lambda: {}
+		)
+	__transformer_cache = _loaded_caches[transformer_cache_name]
+
+	return get_cached_values(
+		list(zip(system_instructions if system_instructions else [None] * len(prompts), prompts)),
+		__transformer_cache,
+		parallel_fetch_fn,
+		key_fn=lambda x: (x, model_id, cache_key),
+		empty_is_missing=True,
+		cache_name=transformer_cache_name,
+		transform_fn=lambda v: (np.asarray(v, dtype=np.float32) if v is not None else None),
+	)

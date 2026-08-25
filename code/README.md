@@ -1,108 +1,59 @@
-# Code guide
+# Source-code layout
 
-The `code/` directory contains the executable Python packages and shell orchestration for the causal channel-intervention repository. Direct Python module commands should be run from this directory so imports such as `lib.*`, `analysis.*`, `experiments.*`, `pipeline.*`, and `poisoning.*` resolve normally.
+`code/` is the Python import root. Its directories are organized by dependency and study ownership.
 
-## Start here
-
-From repository root, install the Python 3.12 environment with:
-
-```bash
-bash setup.sh
-source .env/bin/activate
+```text
+code/
+├── core/                       reusable primitives shared by both studies
+├── pipeline/                   shared causal-intervention workflow
+├── reporting/                  cross-study result orchestration
+├── studies/
+│   ├── overtopping/
+│   │   ├── experiments/        catalogue and execution
+│   │   └── analysis/           overtopping-specific analysis
+│   └── poisoning/              poisoning-specific workflow
+└── docs/                       canonical documentation
 ```
 
-Then enter the implementation directory:
+## Shared packages
 
-```bash
-cd code
-```
+### `core/`
 
-Validate syntax and inspect the command surfaces without running models:
-
-```bash
-python3 -m compileall -q analysis experiments lib pipeline poisoning
-python3 -m experiments.run_experiments --suite all --list
-python3 -m analysis.generate_final_results --help
-python3 -m poisoning.tasks.grammar --help
-python3 -m poisoning.tasks.arithmetic --help
-bash -n pipeline/_run_pipeline.sh
-find poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-```
-
-## Packages
-
-### `experiments/`
-
-Defines the explicit standard non-poisoning catalogue. The catalogue contains 28 `paper-primary` and 11 `paper-auxiliary` configurations. `run_experiments.py` handles suite selection, exact-value filters, evaluation-split overrides, dry runs, execution, and optional primary manuscript generation.
-
-```bash
-python3 -m experiments.run_experiments --suite paper-primary --list
-python3 -m experiments.run_experiments --suite paper-auxiliary --list
-```
-
-The only supported primary profile is `iclr-28`.
+`core/` contains task interfaces, ordinary-task implementations, model loading and ablation utilities, feature representations, statistics, spectral helpers, EAP/EAP-IG, and repository-path utilities. Both studies and the shared pipeline import it.
 
 ### `pipeline/`
 
-Contains numbered stages 1–7 and `_run_pipeline.sh`, which coordinates one task/model configuration. The pipeline materializes model behavior, constructs features and rules, selects representative rows, discovers candidate causal channels, ranks them, and evaluates singleton and optional simultaneous-set effects.
+`pipeline/` contains the numbered causal-intervention stages. It is used by ordinary overtopping configurations and by poisoning checkpoint analysis. It must therefore remain outside either study package.
 
-Example:
+### `reporting/`
 
-```bash
-bash pipeline/_run_pipeline.sh \
-  grammar_acceptability \
-  Qwen/Qwen2.5-1.5B-Instruct \
-  --spectral_splits \
-  --fast_anchoring \
-  --eval_intervention mean-donor \
-  --evaluation_split test
-```
+`reporting/` contains orchestration that spans study boundaries. `reporting.generate_final_results` invokes overtopping analysis stages and available poisoning cross-seed aggregation without moving study-specific statistical logic into a generic package.
 
-For manuscript configurations, use the `experiments` catalogue rather than assembling commands manually.
+## Study packages
 
-### `analysis/`
+### `studies/overtopping/`
 
-Aggregates experiment artifacts, validates the 28-setting primary matrix, audits exact metric availability, computes primary statistics, and writes manuscript tables, figures, poisoning reports, and diagnostic reports.
+`experiments/` defines the explicit overtopping catalogue and converts `RunSpec` objects into shared-pipeline commands. `analysis/` contains overtopping-specific tables, statistics, figures, diagnostics, and primary-matrix helpers.
 
-```bash
-python3 -m analysis.generate_final_results \
-  --data-root ../data \
-  --results-root ../results \
-  --poisoning-root ../data/poisoning \
-  --primary-profile iclr-28 \
-  --require-complete-new-metrics
-```
+### `studies/poisoning/`
 
-### `lib/`
+The poisoning package owns poisoning task definitions, matched clean/poisoned training, marker handling, checkpoint manifests, trajectory analysis, circuit-overlap analysis, inference-time defence, training-time protection, and cross-seed aggregation. It calls the shared pipeline for its Stage 03 causal discovery.
 
-Provides shared task specifications, prompting and cache helpers, model loading, activation replacement and ablation, intervention statistics, feature/rule utilities, spectral sampling, and the internal EAP/EAP-IG implementation. Standard task modules are under `lib/tasks/`.
+## Import convention
 
-### `poisoning/`
-
-Implements matched clean/poisoned checkpoint training for grammar and arithmetic, fixed evaluation cohorts, trigger-lift and ordinary-correctness causal endpoints, checkpoint trajectory aggregation, cumulative suppression and specificity tests, matrix aggregation, and training-time protection controls.
-
-Canonical task CLIs:
+Run Python modules from `code/`:
 
 ```bash
-python3 -m poisoning.tasks.grammar --help
-python3 -m poisoning.tasks.arithmetic --help
+python3 -m studies.overtopping.experiments.run_experiments --help
+python3 -m pipeline.stage01_generate_prompts_and_answers --help
+python3 -m studies.poisoning.tasks.grammar --help
+python3 -m reporting.generate_final_results --help
 ```
 
-Shared shell drivers are under `poisoning/scripts/`. Marker values are configurable raw one-line strings. The default launcher uses one space for control, `[id=74291]` for trigger, and two spaces for sham; quote whitespace markers when setting them in the shell.
+Shared imports use `core.*`, overtopping imports use `studies.overtopping.*`, and poisoning imports use `studies.poisoning.*`.
 
-## Runtime roots
+## Stage filenames
 
-The project root is the parent of `code/`. Runtime state is intentionally outside the source tree:
+Use `stageNN_` only for files that implement one documented ordered stage. Orchestrators spanning several stages remain unnumbered. The stage number must match the corresponding scientific/output stage.
 
-```text
-../data/       persistent experiment/run artifacts
-../cache/      regenerable caches
-../results/    final aggregate outputs
-../.env/       optional repository virtual environment
-```
-
-`lib/project_paths.py` is the shared path source of truth. Poisoning checkpoint manifests use run-local checkpoint identities rather than absolute paths.
-
-## Documentation
-
-Read [`docs/index.md`](docs/index.md) for the full documentation map. The main pages cover setup, repository layout, concepts, experiment catalogue, pipeline stages, analysis, poisoning protocol/configuration/output layout, EAP/EAP-IG, interpretation limits, and troubleshooting.
+See [`docs/repository-layout.md`](docs/repository-layout.md) and [`docs/architecture.md`](docs/architecture.md) for the complete ownership and dependency model.

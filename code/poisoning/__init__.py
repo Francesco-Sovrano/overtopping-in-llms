@@ -1,2 +1,0 @@
-"""Checkpointed trigger-poisoning experiments."""
-

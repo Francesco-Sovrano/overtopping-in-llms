@@ -1,47 +1,51 @@
 # Documentation
 
-This documentation covers the executable code under `code/`, the runtime artifacts stored at repository root, the standard causal-intervention experiment programme, and the checkpointed trigger-poisoning study.
+This documentation is written for first-time readers. The repository contains two study-specific workflows that reuse one causal-intervention engine.
 
-Unless a command explicitly begins at repository root, commands on these pages assume:
+Unless a command explicitly starts from repository root, Python module commands assume:
 
 ```bash
 cd code
 ```
 
-## Recommended reading order
+## Read first
 
-For the standard non-poisoning workflow:
+1. [Getting started](getting-started.md) — install, validate, and preview both studies.
+2. [Repository layout](repository-layout.md) — understand where shared code, study code, artifacts, caches, and reports live.
+3. [Architecture](architecture.md) — understand package ownership and dependency direction.
+4. [Core concepts](concepts.md) — intervention, phase, evaluation, candidate-set, and provenance terminology.
 
-1. [Getting started](getting-started.md) — installation, validation, and first commands.
-2. [Repository layout](repository-layout.md) — package ownership and runtime roots.
-3. [Core concepts](concepts.md) — tasks, phases, evaluation populations, interventions, and provenance.
-4. [Experiment catalogue](experiments.md) — the 28 primary and 11 auxiliary standard configurations.
-5. [Numbered pipeline](pipeline.md) — stages 1–7, options, caches, and exact metric outputs.
-6. [Analysis](analysis.md) — primary-matrix validation, metric audits, statistics, tables, and figures.
-7. [Interpretation and limitations](interpretation-and-limitations.md) — scope of the causal claims.
-8. [Troubleshooting and validation](troubleshooting.md) — checks and common failure modes.
+## Overtopping study
 
-For checkpointed poisoning studies, read:
+1. [Overtopping experiment catalogue](overtopping-experiments.md) — 28 primary and 11 auxiliary configurations.
+2. [Shared numbered pipeline](pipeline.md) — causal stages 01–08 and task overrides.
+3. [Overtopping analysis](overtopping-analysis.md) — analysis stages, audits, statistics, tables, figures, and diagnostics.
+4. [Interpretation and limitations](interpretation-and-limitations.md) — causal/statistical interpretation boundaries.
 
-1. [Poisoning study overview](poisoning-overview.md) — scientific questions, endpoints, markers, and workflow.
-2. [Poisoning protocol](poisoning-protocol.md) — matched training, checkpoint analysis, specificity, and suppression.
-3. [Poisoning configuration](poisoning-configuration.md) — entry points and configuration variables.
-4. [Poisoning outputs](poisoning-outputs.md) — persistent run layout, caches, summaries, and resume policy.
+## Poisoning study
 
-The internal edge-attribution implementation is documented in [EAP / EAP-IG](eap.md).
+1. [Poisoning overview](poisoning-overview.md) — research questions, marker semantics, and workflow.
+2. [Poisoning protocol](poisoning-protocol.md) — matched training, checkpoint cohorts, discovery, trajectories, and defence.
+3. [Poisoning configuration](poisoning-configuration.md) — launcher defaults and environment controls.
+4. [Poisoning outputs](poisoning-outputs.md) — stage-organized run directories, caches, manifests, and resume policy.
+
+## Shared implementation reference
+
+- [EAP / EAP-IG](eap.md)
+- [Troubleshooting and validation](troubleshooting.md)
 
 ## Main entry points
 
-| Purpose | Entry point |
+| Goal | Command |
 |---|---|
-| List or run standard experiment configurations | `python3 -m experiments.run_experiments` |
-| Run one custom causal pipeline | `bash pipeline/_run_pipeline.sh` |
-| Generate final aggregate/manuscript outputs | `python3 -m analysis.generate_final_results` |
-| Run interaction/set validation | `python3 -m analysis.validate_interactions` |
-| Train grammar poisoning checkpoints | `python3 -m poisoning.tasks.grammar` |
-| Train arithmetic poisoning checkpoints | `python3 -m poisoning.tasks.arithmetic` |
-| Shared poisoning checkpoint driver | `bash poisoning/scripts/run_checkpoint_ft.sh` |
-| Poisoning checkpoint causal discovery | `bash poisoning/scripts/run_backdoor_lift_overtopping.sh` |
-| Poisoning cumulative suppression | `bash poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh` |
+| List overtopping configurations | `python3 -m studies.overtopping.experiments.run_experiments --suite all --list` |
+| Run one shared-pipeline configuration | `bash pipeline/run_pipeline.sh <task> <model> ...` |
+| Generate cross-study final outputs | `python3 -m reporting.generate_final_results ...` |
+| Validate simultaneous/conditional candidate-set effects | `python3 -m pipeline.stage08_validate_interactions ...` |
+| Train grammar poisoning runs directly | `python3 -m studies.poisoning.tasks.grammar ...` |
+| Train arithmetic poisoning runs directly | `python3 -m studies.poisoning.tasks.arithmetic ...` |
+| Run poisoning checkpoint training driver | `bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh` |
+| Run poisoning Stages 02–06 | `bash studies/poisoning/scripts/run_checkpoint_causal_workflow.sh` |
+| Run Stage 07 inference defence | `bash studies/poisoning/scripts/stage07_run_inference_defence.sh` |
 
-From repository root, the three high-level commands are `./run_experiments.sh`, `./generate_results.sh`, and `./run_poisoning_experiments.sh`.
+From repository root, use `./run_overtopping_experiments.sh`, `./run_poisoning_experiments.sh`, and `./generate_results.sh`.

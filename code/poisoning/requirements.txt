@@ -1,9 +1,0 @@
-# Poisoning experiments use the repository's tested/pinned core environment.
-# Keeping a second unpinned transformers/transformer-lens stack here can silently
-# change checkpoint loading or generation behavior relative to the main pipeline.
--r ../../requirements.txt
-
-# Explicit poisoning/runtime helpers not guaranteed by the root direct list.
-accelerate
-einops
-threadpoolctl

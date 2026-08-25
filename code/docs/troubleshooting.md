@@ -8,18 +8,18 @@ From `code/`:
 
 ```bash
 python3 -m compileall -q analysis experiments lib pipeline poisoning
-python3 -m experiments.run_experiments --suite all --list
-python3 -m analysis.generate_final_results --help
-python3 -m poisoning.tasks.grammar --help
-python3 -m poisoning.tasks.arithmetic --help
-bash -n pipeline/_run_pipeline.sh
+python3 -m studies.overtopping.experiments.run_experiments --suite all --list
+python3 -m reporting.generate_final_results --help
+python3 -m studies.poisoning.tasks.grammar --help
+python3 -m studies.poisoning.tasks.arithmetic --help
+bash -n pipeline/run_pipeline.sh
 find poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 ```
 
 For final-result generation, use the required-metric audit rather than assuming that a directory containing some statistics is complete:
 
 ```bash
-python3 -m analysis.generate_final_results \
+python3 -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
   --primary-profile iclr-28 \
@@ -66,8 +66,8 @@ distinguish absent trigger positives from absent ordinary correct behavior.
 
 ### Derive conditional conversion from a stored paired trajectory
 
-Rerun `stage04_aggregate_backdoor_trajectory.py` against the existing causal
-outputs, or include the run in `stage07_aggregate_matrix.py`. Both derive
+Rerun `stage05_aggregate_backdoor_trajectory.py` against the existing causal
+outputs, or include the run in `stage08_aggregate_cross_seed.py`. Both derive
 the conditional denominator from stored paired behavior counts when possible.
 
 ### Ordinary specificity cohort is empty
@@ -90,6 +90,13 @@ that the model identifier and pinned revision exist.
 
 ### Protected and baseline runs do not match
 
-Use `protection01_verify_matched_runs.py`. The base model, revision, data, seed,
+Use `stage07_training_verify_matched_runs.py`. The base model, revision, data, seed,
 poison selection, optimizer, fractions, and fraction-zero initialization must
 match before comparing protection conditions.
+
+
+## External API rate limits or interrupted batches
+
+OpenAI/Groq calls made through `instruct_model()` cache successful responses incrementally. Individual transient failures retry with exponential backoff; any prompts still unresolved are retried in shared recovery passes. If the provider remains unavailable after recovery, the command fails rather than writing a higher-level artifact with missing API results. Re-run the same command after the provider recovers: already completed provider responses are reused and only unresolved prompts are sent again.
+
+Relevant controls are `API_MAX_RETRIES`, `API_RETRY_BASE_SECONDS`, `API_RETRY_MAX_SECONDS`, `API_RETRY_JITTER_SECONDS`, `API_MAX_WORKERS`, `API_RECOVERY_PASSES`, `API_RECOVERY_BASE_SECONDS`, and `API_RECOVERY_MAX_SECONDS`. Lower `API_MAX_WORKERS` when a provider is repeatedly rate-limiting concurrent requests.

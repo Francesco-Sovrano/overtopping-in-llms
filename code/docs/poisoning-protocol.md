@@ -52,17 +52,19 @@ same-`J` causal specificity test below.
 
 ### Phase D: inference-time suppression and specificity
 
-At poisoned checkpoints, cumulative top-`k` groups use the ranking frozen on
-discovery data. Candidate groups and random noncandidate groups are evaluated
-on the same held-out rows. At the final checkpoint, interaction-aware selection
-uses one held-out subset and evaluates once on a disjoint confirmation subset.
+At a defended poisoned checkpoint, cumulative top-`k` groups use the ranking
+frozen at the latest strictly earlier checkpoint with a completed discovery
+ranking. Candidate groups and structurally matched random noncandidate groups
+are then evaluated on the current checkpoint's held-out rows. The current
+checkpoint is never used to choose channel identities, ranking, or coalition
+structure; if no earlier completed ranking exists, that checkpoint is skipped.
 
 The same poisoned `J` is also applied to ordinary target-positive examples.
 This is the task-circuit specificity control described in Section 12.
 
 ### Phase E: aggregate across training seeds
 
-`stage07_aggregate_matrix.py` treats the training seed, not examples or
+`stage08_aggregate_cross_seed.py` treats the training seed, not examples or
 channels, as the replicate unit. It writes seed-level trajectories, across-seed
 means and Student-t intervals, and per-seed developmental timing. A cell and
 each individual metric are marked ready for a developmental claim only when
@@ -156,7 +158,7 @@ They differ only in deterministic poison insertion. RNGs are reset immediately
 before model/LoRA construction for each condition. The fraction-zero adapter
 states can therefore be compared as an initialization check.
 
-`protection01_verify_matched_runs.py` verifies identity fields for protected
+`stage07_training_verify_matched_runs.py` verifies identity fields for protected
 follow-ups. Behavioral clean-versus-poisoned differences are reported at matched
 fractions; clean checkpoints are controls, not additional trigger-selection
 criteria.
@@ -205,8 +207,7 @@ Trigger-lift CHA requires positive trigger-lift examples. Therefore a checkpoint
 with zero conversions cannot have a trigger-lift circuit under this design. It
 does not follow that the model lacks a task circuit.
 
-`run_ordinary_correctness_control.sh` reuses the paired checkpoint cache and
-changes the endpoint to correctness on `prompt_without_trigger`:
+`run_ordinary_correctness_control.sh` reads the trigger-lift checkpoint's paired model-I/O cache directly and changes the endpoint to correctness on `prompt_without_trigger`. It does not copy or regenerate the model-I/O pickle:
 
 ```text
 grammar:    parsed response equals the gold acceptability label
@@ -228,11 +229,11 @@ is optional and writes into the same sibling directory when enabled:
 The ordinary circuit is a checkpoint-specific control. It is distinct from:
 
 - the trigger-lift circuit `J_s`;
-- virgin-model agonists used for overlap or training protection;
+- virgin-model agonists used for overlap or training protection; protection sources are pre-poisoning ordinary-model artifacts, not poisoning-checkpoint discoveries;
 - the downstream experiment that applies poisoned `J_s` to ordinary
   target-positive examples.
 
-`run_backdoor_lift_overtopping.sh` defaults both `RUN_ORDINARY_CORRECTNESS_CONTROL=1` and `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1`, so the companion ordinary-correctness behavior export and CHA/overtopping pipeline run unless disabled. The repository-root launcher also explicitly sets `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1`. Set `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=0` to retain ordinary-correctness behavior/status without running its CHA, or set `RUN_ORDINARY_CORRECTNESS_CONTROL=0` to skip the control entirely.
+`run_checkpoint_causal_workflow.sh` defaults both `RUN_ORDINARY_CORRECTNESS_CONTROL=1` and `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1`, so the companion ordinary-correctness behavior export and CHA/overtopping pipeline run unless disabled. The repository-root launcher inherits those defaults. Set `RUN_ORDINARY_CORRECTNESS_OVERTOPPING=0` to retain ordinary-correctness behavior/status without running its CHA, or set `RUN_ORDINARY_CORRECTNESS_CONTROL=0` to skip the control entirely.
 
 The ordinary task target is `is_correct_control`: correctness on `prompt_control`. Its stage-7 invocation deliberately sets `EVALUATION_BASELINE_SUBSET=positive` (and the corresponding pipeline/analysis environment variables), so singleton refinement is evaluated only on rows where `is_correct_control` is true before intervention. A stage-7 namespace such as
 
@@ -297,13 +298,17 @@ with virgin ordinary-task agonists.
 
 ## Cumulative suppression, random controls, and interactions
 
-For each requested `k`, the downstream experiment uses the first `k` channels
-from `frozen_candidate_ranking.csv`. Held-out singleton outcomes do not reorder
-the set.
+For each requested defended checkpoint and `k`, the downstream experiment uses
+the first `k` channels from the latest strictly earlier checkpoint's
+`frozen_candidate_ranking.csv`. The defended checkpoint never supplies channel
+identity or ranking. If no prior checkpoint has a completed ranking, the defence
+skips that checkpoint rather than using contemporaneous discovery results.
 
 Each candidate coalition is compared with 20 random groups by default. Random
 groups are drawn from eligible noncandidate units and match the candidate group
 exactly by native layer/locus and cardinality.
+
+The cumulative defence figure plots every defended checkpoint that produced a finite result. Because the ranking must come from a strictly earlier checkpoint, the earliest requested checkpoint can be absent from the figure when no earlier completed ranking exists. The plot does not hard-code particular checkpoint fractions.
 
 Reported endpoints include:
 
@@ -314,21 +319,17 @@ Reported endpoints include:
 - ordinary target-positive destruction and the specificity gap;
 - candidate-versus-random empirical comparison.
 
-At the final checkpoint, interaction-aware search considers singleton, pair,
-greedy, and random subsets from a discovery-ranked pool. Selection and
-confirmation trigger-lift rows are disjoint. The confirmation subset is reserved
-before exploratory cumulative evaluation.
 
 ## Multiple models and multiple training seeds
 
 Model identity and seed are independent axes. The supplied shell training driver launches one task/model/seed combination at a time. To study several models or seeds, invoke it separately with explicit `MODEL_NAME`, `SEED`, and distinct `RUN_NAME` values; do not combine several seeds into one run directory. Each matched clean/poisoned pair must share its model and seed.
 
-`stage07_aggregate_matrix.py` accepts a comma-separated `--run_dirs` list and aggregates already completed runs. Across-seed inference is meaningful only when the listed runs are protocol-compatible.
+`stage08_aggregate_cross_seed.py` accepts a comma-separated `--run_dirs` list and aggregates already completed runs. Across-seed inference is meaningful only when the listed runs are protocol-compatible.
 
-The matrix aggregator writes:
+The cross-seed aggregator writes:
 
 ```text
-data/poisoning/summary/matrix/<base-run>/
+data/poisoning/final/<study>/08_cross_seed_aggregation/tables/
     checkpoint_trajectories_all_seeds.csv
     checkpoint_metrics_by_model_across_seeds.csv
     developmental_timing_by_seed.csv

@@ -36,23 +36,39 @@ poisoning/
 │   └── virgin_agonists.py
 ├── scripts/
 │   ├── poisoning_runtime_config.sh
-│   ├── run_checkpoint_ft.sh
-│   ├── run_backdoor_lift_overtopping.sh
-│   ├── run_backdoor_lift_cumulative_ablation.sh
+│   ├── stage01_run_checkpoint_training.sh
+│   ├── run_checkpoint_causal_workflow.sh
+│   ├── stage07_run_inference_defence.sh
 │   ├── run_ordinary_correctness_control.sh
-│   └── run_training_time_protection.sh
-├── stage02_prepare_causal_pool.py
-├── stage03_compare_condition_behavior.py
-├── stage04_aggregate_backdoor_trajectory.py
-├── stage05_compare_checkpoint_circuits.py
-├── stage06_cumulative_ablation.py
-├── stage07_aggregate_matrix.py
-├── stage08_plot_matrix.py
-├── protection01_verify_matched_runs.py
-└── protection02_compare_training_protection.py
+│   └── stage07_run_training_defence.sh
+├── stage02_prepare_evaluation_cohorts.py
+├── stage04_compare_condition_behavior.py
+├── stage05_aggregate_backdoor_trajectory.py
+├── stage06_compare_checkpoint_circuits.py
+├── stage07_inference_cumulative_ablation.py
+├── stage07_training_verify_matched_runs.py
+├── stage07_training_compare_protection.py
+├── stage07_build_defence_overview.py
+├── stage08_aggregate_cross_seed.py
+└── stage08_plot_cross_seed.py
 ```
 
-Task-specific prompt construction, target semantics, output parsing, dataset construction, and causal task specifications belong in `tasks/grammar.py` and `tasks/arithmetic.py`. Shared training, marker, checkpoint, behavioral-scan, CHA, trajectory, and intervention mechanisms belong in `poisoning/lib/`.
+The stage numbers are part of the repository contract and match the poisoning output layout:
+
+| Stage | Meaning | Source entry point |
+|---|---|---|
+| 01 | checkpoint training | `scripts/stage01_run_checkpoint_training.sh` |
+| 02 | deterministic evaluation cohorts | `stage02_prepare_evaluation_cohorts.py` |
+| 03 | checkpoint causal discovery | shared `pipeline/run_pipeline.sh` |
+| 04 | condition-level behavior comparison | `stage04_compare_condition_behavior.py` |
+| 05 | checkpoint behavior trajectories | `stage05_aggregate_backdoor_trajectory.py` |
+| 06 | circuit overlap across checkpoints | `stage06_compare_checkpoint_circuits.py` |
+| 07 | inference- and training-time defence evaluation | `stage07_*.py` and `scripts/stage07_*.sh` |
+| 08 | cross-seed aggregation and figures | `stage08_aggregate_cross_seed.py`, `stage08_plot_cross_seed.py` |
+
+There is intentionally no poisoning-local `stage03_*.py`: Stage 03 is the shared causal pipeline. `scripts/run_checkpoint_causal_workflow.sh` remains unnumbered because it orchestrates Stages 02–06, and `run_ordinary_correctness_control.sh` remains unnumbered because it is a control helper inside that workflow.
+
+Task-specific prompt construction, target semantics, output parsing, dataset construction, and causal task specifications belong in `tasks/grammar.py` and `tasks/arithmetic.py`. Shared training, marker, checkpoint, behavioral-scan, CHA, trajectory, and intervention mechanisms belong in `studies/poisoning/lib/`.
 
 Each task module exposes a task definition and separate causal task specifications for the trigger-lift endpoint and ordinary correctness. Generic stages resolve those capabilities through `tasks/registry.py` instead of branching on task names.
 
@@ -78,7 +94,7 @@ Trigger-lift CHA can be undefined when a checkpoint contains too few trigger-lif
 
 ### Suppression and prevention
 
-The repository evaluates inference-time cumulative channel intervention and a separate training-time protection workflow. These are controlled mechanism tests, not claims of a complete deployment defense.
+The repository evaluates two defence mechanisms in the same root poisoning workflow: prospective inference-time cumulative channel intervention and training-time protection of virgin-model overtopping channels with a matched-random control. These are controlled mechanism tests, not claims of a complete deployment defense.
 
 ## Marker protocol
 
@@ -90,7 +106,7 @@ trigger  [id=74291]
 sham     "  "         # two spaces
 ```
 
-The marker strings are configurable and are treated as opaque values. `poisoning.lib.markers.validate_marker()` accepts any Python string that does not contain a line-break character (`\n` or `\r`) and returns the same string unchanged. It does not call `strip()`, coerce with `str()`, replace characters, or normalize whitespace. Empty strings, tabs, leading/trailing spaces, and whitespace-only strings are therefore significant. `validate_marker_set()` additionally requires the three configured values to be distinct.
+The marker strings are configurable and are treated as opaque values. `studies.poisoning.lib.markers.validate_marker()` accepts any Python string that does not contain a line-break character (`\n` or `\r`) and returns the same string unchanged. It does not call `strip()`, coerce with `str()`, replace characters, or normalize whitespace. Empty strings, tabs, leading/trailing spaces, and whitespace-only strings are therefore significant. `validate_marker_set()` additionally requires the three configured values to be distinct.
 
 `add_marker()` concatenates the configured marker, one newline separator, and the task prompt without changing either input. Marker values are never inferred from their contents and there is no marker-stripping or marker-normalization compatibility path. Code that needs the unmarked task content keeps that content separately rather than recovering it by inspecting a marked prompt. `assert_matched_core_prompts()` compares everything below the first line exactly, so matched conditions can use arbitrary marker text.
 
@@ -198,27 +214,27 @@ SAVE_FRACS             0,0.1,0.25,0.5,0.75,1.0
 
 `MODEL_NAMES` applies a common model list to both tasks. `GRAMMAR_MODEL_NAMES` and `ARITHMETIC_MODEL_NAMES` set task-specific lists. `POISONING_FAST_TEST=1` selects a small behavior-first smoke configuration.
 
-The root launcher runs matched training, checkpoint causal discovery, ordinary-correctness analysis, cumulative suppression/specificity evaluation, and matrix aggregation.
+The root launcher runs matched training, checkpoint causal discovery, ordinary-correctness analysis, cumulative suppression/specificity evaluation, training-time protection controls, and matrix aggregation. Training-time protection is enabled by default through `RUN_TRAINING_PROTECTION=1`.
 
 ## Direct training and analysis
 
 From `code/`, inspect the task CLIs:
 
 ```bash
-python3 -m poisoning.tasks.grammar --help
-python3 -m poisoning.tasks.arithmetic --help
+python3 -m studies.poisoning.tasks.grammar --help
+python3 -m studies.poisoning.tasks.arithmetic --help
 ```
 
 Preview the shared checkpoint driver:
 
 ```bash
-POISONING_TASK=grammar DRY_RUN=1 bash poisoning/scripts/run_checkpoint_ft.sh
+POISONING_TASK=grammar DRY_RUN=1 bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh
 ```
 
 Run matched clean and poisoned training:
 
 ```bash
-POISONING_TASK=grammar CONDITION=both bash poisoning/scripts/run_checkpoint_ft.sh
+POISONING_TASK=grammar CONDITION=both bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh
 ```
 
 The direct shell driver defaults to seed `13`, `POISON_RATE=0.03`, `POISON_RATE_BASIS=total_train`, one epoch, LoRA enabled, and checkpoint fractions `0,0.1,0.25,0.5,0.75,1.0`.
@@ -228,7 +244,7 @@ After training, run checkpoint causal discovery:
 ```bash
 POISONING_TASK=grammar \
 RUN_DIR=../data/poisoning/grammar/<run-name> \
-bash poisoning/scripts/run_backdoor_lift_overtopping.sh
+bash studies/poisoning/scripts/run_checkpoint_causal_workflow.sh
 ```
 
 Then run cumulative suppression and specificity analysis:
@@ -236,7 +252,7 @@ Then run cumulative suppression and specificity analysis:
 ```bash
 POISONING_TASK=grammar \
 RUN_DIR=../data/poisoning/grammar/<run-name> \
-bash poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh
+bash studies/poisoning/scripts/stage07_run_inference_defence.sh
 ```
 
 ## Causal discovery and holdout policy
@@ -268,14 +284,15 @@ data/poisoning/<task>/<run>/
 
 with numbered stage directories for training, cohorts, causal discovery, condition comparisons, trajectories, and circuit-overlap analysis. Regenerable model-I/O and pipeline caches live under `cache/poisoning/`.
 
-For a default run, checkpoint-discovery caches are stored under:
+For a default run, checkpoint-discovery and inference-defence caches are stored together under the same task/run namespace:
 
 ```text
 cache/poisoning/<task>/<run>/
-  checkpoint_causal_discovery/<phase>/adaptive_circuit_discovery/
+├── checkpoint_causal_discovery/<phase>/adaptive_circuit_discovery/
+└── defence/<input_output|output_only>/fraction_<fraction>/
 ```
 
-`POISONING_CACHE_ROOT` changes the top-level poisoning cache. `DISCOVERY_CACHE_ROOT` overrides the per-discovery cache location; relative values are resolved from the repository root.
+`POISONING_CACHE_ROOT` changes the top-level poisoning cache. `DISCOVERY_CACHE_ROOT` overrides only the per-discovery cache location; relative values are resolved from the repository root. Trigger-lift model-I/O is cached once per checkpoint. Ordinary-correctness reuses that same paired model-I/O pickle and keeps only its downstream endpoint-specific pipeline caches separate. Inference-defence caches use the basename of the actual run directory, which keeps grammar and arithmetic caches isolated and keeps each run's regenerable artifacts together.
 
 A nonempty run directory that lacks the canonical training metadata is never moved, deleted, or rewritten automatically. Use a new run name or explicitly relocate the conflicting directory.
 

@@ -40,8 +40,8 @@ Default matrix settings:
 ### Direct task CLIs
 
 ```bash
-python3 -m poisoning.tasks.grammar --help
-python3 -m poisoning.tasks.arithmetic --help
+python3 -m studies.poisoning.tasks.grammar --help
+python3 -m studies.poisoning.tasks.arithmetic --help
 ```
 
 Use these when task-specific arguments need to be controlled directly.
@@ -49,7 +49,7 @@ Use these when task-specific arguments need to be controlled directly.
 ### Shared checkpoint-training driver
 
 ```bash
-POISONING_TASK=grammar DRY_RUN=1 bash poisoning/scripts/run_checkpoint_ft.sh
+POISONING_TASK=grammar DRY_RUN=1 bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh
 ```
 
 This shell driver translates environment variables into the canonical task CLI and activates `<repo>/.env` when it exists.
@@ -107,7 +107,7 @@ both
 
 ### Poison rate basis
 
-Canonical values are defined in `poisoning.lib.protocol`.
+Canonical values are defined in `studies.poisoning.lib.protocol`.
 
 - `total_train`: the requested rate is interpreted relative to the total training set.
 - `eligible_gold_non_target`: the requested rate is interpreted relative to the eligible gold-non-target source pool.
@@ -147,24 +147,24 @@ PREFLIGHT_MAX_EVAL            2048
 
 A negative threshold disables that component of the guard.
 
-## Checkpoint causal discovery
+## Checkpoint analysis workflow (Stages 02–06)
 
-For a completed run:
+For a completed Stage 01 training run:
 
 ```bash
 POISONING_TASK=grammar \
 RUN_DIR=../data/poisoning/grammar/<run-name> \
-bash poisoning/scripts/run_backdoor_lift_overtopping.sh
+bash studies/poisoning/scripts/run_checkpoint_causal_workflow.sh
 ```
 
-The discovery driver requires:
+The multi-stage checkpoint-analysis driver requires:
 
 ```text
 <RUN_DIR>/01_training_checkpoints/metadata/run_config.json
 <RUN_DIR>/01_training_checkpoints/metadata/checkpoint_manifest_all.csv
 ```
 
-It verifies or reconstructs the deterministic causal cohort, reads the marker/target configuration from the run metadata, evaluates paired control/trigger behavior, plans CHA from the available positive counts, and invokes the standard pipeline with baseline-conditioned held-out evaluation.
+It prepares or verifies the Stage 02 deterministic evaluation cohort, invokes the shared pipeline for Stage 03 checkpoint causal discovery, then writes Stage 04 condition comparisons, Stage 05 behavior trajectories, and Stage 06 circuit-overlap summaries. It reads marker/target configuration from run metadata, evaluates paired control/trigger behavior, and plans CHA from the available positive counts.
 
 Task phase defaults are:
 
@@ -175,7 +175,7 @@ Set `PIPELINE_DECODE_ONLY=1` or `0` to override the phase explicitly.
 
 ### Shared CHA and scan controls
 
-`poisoning/scripts/poisoning_runtime_config.sh` defines:
+`studies/poisoning/scripts/poisoning_runtime_config.sh` defines:
 
 | Variable | Default | Meaning |
 |---|---:|---|
@@ -240,7 +240,7 @@ After checkpoint discovery:
 ```bash
 POISONING_TASK=grammar \
 RUN_DIR=../data/poisoning/grammar/<run-name> \
-bash poisoning/scripts/run_backdoor_lift_cumulative_ablation.sh
+bash studies/poisoning/scripts/stage07_run_inference_defence.sh
 ```
 
 Important defaults are:
@@ -254,26 +254,19 @@ MEAN_POINTS                   512
 BATCH_SIZE                    8
 CI_LEVEL                      0.95
 BOOTSTRAP                     5000
-INTERACTION_FRACTION          1.0
-INTERACTION_POOL              16
-INTERACTION_MAX_K             8
-INTERACTION_SELECTION_FRACTION 0.40
-INTERACTION_MIN_EXAMPLES      20
-INTERACTION_RANDOM_DRAWS_PER_K 6
-INTERACTION_PAIR_SCAN         1
 ```
 
-The interaction-aware final-checkpoint analysis separates selection rows from a reserved confirmation subset before evaluating the selected coalition on confirmation data.
+For each defended checkpoint, the coalition ranking is taken from the latest strictly earlier checkpoint with a completed frozen discovery ranking. The defended checkpoint is evaluation-only: it cannot provide channel identities, ranking, or an adaptively selected coalition. If no earlier completed ranking exists, that checkpoint is skipped rather than falling back to its own discovery results.
 
 ## Training-time protection
 
-Training-time protection is separate from the normal matrix:
+Training-time protection is included in the normal root matrix by default. Use `RUN_TRAINING_PROTECTION=0` only to disable it. The isolated lower-level workflow remains available:
 
 ```bash
-bash poisoning/scripts/run_training_time_protection.sh
+bash studies/poisoning/scripts/stage07_run_training_defence.sh
 ```
 
-The protection workflow resolves channels from a virgin-model agonist set, verifies matched baseline/protected run definitions, trains protected and random-protected poisoning trajectories, and compares them with the baseline poisoning trajectory.
+The protection workflow resolves channels from a virgin-model ordinary-task agonist set before poisoned training begins, verifies matched baseline/protected run definitions, trains protected and random-protected poisoning trajectories, and compares them with the baseline poisoning trajectory. Explicit protection sources are phase-checked and must lie under the configured ordinary virgin-model analysis root; anything under `data/poisoning` is rejected. Use `POISONING_<TASK>_VIRGIN_MODEL_ROOT` when the virgin analysis is stored elsewhere. This prevents a protected run from consuming a circuit discovered from a poisoned checkpoint.
 
 Controls include:
 
@@ -304,3 +297,15 @@ For confirmatory runs:
 - retain `run_config.json`, checkpoint manifests, cohort files, discovery status, and defense configuration files;
 - keep persistent artifacts under `data/` and regenerable caches under `cache/`;
 - use at least the configured multi-seed matrix for claims about acquisition timing or circuit stability.
+
+### Defence caching and final outputs
+
+`POISONING_FINAL_ROOT` defaults to `data/poisoning/final`. `POISONING_CACHE_ROOT` defaults to `cache/poisoning` and is the base for both checkpoint-discovery and inference-defence caches. The cumulative-ablation CLI's `--cache_dir` argument has the same base-root meaning; it does not point at a preconstructed defence leaf.
+
+For each defended run, inference-defence cache entries are written to:
+
+```text
+POISONING_CACHE_ROOT/<task>/<run>/defence/<input_output|output_only>/fraction_<fraction>/
+```
+
+The `<run>` component is the basename of the actual poisoning run directory. Complete matching cache entries are reused before loading the defended checkpoint model.

@@ -1,19 +1,19 @@
 # Numbered causal-intervention pipeline
 
-This page documents the generic per-configuration pipeline coordinated by `pipeline/_run_pipeline.sh`. It can be called directly for custom runs or indirectly through the experiment catalogue.
+This page documents the shared per-configuration causal-intervention pipeline coordinated by `pipeline/run_pipeline.sh`. The overtopping catalogue uses it for ordinary task/model configurations, and the poisoning workflow reuses it for checkpoint-specific causal discovery and ordinary-correctness controls. It can also be called directly for custom runs.
 
 The standard per-configuration orchestrator is:
 
 ```bash
 cd code
-bash pipeline/_run_pipeline.sh <TASK> <MODEL> [options]
+bash pipeline/run_pipeline.sh <TASK> <MODEL> [options]
 ```
 
 The experiment catalogue calls this wrapper automatically. Direct use is useful for custom configurations.
 
 ## Cache names for local checkpoints
 
-Local checkpoint paths are never flattened into cache directory or file names. When no explicit `--model_label` is supplied, the runner derives a readable semantic identifier from the checkpoint name and condition when the path uses a `clean/checkpoints/...` or `poisoned/checkpoints/...` layout. Representation caches use the same rule. No absolute-path encoding or hash suffix is added; for example, `poisoned/checkpoints/frac_0100_step_25` becomes `poisoned_frac_0100_step_25`.
+Local checkpoint paths are never flattened into cache directory or file names. When no explicit `--model_label` is supplied, the runner derives a readable semantic identifier from the checkpoint name and condition when the path uses a `clean/checkpoints/...` or `poisoned/checkpoints/...` layout. Representation caches use the same rule. No absolute-path encoding or hash suffix is added; for example, `poisoned/checkpoints/progress_010pct__step_0025` becomes `poisoned_progress_010pct__step_0025`.
 
 ## Default wrapper configuration
 
@@ -100,19 +100,19 @@ identity.
 The wrapper normally resolves the task implementation as:
 
 ```text
-lib.tasks.<experiment_name>_task
+core.tasks.<experiment_name>_task
 ```
 
-Use `--task_module` when an experiment intentionally lives outside `lib.tasks`. The resolver accepts either a module name, which selects that module's `TASK_SPEC`, or `module:attribute`, which selects a named task-spec object. Normal tasks use the former. The single-file poisoning tasks use named attributes when they need to distinguish the backdoor endpoint from the ordinary-correctness endpoint; for example, `poisoning.tasks.grammar:BACKDOOR_TASK_SPEC` and `poisoning.tasks.grammar:ORDINARY_TASK_SPEC`.
+Use `--task_module` when an experiment intentionally lives outside `core.tasks`. The resolver accepts either a module name, which selects that module's `TASK_SPEC`, or `module:attribute`, which selects a named task-spec object. Normal tasks use the former. The single-file poisoning tasks use named attributes when they need to distinguish the backdoor endpoint from the ordinary-correctness endpoint; for example, `studies.poisoning.tasks.grammar:BACKDOOR_TASK_SPEC` and `studies.poisoning.tasks.grammar:ORDINARY_TASK_SPEC`.
 
 Poisoning defines paired trigger-marker/control-marker task specifications under
-`poisoning.tasks`. Its launcher calls this same numbered pipeline
+`studies.poisoning.tasks`. Its launcher calls this same numbered pipeline
 in `--spectral_splits` mode **after training is complete**, once for every
 post-training checkpoint in both clean and poisoned trajectories.
 
-CHA's statistical operating point can be configured generically with `CHA_REFERENCE_N_PER_SIDE`, `CHA_TAU`, `CHA_LOW_DATA_POLICY`, `CHA_MIN_ACTUAL_N_PER_SIDE`, and `CHA_PRUNE_ALPHA`. When these are explicitly exported, `_run_pipeline.sh` uses `CHA_TAU` as the default `--min_flip_rate`, maps `CHA_REFERENCE_N_PER_SIDE` to the reference sample size used by finite-sample UCB calibration, and stage 6 honors the requested low-data policy for under-sized per-circuit samples. Without those variables, the generic pipeline uses its built-in defaults.
+CHA's statistical operating point can be configured generically with `CHA_REFERENCE_N_PER_SIDE`, `CHA_TAU`, `CHA_LOW_DATA_POLICY`, `CHA_MIN_ACTUAL_N_PER_SIDE`, and `CHA_PRUNE_ALPHA`. When these are explicitly exported, `run_pipeline.sh` uses `CHA_TAU` as the default `--min_flip_rate`, maps `CHA_REFERENCE_N_PER_SIDE` to the reference sample size used by finite-sample UCB calibration, and stage 6 honors the requested low-data policy for under-sized per-circuit samples. Without those variables, the generic pipeline uses its built-in defaults.
 
-Stage 7 has one evaluation-size control: `--sampling_max_points`, supplied by `_run_pipeline.sh` from `REFINE_SAMPLING_MAX_POINTS` (10,000 by default). The same cap is used in both modes. With explicit spectral sampling enabled it bounds the spectral sample. With spectral sampling disabled it bounds the selected evaluation pool directly, after `--evaluation_split` and `--evaluation_baseline_subset`, by taking a deterministic seeded uniform sample without replacement from the selected pool.
+Stage 7 has one evaluation-size control: `--sampling_max_points`, supplied by `run_pipeline.sh` from `REFINE_SAMPLING_MAX_POINTS` (10,000 by default). The same cap is used in both modes. With explicit spectral sampling enabled it bounds the spectral sample. With spectral sampling disabled it bounds the selected evaluation pool directly, after `--evaluation_split` and `--evaluation_baseline_subset`, by taking a deterministic seeded uniform sample without replacement from the selected pool.
 
 Poisoning additionally has a trigger-lift candidate-acquisition ceiling, `TRIGGER_LIFT_SCAN_MAX_ROWS`. It defaults to `REFINE_SAMPLING_MAX_POINTS`, so both are 10,000 unless the trigger-lift scan is overridden separately. Grammar and arithmetic candidate pools are deterministically shuffled by their task seed before this cap is applied; the capped causal scan therefore uses a fixed prefix of that seeded order at every checkpoint. Spectral representations are not used to choose causal-scan candidates. Stage 7 reports the actual denominator and exact binomial confidence intervals.
 
@@ -141,7 +141,7 @@ Default state remains outside `code/`:
 
 ## Stage 1 — prompts and answers
 
-`pipeline/1_generate_prompts_and_answers.py`
+`pipeline/stage01_generate_prompts_and_answers.py`
 
 Responsibilities:
 
@@ -151,9 +151,17 @@ Responsibilities:
 - parse the task predicate/correctness;
 - write task/model I/O caches and dataset statistics.
 
+When the requested model-I/O cache already exists, Stage 1 loads it instead of invoking the model. A task may expose `validate_generated_cache()` to reject an incompatible cache before reuse; poisoning task specs use this to check checkpoint/cohort/marker provenance. For a valid poisoning cache, statistics and the poisoning dataset-only `scores.csv` export are produced from the already-loaded object and the pickle is not rewritten.
+
+All external-provider calls made through `instruct_model()` use the same recovery policy, independent of task or pipeline stage. This includes API-backed task labels/classifiers and API-backed feature proposal. OpenAI and Groq requests retry transient rate limits, timeouts, connection failures, and 5xx responses at the individual-request layer with bounded exponential backoff and `Retry-After` support. Remote concurrency is bounded by `API_MAX_WORKERS`.
+
+Successful provider responses are registered for persistent caching as soon as each request finishes, rather than only after the entire batch completes. The cache is written periodically and flushed on normal exit, SIGINT, and SIGTERM. If some prompts remain unresolved after their individual request retries, the shared provider layer performs additional recovery passes over only those unresolved prompts. By default an external-provider batch is strict: if requests are still unresolved after recovery, the call raises instead of allowing a higher-level dataset or feature artifact to be saved with missing API results. Re-running the command reuses all successful provider-cache entries and requests only the unresolved prompts.
+
+The request controls are `API_MAX_RETRIES` (default `6`), `API_RETRY_BASE_SECONDS` (`2`), `API_RETRY_MAX_SECONDS` (`60`), `API_RETRY_JITTER_SECONDS` (`1`), and `API_MAX_WORKERS` (`8`). Batch-level recovery is controlled by `API_RECOVERY_PASSES` (default `2` additional passes), `API_RECOVERY_BASE_SECONDS` (default `15`), and `API_RECOVERY_MAX_SECONDS` (default `60`). The jailbreak classifier may permit an incomplete *primary* classifier batch only long enough to route those specific rows to its configured fallback classifier; the fallback is strict. Recovery and persistence themselves are shared infrastructure, not task-specific hooks.
+
 ## Stage 2 — features
 
-`pipeline/2_generate_features.py`
+`pipeline/stage02_generate_features.py`
 
 Responsibilities:
 
@@ -165,19 +173,19 @@ Responsibilities:
 
 ## Stage 3 — rules
 
-`pipeline/3_extract_rules.py`
+`pipeline/stage03_extract_rules.py`
 
-Extracts symbolic feature rules and rule combinations. It is skipped in `--spectral_splits` mode.
+Extracts symbolic feature rules and rule combinations. Stage 2 must provide the `is_test` split column; Stage 3 fits its rule models on the training rows and refuses stale score tables that predate the split-aware schema. It is skipped in `--spectral_splits` mode.
 
 ## Stage 4 — sampling plan
 
-`pipeline/4_spectral_sample_datapoints.py`
+`pipeline/stage04_spectral_sample_datapoints.py`
 
 Creates representative sampling plans used for rule-based circuit discovery. It is skipped in spectral-split mode.
 
 ## Stage 5 — circuit discovery
 
-`pipeline/5_discover_circuits.py`
+`pipeline/stage05_discover_circuits.py`
 
 Runs EAP/EAP-IG attribution at the selected circuit granularity and writes the eligible circuit population plus manifests used by later model interventions.
 
@@ -191,13 +199,13 @@ The `neural_circuits/` subdirectory contains `manifest.json` and `dataset_info.j
 
 ## Stage 6 — candidate selection
 
-`pipeline/6_analyze_bag_of_rules.py`
+`pipeline/stage06_analyze_bag_of_rules.py`
 
 Evaluates discovery/training effects for candidate channels and creates the frozen candidate set used by stage 7. Candidate ranking for `H_m` is based on discovery-side stage-6 effect information, not evaluation-side singleton rates.
 
 ## Stage 7 — singleton evaluation
 
-`pipeline/7_refine_neuron_anchored_rules.py`
+`pipeline/stage07_refine_neuron_anchored_rules.py`
 
 For each frozen candidate channel:
 
@@ -278,9 +286,9 @@ N_t = |{j : s_j >= t}|
 
 `E(J)` is not defined by singleton unioning; it is computed separately by simultaneous intervention.
 
-## Simultaneous and conditional validation
+## Stage 8 — simultaneous and conditional validation
 
-After stage 7, the wrapper runs `analysis.validate_interactions` when:
+After Stage 7, the wrapper runs `pipeline.stage08_validate_interactions` when:
 
 ```text
 RUN_INTERACTION_VALIDATION=true
@@ -297,7 +305,7 @@ CONDITIONAL_BACKGROUND_MULTIPLIERS default: 1
 FORCE_INTERACTION_VALIDATION       default: false
 ```
 
-The pipeline wrapper itself defaults `INTERACTION_NULL_DRAWS` to `100`. A separate repository-level launcher may override that value; always inspect the environment used for a run rather than assuming a launcher-specific default.
+The pipeline wrapper defaults `INTERACTION_NULL_DRAWS` to `100`. Any explicit environment value supplied by a caller takes precedence, so record the effective environment for expensive interaction-validation runs.
 
 The validator always computes genuine simultaneous:
 
@@ -314,7 +322,7 @@ E(S_b union J)
 E(S_b union K_b)
 ```
 
-and the paired conditional marginal statistic documented in [Analysis and final-result generation](analysis.md). Set `RUN_CMC=false` to retain `E(J)` and matched-null validation while skipping all CMC background interventions.
+and the paired conditional marginal statistic documented in [Analysis and final-result generation](overtopping-analysis.md). Set `RUN_CMC=false` to retain `E(J)` and matched-null validation while skipping all CMC background interventions.
 
 ## Other pipeline environment controls
 
@@ -334,7 +342,7 @@ FORCE_STAGE7
 NO_LLM_FEATURE_GENERATION
 ```
 
-Inspect `_run_pipeline.sh` for the exact current defaults before launching expensive custom runs.
+Inspect `run_pipeline.sh` for the exact current defaults before launching expensive custom runs.
 
 ## Cache safety
 
