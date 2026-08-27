@@ -88,8 +88,6 @@ def poisoning_run_dirs(poisoning_root: Path) -> list[Path]:
             trajectories = run_dir / TRAJECTORIES_DIRNAME
             if not cfg.is_file() or not any(trajectories.glob("*/backdoor_lift_overtopping_trajectory.csv")):
                 continue
-            # Protected/random-protected runs are visualized through the dedicated
-            # training-time defence analysis, not mixed into the ordinary poisoning trajectory aggregate.
             try:
                 config = json.loads(cfg.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -176,17 +174,11 @@ def main() -> None:
             "--run_dirs", ",".join(str(path) for path in poisoning_runs),
             "--output_dir", str(poisoning_aggregate),
         ])
-        # Defence data are already organized by study under data/poisoning/final/*/07_defence_evaluation.
-        # Render all available mechanisms into the same final-results figure directory.
-        defence_roots = sorted((poisoning_root / "final").glob("*/07_defence_evaluation"))
-        command = [
+        run([
             sys.executable, "-m", "studies.poisoning.stage08_plot_cross_seed",
             "--input_dir", str(poisoning_aggregate),
             "--output_dir", str(poisoning_paper_figures),
-        ]
-        if defence_roots:
-            command += ["--defence_root", ",".join(str(path) for path in defence_roots)]
-        run(command)
+        ])
 
     spiking_out = overtopping_spiking_diagnostics(results_root)
     spiking_out.mkdir(parents=True, exist_ok=True)

@@ -1,114 +1,268 @@
-# Poisoning outputs and cache layout
+# Poisoning outputs
 
-Each poisoning task/model/seed run has one persistent run directory under `data/poisoning/<task>/`. The root launcher constructs run IDs from the study name, model slug, and seed.
+This page lists the run-local outputs produced by the poisoning workflow.
 
-Example:
-
-```text
-data/poisoning/grammar/
-└── confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
-```
-
-## Run-local stages
+## Run root
 
 ```text
-<run_dir>/
+data/poisoning/<task>/<run_id>/
 ├── 01_training_checkpoints/
-│   ├── metadata/
-│   ├── clean/
-│   └── poisoned/
 ├── 02_evaluation_cohorts/
 ├── 03_checkpoint_causal_discovery/
 ├── 04_condition_comparisons/
 ├── 05_behavior_trajectories/
-└── 06_circuit_overlap_analysis/
+├── 06_circuit_overlap_analysis/
+└── 07_poisoning_example_detection/
 ```
 
-### Stage 01 — training checkpoints
+Cross-seed Stage 08 outputs are stored under `data/poisoning/final/`.
 
-Contains clean and poisoned checkpoint trajectories plus metadata such as run configuration and checkpoint manifests. Canonical checkpoint directories use labels such as:
+## Stage 01 — training checkpoints
+
+Each condition has a checkpoint manifest and checkpoint directories. Metadata records the training configuration, poison plan, schedule, and checkpoint identity.
+
+## Stage 02 — evaluation cohorts
+
+Stable evaluation rows are stored under:
 
 ```text
-progress_025pct__step_0063
+02_evaluation_cohorts/
 ```
 
-The checkpoint manifest is the authoritative mapping from condition/fraction/step to checkpoint directory.
+The same row identities are reused across matched checkpoints.
 
-### Stage 02 — evaluation cohorts
+## Stage 03 — checkpoint evaluation and causal discovery
 
-Contains deterministic rows used by downstream checkpoint evaluation. Cohorts are fixed before causal comparisons so candidate and control analyses use the intended paired populations.
-
-### Stage 03 — checkpoint causal discovery
-
-Contains per-checkpoint outputs from the shared causal pipeline. Trigger-lift discovery and ordinary-correctness controls use separate endpoint-specific downstream artifacts while reusing appropriate model-I/O caches.
-
-### Stage 04 — condition comparisons
-
-Contains clean-versus-poisoned behavioral comparison tables and associated checkpoint-level summaries.
-
-### Stage 05 — behavior trajectories
-
-Contains checkpoint trajectories derived from paired behavior and causal outputs, including CSV summaries and plots. Phase-specific subdirectories use presentation labels such as `prompt_and_generation` and `generation_only`.
-
-### Stage 06 — circuit overlap
-
-Contains checkpoint circuit-comparison tables, including overlap against the configured virgin-model agonist population where available.
-
-## Stage 07 — defence evaluation
-
-Study-level Stage 07 outputs are written under:
+For each condition and checkpoint:
 
 ```text
-data/poisoning/final/<study_name>/07_defence_evaluation/
-  <task>/<model_slug>/seed_<seed>/<phase>/
+03_checkpoint_causal_discovery/
+└── <condition>/
+    └── <checkpoint>/
+        └── <phase>/
+            ├── backdoor_trigger_test/
+            │   └── eval_<intervention>/
+            │       └── feature_report/
+            ├── normal_task/
+            │   └── eval_<intervention>/
+            │       └── feature_report/
+            └── attack_cohort_control_correctness/
+                └── eval_<intervention>/
+                    ├── feature_report/
+                    ├── neural_circuit_discovery_results/
+                    ├── rule_extraction_results/
+                    └── attack_cohort_control_correctness_status.json
 ```
 
-`<phase>` is `prompt_and_generation` or `generation_only` in result directories.
+The endpoint meanings are:
 
-Inference-time outputs live under `inference_time/`; training-time protection outputs live under `training_time/`.
+- `backdoor_trigger_test`: attack-eligible cohort, control and trigger behavior;
+- `normal_task`: full held-out distribution, control/no-trigger behavior only;
+- `attack_cohort_control_correctness`: attack-eligible cohort, control/no-trigger correctness CHA.
 
-### Inference-defence cache
+The causal endpoint uses `is_correct_control` with `1=correct` and `0=incorrect`.
 
-The expensive model-backed cumulative-ablation evaluations are cached at exactly one location:
+Some compatibility files and fields retain the legacy `ordinary_correctness` name. They refer to the attack-cohort control-correctness causal endpoint, not to the full-cohort `normal_task` behavior endpoint.
+
+## Stage 04 — matched behavior comparison
+
+Stage 04 stores clean/poisoned checkpoint comparisons and trajectories under:
 
 ```text
-cache/poisoning/<task>/<run_id>/defence/<phase>/fraction_<fraction>/
+04_condition_comparisons/<phase>/eval_<intervention>/
 ```
 
-where cache `<phase>` is `input_output` or `output_only`.
-
-For grammar, seed 13, input/output intervention, and the 25% checkpoint:
+Behavior groups are separated into:
 
 ```text
-cache/poisoning/grammar/
-  confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
-  defence/input_output/fraction_0.250000/
+backdoor_trigger_test/
+normal_task/
 ```
 
-A cache leaf contains:
+The backdoor trajectory provides:
 
 ```text
-candidate_rows.csv
-matched_random_rows.csv
-cache_manifest.json
+target_rate_without_trigger
+target_rate_with_trigger
+trigger_induced_target_rate_change
+conversion_rate_among_convertible_examples
+fraction_convertible_without_trigger
+non_target_to_target_flip_rate
 ```
 
-`candidate_rows.csv` stores completed cumulative candidate-coalition evaluations. `matched_random_rows.csv` stores completed matched-random draws. `cache_manifest.json` records the scientific identity used to determine whether those rows apply to the requested evaluation.
+`conversion_rate_among_convertible_examples` is the primary attack-efficacy input for the Stage-07 detectability/attack comparison.
 
-The cache is resumable. Candidate results are persisted when completed, and matched-random results are persisted after each draw. A rerun reuses completed rows and evaluates only missing requested work when the manifest identity is compatible.
+## Stage 05 — developmental trajectories
 
-Changing execution-only settings such as batch size does not change the scientific result represented by a completed cached row. Changes to scientific inputs such as checkpoint content, frozen ranking, cohort/score inputs, intervention semantics, sample limits, or seed make the cache inapplicable and are reported as an explicit cache miss.
+Stage 05 aggregates checkpoint behavior and causal summaries. These tables are descriptive trajectory outputs and are separate from the fixed-candidate Stage-07 materializations.
 
-## Stage 08 — cross-seed aggregation
+## Stage 06 — circuit overlap
 
-Cross-seed tables and figures are written under:
+Stage 06 compares checkpoint-local candidate identities and overlap across clean and poisoned trajectories.
+
+## Stage 07 — poisoning-example detection
+
+Stage 07 writes under:
 
 ```text
-data/poisoning/final/<study_name>/08_cross_seed_aggregation/
+07_poisoning_example_detection/<phase>/
 ```
 
-Stage 08 combines matched task/model/seed cells only after the required per-seed stages are available.
+### `ordinary_candidate_union.csv`
 
-## `cache/` versus `data/`
+Compatibility filename for the union of attack-cohort control-correctness agonist channels discovered across matched clean and poisoned checkpoints.
 
-Delete `cache/` only when the corresponding expensive computations can be regenerated. Do not treat `data/` as disposable: training manifests, checkpoints, fixed cohorts, and completed scientific outputs are persistent experiment artifacts.
+### `ordinary_u_j_materialization/`
+
+Compatibility directory containing fixed-cohort singleton evaluations for every union candidate at every matched checkpoint.
+
+Typical structure:
+
+```text
+ordinary_u_j_materialization/
+├── clean/
+│   └── <checkpoint>/neuron_flip_rules/
+└── poisoned/
+    └── <checkpoint>/neuron_flip_rules/
+```
+
+The fixed singleton strength is:
+
+```text
+U(j) = c2i_count / N_fixed
+```
+
+on the held-out attack-eligible cohort.
+
+### `ordinary_channel_disruption_by_interval.csv`
+
+Compatibility filename for per-channel developmental disruption. Important columns include:
+
+```text
+poisoned_delta_u_j
+clean_delta_u_j
+poisoning_excess_delta_u_j
+disruption_score
+clean_null_z
+comparison_status
+```
+
+### `selected_disruptive_channels_by_interval.csv`
+
+Channels retained after effect-size, simultaneous bootstrap, and optional clean-null criteria.
+
+### `mapped_disruptive_channels.csv`
+
+Interval-local mapping from causal channel identities to LoRA projection rows.
+
+### `training_exposure_order.csv`
+
+Label-neutral persisted training exposure order used for interval scoring.
+
+### `training_example_scores_all_intervals.csv`
+
+One row per scored training exposure. Important columns include:
+
+```text
+wanda_disruption_score
+wanda_interval_percentile
+wanda_interval_robust_z
+is_poisoned
+```
+
+`is_poisoned` is added for post-score evaluation.
+
+### `top_suspected_training_examples.csv`
+
+Run-level top rows sorted by within-interval percentile, then robust z-score, then raw WANDA score.
+
+### `detection_metrics_by_interval.csv`
+
+Interval-level detector metrics. It includes candidate metrics, matched-control summaries, poison prevalence, and top-`N` recovery.
+
+### `detection_vs_attack_success_by_interval.csv`
+
+Joins detector metrics with Stage-04 backdoor behavior.
+
+Key fields include:
+
+```text
+roc_auc
+poison_recovery_in_top_n
+poisoned_conversion_rate_start
+poisoned_conversion_rate_among_convertible_examples
+poisoned_conversion_change_over_interval
+clean_conversion_change_over_interval
+conversion_change_gain_poisoned_vs_clean
+```
+
+The interval alignment is:
+
+```text
+detector metric: rows scored in [t0,t1]
+attack change:   conditional_conversion(t1) - conditional_conversion(t0)
+attack level:    conditional_conversion(t1)
+```
+
+### `detection_vs_attack_association.csv`
+
+Statistical tests of detectability versus backdoor efficacy.
+
+The primary row is:
+
+```text
+test_name = primary_auc_vs_poisoned_conversion_change
+detectability_metric = roc_auc
+attack_metric = poisoned_conversion_change_over_interval
+statistic = spearman_rho
+alternative = two_sided
+```
+
+For at most 9 finite intervals, the p-value is obtained by enumerating all permutations. Larger samples use 100,000 Monte Carlo permutations with a fixed seed.
+
+Secondary rows test interval-end conversion, clean-adjusted conversion change, and top-`N` recovery. `multiplicity_adjustment=none` is recorded in the table.
+
+### `detection_vs_attack_association.json`
+
+JSON representation of the association table.
+
+### Visualizations
+
+```text
+poisoning_example_detection_metrics.pdf
+poisoning_example_score_distribution.pdf
+poisoning_detection_vs_attack_success.pdf
+poisoning_detectability_attack_association.pdf
+```
+
+The association figure plots interval ROC AUC against the change in poisoned conditional conversion over the same interval and reports the primary Spearman statistic and permutation p-value.
+
+### `detection_summary.json`
+
+Run-level Stage-07 metadata, including:
+
+- causal endpoint and candidate definition;
+- `U(j)` definition;
+- WANDA score definition;
+- matched-control configuration;
+- normal-training control count;
+- backdoor behavior source;
+- primary detectability/attack association result.
+
+## Clean-null outputs
+
+When `--clean_null_run_dirs` is supplied, Stage 07 materializes the same fixed union on each additional clean trajectory.
+
+One clean trajectory is one realization of normal training. Clean-null z-scores are reported only when at least three finite independent clean trajectories are available for the channel/interval and the sample variance is positive.
+
+## Cache directories
+
+Regenerable caches are stored under the configured `POISONING_CACHE_ROOT`. The main endpoint cache groups are:
+
+```text
+backdoor_trigger_test/
+normal_task_behavior/
+attack_cohort_control_correctness/
+```
+
+Scientific outputs are under the run directory; cache directories are implementation accelerators.

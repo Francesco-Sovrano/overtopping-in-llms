@@ -1,6 +1,6 @@
 # Numbered causal-intervention pipeline
 
-This page documents the shared per-configuration causal-intervention pipeline coordinated by `pipeline/run_pipeline.sh`. The overtopping catalogue uses it for ordinary task/model configurations, and the poisoning workflow reuses it for checkpoint-specific causal discovery and ordinary-correctness controls. It can also be called directly for custom runs.
+This page documents the shared per-configuration causal-intervention pipeline coordinated by `pipeline/run_pipeline.sh`. The overtopping catalogue uses it for ordinary task/model configurations, and the poisoning workflow reuses it for checkpoint-specific attack-cohort control-correctness causal discovery. It can also be called directly for custom runs.
 
 The standard per-configuration orchestrator is:
 
@@ -103,7 +103,7 @@ The wrapper normally resolves the task implementation as:
 core.tasks.<experiment_name>_task
 ```
 
-Use `--task_module` when an experiment intentionally lives outside `core.tasks`. The resolver accepts either a module name, which selects that module's `TASK_SPEC`, or `module:attribute`, which selects a named task-spec object. Normal tasks use the former. The single-file poisoning tasks use named attributes when they need to distinguish the backdoor endpoint from the ordinary-correctness endpoint; for example, `studies.poisoning.tasks.grammar:BACKDOOR_TASK_SPEC` and `studies.poisoning.tasks.grammar:ORDINARY_TASK_SPEC`.
+Use `--task_module` when an experiment intentionally lives outside `core.tasks`. The resolver accepts either a module name, which selects that module's `TASK_SPEC`, or `module:attribute`, which selects a named task-spec object. Normal tasks use the former. The poisoning tasks use named attributes to separate the backdoor behavior task, full-cohort normal-task behavior, and attack-cohort control-correctness causal task; for example, `BACKDOOR_TASK_SPEC`, `NORMAL_TASK_SPEC`, and `ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC`. `ORDINARY_TASK_SPEC` remains a compatibility alias for the attack-cohort causal task.
 
 Poisoning defines paired trigger-marker/control-marker task specifications under
 `studies.poisoning.tasks`. Its launcher calls this same numbered pipeline

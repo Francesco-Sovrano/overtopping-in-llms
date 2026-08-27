@@ -168,8 +168,16 @@ def compute_singleton_set_metrics(
                 "s_j": float(k_j / n_j) if n_j else math.nan,
             }
         )
-    singleton_df = pd.DataFrame(singleton_rows)
-    candidates = candidates.merge(singleton_df, on="unit_key", how="left", validate="one_to_one")
+    if singleton_rows:
+        singleton_df = pd.DataFrame(singleton_rows)
+        candidates = candidates.merge(singleton_df, on="unit_key", how="left", validate="one_to_one")
+    else:
+        # Preserve the empty candidate schema so U(empty)=0 can be summarized
+        # without inventing a candidate or treating the run as incomplete.
+        candidates = candidates.copy()
+        candidates["singleton_count"] = pd.Series(dtype="int64")
+        candidates["singleton_denominator"] = pd.Series(dtype="int64")
+        candidates["s_j"] = pd.Series(dtype="float64")
     if ranking_status == "ok":
         rank_cols = [c for c in ranked.columns if c not in candidates.columns or c == "unit_key"]
         candidates = candidates.merge(

@@ -20,7 +20,7 @@ from studies.poisoning.lib.run_paths import circuits_dir, metadata_path, phase_d
 import numpy as np
 import pandas as pd
 
-from studies.poisoning.lib.virgin_agonists import resolve_virgin_agonists_path
+from studies.poisoning.lib.virgin_agonists import read_agonist_coordinates, resolve_virgin_agonists_path
 from studies.poisoning.tasks.registry import available_tasks, get_task_definition
 
 
@@ -73,24 +73,7 @@ def _overlap_record(a_name: str, a: set[str], b_name: str, b: set[str]) -> dict:
 def _parse_virgin(path: Path | None) -> set[str]:
     if path is None:
         return set()
-    bucket = path if path.is_file() else path / "neuron_buckets.json"
-    if not bucket.is_file():
-        raise FileNotFoundError(f"Virgin agonist bucket not found: {bucket}")
-    payload = json.loads(bucket.read_text(encoding="utf-8"))
-    block = payload.get("non_catastrophic_agonists", {}) if isinstance(payload, dict) else {}
-    out: set[str] = set()
-    if isinstance(block, dict):
-        for key, entry in block.items():
-            rec = entry.get("last_record", {}) if isinstance(entry, dict) else {}
-            layer = rec.get("layer_label")
-            neuron_id = rec.get("neuron_id")
-            if layer is None or neuron_id is None:
-                try:
-                    layer, raw = str(key).rsplit(":", 1); neuron_id = int(raw)
-                except Exception:
-                    continue
-            out.add(_unit_key(str(layer), int(neuron_id)))
-    return out
+    return {_unit_key(layer, neuron_id) for layer, neuron_id in read_agonist_coordinates(path)}
 
 
 def main() -> None:
@@ -143,7 +126,8 @@ def main() -> None:
             ordinary_keys, ordinary_ranking = _load_set(Path(ordinary_stats_raw))
             ordinary_sets[(condition, fraction)] = ordinary_keys
         scientifically_undefined = status in {
-            "no_tl_trigger_lift", "no_discoverable_trigger_lift", "not_run_fraction_zero"
+            "no_tl_trigger_lift", "no_discoverable_trigger_lift", "not_run_fraction_zero",
+            "no_qualifying_neurons",
         }
         n_discovered = len(keys) if circuit_defined else (0 if scientifically_undefined else np.nan)
         entries.append({
@@ -176,7 +160,9 @@ def main() -> None:
             "all_points_top1_mass": row.get("all_points_top1_mass"),
             "stats_dir": stats_raw if isinstance(stats_raw, str) else None,
             "all_points_stats_dir": row.get("all_points_overtopping_stats_dir"),
-            "ordinary_correctness_status": row.get("ordinary_correctness_status"),
+            "normal_task_correctness_status": row.get("normal_task_correctness_status", row.get("ordinary_correctness_status")),
+            "normal_task_correctness_circuit_defined": bool(ordinary_circuit_defined),
+            "ordinary_correctness_status": row.get("ordinary_correctness_status"),  # compatibility
             "ordinary_correctness_circuit_defined": bool(ordinary_circuit_defined),
             "n_ordinary_correctness_channels": (
                 len(ordinary_keys) if ordinary_circuit_defined else np.nan
@@ -220,13 +206,13 @@ def main() -> None:
         ordinary = ordinary_sets.get((condition, frac))
         if trigger is not None and ordinary is not None:
             rec = _overlap_record(
-                f"trigger_lift:{condition}:{frac:g}", trigger,
-                f"ordinary_correctness:{condition}:{frac:g}", ordinary,
+                f"backdoor_trigger_test:{condition}:{frac:g}", trigger,
+                f"normal_task_correctness:{condition}:{frac:g}", ordinary,
             )
         else:
             rec = {
-                "set_a": f"trigger_lift:{condition}:{frac:g}",
-                "set_b": f"ordinary_correctness:{condition}:{frac:g}",
+                "set_a": f"backdoor_trigger_test:{condition}:{frac:g}",
+                "set_b": f"normal_task_correctness:{condition}:{frac:g}",
                 "n_a": len(trigger) if trigger is not None else np.nan,
                 "n_b": len(ordinary) if ordinary is not None else np.nan,
                 "n_intersection": np.nan,
@@ -236,7 +222,7 @@ def main() -> None:
                 "fraction_b_explained": np.nan,
             }
         rec.update({
-            "comparison": "trigger_lift_vs_ordinary_correctness",
+            "comparison": "backdoor_trigger_test_vs_normal_task_correctness",
             "condition": condition,
             "fraction": frac,
             "trigger_circuit_defined": trigger is not None,
@@ -244,7 +230,7 @@ def main() -> None:
         })
         trigger_vs_ordinary.append(rec)
     pd.DataFrame(trigger_vs_ordinary).to_csv(
-        summary_dir / "trigger_vs_ordinary_correctness_circuit_overlap.csv",
+        summary_dir / "backdoor_trigger_vs_normal_task_circuit_overlap.csv",
         index=False,
     )
 

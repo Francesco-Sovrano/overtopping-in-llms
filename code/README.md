@@ -1,59 +1,30 @@
-# Source-code layout
+# Code packages
 
-`code/` is the Python import root. Its directories are organized by dependency and study ownership.
+The `code/` directory contains importable Python packages and project documentation.
 
 ```text
 code/
-├── core/                       reusable primitives shared by both studies
-├── pipeline/                   shared causal-intervention workflow
-├── reporting/                  cross-study result orchestration
+├── core/                 shared utilities and ordinary task definitions
+├── pipeline/             shared causal-discovery pipeline
+├── reporting/            aggregate/manuscript reporting
 ├── studies/
-│   ├── overtopping/
-│   │   ├── experiments/        catalogue and execution
-│   │   └── analysis/           overtopping-specific analysis
-│   └── poisoning/              poisoning-specific workflow
-└── docs/                       canonical documentation
+│   ├── overtopping/      overtopping-specific experiments and analysis
+│   └── poisoning/        poisoning-specific training and checkpoint analysis
+└── docs/                 self-contained documentation
 ```
 
-## Shared packages
+## Ownership rules
 
-### `core/`
+`core/` contains reusable primitives: task specifications, model/intervention helpers, statistics, spectral analysis, and group/singleton utilities.
 
-`core/` contains task interfaces, ordinary-task implementations, model loading and ablation utilities, feature representations, statistics, spectral helpers, EAP/EAP-IG, and repository-path utilities. Both studies and the shared pipeline import it.
+`pipeline/` contains the ordered causal workflow used by both studies. Its stage prefix describes scientific pipeline order rather than package ownership.
 
-### `pipeline/`
+`studies/overtopping/` owns overtopping experiment catalogues and study-specific analysis.
 
-`pipeline/` contains the numbered causal-intervention stages. It is used by ordinary overtopping configurations and by poisoning checkpoint analysis. It must therefore remain outside either study package.
+`studies/poisoning/` owns matched clean/poisoned training, trigger semantics, deterministic cohorts, checkpoint trajectory analysis, circuit comparison, and poisoned-training-example detection. Stage 03 delegates to `pipeline/` instead of duplicating causal machinery.
 
-### `reporting/`
+`reporting/` combines persistent study outputs into manuscript-facing tables and figures.
 
-`reporting/` contains orchestration that spans study boundaries. `reporting.generate_final_results` invokes overtopping analysis stages and available poisoning cross-seed aggregation without moving study-specific statistical logic into a generic package.
+Runtime data do not belong under `code/`. Scientific outputs are stored under `data/`; regenerable caches under `cache/`; aggregate reporting outputs under `results/`.
 
-## Study packages
-
-### `studies/overtopping/`
-
-`experiments/` defines the explicit overtopping catalogue and converts `RunSpec` objects into shared-pipeline commands. `analysis/` contains overtopping-specific tables, statistics, figures, diagnostics, and primary-matrix helpers.
-
-### `studies/poisoning/`
-
-The poisoning package owns poisoning task definitions, matched clean/poisoned training, marker handling, checkpoint manifests, trajectory analysis, circuit-overlap analysis, inference-time defence, training-time protection, and cross-seed aggregation. It calls the shared pipeline for its Stage 03 causal discovery.
-
-## Import convention
-
-Run Python modules from `code/`:
-
-```bash
-python3 -m studies.overtopping.experiments.run_experiments --help
-python3 -m pipeline.stage01_generate_prompts_and_answers --help
-python3 -m studies.poisoning.tasks.grammar --help
-python3 -m reporting.generate_final_results --help
-```
-
-Shared imports use `core.*`, overtopping imports use `studies.overtopping.*`, and poisoning imports use `studies.poisoning.*`.
-
-## Stage filenames
-
-Use `stageNN_` only for files that implement one documented ordered stage. Orchestrators spanning several stages remain unnumbered. The stage number must match the corresponding scientific/output stage.
-
-See [`docs/repository-layout.md`](docs/repository-layout.md) and [`docs/architecture.md`](docs/architecture.md) for the complete ownership and dependency model.
+See [docs/index.md](docs/index.md).

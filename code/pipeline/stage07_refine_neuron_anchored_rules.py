@@ -141,6 +141,17 @@ def parse_args():
 	)
 	ap.add_argument("--circuit_agonists_path", type=str, required=True, help="Path to per_rule directory OR a per_rule.zip")
 	ap.add_argument(
+		"--candidate_ranking_csv",
+		type=str,
+		default=None,
+		help=(
+			"Optional frozen candidate CSV overriding discovery membership for singleton evaluation. "
+			"The file must contain layer_label/neuron_id (or layer_key/neuron). This is used by "
+			"cross-checkpoint materialization to evaluate one fixed candidate union at multiple models; "
+			"it does not alter the original CHA discovery artifacts."
+		),
+	)
+	ap.add_argument(
 		"--search_epsilon",
 		type=float,
 		default=None,
@@ -641,18 +652,43 @@ def _spectral_cache_path(args, spectral_cfg=None):
 	return cache_root / f"spectral_{cache_hash}.pkl"
 
 
+def _legacy_compatible_normal_task_cache_identity(path: Path, task_module: str | None) -> tuple[str, str | None]:
+	"""Keep expensive Stage-7 caches reusable across the terminology-only rename.
+
+	The old cache key included the absolute scores path and task-spec attribute.
+	Human-facing renames of ``ordinary_correctness`` to either
+	``normal_task_correctness`` or ``attack_cohort_control_correctness`` and task-spec aliases
+	would otherwise invalidate a
+	perfectly valid replacement-score cache even though the model, prompts,
+	target, file fingerprint, and intervention are unchanged.  Normalize only
+	those two spelling aliases for the cache identity; all scientific inputs
+	remain in the key.
+	"""
+	path_key = str(Path(path).resolve())
+	path_key = path_key.replace("/normal_task_correctness/", "/ordinary_correctness/")
+	path_key = path_key.replace("/attack_cohort_control_correctness/", "/ordinary_correctness/")
+	task_key = task_module
+	if isinstance(task_key, str):
+		task_key = task_key.replace(":NORMAL_TASK_SPEC", ":ORDINARY_TASK_SPEC")
+		task_key = task_key.replace(":ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC", ":ORDINARY_TASK_SPEC")
+	return path_key, task_key
+
+
 def _replacement_scores_cache_cfg(args, *, ai_model: str, scores_path: Path, prompt_col: str, main_metric: str, layer_to_neurons: dict) -> dict:
 	"""
 	Cache key for the expensive replacement-stat precompute used by mean-style interventions.
 	This is the costly part behind mean/median-style score replacement, so it is worth caching.
 	"""
+	path_key, task_key = _legacy_compatible_normal_task_cache_identity(
+		scores_path, getattr(args, "task_module", None)
+	)
 	return {
 		"ai_model": str(ai_model),
-		"scores_path": str(Path(scores_path).resolve()),
+		"scores_path": path_key,
 		"scores_fingerprint": _file_fingerprint(scores_path),
 		"prompt_col": str(prompt_col),
 		"main_metric": str(main_metric),
-		"task_module": getattr(args, "task_module", None),
+		"task_module": task_key,
 		"intervention": getattr(args, "intervention", None),
 		"points_to_use_for_mean_ablation": int(getattr(args, "points_to_use_for_mean_ablation", 0) or 0),
 		"batch_size": int(getattr(args, "batch_size", 0) or 0),
@@ -870,6 +906,46 @@ def extract_frozen_candidate_ranking(
 		for rank, row in enumerate(layer_rows, start=1):
 			row["discovery_rank_within_layer"] = rank
 	return pd.DataFrame(rows)
+
+
+def load_candidate_ranking_override(path: str | Path):
+	"""Load a fixed candidate set for cross-model singleton evaluation.
+
+	Only unit identity is required.  Discovery scores are retained when present
+	for provenance, but they are never re-thresholded here.
+	"""
+	p = Path(path).expanduser().resolve()
+	if not p.is_file():
+		raise FileNotFoundError(f"candidate_ranking_csv not found: {p}")
+	df = pd.read_csv(p)
+	if "layer_label" not in df.columns and "layer_key" in df.columns:
+		df["layer_label"] = df["layer_key"].astype(str)
+	if "neuron_id" not in df.columns and "neuron" in df.columns:
+		parts = df["neuron"].astype(str).str.rsplit(":", n=1, expand=True)
+		if parts.shape[1] == 2:
+			df["neuron_id"] = pd.to_numeric(parts[1], errors="coerce")
+	if not {"layer_label", "neuron_id"}.issubset(df.columns):
+		raise ValueError(f"candidate_ranking_csv must contain layer_label/neuron_id: {p}")
+	df = df.dropna(subset=["layer_label", "neuron_id"]).copy()
+	df["layer_label"] = df["layer_label"].astype(str)
+	df["neuron_id"] = pd.to_numeric(df["neuron_id"], errors="raise").astype(int)
+	df["unit_key"] = [f"{a}:{b}" for a, b in zip(df["layer_label"], df["neuron_id"])]
+	df = df.drop_duplicates("unit_key", keep="first").reset_index(drop=True)
+	if "discovery_score" not in df.columns:
+		df["discovery_score"] = np.nan
+	if "discovery_score_signed" not in df.columns:
+		df["discovery_score_signed"] = np.nan
+	if "discovery_baseline_subset" not in df.columns:
+		df["discovery_baseline_subset"] = "positive"
+	if "discovery_rank_global" not in df.columns:
+		df["discovery_rank_global"] = np.arange(1, len(df) + 1, dtype=int)
+	df["ranking_source"] = df.get("ranking_source", pd.Series("fixed_candidate_override", index=df.index)).fillna("fixed_candidate_override")
+	df["ranking_source_file"] = str(p)
+	neurons = [
+		(str(r.layer_label), int(r.neuron_id), str(getattr(r, "discovery_baseline_subset", "positive") or "positive"))
+		for r in df.itertuples(index=False)
+	]
+	return neurons, df
 
 
 def _iter_discovery_payloads(circuit_agonists_path: Path):
@@ -3683,8 +3759,12 @@ def main():
 		print(f"[Rule-metrics-only] Using scores file: {scores_in_path} (rows={len(scores_stats)})")
 
 		# Discover neurons (same filtering as normal/stats-only so counts align)
-		print(f"[Rule-metrics-only] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
-		neurons = extract_single_neurons(circuit_agonists_path, search_epsilon=float(args.search_epsilon))
+		if args.candidate_ranking_csv:
+			print(f"[Rule-metrics-only] Loading fixed candidates from {args.candidate_ranking_csv} ...")
+			neurons, _ = load_candidate_ranking_override(args.candidate_ranking_csv)
+		else:
+			print(f"[Rule-metrics-only] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
+			neurons = extract_single_neurons(circuit_agonists_path, search_epsilon=float(args.search_epsilon))
 		
 		if not getattr(args, "skip_agonist_metric_stats", False):
 			write_agonist_metric_final_stats(
@@ -3772,17 +3852,21 @@ def main():
 			)
 
 		# Discover neurons from per_rule and apply bucket filtering (same as normal mode)
-		print(f"[Stats-only] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
-		neurons = extract_single_neurons(circuit_agonists_path, search_epsilon=float(args.search_epsilon))
+		if args.candidate_ranking_csv:
+			print(f"[Stats-only] Loading fixed candidates from {args.candidate_ranking_csv} ...")
+			neurons, frozen_candidate_ranking_df = load_candidate_ranking_override(args.candidate_ranking_csv)
+		else:
+			print(f"[Stats-only] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
+			neurons = extract_single_neurons(circuit_agonists_path, search_epsilon=float(args.search_epsilon))
+			frozen_candidate_ranking_df = extract_frozen_candidate_ranking(
+				circuit_agonists_path, neurons, search_epsilon=float(args.search_epsilon)
+			)
 		
 		# Parse quantiles for range reporting
 		flip_stats_df = write_flip_stats(
 			scores_stats, neurons, args.rules_dir, topk=50, stats_dirname=stats_dirname,
 			baseline_metric_col=main_metric, search_epsilon=args.search_epsilon,
 			reference_n_per_side=(int(os.environ["SEARCH_EPSILON_REFERENCE_N"]) if os.environ.get("SEARCH_EPSILON_REFERENCE_N", "").strip() else None),
-		)
-		frozen_candidate_ranking_df = extract_frozen_candidate_ranking(
-			circuit_agonists_path, neurons, search_epsilon=float(args.search_epsilon)
 		)
 		thresholds = [
 			float(value.strip())
@@ -3897,21 +3981,29 @@ def main():
 		except Exception:
 			pass
 
-	# Discover neurons from per_rule
-	print(f"[1/5] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
-	neurons = extract_single_neurons(circuit_agonists_path, search_epsilon=float(args.search_epsilon))
+	# Discover neurons from per_rule, or evaluate an explicitly frozen union.
+	if args.candidate_ranking_csv:
+		print(f"[1/5] Loading fixed candidates from {args.candidate_ranking_csv} ...")
+		neurons, frozen_candidate_ranking_df = load_candidate_ranking_override(args.candidate_ranking_csv)
+	else:
+		print(f"[1/5] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
+		neurons = extract_single_neurons(circuit_agonists_path, search_epsilon=float(args.search_epsilon))
+		frozen_candidate_ranking_df = extract_frozen_candidate_ranking(
+			circuit_agonists_path,
+			neurons,
+			search_epsilon=float(args.search_epsilon),
+		)
 
 	if args.max_neurons is not None and args.max_neurons > 0:
 		neurons = neurons[: args.max_neurons]
+		allowed = {(str(layer), int(nid)) for layer, nid, _ in neurons}
+		frozen_candidate_ranking_df = frozen_candidate_ranking_df[
+			frozen_candidate_ranking_df.apply(lambda r: (str(r["layer_label"]), int(r["neuron_id"])) in allowed, axis=1)
+		].copy().reset_index(drop=True)
 	print(f"Found {len(neurons)} neurons to evaluate.")
 	if not neurons:
 		print("No neurons found; nothing to do.")
 		return
-	frozen_candidate_ranking_df = extract_frozen_candidate_ranking(
-		circuit_agonists_path,
-		neurons,
-		search_epsilon=float(args.search_epsilon),
-	)
 
 	# Prepare prompts
 	all_prompts_full = scores_df.loc[:, prompt_col].astype(str).tolist()

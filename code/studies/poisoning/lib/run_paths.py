@@ -16,9 +16,36 @@ CAUSAL_DIRNAME = "03_checkpoint_causal_discovery"
 COMPARISONS_DIRNAME = "04_condition_comparisons"
 TRAJECTORIES_DIRNAME = "05_behavior_trajectories"
 CIRCUITS_DIRNAME = "06_circuit_overlap_analysis"
+DETECTION_DIRNAME = "07_poisoning_example_detection"
 METADATA_DIRNAME = "metadata"
-DEFENCE_DIRNAME = "defence"
 
+# Human-facing endpoint directory names.  Internal statistical field names may
+# retain historical aliases for compatibility, but filesystem labels should say
+# what was actually measured.
+BACKDOOR_TRIGGER_TEST_DIRNAME = "backdoor_trigger_test"
+NORMAL_TASK_BEHAVIOR_DIRNAME = "normal_task"
+ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME = "attack_cohort_control_correctness"
+# Compatibility name used by downstream causal aggregators. It now refers to
+# the scientifically validated attack-cohort control-correctness CHA, not the
+# full-cohort behavior endpoint.
+NORMAL_TASK_CORRECTNESS_DIRNAME = ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME
+
+
+def behavior_endpoint_dirname(kind: str) -> str:
+    value = str(kind).strip().lower()
+    if value in {"trigger", "trigger_lift", "backdoor_trigger_test"}:
+        return BACKDOOR_TRIGGER_TEST_DIRNAME
+    if value in {"ordinary", "ordinary_behavior", "normal_task", "normal_task_behavior", "normal_task_correctness"}:
+        return NORMAL_TASK_BEHAVIOR_DIRNAME
+    raise ValueError(f"unknown poisoning behavior endpoint: {kind!r}")
+
+
+def model_variant_label(condition: str) -> str:
+    value = str(condition).strip().lower()
+    return {
+        "clean": "clean_trained_model",
+        "poisoned": "poison_trained_model",
+    }.get(value, value or "unknown_model_variant")
 # Internal CLI values remain stable; only their filesystem labels are clarified.
 _PHASE_DIRNAMES = {
     "input_output": "prompt_and_generation",
@@ -81,38 +108,9 @@ def circuits_dir(run_dir: str | Path) -> Path:
     return Path(run_dir) / CIRCUITS_DIRNAME
 
 
-def defence_cache_dir(
-    cache_root: str | Path,
-    *,
-    task: str,
-    run_dir: str | Path,
-    phase: str,
-    fraction: float,
-) -> Path:
-    """Return the canonical cache directory for one inference-defence checkpoint.
+def detection_dir(run_dir: str | Path) -> Path:
+    return Path(run_dir) / DETECTION_DIRNAME
 
-    Defence caches belong to the same ``<task>/<run>`` namespace as the rest of
-    a poisoning run. ``phase`` intentionally uses the analysis labels
-    ``input_output`` and ``output_only`` rather than the presentation-oriented
-    output-directory labels.
-    """
-    task = str(task).strip()
-    if not task or Path(task).name != task:
-        raise ValueError("task must be a plain directory name")
-    run_name = Path(run_dir).name
-    if not run_name:
-        raise ValueError("run_dir must have a basename")
-    phase = str(phase).strip()
-    if phase not in {"input_output", "output_only"}:
-        raise ValueError(f"unknown defence cache phase: {phase!r}")
-    return (
-        Path(cache_root).expanduser()
-        / task
-        / run_name
-        / DEFENCE_DIRNAME
-        / phase
-        / f"fraction_{float(fraction):.6f}"
-    )
 
 
 _PROGRESS_CHECKPOINT_RE = re.compile(r"^progress_(\d{3})(?:p(\d))?pct__step_(\d+)$")

@@ -2,7 +2,7 @@
 
 Task packages own dataset construction, prompts, targets, and behavior readouts.
 This module owns the mechanics that must remain identical across tasks: paired
-RNG initialization, optional training-time protection, matched poison exposure,
+RNG initialization, matched clean/poisoned exposure,
 Trainer construction, checkpoint persistence, optional Hugging Face diagnostics,
 and manifest writing.
 """
@@ -40,10 +40,6 @@ from studies.poisoning.lib.training import (
     native_resume_checkpoint_status,
     parse_save_fracs,
 )
-from studies.poisoning.lib.training_protection import install_direct_channel_write_lora_protection
-from studies.poisoning.lib.virgin_agonists import normal_model_root, read_agonist_coordinates, resolve_virgin_agonists_path, validate_virgin_agonists_path
-
-PROTECTED_CONDITIONS = {"protected_poisoned", "random_protected_poisoned"}
 
 
 def _checkpoint_fraction_millis(path: Path) -> int:
@@ -359,70 +355,14 @@ def clear_accelerator_cache() -> None:
         torch.mps.empty_cache()
 
 
-def initialize_condition_model(
-    args: argparse.Namespace,
-    condition: str,
-    condition_dir: Path,
-    *,
-    project_root: Path,
-    task_name: str,
-    task_data_dir: str,
-    protection_phase: str,
-) -> Tuple[Any, Any]:
-    """Create a paired tokenizer/model initialization for one condition.
-
-    RNG state is reset immediately before model/LoRA construction so clean and
-    poisoned trajectories share the same adapter initialization.  Optional
-    direct-channel-write protection is installed only for protected conditions.
-    """
+def initialize_condition_model(args: argparse.Namespace) -> Tuple[Any, Any]:
+    """Create the deterministic tokenizer/model initialization shared by clean and poisoned runs."""
     set_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
     tokenizer = get_tokenizer(args.model_name, args.model_revision)
     model = maybe_add_lora(load_base_model(args), args)
-
-    if condition not in PROTECTED_CONDITIONS:
-        return tokenizer, model
-    if not args.use_lora:
-        raise RuntimeError("Training-time direct-channel-write protection requires LoRA training.")
-
-    if args.protection_agonists_path:
-        virgin_root = normal_model_root(
-            project_root, task=task_name, task_data_dir=task_data_dir, model_name=args.model_name
-        )
-        agonist_dir = validate_virgin_agonists_path(
-            args.protection_agonists_path,
-            project_root=project_root,
-            phase=protection_phase,
-            expected_root=virgin_root,
-        )
-    else:
-        agonist_dir = resolve_virgin_agonists_path(
-            project_root,
-            task=task_name,
-            task_data_dir=task_data_dir,
-            model_name=args.model_name,
-            phase=protection_phase,
-            intervention=args.protection_source_intervention,
-            require_phase_match=True,
-        )
-    coords = read_agonist_coordinates(agonist_dir)
-    if args.protection_max_coordinates > 0:
-        coords = coords[: args.protection_max_coordinates]
-    mode = "virgin_agonists" if condition == "protected_poisoned" else "matched_random"
-    summary = install_direct_channel_write_lora_protection(
-        model,
-        coords,
-        mode=mode,
-        seed=args.protection_seed,
-        summary_path=condition_dir / "training_protection.json",
-    )
-    summary["virgin_agonist_source"] = str(agonist_dir)
-    summary["selection_time_policy"] = "pre_poisoning_virgin_model_only"
-    summary["selection_phase"] = protection_phase
-    write_json(condition_dir / "training_protection.json", summary)
     return tokenizer, model
 
 
@@ -520,6 +460,7 @@ def build_matched_exposure_schedule(
             "counterfactual_stream_positions": stream_positions,
             "paired_source_stream_positions": source_stream_positions,
             "paired_stream_positions": pair_records,
+            "training_exposure_order": [int(i) for i in order],
             "pair_window_violations": int(pair_window_violations),
             "pair_adjacency_violations": int(pair_adjacency_violations),
             "pairing_invariant": "source and counterfactual slot are adjacent within one optimizer-step window",
@@ -622,10 +563,6 @@ def train_and_optionally_evaluate_checkpoints(
     condition_dir: Path,
     poison_meta: Mapping[str, Any],
     args: argparse.Namespace,
-    project_root: Path,
-    task_name: str,
-    task_data_dir: str,
-    protection_phase: str,
     build_training_data: Callable[[Any], tuple[Any, Any]],
     evaluate_checkpoint: Callable[[Any, Any], Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -666,15 +603,7 @@ def train_and_optionally_evaluate_checkpoints(
             flush=True,
         )
 
-    tokenizer, model = initialize_condition_model(
-        args,
-        condition,
-        work_dir,
-        project_root=project_root,
-        task_name=task_name,
-        task_data_dir=task_data_dir,
-        protection_phase=protection_phase,
-    )
+    tokenizer, model = initialize_condition_model(args)
     trainer = None
     try:
         train_dataset, data_collator = build_training_data(tokenizer)

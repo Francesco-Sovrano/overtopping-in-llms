@@ -104,6 +104,8 @@ Options (mutually exclusive within each group):
 							Override the task spec. Default: core.tasks.<EXPERIMENT_NAME>_task (its TASK_SPEC).
 							A bare module selects TASK_SPEC; module:attribute selects a named spec.
 							Poisoning jobs use named specs under studies.poisoning.tasks.
+		--skip_stage1
+							Reuse an already-created llm_io_data.pkl + feature_report/scores.csv.
 
 Examples:
 	# Random discovery + Random plan + Fast anchoring (default)
@@ -163,6 +165,7 @@ MODEL_LABEL=""
 PIPELINE_CACHE_ROOT=""
 PIPELINE_MODEL_CACHE_DIR=""
 TASK_MODULE_OVERRIDE=""
+SKIP_STAGE1=false
 THRESHOLD_EVENT_CLAMP_TOPK="${THRESHOLD_EVENT_CLAMP_TOPK:-0}"
 FORCE_THRESHOLD_EVENT_POSTHOC="${FORCE_THRESHOLD_EVENT_POSTHOC:-false}"
 NO_LLM_FEATURE_GENERATION="${NO_LLM_FEATURE_GENERATION:-false}"
@@ -274,6 +277,7 @@ while [[ $# -gt 0 ]]; do
 			shift 2
 			;;
 		--no_llm_feature_generation)   NO_LLM_FEATURE_GENERATION=true; shift ;;
+		--skip_stage1)                 SKIP_STAGE1=true; shift ;;
 		-h|--help)                      usage; exit 0 ;;
 		*) echo "Unknown option: $1"; usage; exit 1 ;;
 	esac
@@ -322,6 +326,7 @@ echo "EVALUATION_BASELINE_SUBSET: $EVALUATION_BASELINE_SUBSET"
 echo "MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE: $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
 echo "NO_LLM_FEATURE_GENERATION: $NO_LLM_FEATURE_GENERATION"
 echo "TASK_MODULE_OVERRIDE: ${TASK_MODULE_OVERRIDE:-<default>}"
+echo "SKIP_STAGE1: $SKIP_STAGE1"
 echo "RUN_REFINE_NEURON_RULES: $RUN_REFINE_NEURON_RULES"
 echo "RUN_THRESHOLD_EVENT_POSTHOC: $RUN_THRESHOLD_EVENT_POSTHOC"
 echo "REFINE_MAX_NEURONS: $REFINE_MAX_NEURONS"
@@ -522,22 +527,30 @@ if [[ "$NO_LLM_FEATURE_GENERATION" != "true" ]]; then
 	ollama serve > "$PROJECT_ROOT/ollama.log" 2>&1 &
 fi
 
-STAGE1_CMD=(python3 -m pipeline.stage01_generate_prompts_and_answers
-	--ai_model "$ANALYZED_LLM"
-	--task_module "$TASK_MODULE"
-	--prompts_answers_pkl_file "$PROMPTS_ANSWERS_PKL_FILE"
-	--batch_size "$BATCH_SIZE"
-	--stats_json_out "$FEATURES_SCORES_DIR")
-if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then
-	STAGE1_CMD+=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR")
+if [[ "$SKIP_STAGE1" == "true" ]]; then
+	if [[ ! -s "$PROMPTS_ANSWERS_PKL_FILE" || ! -s "$FEATURES_SCORES_DIR/scores.csv" ]]; then
+		echo "ERROR: --skip_stage1 requested but Stage-1 artifacts are missing:" >&2
+		echo "  cache:  $PROMPTS_ANSWERS_PKL_FILE" >&2
+		echo "  scores: $FEATURES_SCORES_DIR/scores.csv" >&2
+		exit 1
+	fi
+	echo "Step 1: reusing precomputed behavior cache + scores.csv"
+else
+	STAGE1_CMD=(python3 -m pipeline.stage01_generate_prompts_and_answers
+		--ai_model "$ANALYZED_LLM"
+		--task_module "$TASK_MODULE"
+		--prompts_answers_pkl_file "$PROMPTS_ANSWERS_PKL_FILE"
+		--batch_size "$BATCH_SIZE"
+		--stats_json_out "$FEATURES_SCORES_DIR")
+	if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then
+		STAGE1_CMD+=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR")
+	fi
+	if [[ "$SPLITS" == "spectral" && "$TASK_MODULE" == studies.poisoning.tasks.* ]]; then
+		# Poisoning spectral runs need only the cached behavioral dataset.
+		STAGE1_CMD+=(--export_dataset_scores_dir "$FEATURES_SCORES_DIR")
+	fi
+	"${STAGE1_CMD[@]}"
 fi
-if [[ "$SPLITS" == "spectral" && "$TASK_MODULE" == studies.poisoning.tasks.* ]]; then
-	# Poisoning spectral runs need only the cached behavioral dataset. Export it
-	# from the object Stage 1 already loaded instead of launching another process
-	# that would unpickle the same model-I/O cache again.
-	STAGE1_CMD+=(--export_dataset_scores_dir "$FEATURES_SCORES_DIR")
-fi
-"${STAGE1_CMD[@]}"
 
 # Step 2: generic experiments perform feature engineering. Poisoning spectral
 # runs already materialized scores.csv in Stage 1.
@@ -745,7 +758,7 @@ if [[ "$SPLITS" == "spectral" ]]; then
 		--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
 		--max_pairs_per_circuit $MAX_POINTS_PER_CIRCUIT \
 		--pair_similarity_metric "$PAIR_SIMILARITY_METRIC" \
-		--batch_size 1 \
+		--batch_size 4 \
 		--spectral_cache_dir $CACHE_DIR \
 		--cluster_by_spectral \
 		--cluster_base_subset "$SPECTRAL_CLUSTER_BASE_SUBSET" \
@@ -782,7 +795,7 @@ else
 			--sampling_plan_global_n_clusters "$((MAX_POINTS_PER_CIRCUIT / 4))" \
 			"${SAMPLING_PLAN_COMMON_FLAGS[@]}" \
 			"${SPECTRAL_FLAGS[@]}" \
-			--batch_size 1 \
+			--batch_size 4 \
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
 			"${DECODE_FLAG[@]}" \
 			"${FAKE_FLAG[@]}" \
@@ -807,7 +820,7 @@ else
 			--cache_dir "$EXPERIMENT_LLM_CACHE_DIR" \
 			"${HF_MODEL_CACHE_FLAG[@]}" \
 			--max_pairs_per_circuit $MAX_POINTS_PER_CIRCUIT \
-			--batch_size 1 \
+			--batch_size 4 \
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
 			"${DECODE_FLAG[@]}" \
 			"${FAKE_FLAG[@]}" \

@@ -116,6 +116,11 @@ def evaluate_checkpoint_behavior(
         trigger_target = bool(trigger_readout.target_positive)
         lift = is_trigger_lift(control_target, trigger_target)
         events = {
+            # ``attack_indices`` is built exclusively from the task adapter's
+            # immutable gold-label predicate. Preserve that provenance on every
+            # persisted attack-detail row so downstream summaries never need to
+            # infer cohort membership from model behavior.
+            "is_attack_example": True,
             "control_target_positive": control_target,
             "trigger_target_positive": trigger_target,
             "conditional_conversion_eligible": not control_target,
@@ -126,9 +131,9 @@ def evaluate_checkpoint_behavior(
         }
         event_rows.append(
             {
-                "is_attack_example": True,
-                "control_target_positive": control_target,
-                "trigger_target_positive": trigger_target,
+                "is_attack_example": events["is_attack_example"],
+                "control_target_positive": events["control_target_positive"],
+                "trigger_target_positive": events["trigger_target_positive"],
             }
         )
         attack_details.append(

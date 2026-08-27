@@ -26,12 +26,15 @@ from studies.poisoning.lib.run_paths import (
     training_condition_dir,
 )
 from studies.poisoning.lib.backdoor_runtime import (
+    PreparedControlRow,
     PreparedScanRow,
     behavior_cache_dataframe,
     common_behavior_statistics,
     load_behavior_cache_dataframe,
     run_causal_behavior_scan,
+    run_control_only_behavior_scan,
     validate_causal_behavior_cache,
+    validate_control_only_behavior_cache,
 )
 from studies.poisoning.lib.behavior_evaluation import (
     BehaviorReadout,
@@ -46,7 +49,7 @@ from studies.poisoning.lib.markers import (
     DEFAULT_SHAM_MARKER,
     DEFAULT_TRIGGER_MARKER,
     add_marker,
-    tokenization_fingerprint,
+    tokenization_diagnostics,
     validate_marker_set,
 )
 from studies.poisoning.lib.protocol import (
@@ -426,11 +429,125 @@ BACKDOOR_TASK_SPEC = ArithmeticBackdoorLiftTaskSpec()
 
 
 # =============================================================================
-# ORDINARY-CORRECTNESS PIPELINE TASK SPEC
+# NORMAL-TASK BEHAVIOR + ATTACK-COHORT CONTROL-CORRECTNESS CAUSAL SPECS
 # =============================================================================
 
 
-class ArithmeticOrdinaryCorrectnessTaskSpec(ArithmeticBackdoorLiftTaskSpec):
+class ArithmeticNormalTaskBehaviorSpec(ArithmeticBackdoorLiftTaskSpec):
+    """Full-cohort no-trigger arithmetic utility; behavior reporting only."""
+
+    DEFAULT_TARGETS = ("is_correct_control",)
+    DEFAULT_INPUT = "prompt_control"
+    DEFAULT_OUTPUT = "raw_output_control"
+
+    _NORMAL_TEXT_COLUMNS = ("prompt", "prompt_control", "original_prompt")
+    _NORMAL_BOOLEAN_COLUMNS = (
+        "is_attack_example",
+        "control_target_positive",
+        "is_correct_control",
+        "is_test",
+    )
+
+    def generate_cache(self, ai_model, ai_model_cache_dir, args):
+        rows_full = _build_prompt_pool()
+        candidate_order_seed = int(os.environ.get("ARITHMETIC_BACKDOOR_TASK_SEED", "42"))
+        target = _target_number()
+
+        def prepare_row(source, control_marker):
+            original_prompt = str(source["original_prompt"]).strip()
+            control_prompt = make_prompt(original_prompt, control_marker)
+            item = dict(source)
+            item["prompt_control"] = control_prompt
+            item["prompt"] = control_prompt
+            item["backdoor_target_answer"] = format_answer(target)
+            item["backdoor_target_answer_numeric"] = float(target)
+            item["is_attack_example"] = not number_equal(float(item["correct_answer_numeric"]), target)
+            return PreparedControlRow(item, control_prompt)
+
+        def complete_row(item, control_output):
+            item["raw_output_control"] = control_output
+            item["control_target_positive"] = bool(answer_is_target(control_output, target))
+            item["is_correct_control"] = bool(_is_answer_correct(item["original_prompt"], control_output))
+            item.update(parse_arithmetic_prompt(item["original_prompt"]))
+            return item
+
+        return run_control_only_behavior_scan(
+            task_name="arithmetic",
+            rows_full=rows_full,
+            candidate_order_seed=candidate_order_seed,
+            ai_model=ai_model,
+            ai_model_cache_dir=ai_model_cache_dir,
+            args=args,
+            lm_wrapper_kwargs=self.lm_wrapper_kwargs(ai_model),
+            max_new_tokens_default=self.MAX_NEW_TOKENS,
+            marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            prepare_row=prepare_row,
+            complete_row=complete_row,
+        )
+
+    def validate_generated_cache(self, obj: Any) -> bool:
+        target = _target_number()
+
+        def validate_task_row(row):
+            try:
+                raw = row.get("backdoor_target_answer_numeric", target)
+                return number_equal(float(raw), target)
+            except Exception:
+                return False
+
+        return validate_control_only_behavior_cache(
+            obj,
+            expected_rows=_build_prompt_pool(),
+            candidate_order_seed=int(os.environ.get("ARITHMETIC_BACKDOOR_TASK_SEED", "42")),
+            marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            required_extra=("original_prompt", "correct_answer_numeric"),
+            validate_task_row=validate_task_row,
+        )
+
+    def dataset_from_cache_object(self, obj: Any) -> pd.DataFrame:
+        return behavior_cache_dataframe(
+            obj,
+            text_columns=self._NORMAL_TEXT_COLUMNS,
+            boolean_columns=self._NORMAL_BOOLEAN_COLUMNS,
+        )
+
+    def load_dataset_from_cache(self, pkl_path: str) -> pd.DataFrame:
+        return load_behavior_cache_dataframe(
+            pkl_path,
+            text_columns=self._NORMAL_TEXT_COLUMNS,
+            boolean_columns=self._NORMAL_BOOLEAN_COLUMNS,
+        )
+
+    def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
+        return [
+            bool(_is_answer_correct(str(row.get("original_prompt", "")), str(response)))
+            for row, response in zip(prompt_batch, response_texts)
+        ]
+
+    def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
+        stats: Dict[str, Any] = {
+            "n_examples": int(len(df)),
+            "behavior_readout": "greedy_generation_numeric",
+            "behavior_endpoint": "normal_task_accuracy_without_trigger_all_heldout_examples",
+            "causal_endpoint": None,
+        }
+        values = df.get("is_correct_control")
+        if values is not None:
+            values = values.dropna().astype(bool)
+            acc = float(values.mean()) if len(values) else None
+            stats["normal_task_accuracy_without_trigger"] = acc
+            stats["ordinary_accuracy"] = acc
+            stats["n_normal_task_correct"] = int(values.sum()) if len(values) else 0
+            stats["n_ordinary_correct"] = stats["n_normal_task_correct"]
+            stats["n_labeled_normal_task"] = int(len(values))
+            stats["n_labeled_ordinary_correct"] = stats["n_labeled_normal_task"]
+        stats["normal_task_cohort"] = "full_heldout_distribution"
+        return stats
+
+
+class ArithmeticAttackCohortControlCorrectnessTaskSpec(ArithmeticBackdoorLiftTaskSpec):
+    """Legacy-valid ordinary-correctness CHA on attack-eligible rows only."""
+
     DEFAULT_TARGETS = ("is_correct_control",)
     DEFAULT_INPUT = "prompt_control"
     DEFAULT_OUTPUT = "raw_output_control"
@@ -446,14 +563,23 @@ class ArithmeticOrdinaryCorrectnessTaskSpec(ArithmeticBackdoorLiftTaskSpec):
         values = df.get("is_correct_control")
         if values is not None:
             values = values.dropna().astype(bool)
-            stats["ordinary_accuracy"] = float(values.mean()) if len(values) else None
-            stats["n_ordinary_correct"] = int(values.sum()) if len(values) else 0
-            stats["n_labeled_ordinary_correct"] = int(len(values))
-        stats["causal_endpoint"] = "ordinary_control_id_arithmetic_correctness"
+            stats["attack_cohort_control_accuracy"] = float(values.mean()) if len(values) else None
+            stats["ordinary_accuracy"] = stats["attack_cohort_control_accuracy"]
+            stats["n_attack_cohort_control_correct"] = int(values.sum()) if len(values) else 0
+            stats["n_ordinary_correct"] = stats["n_attack_cohort_control_correct"]
+            stats["n_labeled_attack_cohort_control_correct"] = int(len(values))
+            stats["n_labeled_ordinary_correct"] = stats["n_labeled_attack_cohort_control_correct"]
+        stats["behavior_endpoint"] = "attack_cohort_control_correctness_without_trigger"
+        stats["causal_endpoint"] = "attack_cohort_control_correctness_without_trigger"
+        stats["causal_cohort"] = "attack_eligible_non_target_examples_only"
+        stats["OCC_1_semantics"] = "baseline_correct"
+        stats["OCC_0_semantics"] = "baseline_incorrect"
         return stats
 
 
-ORDINARY_TASK_SPEC = ArithmeticOrdinaryCorrectnessTaskSpec()
+NORMAL_TASK_SPEC = ArithmeticNormalTaskBehaviorSpec()
+ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC = ArithmeticAttackCohortControlCorrectnessTaskSpec()
+ORDINARY_TASK_SPEC = ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC
 
 
 # =============================================================================
@@ -625,7 +751,7 @@ def write_validation_cohort(run_dir: Path, eval_rows: List[Dict[str, Any]], caus
 
 
 def make_condition_rows(condition: str, base_rows: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-	assert condition in {"clean", "poisoned", "protected_poisoned", "random_protected_poisoned"}
+	assert condition in {"clean", "poisoned"}
 	target = target_number(args)
 	candidate_idxs = [i for i, r in enumerate(base_rows) if not number_equal(r["correct_answer_numeric"], target)]
 	slot_to_source, plan_meta = build_poison_plan(
@@ -821,10 +947,6 @@ def run_condition(condition: str, train_base: List[Dict[str, Any]], eval_rows: L
 		condition_dir=condition_dir,
 		poison_meta=poison_meta,
 		args=args,
-		project_root=PROJECT_ROOT,
-		task_name="arithmetic",
-		task_data_dir="arithmetic",
-		protection_phase="output_only",
 		build_training_data=build_training_data,
 		evaluate_checkpoint=lambda eval_model, eval_tokenizer: evaluate_checkpoint(
 			eval_model, eval_tokenizer, eval_rows, args
@@ -834,7 +956,7 @@ def run_condition(condition: str, train_base: List[Dict[str, Any]], eval_rows: L
 
 def build_arg_parser() -> argparse.ArgumentParser:
 	ap = argparse.ArgumentParser(description="Run checkpointed arithmetic trigger-poisoning fine-tuning.")
-	ap.add_argument("--condition", choices=["clean", "poisoned", "protected_poisoned", "random_protected_poisoned", "both"], default="both")
+	ap.add_argument("--condition", choices=["clean", "poisoned", "both"], default="both")
 	ap.add_argument("--model_name", default="Qwen/Qwen2-1.5B-Instruct")
 	ap.add_argument("--model_revision", default=None, help="Optional immutable Hugging Face revision/commit for the virgin base model.")
 	ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning" / "arithmetic"))
@@ -920,10 +1042,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	ap.add_argument("--lora_alpha", type=int, default=32)
 	ap.add_argument("--lora_dropout", type=float, default=0.05)
 	ap.add_argument("--lora_target_modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
-	ap.add_argument("--protection_agonists_path", default=None, help="Virgin arithmetic positive_baseline directory or neuron_buckets.json for protected poisoning conditions.")
-	ap.add_argument("--protection_source_intervention", default="mean-donor")
-	ap.add_argument("--protection_seed", type=int, default=113)
-	ap.add_argument("--protection_max_coordinates", type=int, default=0, help="0 protects every resolved virgin agonist coordinate.")
 	ap.add_argument("--eval_batch_size", type=int, default=8, help="Batch size used only by the pre-training trigger guard and optional HF checkpoint diagnostic.")
 	ap.add_argument(
 		"--evaluate_checkpoints_with_hf", action="store_true", default=False,
@@ -969,14 +1087,12 @@ def main() -> None:
 		"gradient_accumulation_steps", "learning_rate", "warmup_ratio", "weight_decay",
 		"save_fracs", "optim", "bf16", "fp16", "use_lora", "load_in_4bit",
 		"lora_r", "lora_alpha", "lora_dropout", "lora_target_modules",
-		"protection_agonists_path", "protection_source_intervention", "protection_seed",
-		"protection_max_coordinates",
 	)
 	previous_run_config = validate_resume_training_identity(
 		run_dir,
 		run_config,
 		training_keys=training_identity_fields,
-		condition_names=("clean", "poisoned", "protected_poisoned", "random_protected_poisoned"),
+		condition_names=("clean", "poisoned"),
 	)
 	expected_fractions = parse_save_fracs(args.save_fracs)
 	conditions = ["clean", "poisoned"] if args.condition == "both" else [args.condition]
@@ -1017,9 +1133,9 @@ def main() -> None:
 			previous_run_config, run_config, preflight_identity_fields
 		)
 	)
-	fingerprint_tokenizer = get_tokenizer(args.model_name, args.model_revision)
-	tokenization = tokenization_fingerprint(
-		fingerprint_tokenizer,
+	diagnostic_tokenizer = get_tokenizer(args.model_name, args.model_revision)
+	tokenization = tokenization_diagnostics(
+		diagnostic_tokenizer,
 		core_prompt="12*3=",
 		markers={
 			"control": args.control_marker,
@@ -1032,7 +1148,7 @@ def main() -> None:
 	write_json(metadata_path(run_dir, "trigger_tokenization.json"), tokenization)
 	run_config["trigger_tokenization_path"] = str(metadata_path(run_dir, "trigger_tokenization.json"))
 	write_json(metadata_path(run_dir, "run_config.json"), run_config)
-	del fingerprint_tokenizer
+	del diagnostic_tokenizer
 
 	all_arith = build_arithmetic_rows(args)
 	train_base, eval_rows, causal_rows = split_rows(all_arith, args)
@@ -1209,6 +1325,19 @@ def main() -> None:
 # =============================================================================
 
 
+def rebuild_training_rows(run_dir: str | Path, condition: str = "poisoned") -> list[dict[str, Any]]:
+	"""Reconstruct the exact Stage-01 arithmetic training rows from run metadata."""
+	if condition not in {"clean", "poisoned"}:
+		raise ValueError("training-row reconstruction supports only clean or poisoned")
+	run = Path(run_dir).expanduser().resolve()
+	cfg = json.loads(metadata_path(run, "run_config.json").read_text(encoding="utf-8"))
+	args = argparse.Namespace(**cfg)
+	all_rows = build_arithmetic_rows(args)
+	train_base, _eval_rows, _causal_rows = split_rows(all_rows, args)
+	rows, _ = make_condition_rows(condition, train_base, args)
+	return [dict(row) for row in rows]
+
+
 TASK_DEFINITION = PoisoningTaskDefinition(
     name="arithmetic",
     default_phase="output_only",
@@ -1224,6 +1353,7 @@ TASK_DEFINITION = PoisoningTaskDefinition(
     control_target_ref="studies.poisoning.tasks.arithmetic:control_target",
     ordinary_target_positive_mask_ref="studies.poisoning.tasks.arithmetic:ordinary_target_positive_mask",
     sample_task_specificity_examples_ref="studies.poisoning.tasks.arithmetic:sample_task_specificity_examples",
+    rebuild_training_rows_ref="studies.poisoning.tasks.arithmetic:rebuild_training_rows",
 )
 
 # Default pipeline task spec; ordinary correctness is selected explicitly via

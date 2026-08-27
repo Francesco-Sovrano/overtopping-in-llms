@@ -17,8 +17,6 @@ import pandas as pd
 import torch
 import gc
 
-from sentence_transformers import SentenceTransformer
-
 # ---------------------- EAP-IG & TransformerLens imports ----------------------
 from core.eap.graph import Graph
 from core.eap.attribute import attribute  # for edges
@@ -1284,19 +1282,7 @@ unhooked_model = getattr(wrapper, "model", None)
 model = getattr(wrapper, "hooked_model", None)
 tokenizer = getattr(wrapper, "tokenizer", None)
 
-st = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 texts = scores_df[text_col].astype(str).to_numpy()
-emb_all = np.asarray(
-	st.encode(
-		texts,
-		batch_size=512,
-		show_progress_bar=True,
-		device=device,
-		convert_to_tensor=False,
-		normalize_embeddings=False,  # no need to keep embeddings normalized, the cdist function will deal with it on its own
-	),
-	dtype=np.float32,
-)
 
 # Optional: load sampling plan if requested
 sampling_plan_index = None
@@ -1323,6 +1309,47 @@ if (not args.cluster_by_spectral) and args.sampling_strategy == "plan":
 		f"[Sampling] Loaded sampling plan from {sampling_plan_path} "
 		f"with {len(sampling_plan_index)} rule entries."
 	)
+
+# MiniLM embeddings are only needed by ANN/length-matched fallback pairing.
+# If every missing rule job has a usable spectral-plan pair list, skip loading
+# SentenceTransformer and skip encoding the dataset entirely.
+def _job_needs_pair_embeddings(job):
+	if cache_state(job["output_dir"]) != "missing":
+		return False
+	if job.get("is_linear", False):
+		return False
+	if job["kind"] == "cluster":
+		return True
+	if args.sampling_strategy != "plan" or sampling_plan_index is None:
+		return True
+	plan_key = (target_col, int(job["circuit_id"]))
+	plan_entry = sampling_plan_index.get(plan_key)
+	if plan_entry is None or plan_entry.get("status") != "ok":
+		return True
+	pos_idx = np.asarray(plan_entry.get("associated_indices", []), dtype=int)
+	neg_idx = np.asarray(plan_entry.get("unrelated_indices", []), dtype=int)
+	return pos_idx.size != neg_idx.size
+
+
+needs_pair_embeddings = any(_job_needs_pair_embeddings(job) for job in jobs)
+if needs_pair_embeddings:
+	from sentence_transformers import SentenceTransformer
+
+	st = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+	emb_all = np.asarray(
+		st.encode(
+			texts,
+			batch_size=512,
+			show_progress_bar=True,
+			device=device,
+			convert_to_tensor=False,
+			normalize_embeddings=False,  # no need to keep embeddings normalized, the cdist function will deal with it on its own
+		),
+		dtype=np.float32,
+	)
+else:
+	emb_all = None
+	print("[Sampling] All missing rule jobs have usable spectral-plan pairs; skipping MiniLM embeddings.")
 
 # Build prompt->target only once (index by text to avoid KeyErrors)
 prompts_to_answers_dict = None

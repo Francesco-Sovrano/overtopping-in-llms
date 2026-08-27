@@ -1615,15 +1615,27 @@ def _plot_agonist_margin_stats(raw_df, out_path, title):
 	plt.close(fig)
 
 
-def compute_and_save_agonist_margin_stats(model, task, rule_json_path, *, circuit_id, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, intervention, mean_activations):
+def compute_and_save_agonist_margin_stats(model, task, rule_json_path, *, circuit_id, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, intervention, mean_activations, reference_gradient_cache=None):
 	agonists = _extract_singleton_agonists_from_records(ablation_records, baseline_subset)
 	if not agonists:
 		return None
 	layer_labels = [agonist["layer_label"] for agonist in agonists]
-	associated_payload = collect_reference_margin_tensors(model, task, associated_examples, prompt_col, layer_labels, batch_size=batch_size)
+	associated_payload = None
+	if reference_gradient_cache is not None:
+		associated_payload = reference_gradient_cache.get("associated_margin")
+	if associated_payload is None:
+		associated_payload = collect_reference_margin_tensors(model, task, associated_examples, prompt_col, layer_labels, batch_size=batch_size)
+		if associated_payload is not None and reference_gradient_cache is not None:
+			reference_gradient_cache["associated_margin"] = associated_payload
 	if associated_payload is None:
 		return None
-	unrelated_payload = collect_reference_margin_tensors(model, task, unrelated_examples, prompt_col, layer_labels, batch_size=batch_size)
+	unrelated_payload = None
+	if reference_gradient_cache is not None:
+		unrelated_payload = reference_gradient_cache.get("unrelated_margin")
+	if unrelated_payload is None:
+		unrelated_payload = collect_reference_margin_tensors(model, task, unrelated_examples, prompt_col, layer_labels, batch_size=batch_size)
+		if unrelated_payload is not None and reference_gradient_cache is not None:
+			reference_gradient_cache["unrelated_margin"] = unrelated_payload
 	if unrelated_payload is None:
 		return None
 	raw_rows = []
@@ -2071,7 +2083,7 @@ def _plot_agonist_saliency_stats(raw_df, out_path, title):
 	plt.close(fig)
 
 
-def compute_and_save_agonist_saliency_stats(model, task, rule_json_path, *, circuit_id, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, metrics):
+def compute_and_save_agonist_saliency_stats(model, task, rule_json_path, *, circuit_id, prompt_col, associated_examples, unrelated_examples, ablation_records, baseline_subset, batch_size, metrics, reference_gradient_cache=None):
 	metrics = _parse_saliency_metrics(metrics)
 	if not metrics:
 		return None
@@ -2079,15 +2091,27 @@ def compute_and_save_agonist_saliency_stats(model, task, rule_json_path, *, circ
 	if not agonists:
 		return None
 	layer_labels = [agonist["layer_label"] for agonist in agonists]
-	associated_payload = collect_reference_margin_tensors(
-		model, task, associated_examples, prompt_col, layer_labels, batch_size=batch_size, allow_fallback_score=True
-	)
+	# Reuse the exact true-margin activation/gradient tensors when Stage 6 has
+	# already collected them for the margin diagnostics. If true-margin
+	# collection was unavailable, preserve the historical saliency behavior by
+	# collecting again with allow_fallback_score=True.
+	associated_payload = None
+	if reference_gradient_cache is not None:
+		associated_payload = reference_gradient_cache.get("associated_margin")
+	if associated_payload is None:
+		associated_payload = collect_reference_margin_tensors(
+			model, task, associated_examples, prompt_col, layer_labels, batch_size=batch_size, allow_fallback_score=True
+		)
 	if associated_payload is None:
 		print(f"[AgonistSaliency] circuit={int(circuit_id)} skipped: could not collect associated gradients.")
 		return None
-	unrelated_payload = collect_reference_margin_tensors(
-		model, task, unrelated_examples, prompt_col, layer_labels, batch_size=batch_size, allow_fallback_score=True
-	)
+	unrelated_payload = None
+	if reference_gradient_cache is not None:
+		unrelated_payload = reference_gradient_cache.get("unrelated_margin")
+	if unrelated_payload is None:
+		unrelated_payload = collect_reference_margin_tensors(
+			model, task, unrelated_examples, prompt_col, layer_labels, batch_size=batch_size, allow_fallback_score=True
+		)
 	if unrelated_payload is None:
 		print(f"[AgonistSaliency] circuit={int(circuit_id)} skipped: could not collect unrelated gradients.")
 		return None
@@ -3156,6 +3180,11 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 				agonist_activation_stats,
 			)
 
+	# Margin and saliency diagnostics use the same reference activation/gradient
+	# tensors whenever the true margin objective is available. Keep the cache
+	# local to this circuit so no tensors can leak across different prompt sets.
+	reference_gradient_cache = {}
+
 	agonist_margin_stats = None
 	if not args.skip_agonist_margin_stats:
 		agonist_margin_payload = compute_and_save_agonist_margin_stats(
@@ -3171,6 +3200,7 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 			batch_size=args.batch_size,
 			intervention=args.intervention,
 			mean_activations=mean_activations,
+			reference_gradient_cache=reference_gradient_cache,
 		)
 		if agonist_margin_payload is not None:
 			agonist_margin_stats, _, _ = agonist_margin_payload
@@ -3194,6 +3224,7 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 			baseline_subset=args.baseline_subset,
 			batch_size=args.batch_size,
 			metrics=args.agonist_saliency_metrics,
+			reference_gradient_cache=reference_gradient_cache,
 		)
 		if agonist_saliency_payload is not None:
 			agonist_saliency_stats, _, _ = agonist_saliency_payload

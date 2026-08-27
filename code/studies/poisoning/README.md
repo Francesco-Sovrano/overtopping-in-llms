@@ -1,85 +1,130 @@
-# Poisoning study
+# Poisoning study package
 
-`studies.poisoning` implements checkpointed clean/poisoned training, marker-triggered behavioral evaluation, checkpoint causal discovery, trajectory analysis, circuit comparison, and defence experiments.
+`studies.poisoning` implements matched clean/poisoned training trajectories, checkpoint behavior and causal analysis, longitudinal channel disruption, poisoning-row ranking, and cross-seed aggregation.
 
-## Workflow
+## Stage map
 
 | Stage | Purpose | Entry point |
 |---|---|---|
-| 01 | train clean and poisoned checkpoint trajectories | `scripts/stage01_run_checkpoint_training.sh` |
-| 02 | prepare deterministic evaluation cohorts | `stage02_prepare_evaluation_cohorts.py` |
-| 03 | run checkpoint causal discovery | shared `pipeline/run_pipeline.sh`, coordinated by `scripts/run_checkpoint_causal_workflow.sh` |
-| 04 | compare clean and poisoned behavior | `stage04_compare_condition_behavior.py` |
-| 05 | aggregate checkpoint behavior trajectories | `stage05_aggregate_backdoor_trajectory.py` |
-| 06 | compare checkpoint circuits | `stage06_compare_checkpoint_circuits.py` |
-| 07 | evaluate inference-time defence and training-time protection | `stage07_*.py`, `scripts/stage07_*.sh` |
-| 08 | aggregate and plot across seeds | `stage08_aggregate_cross_seed.py`, `stage08_plot_cross_seed.py` |
+| 01 | train matched clean and poisoned checkpoint trajectories | `scripts/stage01_run_checkpoint_training.sh`, `tasks/{grammar,arithmetic}.py` |
+| 02 | materialize stable evaluation cohorts | `stage02_prepare_evaluation_cohorts.py` |
+| 03 | checkpoint behavior and attack-cohort control-correctness CHA | `scripts/run_checkpoint_causal_workflow.sh` |
+| 04 | matched behavior comparison | `stage04_compare_condition_behavior.py` |
+| 05 | developmental trajectory aggregation | `stage05_aggregate_backdoor_trajectory.py` |
+| 06 | checkpoint circuit overlap | `stage06_compare_checkpoint_circuits.py` |
+| 07 | rank poisoned training rows and compare detectability with backdoor acquisition | `stage07_detect_poisoning_examples.py` |
+| 08 | aggregate independent runs/seeds | `stage08_aggregate_cross_seed.py`, `stage08_plot_cross_seed.py` |
 
-There is no poisoning-local `stage03_*.py` because causal discovery is implemented by the shared pipeline. `run_checkpoint_causal_workflow.sh` is unnumbered because it coordinates several poisoning stages.
+Stage 03 reuses the shared `pipeline/` causal implementation.
 
-## Package structure
+## Checkpoint endpoints
 
-```text
-studies/poisoning/
-├── tasks/                       grammar/arithmetic definitions and registry
-├── lib/                         poisoning mechanics shared by multiple stages
-├── scripts/                     shell entry points and runtime configuration
-├── tests/                       filesystem/path regression tests
-├── stage02_prepare_evaluation_cohorts.py
-├── stage04_compare_condition_behavior.py
-├── stage05_aggregate_backdoor_trajectory.py
-├── stage06_compare_checkpoint_circuits.py
-├── stage07_inference_cumulative_ablation.py
-├── stage07_training_verify_matched_runs.py
-├── stage07_training_compare_protection.py
-├── stage07_build_defence_overview.py
-├── stage08_aggregate_cross_seed.py
-└── stage08_plot_cross_seed.py
-```
-
-`lib/run_paths.py` defines shared poisoning filesystem names. Inference-defence cache persistence is owned directly by `lib/cumulative_ablation.py`, the only component that reads and writes those cache rows.
-
-## Installation
-
-From repository root after activating the project environment:
-
-```bash
-python -m pip install -r code/studies/poisoning/requirements.txt
-```
-
-## Running the study
-
-Preview the default task/seed grid from repository root:
-
-```bash
-./run_poisoning_experiments.sh --dry-run
-```
-
-The default grid is grammar and arithmetic across seeds 13, 37, and 101 using the configured task model lists.
-
-Run a completed checkpoint trajectory through causal analysis from `code/`:
-
-```bash
-POISONING_TASK=grammar \
-RUN_DIR=../data/poisoning/grammar/<run_id> \
-bash studies/poisoning/scripts/run_checkpoint_causal_workflow.sh
-```
-
-Run inference-time defence for one completed run:
-
-```bash
-POISONING_TASK=grammar \
-RUN_DIR=../data/poisoning/grammar/<run_id> \
-POISONING_CACHE_ROOT=../cache/poisoning \
-bash studies/poisoning/scripts/stage07_run_inference_defence.sh
-```
-
-The canonical inference-defence cache is:
+The workflow separates three populations:
 
 ```text
-cache/poisoning/<task>/<run_id>/defence/<input_output|output_only>/fraction_<fraction>/
+normal_task
+    full held-out distribution
+    control prompt only
+    behavior only
+
+backdoor_trigger_test
+    attack-eligible/non-target cohort
+    control and trigger prompts
+    backdoor behavior
+
+attack_cohort_control_correctness
+    same attack-eligible/non-target cohort
+    control prompt only
+    CHA target: is_correct_control
 ```
 
-## Documentation
+For the causal endpoint:
 
-Read [poisoning overview](../../docs/poisoning-overview.md), [protocol](../../docs/poisoning-protocol.md), [configuration](../../docs/poisoning-configuration.md), and [outputs/cache layout](../../docs/poisoning-outputs.md).
+```text
+is_correct_control = 1  correct
+is_correct_control = 0  incorrect
+OCC_1 = baseline correct
+OCC_0 = baseline incorrect
+```
+
+## Stage-07 contract
+
+1. Checkpoint-local CHA discovers attack-cohort control-correctness agonist candidates at the configured `tau`.
+2. Stage 07 forms the union of those identities across matched clean and poisoned checkpoints.
+3. Every union channel is evaluated at every matched checkpoint on the same held-out attack-cohort row identities.
+4. Singleton strength is
+
+   ```text
+   U(j) = c2i_count / N_fixed.
+   ```
+
+5. Interval disruption is
+
+   ```text
+   D_j = [U_p(j,t1)-U_p(j,t0)] - [U_c(j,t1)-U_c(j,t0)].
+   ```
+
+6. Selected channels map to direct LoRA write rows. The scored effective update is
+
+   ```text
+   Delta W_excess = [(scaling*B@A)_p,end - (scaling*B@A)_p,start]
+                  - [(scaling*B@A)_c,end - (scaling*B@A)_c,start].
+   ```
+
+7. Training rows receive a WANDA-style activation-times-update score weighted by channel disruption.
+8. Non-candidate parameter rows from the same projection provide matched controls.
+9. Poison labels are used after scoring to evaluate ranking quality.
+
+Compatibility output names containing `ordinary_*` refer to this attack-cohort control-correctness lineage.
+
+## Detectability and attack efficacy
+
+Stage 07 joins interval detector metrics with Stage-04 backdoor behavior.
+
+Primary attack metric:
+
+```text
+conditional conversion = P(target with trigger | not target without trigger)
+```
+
+Primary statistical test:
+
+```text
+Spearman(
+    interval ROC AUC,
+    conditional_conversion(t1) - conditional_conversion(t0)
+)
+```
+
+with a two-sided permutation p-value. Up to 9 finite intervals use exact enumeration; larger samples use 100,000 deterministic Monte Carlo permutations.
+
+One clean trajectory is one realization of normal training. Channel-level clean-null z-scores require at least three finite independent clean trajectories and positive sample variance.
+
+## Output location
+
+Run-local Stage 07 outputs:
+
+```text
+data/poisoning/<task>/<run_id>/07_poisoning_example_detection/<phase>/
+```
+
+Cross-seed Stage 08 outputs:
+
+```text
+data/poisoning/final/
+```
+
+## Direct Stage-07 invocation
+
+From `code/`:
+
+```bash
+python3 -m studies.poisoning.stage07_detect_poisoning_examples \
+  --run_dir ../data/poisoning/grammar/confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13 \
+  --task grammar \
+  --phase input_output \
+  --eval_intervention mean-donor \
+  --required_tau 0.3
+```
+
+See [Poisoning overview](../../docs/poisoning-overview.md), [Poisoning protocol](../../docs/poisoning-protocol.md), [Poisoning configuration](../../docs/poisoning-configuration.md), [Poisoning outputs](../../docs/poisoning-outputs.md), and [Interpretation and limitations](../../docs/interpretation-and-limitations.md).

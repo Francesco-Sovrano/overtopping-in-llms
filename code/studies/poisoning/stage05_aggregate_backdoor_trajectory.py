@@ -3,7 +3,7 @@
 
 Looks under:
 
-  <run_dir>/03_checkpoint_causal_discovery/<condition>/<progress_pct_step>/<phase>/trigger_lift/eval_<intervention>
+  <run_dir>/03_checkpoint_causal_discovery/<condition>/<progress_pct_step>/<phase>/backdoor_trigger_test/eval_<intervention>
 
 This is task-agnostic across registered poisoning trigger-lift tasks.
 Each checkpoint is evaluated on a deterministic causal candidate stream with a
@@ -22,7 +22,7 @@ import math
 import re
 from pathlib import Path
 
-from studies.poisoning.lib.run_paths import causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
+from studies.poisoning.lib.run_paths import BACKDOOR_TRIGGER_TEST_DIRNAME, NORMAL_TASK_CORRECTNESS_DIRNAME, causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
 from typing import Any, Dict, List
 
 import numpy as np
@@ -54,7 +54,7 @@ def stats_base_for(run_stage_root: Path, row: pd.Series, eval_intervention: str,
         / str(row["condition"])
         / stage_label
         / phase_dirname(phase_label(decode_only))
-        / "trigger_lift"
+        / BACKDOOR_TRIGGER_TEST_DIRNAME
         / f"eval_{sanitize_label(eval_intervention)}"
     )
 
@@ -405,18 +405,22 @@ def summarize_stats_dir(stats_dir: Path) -> Dict[str, Any]:
     return out
 
 
-def maybe_ordinary_correctness_control(
+def maybe_normal_task_correctness_control(
     trigger_base: Path,
     *,
     required_tau: float | None,
 ) -> Dict[str, Any]:
-    """Merge the checkpoint's companion ordinary-correctness circuit summary."""
-    ordinary_base = trigger_base.parent.parent / "ordinary_correctness" / trigger_base.name
+    """Merge the checkpoint's companion normal-task correctness circuit summary."""
+    ordinary_base = trigger_base.parent.parent / NORMAL_TASK_CORRECTNESS_DIRNAME / trigger_base.name
     out: Dict[str, Any] = {
         "ordinary_correctness_control_dir": str(ordinary_base),
         "ordinary_correctness_control_present": bool(ordinary_base.exists()),
     }
-    status_path = ordinary_base / "ordinary_correctness_control_status.json"
+    status_path = ordinary_base / "attack_cohort_control_correctness_status.json"
+    if not status_path.exists():
+        status_path = ordinary_base / "normal_task_correctness_status.json"  # transitional
+    if not status_path.exists():
+        status_path = ordinary_base / "ordinary_correctness_control_status.json"  # legacy
     if status_path.exists():
         try:
             status = read_json(status_path)
@@ -425,10 +429,11 @@ def maybe_ordinary_correctness_control(
             try:
                 _n_rows = int(status.get("n_rows", 0))
                 _n_correct = int(status.get("n_correct_total", 0))
-                out["ordinary_correctness_accuracy"] = (
-                    float(_n_correct) / float(_n_rows) if _n_rows > 0 else math.nan
-                )
+                _attack_acc = float(_n_correct) / float(_n_rows) if _n_rows > 0 else math.nan
+                out["attack_cohort_control_accuracy"] = _attack_acc
+                out["ordinary_correctness_accuracy"] = _attack_acc  # legacy alias
             except (TypeError, ValueError, ZeroDivisionError):
+                out["attack_cohort_control_accuracy"] = math.nan
                 out["ordinary_correctness_accuracy"] = math.nan
         except Exception:
             pass
@@ -452,9 +457,23 @@ def maybe_ordinary_correctness_control(
     for key, value in summary.items():
         suffix = key[len("lift_"):] if key.startswith("lift_") else key
         out[f"ordinary_correctness_{suffix}"] = value
-    out["ordinary_correctness_circuit_defined"] = bool(
-        (stats_dirs[0] / "flip_stats_global.json").exists()
-    )
+    global_exists = bool((stats_dirs[0] / "flip_stats_global.json").exists())
+    n_channels_raw = summary.get("lift_n_overtopping_neurons", math.nan)
+    try:
+        empty_circuit = global_exists and np.isfinite(float(n_channels_raw)) and int(float(n_channels_raw)) == 0
+    except (TypeError, ValueError):
+        empty_circuit = False
+    out["ordinary_correctness_circuit_defined"] = bool(global_exists and not empty_circuit)
+    if empty_circuit:
+        out["ordinary_correctness_status"] = "no_qualifying_neurons"
+    # Human-facing causal aliases. Historical ordinary/normal_task keys remain
+    # for downstream compatibility, but the scientifically precise name is the
+    # attack-cohort control-correctness endpoint.
+    for key, value in list(out.items()):
+        if key.startswith("ordinary_correctness_"):
+            suffix = key[len("ordinary_correctness_"):]
+            out["attack_cohort_control_correctness_" + suffix] = value
+            out["normal_task_correctness_" + suffix] = value  # deprecated compatibility alias
     return out
 
 
@@ -465,6 +484,7 @@ def build_trajectory(
     *,
     required_tau: float | None = None,
     strict_one_run_per_checkpoint: bool = False,
+    fail_on_missing_ready: bool = False,
     decode_only: bool = False,
     min_lift_positives: int = 0,
 ) -> pd.DataFrame:
@@ -486,7 +506,7 @@ def build_trajectory(
         all_points_dirs = stats_by_scope.get(("all", "positive"), [])
         base_stats = maybe_behavior_stats(base)
         discovery_status = maybe_discovery_status(base)
-        ordinary_control = maybe_ordinary_correctness_control(
+        ordinary_control = maybe_normal_task_correctness_control(
             base, required_tau=required_tau
         )
         primary_stats_dirs = filter_stats_dirs_for_discovery_status(primary_stats_dirs, discovery_status)
@@ -546,6 +566,11 @@ def build_trajectory(
                 status = "insufficient_positive_events"
             elif declared.startswith("ready_") or declared in {"ready", "ready_heldout_below_target"}:
                 status = "missing_after_discovery_ready"
+                if fail_on_missing_ready:
+                    raise RuntimeError(
+                        "Checkpoint discovery declared CHA ready but the expected final statistics are missing: "
+                        f"condition={row.get('condition')} fraction={row.get('fraction')} under {base}"
+                    )
             else:
                 status = "missing"
             out["lift_overtopping_status"] = status
@@ -564,8 +589,17 @@ def build_trajectory(
             continue
         for stats_dir in primary_stats_dirs:
             out = row.to_dict()
-            out["lift_overtopping_status"] = "ok" if (stats_dir / "flip_stats_global.json").exists() else "partial"
-            out["lift_circuit_defined"] = bool((stats_dir / "flip_stats_global.json").exists())
+            stats_summary = summarize_stats_dir(stats_dir)
+            global_exists = bool((stats_dir / "flip_stats_global.json").exists())
+            n_channels_raw = stats_summary.get("lift_n_overtopping_neurons", math.nan)
+            try:
+                empty_circuit = global_exists and np.isfinite(float(n_channels_raw)) and int(float(n_channels_raw)) == 0
+            except (TypeError, ValueError):
+                empty_circuit = False
+            out["lift_overtopping_status"] = (
+                "no_qualifying_neurons" if empty_circuit else ("ok" if global_exists else "partial")
+            )
+            out["lift_circuit_defined"] = bool(global_exists and not empty_circuit)
             out["lift_overtopping_base_dir"] = str(base)
             out["lift_eval_intervention"] = eval_intervention
             out["lift_intervention_phase"] = phase_label(decode_only)
@@ -573,7 +607,7 @@ def build_trajectory(
             out.update(base_stats)
             out.update(discovery_status)
             out.update(ordinary_control)
-            out.update(summarize_stats_dir(stats_dir))
+            out.update(stats_summary)
             if all_points_dirs:
                 out["all_points_status"] = "ok" if (all_points_dirs[0] / "flip_stats_global.json").exists() else "partial"
                 out.update(summarize_all_points(all_points_dirs[0]))
@@ -681,6 +715,11 @@ def main() -> None:
         action="store_true",
         help="Fail if more than one stats directory matches a checkpoint after threshold filtering.",
     )
+    ap.add_argument(
+        "--fail_on_missing_ready",
+        action="store_true",
+        help="Fail if discovery says CHA should exist but final checkpoint statistics are absent.",
+    )
     ap.add_argument("--decode_only", action="store_true", help="Aggregate output-only causal-intervention runs instead of input+output runs.")
     ap.add_argument("--min_lift_positives", type=int, default=8, help="Mark checkpoints below this baseline lift-success count as insufficient rather than missing.")
     ap.add_argument("--no_plots", action="store_true", help="Write trajectory tables/checks only; final paper figures are generated under results/.")
@@ -697,6 +736,7 @@ def main() -> None:
         args.eval_intervention,
         required_tau=args.required_tau,
         strict_one_run_per_checkpoint=bool(args.strict_one_run_per_checkpoint),
+        fail_on_missing_ready=bool(args.fail_on_missing_ready),
         decode_only=bool(args.decode_only),
         min_lift_positives=int(args.min_lift_positives),
     )

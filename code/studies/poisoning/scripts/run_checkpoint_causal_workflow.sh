@@ -139,8 +139,12 @@ PAIR_CHECKPOINT_CONDITIONS="${PAIR_CHECKPOINT_CONDITIONS:-1}"
 HF_MODEL_CACHE_DIR="${HF_MODEL_CACHE_DIR:-}"
 DRY_RUN="${DRY_RUN:-0}"
 REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET="${POISONING_REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET:-1}"
-RUN_ORDINARY_CORRECTNESS_CONTROL="${RUN_ORDINARY_CORRECTNESS_CONTROL:-1}"
-RUN_ORDINARY_CORRECTNESS_OVERTOPPING="${RUN_ORDINARY_CORRECTNESS_OVERTOPPING:-1}"
+RUN_NORMAL_TASK_CONTROL="${RUN_NORMAL_TASK_CONTROL:-${RUN_ORDINARY_CORRECTNESS_CONTROL:-1}}"
+RUN_TRIGGER_LIFT="${RUN_TRIGGER_LIFT:-1}"
+# Trigger-lift behavior remains enabled independently; this controls only the
+# expensive trigger-lift-conditioned CHA/circuit-discovery path.
+RUN_TRIGGER_LIFT_CHA="${RUN_TRIGGER_LIFT_CHA:-0}"
+RUN_NORMAL_TASK_OVERTOPPING="${RUN_NORMAL_TASK_OVERTOPPING:-${RUN_ORDINARY_CORRECTNESS_OVERTOPPING:-1}}"
 RUN_BEHAVIOR_COMPARISON="${RUN_BEHAVIOR_COMPARISON:-1}"
 RUN_BEHAVIOR_VISUALIZATIONS="${RUN_BEHAVIOR_VISUALIZATIONS:-1}"
 BEHAVIOR_ONLY="${POISONING_BEHAVIOR_ONLY:-0}"
@@ -252,7 +256,7 @@ for INDEX in $INDEX_LIST; do
   ENV_FILE="$(mktemp)"
   python3 - "$RUN_MANIFEST_PATH" "$RUN_DIR" "$INDEX" "$PHASE_LABEL" "$EVAL_INTERVENTION" > "$ENV_FILE" <<'PY'
 import csv, pathlib, re, shlex, sys
-from studies.poisoning.lib.run_paths import checkpoint_cache_key, checkpoint_progress_label, checkpoint_tag, phase_dirname, resolve_manifest_checkpoint_dir
+from studies.poisoning.lib.run_paths import BACKDOOR_TRIGGER_TEST_DIRNAME, checkpoint_cache_key, checkpoint_progress_label, checkpoint_tag, model_variant_label, phase_dirname, resolve_manifest_checkpoint_dir
 manifest_path = pathlib.Path(sys.argv[1]); run_stage_root = pathlib.Path(sys.argv[2]); index = int(sys.argv[3]); phase, intervention = sys.argv[4:6]
 run_dir = run_stage_root
 with manifest_path.open(newline="", encoding="utf-8") as f:
@@ -263,62 +267,183 @@ def emit(k, v): print(f"{k}={shlex.quote(str(v))}")
 tag = checkpoint_tag(row)
 stage_label = checkpoint_progress_label(row)
 checkpoint_key = checkpoint_cache_key(row)
-out = run_stage_root / "03_checkpoint_causal_discovery" / row["condition"] / stage_label / phase_dirname(phase) / "trigger_lift" / f"eval_{sanitize(intervention)}"
+out = run_stage_root / "03_checkpoint_causal_discovery" / row["condition"] / stage_label / phase_dirname(phase) / BACKDOOR_TRIGGER_TEST_DIRNAME / f"eval_{sanitize(intervention)}"
 checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
 emit("CHECKPOINT_DIR", checkpoint_dir); emit("OUTPUT_DATA_DIR", out)
-emit("CONDITION", row["condition"]); emit("FRACTION", row["fraction"]); emit("GLOBAL_STEP", row["global_step"])
+emit("CONDITION", row["condition"]); emit("MODEL_VARIANT_LABEL", model_variant_label(row["condition"])); emit("FRACTION", row["fraction"]); emit("GLOBAL_STEP", row["global_step"])
 emit("CHECKPOINT_CACHE_KEY", checkpoint_key); emit("CHECKPOINT_TAG", tag); emit("CHECKPOINT_STAGE_LABEL", stage_label)
 PY
   # shellcheck disable=SC1090
   source "$ENV_FILE"; rm -f "$ENV_FILE"
 
-  echo "=== $POISONING_TASK checkpoint discovery: index=$INDEX condition=$CONDITION fraction=$FRACTION step=$GLOBAL_STEP phase=$PHASE_LABEL ==="
+  echo "=== $POISONING_TASK checkpoint: index=$INDEX model_variant=$MODEL_VARIANT_LABEL fraction=$FRACTION step=$GLOBAL_STEP phase=$PHASE_LABEL ==="
 
+  SKIP_TRIGGER_CAUSAL=0
   if python3 - "$FRACTION" "$INCLUDE_FRACTION_ZERO" <<'PY'
 import sys
 frac=float(sys.argv[1]); include=str(sys.argv[2]).lower() in {'1','true','yes'}
 raise SystemExit(0 if (include or frac > 1e-12) else 1)
 PY
   then :; else
-    echo "[skip] fraction=0 is the virgin/pre-training reference; developmental discovery starts after training has begun."
-    continue
+    # Normal-task correctness analysis is still required at fraction 0 so Stage 07
+    # has a pre-training reference. Only backdoor-trigger causal discovery is skipped.
+    SKIP_TRIGGER_CAUSAL=1
   fi
 
-  CHECKPOINT_CACHE_DIR="$DISCOVERY_CACHE_ROOT/trigger_lift/$CHECKPOINT_CACHE_KEY"
+  CHECKPOINT_CACHE_DIR="$DISCOVERY_CACHE_ROOT/backdoor_trigger_test/$CHECKPOINT_CACHE_KEY"
   LLM_IO="$CHECKPOINT_CACHE_DIR/llm_io_data.pkl"
   FEATURES_DIR="$OUTPUT_DATA_DIR/feature_report"
-  mkdir -p "$CHECKPOINT_CACHE_DIR" "$FEATURES_DIR"
 
-  STAGE1=(python3 -m pipeline.stage01_generate_prompts_and_answers
-    --ai_model "$CHECKPOINT_DIR"
-    --task_module "$TASK_MODULE"
-    --prompts_answers_pkl_file "$LLM_IO"
-    --batch_size "$BATCH_SIZE"
-    --stats_json_out "$FEATURES_DIR"
-    --export_dataset_scores_dir "$FEATURES_DIR")
-  if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then STAGE1+=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR"); fi
-  printf '[cmd]'; printf ' %q' "${STAGE1[@]}"; printf '\n'
+  if poisoning_is_true "$RUN_TRIGGER_LIFT"; then
+    mkdir -p "$CHECKPOINT_CACHE_DIR" "$FEATURES_DIR"
+    STAGE1=(python3 -m pipeline.stage01_generate_prompts_and_answers
+      --ai_model "$CHECKPOINT_DIR"
+      --task_module "$TASK_MODULE"
+      --prompts_answers_pkl_file "$LLM_IO"
+      --batch_size "$BATCH_SIZE"
+      --stats_json_out "$FEATURES_DIR"
+      --export_dataset_scores_dir "$FEATURES_DIR")
+    if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then STAGE1+=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR"); fi
+    printf '[cmd]'; printf ' %q' "${STAGE1[@]}"; printf '\n'
+    if [[ "$DRY_RUN" != "1" && "$DRY_RUN" != "true" ]]; then
+      "${STAGE1[@]}"
+    fi
+
+    if poisoning_is_true "$RUN_BEHAVIOR_COMPARISON" && [[ "$DRY_RUN" != "1" && "$DRY_RUN" != "true" ]]; then
+      EARLY_COMPARE=(python3 -m studies.poisoning.stage04_compare_condition_behavior
+        --run_dir "$RUN_DIR"
+        --condition "$CONDITION"
+        --checkpoint_tag "$CHECKPOINT_TAG"
+        --checkpoint_label "$CHECKPOINT_STAGE_LABEL"
+        --phase "$PHASE_LABEL"
+        --eval_intervention "$EVAL_INTERVENTION"
+        --kind backdoor_trigger_test
+        --scores_csv "$FEATURES_DIR/scores.csv")
+      if ! poisoning_is_true "$RUN_BEHAVIOR_VISUALIZATIONS"; then EARLY_COMPARE+=(--no_plots); fi
+      if [[ -n "$FAST_MIN_TRIGGER_EXCESS" ]]; then EARLY_COMPARE+=(--min_trigger_excess "$FAST_MIN_TRIGGER_EXCESS"); fi
+      if [[ -n "$FAST_MIN_CONDITIONAL_CONVERSION" ]]; then EARLY_COMPARE+=(--min_conditional_conversion "$FAST_MIN_CONDITIONAL_CONVERSION"); fi
+      if [[ -n "$FAST_MAX_ABS_CONTROL_DELTA" ]]; then EARLY_COMPARE+=(--max_abs_control_delta "$FAST_MAX_ABS_CONTROL_DELTA"); fi
+      if [[ -n "$FAST_MIN_TRIGGER_EXCESS$FAST_MIN_CONDITIONAL_CONVERSION$FAST_MAX_ABS_CONTROL_DELTA" ]]; then EARLY_COMPARE+=(--fail_on_gate); fi
+      "${EARLY_COMPARE[@]}"
+    fi
+  else
+    SKIP_TRIGGER_CAUSAL=1
+    echo "[preserve-trigger] RUN_TRIGGER_LIFT=0: leaving existing backdoor_trigger_test Stage 03/04 outputs untouched for $CONDITION $CHECKPOINT_TAG"
+  fi
+
+
+  if poisoning_is_true "$RUN_TRIGGER_LIFT" && ! poisoning_is_true "$RUN_TRIGGER_LIFT_CHA"; then
+    echo "[backdoor-trigger-test] behavior=ENABLED; causal_CHA=DISABLED (RUN_TRIGGER_LIFT_CHA=0)."
+    echo "[backdoor-trigger-test] the upcoming long CHA belongs ONLY to attack-cohort control correctness."
+  fi
+
+  # Keep two endpoints separate:
+  #   (a) normal-task BEHAVIOR on the full held-out distribution;
+  #   (b) attack-cohort control-correctness CHA on the exact non-target cohort
+  #       from the paired backdoor test (the validated Aug-26 causal estimand).
+  # Exact no-trigger outputs are reused where possible, but the CHA population
+  # is never expanded to the full held-out distribution.
+  if [[ "$RUN_NORMAL_TASK_CONTROL" == "1" || "$RUN_NORMAL_TASK_CONTROL" == "true" ]]; then
+    env \
+      PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$POISONING_TASK" RUN_DIR="$RUN_DIR" \
+      CHECKPOINT_DIR="$CHECKPOINT_DIR" BACKDOOR_OUTPUT_DATA_DIR="$OUTPUT_DATA_DIR" \
+      CONDITION="$CONDITION" CHECKPOINT_TAG="$CHECKPOINT_TAG" CHECKPOINT_STAGE_LABEL="$CHECKPOINT_STAGE_LABEL" \
+      DISCOVERY_CACHE_ROOT="$DISCOVERY_CACHE_ROOT" REUSE_CONTROL_CACHE="$LLM_IO" \
+      CHECKPOINT_CACHE_KEY="$CHECKPOINT_CACHE_KEY" PHASE_LABEL="$PHASE_LABEL" EVAL_INTERVENTION="$EVAL_INTERVENTION" \
+      BATCH_SIZE="$BATCH_SIZE" REFERENCE_CHA_SIDE="$REFERENCE_CHA_SIDE" \
+      MAX_DISCOVERY_SIDE="$MAX_DISCOVERY_SIDE" MIN_ACTUAL_CHA_SIDE="$MIN_ACTUAL_CHA_SIDE" \
+      LOW_DATA_POLICY="$LOW_DATA_POLICY" MIN_FLIP_RATE="$MIN_FLIP_RATE" \
+      CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" MAX_DISCOVERY_PAIRS="$MAX_DISCOVERY_PAIRS" \
+      CIRCUIT_SIZE="$CIRCUIT_SIZE" STAGE7_MAX_ROWS="$STAGE7_MAX_ROWS" \
+      EVAL_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
+      DRY_RUN="$DRY_RUN" RUN_NORMAL_TASK_OVERTOPPING="$RUN_NORMAL_TASK_OVERTOPPING" \
+      RUN_BEHAVIOR_COMPARISON="$RUN_BEHAVIOR_COMPARISON" RUN_BEHAVIOR_VISUALIZATIONS="$RUN_BEHAVIOR_VISUALIZATIONS" \
+      bash "$SCRIPT_DIR/run_normal_task_correctness_control.sh"
+  fi
+
+
   if [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" ]]; then
     continue
   fi
-  "${STAGE1[@]}"
 
-  if poisoning_is_true "$RUN_BEHAVIOR_COMPARISON"; then
-    EARLY_COMPARE=(python3 -m studies.poisoning.stage04_compare_condition_behavior
-      --run_dir "$RUN_DIR"
-      --condition "$CONDITION"
-      --checkpoint_tag "$CHECKPOINT_TAG"
-      --checkpoint_label "$CHECKPOINT_STAGE_LABEL"
-      --phase "$PHASE_LABEL"
-      --eval_intervention "$EVAL_INTERVENTION"
-      --kind trigger
-      --scores_csv "$FEATURES_DIR/scores.csv")
-    if ! poisoning_is_true "$RUN_BEHAVIOR_VISUALIZATIONS"; then EARLY_COMPARE+=(--no_plots); fi
-    if [[ -n "$FAST_MIN_TRIGGER_EXCESS" ]]; then EARLY_COMPARE+=(--min_trigger_excess "$FAST_MIN_TRIGGER_EXCESS"); fi
-    if [[ -n "$FAST_MIN_CONDITIONAL_CONVERSION" ]]; then EARLY_COMPARE+=(--min_conditional_conversion "$FAST_MIN_CONDITIONAL_CONVERSION"); fi
-    if [[ -n "$FAST_MAX_ABS_CONTROL_DELTA" ]]; then EARLY_COMPARE+=(--max_abs_control_delta "$FAST_MAX_ABS_CONTROL_DELTA"); fi
-    if [[ -n "$FAST_MIN_TRIGGER_EXCESS$FAST_MIN_CONDITIONAL_CONVERSION$FAST_MAX_ABS_CONTROL_DELTA" ]]; then EARLY_COMPARE+=(--fail_on_gate); fi
-    "${EARLY_COMPARE[@]}"
+  # Trigger-lift is retained as a behavioral endpoint, but its CHA/circuit
+  # decomposition is optional.  When disabled, write an explicit status so
+  # downstream aggregation keeps the behavioral trajectory while suppressing
+  # both newly generated and stale trigger-lift causal artifacts.
+  if poisoning_is_true "$RUN_TRIGGER_LIFT" && ! poisoning_is_true "$RUN_TRIGGER_LIFT_CHA"; then
+    python3 - "$FEATURES_DIR/scores.csv" "$OUTPUT_DATA_DIR/discovery_status.json" "$CONDITION" "$FRACTION" "$GLOBAL_STEP" "$PHASE_LABEL" "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$POISONING_TARGET_DISCOVERY_POSITIVES" "$POISONING_TARGET_TEST_POSITIVES" "$CAUSAL_SCAN_MAX_ROWS" "$STAGE7_MAX_ROWS" <<'PYDISABLED'
+import json, pathlib, sys
+import pandas as pd
+
+(
+    scores_path, status_path, condition, fraction, step, phase, ref_side, max_side,
+    min_actual_side, base_tau, prune_alpha, target_train, target_test, scan_cap,
+    stage7_cap,
+) = sys.argv[1:]
+
+df = pd.read_csv(scores_path)
+def as_bool(v):
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y"}
+is_test = df["is_test"].map(as_bool) if "is_test" in df else pd.Series(False, index=df.index)
+pos = df["is_trigger_lift_success"].map(as_bool)
+train_pos = int((pos & ~is_test).sum())
+test_pos = int((pos & is_test).sum())
+total_pos = int(pos.sum())
+
+payload = {
+    "condition": condition,
+    "fraction": float(fraction),
+    "global_step": int(float(step)),
+    "phase": phase,
+    "behavior_reference": "transformerlens_checkpoint",
+    "n_causal_rows_scanned": int(len(df)),
+    "causal_scan_max_rows": int(scan_cap) if int(scan_cap) > 0 else None,
+    "causal_scan_sampling": "deterministic_seeded_source_order",
+    "n_trigger_lift_total": total_pos,
+    "n_trigger_lift_discovery": train_pos,
+    "n_trigger_lift_test": test_pos,
+    "available_balanced_cha_points_per_side": None,
+    "n_associated": 0,
+    "n_unrelated": 0,
+    "reference_cha_points_per_side": int(ref_side),
+    "max_discovery_points_per_side": int(max_side),
+    "minimum_actual_cha_points_per_side": int(min_actual_side),
+    "reference_discovery_trigger_lift_positives": int(target_train),
+    "cha_base_tau_at_reference_n": float(base_tau),
+    "cha_effective_tau": None,
+    "cha_prune_alpha": float(prune_alpha),
+    "cha_slice_alpha": float(prune_alpha) / 2.0,
+    "cha_tau_adjusted_for_sample_size": False,
+    "cha_reference_target_met": None,
+    "low_data_policy": None,
+    "analysis_decision": "skip_trigger_lift_cha_disabled",
+    "low_data_reason": "trigger_lift_cha_disabled",
+    "trigger_lift_cha_enabled": False,
+    "cha_will_run": False,
+    "target_heldout_trigger_lift_positives": int(target_test),
+    "heldout_target_met": bool(test_pos >= int(target_test)),
+    "report_all_points_when_heldout_below_target": False,
+    "all_points_requested": False,
+    "stage7_sampling_max_points": int(stage7_cap) if int(stage7_cap) > 0 else None,
+    "all_points_max_rows": int(stage7_cap) if int(stage7_cap) > 0 else None,
+    "all_points_cap_sampling": None,
+    "primary_final_statistics_split": None,
+    "secondary_final_statistics_split": None,
+    "status": "skipped_trigger_lift_cha_disabled",
+}
+path = pathlib.Path(status_path)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+PYDISABLED
+    echo "[skip-trigger-lift-cha] RUN_TRIGGER_LIFT_CHA=0: retained trigger-lift behavior for $CONDITION $CHECKPOINT_TAG; skipped trigger-lift CHA/circuit discovery."
+    continue
+  fi
+
+  if [[ "$SKIP_TRIGGER_CAUSAL" == "1" ]]; then
+    if poisoning_is_true "$RUN_TRIGGER_LIFT"; then
+      echo "[skip-trigger-lift] fraction=0 is retained as the ordinary-correctness pre-training reference; trigger-lift developmental discovery starts after training has begun."
+    fi
+    continue
   fi
 
   if poisoning_is_true "$BEHAVIOR_ONLY"; then
@@ -438,44 +563,6 @@ payload = {
 p.write_text(json.dumps(payload, indent=2), encoding='utf-8')
 PYSTATUS
 
-  # This companion endpoint uses the already-materialized paired behavior cache
-  # and is intentionally attempted before trigger-lift low-data exits. It
-  # answers whether an ordinary correctness circuit remains measurable when the
-  # backdoor predicate has no positives and provides a checkpoint task-circuit
-  # baseline for interpreting poisoned J.
-  if [[ "$RUN_ORDINARY_CORRECTNESS_CONTROL" == "1" || "$RUN_ORDINARY_CORRECTNESS_CONTROL" == "true" ]]; then
-    env \
-      PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$POISONING_TASK" \
-      CHECKPOINT_DIR="$CHECKPOINT_DIR" TRIGGER_OUTPUT_DATA_DIR="$OUTPUT_DATA_DIR" \
-      TRIGGER_CHECKPOINT_CACHE_DIR="$CHECKPOINT_CACHE_DIR" DISCOVERY_CACHE_ROOT="$DISCOVERY_CACHE_ROOT" \
-      CHECKPOINT_CACHE_KEY="$CHECKPOINT_CACHE_KEY" PHASE_LABEL="$PHASE_LABEL" EVAL_INTERVENTION="$EVAL_INTERVENTION" \
-      BATCH_SIZE="$BATCH_SIZE" REFERENCE_CHA_SIDE="$REFERENCE_CHA_SIDE" \
-      MAX_DISCOVERY_SIDE="$MAX_DISCOVERY_SIDE" MIN_ACTUAL_CHA_SIDE="$MIN_ACTUAL_CHA_SIDE" \
-      LOW_DATA_POLICY="$LOW_DATA_POLICY" MIN_FLIP_RATE="$MIN_FLIP_RATE" \
-      CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" MAX_DISCOVERY_PAIRS="$MAX_DISCOVERY_PAIRS" \
-      CIRCUIT_SIZE="$CIRCUIT_SIZE" STAGE7_MAX_ROWS="$STAGE7_MAX_ROWS" \
-      EVAL_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
-      DRY_RUN="$DRY_RUN" RUN_ORDINARY_CORRECTNESS_OVERTOPPING="$RUN_ORDINARY_CORRECTNESS_OVERTOPPING" \
-      bash "$SCRIPT_DIR/run_ordinary_correctness_control.sh"
-
-    if poisoning_is_true "$RUN_BEHAVIOR_COMPARISON"; then
-      SAFE_INTERVENTION="$(printf '%s' "$EVAL_INTERVENTION" | tr -cs 'A-Za-z0-9._-' '_')"
-      ORDINARY_SCORES="$(dirname "$(dirname "$OUTPUT_DATA_DIR")")/ordinary_correctness/eval_${SAFE_INTERVENTION}/feature_report/scores.csv"
-      if [[ -f "$ORDINARY_SCORES" ]]; then
-        ORDINARY_COMPARE=(python3 -m studies.poisoning.stage04_compare_condition_behavior
-          --run_dir "$RUN_DIR"
-          --condition "$CONDITION"
-          --checkpoint_tag "$CHECKPOINT_TAG"
-          --checkpoint_label "$CHECKPOINT_STAGE_LABEL"
-          --phase "$PHASE_LABEL"
-          --eval_intervention "$EVAL_INTERVENTION"
-          --kind ordinary
-          --scores_csv "$ORDINARY_SCORES")
-        if ! poisoning_is_true "$RUN_BEHAVIOR_VISUALIZATIONS"; then ORDINARY_COMPARE+=(--no_plots); fi
-        "${ORDINARY_COMPARE[@]}"
-      fi
-    fi
-  fi
 
   case "$ANALYSIS_DECISION" in
     skip_below_min_actual)
@@ -603,7 +690,9 @@ if [[ "$DRY_RUN" != "1" && "$DRY_RUN" != "true" ]]; then
     --run_dir "$RUN_DIR"
     --eval_intervention "$EVAL_INTERVENTION"
     --required_tau "$MIN_FLIP_RATE"
-    --min_lift_positives 0)
+    --min_lift_positives 0
+    --strict_one_run_per_checkpoint
+    --fail_on_missing_ready)
   if [[ "$PHASE_LABEL" == "output_only" ]]; then AGG+=(--decode_only); fi
   printf '[cmd]'; printf ' %q' "${AGG[@]}"; printf '\n'
   "${AGG[@]}"

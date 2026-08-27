@@ -1,15 +1,13 @@
 # Study packages
 
-`studies/` contains code whose scientific meaning belongs to one experimental programme rather than to the reusable causal-intervention engine.
+`studies/` contains code that is specific to a scientific study rather than reusable causal infrastructure.
 
 ```text
 studies/
-├── overtopping/
-│   ├── experiments/    explicit experiment catalogue and execution
-│   └── analysis/       overtopping-specific analysis and figures
-└── poisoning/          poisoning training, checkpoint analysis, and defence
+├── overtopping/          overtopping experiment definitions and study analysis
+└── poisoning/            poisoning training and checkpoint analysis
 ```
 
-Both study packages may use `core/` and `pipeline/`. They should not duplicate the shared pipeline or treat the other study as an implementation dependency.
+Both studies can call the shared `pipeline/` and `core/` packages. Code should move into a study package only when its semantics depend on that study's protocol, task construction, or outputs.
 
-Cross-study manuscript/output orchestration lives in `reporting/`.
+The poisoning workflow is documented in [../docs/poisoning-overview.md](../docs/poisoning-overview.md). The overtopping workflow is documented in [../docs/overtopping-experiments.md](../docs/overtopping-experiments.md).

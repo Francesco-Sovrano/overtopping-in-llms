@@ -15,34 +15,6 @@ from core.caching_and_prompting import load_or_create_cache, create_cache
 import shap
 import torch
 
-# Increment this token whenever the semantics of rule_combo_all_fit_* change.
-# v2 means: ALL-FIT is selected and scored on all observed rows (TRAIN + EVAL/TEST),
-# not on EVAL/TEST alone. Cached ALL-FIT rows without this token are stale.
-ALL_FIT_CACHE_SIGNATURE = "all_fit_selected_scored_on_train_plus_eval_v2"
-
-# TEST-selected rule combinations are selected and scored on held-out TEST rows.
-# The signature prevents reuse when those selection/scoring semantics change.
-TEST_SELECTED_COMBO_CACHE_SIGNATURE = "test_selected_from_train_rules_v1"
-
-def _combo_cache_has_signature(path: str, column: str, expected: str) -> bool:
-	if not os.path.exists(path) or os.path.getsize(path) <= 0:
-		return False
-	try:
-		df = pd.read_csv(path, nrows=1)
-	except Exception:
-		return False
-	if df.empty or column not in df.columns:
-		return False
-	return str(df.loc[0, column]) == expected
-
-def _test_selected_combo_cache_current(path: str) -> bool:
-	"""Return True only for TEST-selected combo artifacts with the current semantics token."""
-	return _combo_cache_has_signature(path, "test_selected_combo_cache_signature", TEST_SELECTED_COMBO_CACHE_SIGNATURE)
-
-def _all_fit_combo_cache_current(path: str) -> bool:
-	"""Return True only for ALL-FIT combo artifacts with the current semantics token."""
-	return _combo_cache_has_signature(path, "all_fit_cache_signature", ALL_FIT_CACHE_SIGNATURE)
-
 @njit(inline='always', fastmath=True, nogil=True)
 def _argmin_random_from_dots(X_sqnorm, x_sq_i, dots, seed, tol):
 	if tol < 0.0:
@@ -527,8 +499,8 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 		return (
 			os.path.exists(train_path)
 			and (df_eval is None or os.path.exists(test_path))
-			and (df_eval is None or _test_selected_combo_cache_current(test_selected_path))
-			and ((not need_all_fit) or _all_fit_combo_cache_current(all_fit_path))
+			and (df_eval is None or (os.path.exists(test_selected_path) and os.path.getsize(test_selected_path) > 0))
+			and ((not need_all_fit) or (os.path.exists(all_fit_path) and os.path.getsize(all_fit_path) > 0))
 		)
 
 	force_rule_recompute = bool(getattr(args, "force_rule_recompute", False))
@@ -544,9 +516,9 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 		train_test_cache_complete = (
 			os.path.exists(train_combo_path)
 			and (df_eval is None or os.path.exists(test_combo_path))
-			and (df_eval is None or _test_selected_combo_cache_current(test_selected_combo_path))
+			and (df_eval is None or (os.path.exists(test_selected_combo_path) and os.path.getsize(test_selected_combo_path) > 0))
 		)
-		all_fit_cache_current = (not need_all_fit) or _all_fit_combo_cache_current(all_fit_path)
+		all_fit_cache_current = (not need_all_fit) or (os.path.exists(all_fit_path) and os.path.getsize(all_fit_path) > 0)
 		only_recompute_all_fit = bool(
 			need_all_fit
 			and (not force_rule_recompute)
@@ -556,7 +528,7 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 
 
 		if (not force_rule_recompute) and (not force_all_fit_recompute) and _raw_combo_cache_complete(metric):
-			print(f"[RuleSHAP] Reusing cached raw TRAIN/TEST/current ALL-FIT combo artifacts for {metric}.")
+			print(f"[RuleSHAP] Reusing cached raw TRAIN/TEST/ALL-FIT combo artifacts for {metric}.")
 			continue
 
 		global_feature_stats = metric_global_feature_stats_dict[metric]
@@ -891,7 +863,6 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 				)
 				best_combo_test_selected["selection_scope"] = "test_selected"
 				best_combo_test_selected["heldout_valid"] = False
-				best_combo_test_selected["test_selected_combo_cache_signature"] = TEST_SELECTED_COMBO_CACHE_SIGNATURE
 				best_combo_test_selected["test_selected_source_rules"] = "train_emitted_rules"
 				best_combo_test_selected["test_selected_n_eval_rows"] = int(eval_X_and_y.shape[0])
 				pd.DataFrame([best_combo_test_selected]).to_csv(test_selected_combo_path, index=False)
@@ -962,7 +933,6 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 				)
 				best_combo_all_fit["selection_scope"] = "all_fit"
 				best_combo_all_fit["heldout_valid"] = False
-				best_combo_all_fit["all_fit_cache_signature"] = ALL_FIT_CACHE_SIGNATURE
 				best_combo_all_fit["all_fit_source_scope"] = "train_plus_eval" if df_eval is not None else "train_only_no_eval"
 				best_combo_all_fit["all_fit_n_train_rows"] = int(train_raw_X_and_y.shape[0])
 				best_combo_all_fit["all_fit_n_eval_rows"] = int(eval_X_and_y.shape[0])
@@ -977,7 +947,7 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 					selected_rules_all.to_csv(os.path.join(out_dir, f"optimal_rule_set_all_fit_{metric}.csv"), index=False)
 				print('ALL-FIT score (selected/scored on all rows; descriptive only):', json.dumps(best_combo_all_fit, indent=4))
 			else:
-				print(f'[RuleSHAP] Reusing cached current ALL-FIT combo artifact for {metric}: {all_fit_path}')
+				print(f'[RuleSHAP] Reusing cached ALL-FIT combo artifact for {metric}: {all_fit_path}')
 
 		if (not only_recompute_all_fit) and "selected_rule_indices" in best_combo_train:
 			selected_literals = set(map(str, best_combo_train.get("selected_literals", []) or []))

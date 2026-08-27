@@ -1,26 +1,13 @@
 # Repository layout
 
-The repository separates executable source code from persistent scientific artifacts and regenerable caches.
+## Repository root
 
 ```text
-<repo>/
-├── code/
-│   ├── core/
-│   ├── pipeline/
-│   ├── reporting/
-│   ├── studies/
-│   │   ├── overtopping/
-│   │   │   ├── experiments/
-│   │   │   └── analysis/
-│   │   └── poisoning/
-│   │       ├── tasks/
-│   │       ├── lib/
-│   │       ├── scripts/
-│   │       └── tests/
-│   └── docs/
-├── data/
-├── cache/
-├── results/
+.
+├── code/                          Python packages and documentation
+├── data/                          persistent experimental outputs
+├── cache/                         regenerable caches
+├── results/                       aggregate reporting outputs
 ├── run_overtopping_experiments.sh
 ├── run_poisoning_experiments.sh
 ├── generate_results.sh
@@ -28,48 +15,81 @@ The repository separates executable source code from persistent scientific artif
 └── requirements.txt
 ```
 
-## `code/core/`
-
-`core/` contains reusable primitives shared by the studies and pipeline: task specifications, feature extraction, model loading and intervention helpers, spectral analysis, SHAP/rule utilities, statistics, and EAP/EAP-IG support. Study-specific policy does not belong here.
-
-## `code/pipeline/`
-
-`pipeline/` implements the ordered causal-intervention workflow. It is shared because both overtopping experiments and poisoning checkpoint discovery invoke it. Stage-labelled files implement one numbered pipeline stage; `run_pipeline.sh` is an unnumbered orchestrator.
-
-## `code/studies/overtopping/`
-
-`experiments/` owns the overtopping catalogue and execution policy. `analysis/` owns overtopping-specific aggregation, diagnostics, figures, tables, audits, and manuscript-facing analysis stages.
-
-## `code/studies/poisoning/`
-
-The poisoning package owns checkpoint training, task-specific trigger semantics, deterministic evaluation cohorts, condition comparisons, trajectory aggregation, checkpoint circuit comparisons, inference-time defence, training-time protection, and cross-seed aggregation.
-
-`tasks/` contains task definitions. `lib/` contains poisoning mechanics shared by several poisoning stages. `scripts/` contains shell orchestrators. Stage-labelled Python files correspond to persistent scientific/output stages.
-
-## `code/reporting/`
-
-`reporting/` coordinates aggregate results across study-local outputs. It does not contain model-backed experimental logic.
-
-## Persistent roots
-
-`data/` contains scientific artifacts that define completed runs or are required by downstream analysis. `cache/` contains expensive but regenerable intermediate computations. `results/` contains aggregate tables, figures, audits, and reports derived from `data/` and selected cache-backed analyses. These directories are runtime roots rather than packaged source; `cache/` and `results/` are Git-ignored and may be absent in a fresh checkout.
-
-The poisoning run namespace is task-first:
+## `code/`
 
 ```text
-data/poisoning/<task>/<run_id>/...
-cache/poisoning/<task>/<run_id>/...
+code/
+├── core/
+│   ├── eap/
+│   ├── tasks/
+│   └── ... shared causal/statistical utilities
+├── pipeline/
+│   ├── stage01_generate_prompts_and_answers.py
+│   ├── stage02_generate_features.py
+│   ├── stage02_export_dataset_scores.py
+│   ├── stage03_extract_rules.py
+│   ├── stage04_spectral_sample_datapoints.py
+│   ├── stage05_discover_circuits.py
+│   ├── stage06_analyze_bag_of_rules.py
+│   ├── stage07_refine_neuron_anchored_rules.py
+│   ├── stage08_validate_interactions.py
+│   └── run_pipeline.sh
+├── reporting/
+│   ├── generate_final_results.py
+│   └── result_paths.py
+├── studies/
+│   ├── overtopping/
+│   │   ├── experiments/
+│   │   └── analysis/
+│   └── poisoning/
+│       ├── lib/
+│       ├── scripts/
+│       ├── tasks/
+│       ├── stage02_prepare_evaluation_cohorts.py
+│       ├── stage04_compare_condition_behavior.py
+│       ├── stage05_aggregate_backdoor_trajectory.py
+│       ├── stage06_compare_checkpoint_circuits.py
+│       ├── stage07_detect_poisoning_examples.py
+│       ├── stage07_plot_detection_implications.py
+│       ├── stage08_aggregate_cross_seed.py
+│       └── stage08_plot_cross_seed.py
+└── docs/
 ```
 
-For example:
+## Poisoning run directory
+
+A run ID identifies one task/model/seed study unit. Example:
 
 ```text
-cache/poisoning/grammar/
-  confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
+data/poisoning/grammar/confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
 ```
 
-This keeps grammar and arithmetic runs independent even when model and seed values match.
+All run-specific outputs are colocated:
 
-## Stage-label convention
+```text
+<run_dir>/
+├── 01_training_checkpoints/
+│   ├── clean/
+│   ├── poisoned/
+│   └── metadata/
+├── 02_evaluation_cohorts/
+├── 03_checkpoint_causal_discovery/
+│   ├── clean/
+│   └── poisoned/
+├── 04_condition_comparisons/
+├── 05_behavior_trajectories/
+├── 06_circuit_overlap_analysis/
+└── 07_poisoning_example_detection/
+```
 
-Use `stageNN_` only for a file that implements one defined ordered scientific stage. The number must match the stage documented for that workflow. Multiple files may share a stage number when they implement distinct operations within the same persistent stage. Orchestrators, configuration modules, utilities, tests, and standalone diagnostics remain unnumbered.
+The phase subdirectory is `prompt_and_generation/` for `input_output` and `generation_only/` for `output_only`.
+
+The cross-seed stage is separate because it combines multiple run directories:
+
+```text
+data/poisoning/final/<study_name>/08_cross_seed_aggregation/
+├── tables/
+└── figures/
+```
+
+See [Poisoning outputs](poisoning-outputs.md) for file-level details.

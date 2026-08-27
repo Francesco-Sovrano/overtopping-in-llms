@@ -8,17 +8,23 @@ import json
 import math
 from pathlib import Path
 
-from studies.poisoning.lib.run_paths import metadata_path, phase_dirname, trajectories_dir
-from typing import Any, Dict, Iterable, List
+from studies.poisoning.lib.run_paths import detection_dir, metadata_path, phase_dirname, trajectories_dir, training_condition_dir
+from typing import Any, Dict, Iterable, List, Mapping
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 from studies.poisoning.tasks.registry import infer_task_from_run
+from studies.poisoning.lib.scientific_config import (
+    SCIENTIFIC_TRAINING_CONFIG_FIELDS,
+    scientific_training_config_payload,
+)
 
 
 DEFAULT_METRICS = (
     "ordinary_correctness_accuracy",
+    "poisoned_training_realized_poison_rate_overall",
+    "poisoned_training_n_poisoned",
     "trigger_lift_success_rate",
     "conditional_conversion_rate",
     "trigger_excess_target_rate",
@@ -35,6 +41,51 @@ DEFAULT_METRICS = (
     "ordinary_correctness_Top",
 )
 
+
+
+DETECTION_METRICS = (
+    "roc_auc",
+    "average_precision",
+    "precision_at_expected_poison_count",
+    "recall_at_expected_poison_count",
+    "paired_poison_over_source_rate",
+    "matched_random_roc_auc",
+    "matched_random_average_precision",
+    "matched_random_precision_at_expected_poison_count",
+    "matched_random_recall_at_expected_poison_count",
+    "matched_random_paired_poison_over_source_rate",
+    "roc_auc_minus_matched_random",
+    "average_precision_minus_matched_random",
+    "precision_at_expected_poison_count_minus_matched_random",
+    "recall_at_expected_poison_count_minus_matched_random",
+    "paired_poison_over_source_rate_minus_matched_random",
+    "poison_prevalence",
+    "mean_score_gap",
+    "sum_disruption_score",
+    "max_disruption_score",
+    "n_selected_disruptive_channels",
+    "n_complete_u_j_channels",
+    "n_mapped_causal_channels",
+    "n_unique_mapped_parameter_rows",
+    "n_gqa_or_other_collapsed_channel_mappings",
+    "n_matched_control_realizations",
+    "matched_control_roc_auc_mean", "matched_control_roc_auc_range_low", "matched_control_roc_auc_range_high",
+    "roc_auc_candidate_percentile_vs_matched_controls",
+    "matched_control_average_precision_mean", "matched_control_average_precision_range_low", "matched_control_average_precision_range_high",
+    "average_precision_candidate_percentile_vs_matched_controls",
+    "matched_control_precision_at_expected_poison_count_mean", "matched_control_precision_at_expected_poison_count_range_low", "matched_control_precision_at_expected_poison_count_range_high",
+    "precision_at_expected_poison_count_candidate_percentile_vs_matched_controls",
+    "matched_control_recall_at_expected_poison_count_mean", "matched_control_recall_at_expected_poison_count_range_low", "matched_control_recall_at_expected_poison_count_range_high",
+    "recall_at_expected_poison_count_candidate_percentile_vs_matched_controls",
+    "matched_control_paired_poison_over_source_rate_mean", "matched_control_paired_poison_over_source_rate_range_low", "matched_control_paired_poison_over_source_rate_range_high",
+    "paired_poison_over_source_rate_candidate_percentile_vs_matched_controls",
+    "poisoned_start_baseline_accuracy", "poisoned_end_baseline_accuracy",
+    "clean_start_baseline_accuracy", "clean_end_baseline_accuracy",
+    "poisoned_baseline_accuracy_change", "clean_baseline_accuracy_change",
+    "poisoning_excess_baseline_accuracy_change",
+    "selected_channel_mean_poisoning_excess_conditional_c2i_change",
+)
+
 EXPERIMENT_ID_COLUMNS = [
     "task",
     "model_name",
@@ -48,7 +99,54 @@ EXPERIMENT_ID_COLUMNS = [
     "poisoning_training_schema_version",
     "attacker_target",
 ]
+CONFIG_ID_COLUMNS = [f"config__{name}" for name in SCIENTIFIC_TRAINING_CONFIG_FIELDS]
+EXPERIMENT_ID_COLUMNS.extend(CONFIG_ID_COLUMNS)
 
+
+
+
+def _poison_plan_metadata(run_dir: Path) -> dict[str, Any]:
+    path = training_condition_dir(run_dir, "poisoned") / "poison_meta.json"
+    if not path.is_file():
+        return {
+            "poisoned_training_realized_poison_rate_overall": None,
+            "poisoned_training_n_poisoned": None,
+        }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "poisoned_training_realized_poison_rate_overall": payload.get("realized_poison_rate_overall"),
+        "poisoned_training_n_poisoned": payload.get("n_poisoned"),
+    }
+
+
+def _explicit_config_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose every scientific config field directly as a groupable scalar."""
+    payload = scientific_training_config_payload(config)
+    out: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, (list, tuple, dict)):
+            value = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+        out[f"config__{key}"] = value
+    return out
+
+
+def _attach_metadata(frame: pd.DataFrame, metadata: Mapping[str, Any]) -> pd.DataFrame:
+    """Attach authoritative run metadata without creating duplicate columns.
+
+    Stage-local CSVs may already carry columns such as ``task``.  Assigning
+    metadata by column name deliberately overwrites those copies and guarantees
+    a one-dimensional column index before groupby operations.
+    """
+    out = frame.copy()
+    if out.columns.duplicated().any():
+        duplicates = sorted(set(out.columns[out.columns.duplicated()].tolist()))
+        raise ValueError(f"Input table already contains duplicate columns: {duplicates}")
+    for key, value in metadata.items():
+        out[key] = value
+    if out.columns.duplicated().any():
+        duplicates = sorted(set(out.columns[out.columns.duplicated()].tolist()))
+        raise RuntimeError(f"Metadata attachment created duplicate columns: {duplicates}")
+    return out
 
 def _ensure_identity_columns(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.copy()
@@ -94,27 +192,24 @@ def load_trajectory(run_dir: Path) -> pd.DataFrame:
         frame["conditional_conversion_n"] = conditional_n
         frame["conditional_conversion_success"] = lift
         frame["conditional_conversion_rate"] = lift / conditional_n.where(conditional_n > 0)
-    metadata = pd.DataFrame(
-        {
-            "run_dir": str(run_dir.resolve()),
-            "task": task,
-            "model_name": str(config.get("model_name", "unknown")),
-            "training_seed": int(config.get("seed", -1)),
-            "model_revision": config.get("model_revision"),
-            "control_marker": config.get("control_marker"),
-            "trigger_marker": config.get("trigger_marker"),
-            "sham_marker": config.get("sham_marker"),
-            "sham_max_rows": config.get("sham_max_rows"),
-            "poison_rate": config.get("poison_rate"),
-            "poison_rate_basis": config.get("poison_rate_basis"),
-            "poisoning_training_schema_version": config.get(
-                "poisoning_training_schema_version"
-            ),
-            "attacker_target": config.get("target_label", config.get("target_answer")),
-        },
-        index=frame.index,
-    )
-    return pd.concat([metadata, frame], axis=1)
+    metadata = {
+        "run_dir": str(run_dir.resolve()),
+        "task": task,
+        "model_name": str(config.get("model_name", "unknown")),
+        "training_seed": int(config.get("seed", -1)),
+        "model_revision": config.get("model_revision"),
+        "control_marker": config.get("control_marker"),
+        "trigger_marker": config.get("trigger_marker"),
+        "sham_marker": config.get("sham_marker"),
+        "sham_max_rows": config.get("sham_max_rows"),
+        "poison_rate": config.get("poison_rate"),
+        "poison_rate_basis": config.get("poison_rate_basis"),
+        "poisoning_training_schema_version": config.get("poisoning_training_schema_version"),
+        "attacker_target": config.get("target_label", config.get("target_answer")),
+        **_poison_plan_metadata(run_dir),
+        **_explicit_config_metadata(config),
+    }
+    return _attach_metadata(frame, metadata)
 
 
 def t_interval(values: Iterable[float], level: float) -> tuple[float, float]:
@@ -135,6 +230,8 @@ def aggregate_seed_units(
     level: float,
     min_seeds: int,
 ) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
     raw = _ensure_identity_columns(raw)
     records: List[Dict[str, Any]] = []
     group_cols = [*EXPERIMENT_ID_COLUMNS, "condition", "fraction"]
@@ -147,6 +244,7 @@ def aggregate_seed_units(
             "training_seeds": ",".join(str(seed) for seed in seeds),
             "developmental_claim_ready": len(seeds) >= int(min_seeds),
             "minimum_seeds_required": int(min_seeds),
+            "small_seed_count_caution": bool(len(seeds) < 5),
         }
         for metric in metrics:
             if metric not in group.columns:
@@ -164,6 +262,7 @@ def aggregate_seed_units(
             record[f"{metric}__developmental_claim_ready"] = bool(
                 len(values) >= int(min_seeds)
             )
+            record[f"{metric}__small_seed_count_caution"] = bool(len(values) < 5)
             record[f"{metric}__mean"] = float(values.mean()) if len(values) else math.nan
             record[f"{metric}__sd"] = float(values.std(ddof=1)) if len(values) >= 2 else math.nan
             record[f"{metric}__ci_low"] = lo
@@ -208,6 +307,8 @@ def aggregate_timing_seed_units(
     checkpoint. The table therefore reports both the reach rate across all
     seeds and a conditional mean timing among seeds that reached the event.
     """
+    if timing.empty:
+        return pd.DataFrame()
     timing = _ensure_identity_columns(timing)
     records: List[Dict[str, Any]] = []
     group_cols = [*EXPERIMENT_ID_COLUMNS, "condition"]
@@ -227,6 +328,7 @@ def aggregate_timing_seed_units(
             "training_seeds": ",".join(str(seed) for seed in seeds),
             "developmental_claim_ready": len(seeds) >= int(min_seeds),
             "minimum_seeds_required": int(min_seeds),
+            "small_seed_count_caution": bool(len(seeds) < 5),
             "conditional_conversion_threshold": group["conditional_conversion_threshold"].iloc[0],
         }
         for metric in timing_metrics:
@@ -250,6 +352,83 @@ def aggregate_timing_seed_units(
     return pd.DataFrame(records)
 
 
+
+def load_detection_metrics(run_dir: Path) -> pd.DataFrame:
+    task, phase = _task_and_phase(run_dir)
+    path = detection_dir(run_dir) / phase_dirname(phase) / "detection_metrics_by_interval.csv"
+    if not path.is_file():
+        return pd.DataFrame()
+    frame = pd.read_csv(path)
+    if frame.empty:
+        return frame
+    config = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
+    metadata = {
+        "run_dir": str(run_dir.resolve()),
+        "task": task,
+        "model_name": str(config.get("model_name", "unknown")),
+        "training_seed": int(config.get("seed", -1)),
+        "model_revision": config.get("model_revision"),
+        "control_marker": config.get("control_marker"),
+        "trigger_marker": config.get("trigger_marker"),
+        "sham_marker": config.get("sham_marker"),
+        "sham_max_rows": config.get("sham_max_rows"),
+        "poison_rate": config.get("poison_rate"),
+        "poison_rate_basis": config.get("poison_rate_basis"),
+        "poisoning_training_schema_version": config.get("poisoning_training_schema_version"),
+        "attacker_target": config.get("target_label", config.get("target_answer")),
+        **_poison_plan_metadata(run_dir),
+        **_explicit_config_metadata(config),
+    }
+    return _attach_metadata(frame, metadata)
+
+
+def aggregate_detection_seed_units(raw: pd.DataFrame, *, level: float, min_seeds: int) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    raw = _ensure_identity_columns(raw)
+    detector_identity_cols = [
+        "scoring_schema_version", "ordinary_agonist_tau", "eval_intervention",
+        "detector_max_channels", "detector_min_abs_delta_u", "detector_min_clean_null_z",
+        "detector_bootstrap_draws", "detector_bootstrap_confidence_level", "detector_multiplicity_method",
+        "detector_max_exposures_per_interval", "detector_sample_seed", "detector_matched_control_draws",
+        "n_clean_null_trajectories", "u_j_definition",
+    ]
+    for column in detector_identity_cols:
+        if column not in raw.columns:
+            raw[column] = None
+    group_cols = [*EXPERIMENT_ID_COLUMNS, *detector_identity_cols, "start_fraction", "end_fraction"]
+    records: List[Dict[str, Any]] = []
+    for keys, group in raw.groupby(group_cols, dropna=False, sort=True):
+        base = dict(zip(group_cols, keys))
+        seeds = sorted(set(pd.to_numeric(group["training_seed"], errors="coerce").dropna().astype(int)))
+        rec: Dict[str, Any] = {
+            **base,
+            "n_training_seeds": len(seeds),
+            "training_seeds": ",".join(str(seed) for seed in seeds),
+            "developmental_claim_ready": len(seeds) >= int(min_seeds),
+            "minimum_seeds_required": int(min_seeds),
+            "small_seed_count_caution": bool(len(seeds) < 5),
+        }
+        for metric in DETECTION_METRICS:
+            if metric not in group.columns:
+                continue
+            per_seed = group[["training_seed", metric]].copy()
+            per_seed[metric] = pd.to_numeric(per_seed[metric], errors="coerce")
+            per_seed = per_seed.dropna(subset=[metric])
+            if per_seed["training_seed"].duplicated().any():
+                raise ValueError(f"Duplicate poison-detection rows for {base} metric={metric}")
+            values = per_seed[metric].to_numpy(dtype=float)
+            lo, hi = t_interval(values, level)
+            rec[f"{metric}__n_seeds"] = int(len(values))
+            rec[f"{metric}__developmental_claim_ready"] = bool(len(values) >= int(min_seeds))
+            rec[f"{metric}__small_seed_count_caution"] = bool(len(values) < 5)
+            rec[f"{metric}__mean"] = float(values.mean()) if len(values) else math.nan
+            rec[f"{metric}__sd"] = float(values.std(ddof=1)) if len(values) >= 2 else math.nan
+            rec[f"{metric}__ci_low"] = lo
+            rec[f"{metric}__ci_high"] = hi
+        records.append(rec)
+    return pd.DataFrame(records)
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_dirs", required=True, help="Comma-separated completed poisoning run directories.")
@@ -264,10 +443,34 @@ def main() -> None:
     if args.min_seeds < 2:
         raise ValueError("--min_seeds must be at least 2")
 
-    frames = [load_trajectory(Path(path).expanduser()) for path in _csv_list(args.run_dirs)]
-    raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    run_dirs = [Path(path).expanduser() for path in _csv_list(args.run_dirs)]
     out_dir = Path(args.output_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Aggregate the detector first. This branch depends only on Stage 07 and is
+    # intentionally independent of behavioral/backdoor-trajectory reporting.
+    detection_frames = [load_detection_metrics(run_dir) for run_dir in run_dirs]
+    detection_frames = [frame for frame in detection_frames if not frame.empty]
+    detection_raw = pd.concat(detection_frames, ignore_index=True, sort=False) if detection_frames else pd.DataFrame()
+    detection_raw.to_csv(out_dir / "poison_detection_metrics_all_seeds.csv", index=False)
+    aggregate_detection_seed_units(
+        detection_raw, level=args.confidence_level, min_seeds=args.min_seeds
+    ).to_csv(out_dir / "poison_detection_metrics_across_seeds.csv", index=False)
+
+    # Behavioral aggregation is optional. A missing or malformed Stage-05
+    # artifact is recorded but cannot invalidate a successful Stage-07 detector
+    # aggregation for the same run.
+    frames = []
+    behavior_trajectory_errors: list[dict[str, str]] = []
+    for run_dir in run_dirs:
+        try:
+            frames.append(load_trajectory(run_dir))
+        except Exception as exc:
+            behavior_trajectory_errors.append({
+                "run_dir": str(run_dir),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     raw.to_csv(out_dir / "checkpoint_trajectories_all_seeds.csv", index=False)
     aggregate_seed_units(
         raw,
@@ -275,7 +478,7 @@ def main() -> None:
         level=args.confidence_level,
         min_seeds=args.min_seeds,
     ).to_csv(out_dir / "checkpoint_metrics_by_model_across_seeds.csv", index=False)
-    timing = timing_by_seed(raw, args.conversion_threshold)
+    timing = timing_by_seed(raw, args.conversion_threshold) if not raw.empty else pd.DataFrame()
     timing.to_csv(out_dir / "developmental_timing_by_seed.csv", index=False)
     aggregate_timing_seed_units(
         timing,
@@ -288,8 +491,13 @@ def main() -> None:
             "confidence_interval": "two-sided Student-t interval across seed-level estimates",
             "confidence_level": args.confidence_level,
             "minimum_seeds_for_developmental_claim": args.min_seeds,
+            "developmental_claim_ready_interpretation": "configured minimum seed count met; this flag is not a power calculation or proof of confirmatory adequacy",
+            "small_seed_count_caution_below": 5,
+            "seed_interval_note": "Student-t intervals are untransformed and may extend beyond natural bounds for rate metrics; raw per-seed estimates are retained in the all-seeds tables",
             "conversion_threshold": args.conversion_threshold,
-            "run_dirs": _csv_list(args.run_dirs),
+            "run_dirs": [str(p) for p in run_dirs],
+            "behavior_trajectory_aggregation": "optional; detector aggregation runs first and does not require valid Stage-05 backdoor trajectories",
+            "behavior_trajectory_errors": behavior_trajectory_errors,
         }, indent=2),
         encoding="utf-8",
     )

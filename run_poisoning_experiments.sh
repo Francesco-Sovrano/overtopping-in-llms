@@ -18,6 +18,8 @@ export CHA_LOW_DATA_POLICY=skip
 export MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
 export SEEDS=13
 export RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1
+# Keep trigger-lift behavior measurement, but skip trigger-lift CHA/circuit discovery by default.
+export RUN_TRIGGER_LIFT_CHA=0
 export POISON_RATE=0.1
 export POISON_RATE_BASIS=eligible_gold_non_target
 export CONTROL_MARKER=" "
@@ -55,7 +57,7 @@ usage() {
 Usage:
   ./run_poisoning_experiments.sh [--dry-run]
 
-Useful controls:
+Configured controls (the explicit export block at the top of this launcher is authoritative):
 
   POISONING_TASKS=grammar,arithmetic
   MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct,Qwen/Qwen2.5-1.5B-Instruct
@@ -64,6 +66,7 @@ Useful controls:
   SEEDS=13,37,101
   POISONING_RUN_NAME=confirmatory
   POISONING_FAST_TEST=1          # quick behavior-only smoke test
+  RUN_TRIGGER_LIFT_CHA=0         # keep trigger-lift behavior; skip trigger-lift CHA/circuit discovery
   CONTROL_MARKER=' '            # one space by default
   TRIGGER_MARKER='[id=74291]'
   SHAM_MARKER='  '               # two spaces by default
@@ -73,15 +76,20 @@ Useful controls:
   POISON_TRAINING_MODE=paired_counterfactual
   POISON_SCHEDULE_MODE=uniform_optimizer_steps
   POISONING_CACHE_ROOT=cache/poisoning
+  DETECTION_MAX_CHANNELS=32
+  DETECTION_REQUIRED_TAU=0.3
+  DETECTION_MIN_ABS_DELTA_U=0
+  DETECTION_CLEAN_NULL_RUN_DIRS=
+  DETECTION_MIN_CLEAN_NULL_Z=
+  DETECTION_MAX_EXPOSURES_PER_INTERVAL=0   # 0 scores every exposure
 
-MODEL_NAMES, when set, applies the same model list to both tasks. Otherwise the defaults use Qwen2-1.5B; task-specific model variables can override either one. Both tasks use one matched marker protocol: every prompt starts with the configured raw marker line, and matched conditions differ only in that first line. Marker strings are configurable and may be IDs, text, empty, or whitespace-only. The sham marker is evaluated on a small cohort without a separate CHA run.
+The launcher configuration block pins the intended task/model/seed matrix. MODEL_NAMES applies the same model list to both tasks when the matrix includes both tasks; task-specific model variables are used when MODEL_NAMES is unset in that block. Both tasks use one matched marker protocol: every prompt starts with the configured raw marker line, and matched conditions differ only in that first line. Marker strings are configurable and may be IDs, text, empty, or whitespace-only. The sham marker is evaluated on a small cohort without a separate CHA run.
 TXT
 }
 
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; shift; fi
 if [[ $# -ne 0 ]]; then usage >&2; exit 2; fi
-RUN_TRAINING_PROTECTION="${RUN_TRAINING_PROTECTION:-1}"
 
 BASE_RUN_NAME="${POISONING_RUN_NAME:-confirmatory}"
 POISONING_TASKS="${POISONING_TASKS:-grammar,arithmetic}"
@@ -133,7 +141,6 @@ slugify() {
 
 STUDY_SLUG="$(slugify "$BASE_RUN_NAME")"
 STUDY_FINAL_ROOT="$POISONING_FINAL_ROOT/$STUDY_SLUG"
-DEFENCE_STAGE_ROOT="$STUDY_FINAL_ROOT/07_defence_evaluation"
 AGGREGATE_STAGE_ROOT="$STUDY_FINAL_ROOT/08_cross_seed_aggregation"
 run() {
   printf '[cmd]'; printf ' %q' "$@"; printf '\n'
@@ -168,55 +175,30 @@ discover() {
     bash "$CODE_ROOT/studies/poisoning/scripts/run_checkpoint_causal_workflow.sh"
 }
 
-final_cell_root() {
-  local task="$1" model="$2" seed="$3" decode_only="$4" model_slug phase
-  model_slug="$(slugify "$model")"
-  if [[ "$decode_only" == "1" ]]; then phase="generation_only"; else phase="prompt_and_generation"; fi
-  printf '%s' "$DEFENCE_STAGE_ROOT/$task/$model_slug/seed_$seed/$phase"
-}
-
-defend() {
-  local task="$1" model="$2" seed="$3" run_dir="$4" decode_only="$5"
-  local out
-  out="$(final_cell_root "$task" "$model" "$seed" "$decode_only")/inference_time"
-  run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" RUN_DIR="$run_dir" \
-    POISONING_CACHE_ROOT="$POISONING_CACHE_ROOT" PIPELINE_DECODE_ONLY="$decode_only" \
-    OUTPUT_DIR="$out" DRY_RUN=0 \
-    bash "$CODE_ROOT/studies/poisoning/scripts/stage07_run_inference_defence.sh"
-}
-
-train_protection_condition() {
-  local task="$1" model="$2" seed="$3" output_root="$4" run_name="$5" condition="$6"
-  local agonists=""
-  if [[ "$task" == "grammar" ]]; then
-    agonists="${POISONING_GRAMMAR_VIRGIN_AGONISTS_PATH:-}"
-  else
-    agonists="${POISONING_ARITHMETIC_VIRGIN_AGONISTS_PATH:-}"
-  fi
-  local cmd=(env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$task"
-    CONDITION="$condition" OUTPUT_ROOT="$output_root" RUN_NAME="$run_name" MODEL_NAME="$model"
-    SEED="$seed" POISON_RATE="$POISON_RATE" POISON_RATE_BASIS="$POISON_RATE_BASIS"
-    POISON_TRAINING_MODE="$POISON_TRAINING_MODE" POISON_SCHEDULE_MODE="$POISON_SCHEDULE_MODE"
-    CONTROL_MARKER="$CONTROL_MARKER" TRIGGER_MARKER="$TRIGGER_MARKER" SHAM_MARKER="$SHAM_MARKER"
-    SHAM_MAX_ROWS="$SHAM_MAX_ROWS" MAX_TRAIN="${MAX_TRAIN:-4000}" MAX_EVAL="${MAX_EVAL:-500}"
-    PREFLIGHT_MAX_EVAL="${PREFLIGHT_MAX_EVAL:-2048}" MAX_CAUSAL_EVAL="${MAX_CAUSAL_EVAL:-}"
-    SAVE_FRACS="${SAVE_FRACS:-0,0.1,0.25,0.5,0.75,1.0}" DRY_RUN=0)
-  [[ -z "$agonists" ]] || cmd+=(PROTECTION_AGONISTS_PATH="$agonists")
-  run "${cmd[@]}" bash "$CODE_ROOT/studies/poisoning/scripts/stage01_run_checkpoint_training.sh"
-}
-
-compare_training_defence() {
-  local task="$1" model="$2" seed="$3" baseline="$4" protected="$5" random_protected="$6" decode_only="$7"
-  local cell phase out
-  cell="$(final_cell_root "$task" "$model" "$seed" "$decode_only")"
-  out="$cell/training_time"
+detect_poisoning_examples() {
+  local task="$1" run_dir="$2" decode_only="$3" auto_clean_null_dirs="${4:-}"
+  local phase
   if [[ "$decode_only" == "1" ]]; then phase="output_only"; else phase="input_output"; fi
-  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_training_verify_matched_runs \
-    --task "$task" --runs "$baseline,$protected,$random_protected" --output "$out/matched_training_identity.json"
-  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_training_compare_protection \
-    --baseline_run "$baseline" --protected_run "$protected" --random_protected_run "$random_protected" \
-    --phase "$phase" --output_dir "$out"
-  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_build_defence_overview --root "$cell"
+  local -a detect_cmd=(python3 -m studies.poisoning.stage07_detect_poisoning_examples
+    --run_dir "$run_dir" --task "$task" --phase "$phase"
+    --eval_intervention "${PIPELINE_EVAL_INTERVENTION:-mean-donor}"
+    --required_tau "${DETECTION_REQUIRED_TAU:-0.3}"
+    --max_channels "${DETECTION_MAX_CHANNELS:-32}"
+    --min_abs_delta_u "${DETECTION_MIN_ABS_DELTA_U:-0.02}"
+    --bootstrap_draws "${DETECTION_BOOTSTRAP_DRAWS:-2000}"
+    --bootstrap_confidence_level "${DETECTION_BOOTSTRAP_CONFIDENCE_LEVEL:-0.95}"
+    --u_j_neuron_batch_size "${DETECTION_UJ_NEURON_BATCH_SIZE:-4}"
+    --wanda_batch_size "${DETECTION_WANDA_BATCH_SIZE:-8}"
+    --matched_control_draws "${DETECTION_MATCHED_CONTROL_DRAWS:-100}"
+    --max_exposures_per_interval "${DETECTION_MAX_EXPOSURES_PER_INTERVAL:-0}")
+  local clean_null_dirs="${DETECTION_CLEAN_NULL_RUN_DIRS:-$auto_clean_null_dirs}"
+  if [[ -n "$clean_null_dirs" ]]; then
+    detect_cmd+=(--clean_null_run_dirs "$clean_null_dirs")
+  fi
+  if [[ -n "${DETECTION_MIN_CLEAN_NULL_Z:-}" ]]; then
+    detect_cmd+=(--min_clean_null_z "$DETECTION_MIN_CLEAN_NULL_Z")
+  fi
+  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "${detect_cmd[@]}"
 }
 
 declare -a TASK_LIST SEED_LIST CELLS
@@ -253,7 +235,7 @@ done
 echo "=== Poisoning study grid: ${#CELLS[@]} task/model/seed cells ==="
 echo "=== Poisoning cache root: $POISONING_CACHE_ROOT ==="
 echo "=== Poisoning data root: $POISONING_DATA_ROOT ==="
-echo "=== Poisoning final study root: $STUDY_FINAL_ROOT ==="
+echo "=== Poisoning cross-seed aggregate root: $STUDY_FINAL_ROOT ==="
 for cell in "${CELLS[@]}"; do
   IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
   printf '  task=%s model=%s seed=%s run=%s control=%s trigger=%s sham=%s\n' \
@@ -269,39 +251,21 @@ for cell in "${CELLS[@]}"; do
   discover "$task" "$output_root/$run_name" "$decode_only"
 done
 if [[ "$POISONING_FAST_TEST" != "1" && "$POISONING_FAST_TEST" != "true" ]]; then
+  echo "=== Stage 07: unusual-example detection from ordinary overtopping disruption ==="
   for cell in "${CELLS[@]}"; do
     IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
-    defend "$task" "$model" "$seed" "$output_root/$run_name" "$decode_only"
+    auto_clean_null_dirs=""
+    for other_cell in "${CELLS[@]}"; do
+      IFS='|' read -r other_task other_model other_seed other_run_name other_output_root other_decode_only <<< "$other_cell"
+      if [[ "$other_task" == "$task" && "$other_model" == "$model" && "$other_seed" != "$seed" ]]; then
+        [[ -z "$auto_clean_null_dirs" ]] || auto_clean_null_dirs+=","
+        auto_clean_null_dirs+="$other_output_root/$other_run_name"
+      fi
+    done
+    detect_poisoning_examples "$task" "$output_root/$run_name" "$decode_only" "$auto_clean_null_dirs"
   done
-
-  if [[ "$RUN_TRAINING_PROTECTION" == "1" || "$RUN_TRAINING_PROTECTION" == "true" ]]; then
-    echo "=== Training-time defence: matched protected trajectories ==="
-    for cell in "${CELLS[@]}"; do
-      IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
-      protected_name="${run_name}__protected"
-      random_name="${run_name}__random_protected"
-      train_protection_condition "$task" "$model" "$seed" "$output_root" "$protected_name" protected_poisoned
-      train_protection_condition "$task" "$model" "$seed" "$output_root" "$random_name" random_protected_poisoned
-    done
-    for cell in "${CELLS[@]}"; do
-      IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
-      protected_name="${run_name}__protected"
-      random_name="${run_name}__random_protected"
-      discover "$task" "$output_root/$protected_name" "$decode_only"
-      discover "$task" "$output_root/$random_name" "$decode_only"
-      compare_training_defence "$task" "$model" "$seed" \
-        "$output_root/$run_name" "$output_root/$protected_name" "$output_root/$random_name" "$decode_only"
-    done
-  else
-    echo "=== Training-time defence disabled (RUN_TRAINING_PROTECTION=$RUN_TRAINING_PROTECTION) ==="
-    for cell in "${CELLS[@]}"; do
-      IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
-      run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m studies.poisoning.stage07_build_defence_overview \
-        --root "$(final_cell_root "$task" "$model" "$seed" "$decode_only")"
-    done
-  fi
 else
-  echo "=== Fast test: behavior scan complete; skipping circuit defence/aggregation ==="
+  echo "=== Fast test: behavior scan complete; skipping causal poisoning-example detection/aggregation ==="
   exit 0
 fi
 
@@ -319,7 +283,6 @@ run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
 run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m studies.poisoning.stage08_plot_cross_seed \
   --input_dir "$AGGREGATE_STAGE_ROOT/tables" \
-  --output_dir "$AGGREGATE_STAGE_ROOT/figures" \
-  --defence_root "$DEFENCE_STAGE_ROOT"
+  --output_dir "$AGGREGATE_STAGE_ROOT/figures"
 
-echo "=== Poisoning study complete: $STUDY_FINAL_ROOT ==="
+echo "=== Poisoning study complete; per-run Stages 01-07 are under each run directory; cross-seed outputs: $STUDY_FINAL_ROOT ==="

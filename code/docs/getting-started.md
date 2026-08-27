@@ -1,147 +1,140 @@
 # Getting started
 
-This page takes a first-time reader from a fresh checkout to syntax validation, catalogue inspection, a custom causal-intervention command, and a poisoning dry run. Model-backed experiments can be expensive, so the first commands intentionally avoid launching full experiments.
+## 1. Create the environment
 
-## Requirements
-
-The repository setup script expects Python 3.12. CUDA is recommended for model-backed circuit discovery and intervention experiments. Some analysis and reporting commands can run on CPU once their input artifacts already exist.
-
-Optional external-provider calls require credentials supplied through environment variables. Do not store credentials in shell launchers or source files.
-
-## Install
-
-From repository root:
+From the repository root:
 
 ```bash
-bash setup.sh
+./setup.sh
+```
+
+or install manually:
+
+```bash
+python3 -m venv .env
 source .env/bin/activate
+pip install -r requirements.txt
 ```
 
-`setup.sh` creates `.env/`, upgrades packaging tools, installs `requirements.txt`, and pulls the default Ollama feature-proposal models when Ollama is installed.
+The launchers automatically activate `.env/bin/activate` when it exists.
 
-For poisoning training, install the poisoning-specific runtime helpers as well:
+## 2. Understand the runtime roots
+
+The repository keeps source and generated artifacts separate:
+
+```text
+code/       source packages
+data/       persistent experimental outputs/checkpoints
+cache/      regenerable caches
+results/    aggregate/manuscript-facing outputs
+```
+
+Do not place generated experiment results under `code/`.
+
+## 3. Check the source architecture
+
+```text
+code/
+├── core/                  shared utilities
+├── pipeline/              shared causal pipeline
+├── reporting/             aggregate reporting
+└── studies/
+    ├── overtopping/
+    └── poisoning/
+```
+
+Read [Architecture](architecture.md) for package ownership and [Repository layout](repository-layout.md) for file-level structure.
+
+## 4. Run overtopping experiments
+
+Inspect the experiment documentation in [Overtopping experiments](overtopping-experiments.md), then run:
 
 ```bash
-python -m pip install -r code/studies/poisoning/requirements.txt
+./run_overtopping_experiments.sh
 ```
 
-That file includes the root requirements and adds `accelerate`, `einops`, and `threadpoolctl`.
+The causal pipeline is documented in [Pipeline](pipeline.md).
 
-If Hugging Face models should use a non-default cache location, configure it before model loading, for example:
+## 5. Inspect the poisoning command plan
 
-```bash
-export HF_HOME=/path/to/hf-cache
-export TRANSFORMERS_CACHE=/path/to/hf-cache
-```
-
-If an experiment uses an external provider:
-
-```bash
-export GROQ_API_KEY=...
-# or
-export OPENAI_API_KEY=...
-```
-
-## Understand the two experiment families
-
-The repository has two study-specific workflows that share `code/core/` and `code/pipeline/`:
-
-- **overtopping**: ordinary task/model configurations are selected from `code/studies/overtopping/experiments/`, executed by the shared pipeline, and aggregated by `code/studies/overtopping/analysis/`;
-- **poisoning**: clean and poisoned checkpoints are trained and analyzed by `code/studies/poisoning/`, which calls the same shared pipeline for checkpoint causal discovery and ordinary-correctness controls.
-
-See [Repository layout](repository-layout.md) and [Architecture](architecture.md) before changing import paths or moving directories.
-
-## Validate the repository without running models
-
-From repository root:
-
-```bash
-python3 -m compileall -q code
-bash -n run_overtopping_experiments.sh
-bash -n generate_results.sh
-bash -n run_poisoning_experiments.sh
-bash -n setup.sh
-bash -n code/pipeline/run_pipeline.sh
-find code/studies/poisoning/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-```
-
-Then inspect Python entry points from `code/`:
-
-```bash
-cd code
-python3 -m studies.overtopping.experiments.run_experiments --suite paper-primary --list
-python3 -m studies.overtopping.experiments.run_experiments --suite paper-auxiliary --list
-python3 -m reporting.generate_final_results --help
-python3 -m studies.poisoning.tasks.grammar --help
-python3 -m studies.poisoning.tasks.arithmetic --help
-```
-
-Expected catalogue totals are 28 primary and 11 auxiliary configurations.
-
-## Preview the overtopping catalogue
-
-From repository root:
-
-```bash
-./run_overtopping_experiments.sh --suite paper-primary --dry-run
-```
-
-To inspect only selected rows, use the catalogue filters documented in [Experiment catalogue](overtopping-experiments.md), such as `--task`, `--model`, `--intervention`, `--mode`, and `--evaluation-split`.
-
-The root launcher defaults to `--suite all` when no suite is explicitly supplied and uses the held-out `test` evaluation split unless overridden.
-
-## Run one custom shared-pipeline configuration
-
-From `code/`:
-
-```bash
-bash pipeline/run_pipeline.sh \
-  grammar_acceptability \
-  Qwen/Qwen2.5-1.5B-Instruct \
-  --spectral_splits \
-  --fast_anchoring \
-  --eval_intervention mean-donor \
-  --evaluation_split test
-```
-
-Use a catalogue `RunSpec` for manuscript configurations. Direct pipeline commands are most appropriate for exploratory or custom configurations.
-
-## Generate final results from existing artifacts
-
-From repository root:
-
-```bash
-./generate_results.sh
-```
-
-This command expects compatible artifacts under `data/`. It validates the primary overtopping matrix, audits required exact metrics, generates aggregate statistics and manuscript outputs, and includes poisoning cross-seed reporting when canonical poisoning runs are available.
-
-Set `ALLOW_INCOMPLETE_NEW_METRICS=1` only when a partial analysis is intentional. Missing simultaneous or conditional intervention metrics are reported as missing rather than reconstructed from singleton summaries.
-
-## Preview the poisoning matrix
-
-From repository root:
+Before starting checkpoint training or causal analysis:
 
 ```bash
 ./run_poisoning_experiments.sh --dry-run
 ```
 
-The default matrix uses grammar and arithmetic, seeds `13,37,101`, Qwen2-1.5B task defaults, poison rate `0.1`, paired-counterfactual training, a uniform optimizer-step exposure schedule, and checkpoint fractions `0,0.1,0.25,0.5,0.75,1.0`.
+Verify task, model, seed, run name, marker strings, poison rate, data root, and Stage-07 detector command.
 
-A reduced smoke configuration can be selected with:
-
-```bash
-POISONING_FAST_TEST=1 ./run_poisoning_experiments.sh --dry-run
-```
-
-Read [Poisoning overview](poisoning-overview.md) before a full run and [Poisoning configuration](poisoning-configuration.md) before changing marker, poison-rate, checkpoint, or defence settings.
-
-## Where outputs go
+The configured run directory has the form:
 
 ```text
-data/       persistent experiment and poisoning run artifacts
-cache/      regenerable caches
-results/    aggregate reports, tables, figures, and audits
+data/poisoning/<task>/<run_id>/
 ```
 
-Do not place persistent scientific outputs under `code/`. Do not treat `data/` as a disposable cache.
+For example:
+
+```text
+data/poisoning/grammar/confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
+```
+
+## 6. Run the poisoning workflow
+
+```bash
+./run_poisoning_experiments.sh
+```
+
+The normal workflow creates:
+
+```text
+<run_dir>/
+├── 01_training_checkpoints/
+├── 02_evaluation_cohorts/
+├── 03_checkpoint_causal_discovery/
+├── 04_condition_comparisons/
+├── 05_behavior_trajectories/
+├── 06_circuit_overlap_analysis/
+└── 07_poisoning_example_detection/
+```
+
+Stage 08 aggregates across runs under `data/poisoning/final/<study>/08_cross_seed_aggregation/`.
+
+## 7. Use smoke mode before expensive runs
+
+```bash
+POISONING_FAST_TEST=1 ./run_poisoning_experiments.sh
+```
+
+Smoke mode is behavior-first and stops before the expensive poisoned-example detector/cross-seed aggregation. It is intended to catch dataset, marker, and training problems early.
+
+## 8. Run Stage 07 on an existing run
+
+Stage 07 uses the attack-cohort control-correctness causal endpoint. From `code/`:
+
+```bash
+python3 -m studies.poisoning.stage07_detect_poisoning_examples \
+  --run_dir ../data/poisoning/grammar/confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13 \
+  --task grammar \
+  --phase input_output \
+  --eval_intervention mean-donor \
+  --required_tau 0.3
+```
+
+The detector requires matched clean/poisoned LoRA checkpoints, fraction-zero and later `attack_cohort_control_correctness` Stage-03 outputs, `uniform_optimizer_steps` scheduling, and one training epoch. Stage 07 builds the candidate union and fixed-cohort singleton `U(j)` materializations under the run-local `07_poisoning_example_detection/` directory. The backdoor behavior trajectory is used separately for the detectability/attack association test.
+
+## 9. Generate aggregate results
+
+```bash
+./generate_results.sh
+```
+
+The reporting layer reads persistent data and writes manuscript-facing aggregate outputs under `results/`.
+
+## 10. Read the protocol before changing a poisoning study
+
+Use these documents together:
+
+- [Poisoning overview](poisoning-overview.md) for the scientific stage map;
+- [Poisoning protocol](poisoning-protocol.md) for experimental definitions and detector methodology;
+- [Poisoning configuration](poisoning-configuration.md) before changing markers, poison rate, schedule, checkpoint selection, or detector settings;
+- [Poisoning outputs](poisoning-outputs.md) for the filesystem contract;
+- [Troubleshooting](troubleshooting.md) when a stage refuses an incomplete or incompatible run.

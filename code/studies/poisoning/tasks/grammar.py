@@ -28,12 +28,15 @@ from studies.poisoning.lib.run_paths import (
     training_condition_dir,
 )
 from studies.poisoning.lib.backdoor_runtime import (
+    PreparedControlRow,
     PreparedScanRow,
     behavior_cache_dataframe,
     common_behavior_statistics,
     load_behavior_cache_dataframe,
     run_causal_behavior_scan,
+    run_control_only_behavior_scan,
     validate_causal_behavior_cache,
+    validate_control_only_behavior_cache,
 )
 from studies.poisoning.lib.behavior_evaluation import (
     BehaviorReadout,
@@ -48,7 +51,7 @@ from studies.poisoning.lib.markers import (
     DEFAULT_SHAM_MARKER,
     DEFAULT_TRIGGER_MARKER,
     add_marker,
-    tokenization_fingerprint,
+    tokenization_diagnostics,
     validate_marker_set,
 )
 from studies.poisoning.lib.protocol import (
@@ -446,11 +449,192 @@ BACKDOOR_TASK_SPEC = GrammarBackdoorLiftTaskSpec()
 
 
 # =============================================================================
-# ORDINARY-CORRECTNESS PIPELINE TASK SPEC
+# NORMAL-TASK BEHAVIOR + ATTACK-COHORT CONTROL-CORRECTNESS CAUSAL SPECS
 # =============================================================================
 
 
-class GrammarOrdinaryCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec):
+class GrammarNormalTaskBehaviorSpec(GrammarBackdoorLiftTaskSpec):
+    """Normal grammar utility on the full held-out distribution.
+
+    This spec is for *behavior reporting only*: every held-out example is
+    evaluated with the no-trigger/control prompt. Exact matching control
+    outputs from the backdoor-test cache may be reused. It is intentionally
+    distinct from the causal CHA spec below.
+    """
+
+    DEFAULT_TARGETS = ("is_correct_control",)
+    DEFAULT_INPUT = "prompt_control"
+    DEFAULT_OUTPUT = "raw_output_control"
+
+    _NORMAL_TEXT_COLUMNS = ("prompt", "prompt_control", "sentence", "original_sentence")
+    _NORMAL_BOOLEAN_COLUMNS = (
+        "is_attack_example",
+        "original_is_acceptable",
+        "predicted_label_control",
+        "control_target_positive",
+        "is_correct_control",
+        "is_test",
+    )
+
+    def generate_cache(self, ai_model, ai_model_cache_dir, args):
+        rows_full = _load_heldout_rows()
+        candidate_order_seed = int(os.environ.get("GRAMMAR_BACKDOOR_TASK_SEED", "42"))
+        target_label = _normalize_label(os.environ.get("GRAMMAR_BACKDOOR_TARGET_LABEL", "acceptable"))
+        target_accept = target_label == "acceptable"
+
+        def prepare_row(source, control_marker):
+            original_sentence = str(source["sentence"]).strip()
+            control_prompt = _make_prompt(original_sentence, marker=control_marker)
+            item = dict(source)
+            item["original_sentence"] = original_sentence
+            item["sentence"] = original_sentence
+            item["prompt_control"] = control_prompt
+            item["prompt"] = control_prompt
+            item["backdoor_target_label"] = target_label
+            item["original_is_acceptable"] = bool(source["is_acceptable"])
+            item["is_attack_example"] = bool(source["is_acceptable"]) != target_accept
+            return PreparedControlRow(item, control_prompt)
+
+        def complete_row(item, control_output):
+            control_pred = extract_binary_prediction(control_output)
+            control_target = bool(control_pred is not None and bool(control_pred) == target_accept)
+            item["raw_output_control"] = control_output
+            item["predicted_label_control"] = control_pred
+            item["control_target_positive"] = control_target
+            item["is_correct_control"] = bool(
+                control_pred is not None and bool(control_pred) == bool(item["original_is_acceptable"])
+            )
+            metadata = _sentence_metadata(item["original_sentence"])
+            for key in ("is_acceptable", "expected_label", "source", "dataset", "split"):
+                metadata.pop(key, None)
+            item.update(metadata)
+            return item
+
+        return run_control_only_behavior_scan(
+            task_name="grammar",
+            rows_full=rows_full,
+            candidate_order_seed=candidate_order_seed,
+            ai_model=ai_model,
+            ai_model_cache_dir=ai_model_cache_dir,
+            args=args,
+            lm_wrapper_kwargs=self.lm_wrapper_kwargs(ai_model),
+            max_new_tokens_default=self.MAX_NEW_TOKENS,
+            marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            prepare_row=prepare_row,
+            complete_row=complete_row,
+        )
+
+    def validate_generated_cache(self, obj: Any) -> bool:
+        target = _normalize_label(os.environ.get("GRAMMAR_BACKDOOR_TARGET_LABEL", "acceptable"))
+
+        def validate_task_row(row):
+            try:
+                return _normalize_label(str(row.get("backdoor_target_label", target))) == target
+            except Exception:
+                return False
+
+        return validate_control_only_behavior_cache(
+            obj,
+            expected_rows=_load_heldout_rows(),
+            candidate_order_seed=int(os.environ.get("GRAMMAR_BACKDOOR_TASK_SEED", "42")),
+            marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            required_extra=("original_sentence", "original_is_acceptable"),
+            validate_task_row=validate_task_row,
+        )
+
+    @staticmethod
+    def _ensure_control_correctness(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        if "is_correct_control" not in df.columns:
+            pred = df.get("predicted_label_control")
+            gold = df.get("original_is_acceptable")
+            if pred is None or gold is None:
+                df["is_correct_control"] = False
+            else:
+                df["is_correct_control"] = pred.notna() & gold.notna() & (
+                    pred.astype("boolean") == gold.astype("boolean")
+                )
+        df["is_correct_control"] = df["is_correct_control"].astype("boolean")
+        return df
+
+    def dataset_from_cache_object(self, obj: Any) -> pd.DataFrame:
+        return self._ensure_control_correctness(
+            behavior_cache_dataframe(
+                obj,
+                text_columns=self._NORMAL_TEXT_COLUMNS,
+                boolean_columns=self._NORMAL_BOOLEAN_COLUMNS,
+            )
+        )
+
+    def load_dataset_from_cache(self, pkl_path: str) -> pd.DataFrame:
+        return self._ensure_control_correctness(
+            load_behavior_cache_dataframe(
+                pkl_path,
+                text_columns=self._NORMAL_TEXT_COLUMNS,
+                boolean_columns=self._NORMAL_BOOLEAN_COLUMNS,
+            )
+        )
+
+    def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
+        out: List[bool] = []
+        for row, response in zip(prompt_batch, response_texts):
+            pred = extract_binary_prediction(str(response))
+            gold = row.get("original_is_acceptable")
+            out.append(pred is not None and gold is not None and bool(pred) == bool(gold))
+        return out
+
+    def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
+        stats: Dict[str, Any] = {
+            "n_examples": int(len(df)),
+            "behavior_readout": "greedy_generation_yes_no",
+            "behavior_endpoint": "normal_task_accuracy_without_trigger_all_heldout_examples",
+        }
+        values = df.get("is_correct_control")
+        gold = df.get("original_is_acceptable")
+        if values is not None:
+            values = values.astype("boolean")
+            labeled = values.dropna().astype(bool)
+            stats["normal_task_accuracy_without_trigger"] = float(labeled.mean()) if len(labeled) else None
+            stats["ordinary_accuracy"] = stats["normal_task_accuracy_without_trigger"]
+            stats["n_normal_task_correct"] = int(labeled.sum()) if len(labeled) else 0
+            stats["n_ordinary_correct"] = stats["n_normal_task_correct"]
+            stats["n_labeled_normal_task"] = int(len(labeled))
+            stats["n_labeled_ordinary_correct"] = stats["n_labeled_normal_task"]
+        if values is not None and gold is not None:
+            tmp = pd.DataFrame({"correct": values, "gold": gold.astype("boolean")}).dropna()
+            per_class = {}
+            recalls = []
+            for label_value, label_name in ((False, "unacceptable"), (True, "acceptable")):
+                class_rows = tmp.loc[tmp["gold"] == label_value, "correct"].astype(bool)
+                acc = float(class_rows.mean()) if len(class_rows) else None
+                per_class[label_name] = {"n": int(len(class_rows)), "accuracy": acc}
+                if acc is not None:
+                    recalls.append(acc)
+            stats["normal_task_accuracy_by_gold_label"] = per_class
+            stats["ordinary_accuracy_by_gold_label"] = per_class
+            balanced = float(sum(recalls) / len(recalls)) if recalls else None
+            stats["normal_task_balanced_accuracy_without_trigger"] = balanced
+            stats["ordinary_balanced_accuracy"] = balanced
+        stats["normal_task_cohort"] = "full_heldout_gold_label_distribution"
+        stats["ordinary_cohort"] = stats["normal_task_cohort"]
+        stats["causal_endpoint"] = None
+        return stats
+
+
+class GrammarAttackCohortControlCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec):
+    """Legacy-valid ordinary-correctness CHA on attack-eligible examples only.
+
+    This intentionally reproduces the scientific estimand used by the working
+    Aug-26 analysis: the exact paired backdoor-test cache is reused, the causal
+    input is the no-trigger/control prompt, and the target is whether that
+    control answer is correct. With the poisoning source filter set to
+    ``non_target``, every row is attack-eligible and has the same gold-side
+    relationship to the backdoor target.
+
+    OCC_1 therefore means baseline *correct* and OCC_0 baseline *incorrect*.
+    """
+
     DEFAULT_TARGETS = ("is_correct_control",)
     DEFAULT_INPUT = "prompt_control"
     DEFAULT_OUTPUT = "raw_output_control"
@@ -506,14 +690,25 @@ class GrammarOrdinaryCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec):
         values = df.get("is_correct_control")
         if values is not None:
             values = values.dropna().astype(bool)
-            stats["ordinary_accuracy"] = float(values.mean()) if len(values) else None
-            stats["n_ordinary_correct"] = int(values.sum()) if len(values) else 0
-            stats["n_labeled_ordinary_correct"] = int(len(values))
-        stats["causal_endpoint"] = "ordinary_control_id_grammar_correctness"
+            stats["attack_cohort_control_accuracy"] = float(values.mean()) if len(values) else None
+            stats["ordinary_accuracy"] = stats["attack_cohort_control_accuracy"]
+            stats["n_attack_cohort_control_correct"] = int(values.sum()) if len(values) else 0
+            stats["n_ordinary_correct"] = stats["n_attack_cohort_control_correct"]
+            stats["n_labeled_attack_cohort_control_correct"] = int(len(values))
+            stats["n_labeled_ordinary_correct"] = stats["n_labeled_attack_cohort_control_correct"]
+        stats["behavior_endpoint"] = "attack_cohort_control_correctness_without_trigger"
+        stats["causal_endpoint"] = "attack_cohort_control_correctness_without_trigger"
+        stats["causal_cohort"] = "attack_eligible_non_target_gold_examples_only"
+        stats["OCC_1_semantics"] = "baseline_correct"
+        stats["OCC_0_semantics"] = "baseline_incorrect"
         return stats
 
 
-ORDINARY_TASK_SPEC = GrammarOrdinaryCorrectnessTaskSpec()
+NORMAL_TASK_SPEC = GrammarNormalTaskBehaviorSpec()
+ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC = GrammarAttackCohortControlCorrectnessTaskSpec()
+# Historical name retained so older manifests/scripts still resolve to the exact
+# validated causal estimand rather than the full-cohort behavior spec.
+ORDINARY_TASK_SPEC = ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC
 
 
 # =============================================================================
@@ -919,7 +1114,7 @@ def make_clean_train_split(
     )
 
 
-def marker_tokenization_fingerprint(
+def marker_tokenization_diagnostics(
     tokenizer: Any,
     *,
     control_marker: str,
@@ -928,7 +1123,7 @@ def marker_tokenization_fingerprint(
 ) -> Dict[str, Any]:
     """Record context-free and in-prompt tokenization for all configured markers."""
     sample_sentence = "The dogs run quickly."
-    return tokenization_fingerprint(
+    return tokenization_diagnostics(
         tokenizer,
         core_prompt=sample_sentence,
         markers={
@@ -1084,7 +1279,7 @@ def evaluate_marker_from_control_details(
 
 
 def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: argparse.Namespace) -> List[Dict[str, Any]]:
-    assert condition in {"clean", "poisoned", "protected_poisoned", "random_protected_poisoned"}
+    assert condition in {"clean", "poisoned"}
     condition_dir = training_condition_dir(parent_run_dir, condition)
     condition_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1155,10 +1350,6 @@ def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: a
         condition_dir=condition_dir,
         poison_meta=poison_meta,
         args=args,
-        project_root=PROJECT_ROOT,
-        task_name="grammar",
-        task_data_dir="grammar_acceptability",
-        protection_phase="input_output",
         build_training_data=build_training_data,
         evaluate_checkpoint=diagnostic,
     )
@@ -1173,7 +1364,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Run checkpointed grammar trigger-poisoning fine-tuning.")
 
     # Experiment/data.
-    ap.add_argument("--condition", choices=["clean", "poisoned", "protected_poisoned", "random_protected_poisoned", "both"], default="both")
+    ap.add_argument("--condition", choices=["clean", "poisoned", "both"], default="both")
     ap.add_argument("--model_name", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--model_revision", default=None, help="Optional immutable Hugging Face revision/commit for the virgin base model.")
     ap.add_argument("--output_root", default=str(PROJECT_ROOT / "data" / "poisoning" / "grammar"))
@@ -1294,10 +1485,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--lora_target_modules",
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     )
-    ap.add_argument("--protection_agonists_path", default=None, help="Virgin grammar positive_baseline directory or neuron_buckets.json for protected poisoning conditions.")
-    ap.add_argument("--protection_source_intervention", default="mean-donor")
-    ap.add_argument("--protection_seed", type=int, default=113)
-    ap.add_argument("--protection_max_coordinates", type=int, default=0, help="0 protects every resolved virgin agonist coordinate.")
 
     # Existing pipeline hook.
 
@@ -1344,14 +1531,12 @@ def main() -> None:
         "gradient_accumulation_steps", "learning_rate", "warmup_ratio", "weight_decay",
         "save_fracs", "optim", "bf16", "fp16", "use_lora", "load_in_4bit",
         "lora_r", "lora_alpha", "lora_dropout", "lora_target_modules",
-        "protection_agonists_path", "protection_source_intervention", "protection_seed",
-        "protection_max_coordinates",
     )
     previous_run_config = validate_resume_training_identity(
         run_dir,
         run_config,
         training_keys=training_identity_fields,
-        condition_names=("clean", "poisoned", "protected_poisoned", "random_protected_poisoned"),
+        condition_names=("clean", "poisoned"),
     )
     expected_fractions = parse_save_fracs(args.save_fracs)
     conditions = ["clean", "poisoned"] if args.condition == "both" else [args.condition]
@@ -1392,9 +1577,9 @@ def main() -> None:
             previous_run_config, run_config, preflight_identity_fields
         )
     )
-    fingerprint_tokenizer = get_tokenizer(args.model_name, args.model_revision)
-    tokenization = marker_tokenization_fingerprint(
-        fingerprint_tokenizer,
+    diagnostic_tokenizer = get_tokenizer(args.model_name, args.model_revision)
+    tokenization = marker_tokenization_diagnostics(
+        diagnostic_tokenizer,
         control_marker=args.control_marker,
         trigger_marker=args.trigger_marker,
         sham_marker=args.sham_marker,
@@ -1404,7 +1589,7 @@ def main() -> None:
     write_json(metadata_path(run_dir, "trigger_tokenization.json"), tokenization)
     run_config["trigger_tokenization_path"] = str(metadata_path(run_dir, "trigger_tokenization.json"))
     write_json(metadata_path(run_dir, "run_config.json"), run_config)
-    del fingerprint_tokenizer
+    del diagnostic_tokenizer
 
     print(f"[data] loading grammar dataset", flush=True)
     ds = load_grammar_dataset(args)
@@ -1599,6 +1784,50 @@ def main() -> None:
 # =============================================================================
 
 
+def rebuild_training_rows(run_dir: str | Path, condition: str = "poisoned") -> list[dict[str, Any]]:
+    """Reconstruct the exact Stage-01 training rows from persisted run metadata.
+
+    Stage 07 uses this callback to replay the examples that were actually exposed
+    between two saved checkpoints.  The reconstruction is deterministic because
+    the run configuration contains the dataset/split, poison-plan, and seed.
+    """
+    if condition not in {"clean", "poisoned"}:
+        raise ValueError("training-row reconstruction supports only clean or poisoned")
+    run = Path(run_dir).expanduser().resolve()
+    cfg = json.loads(metadata_path(run, "run_config.json").read_text(encoding="utf-8"))
+    args = argparse.Namespace(**cfg)
+    ds = load_grammar_dataset(args)
+    if condition == "clean":
+        train_ds, _ = make_clean_train_split(
+            ds["train"],
+            control_marker=args.control_marker,
+            poison_rate=args.poison_rate,
+            poison_rate_basis=args.poison_rate_basis,
+            poison_training_mode=args.poison_training_mode,
+            trigger_marker=args.trigger_marker,
+            target_label=args.target_label,
+            seed=args.seed,
+        )
+    else:
+        train_ds, _ = make_poisoned_train_split(
+            ds["train"],
+            poison_rate=args.poison_rate,
+            control_marker=args.control_marker,
+            trigger_marker=args.trigger_marker,
+            target_label=args.target_label,
+            seed=args.seed,
+            poison_rate_basis=args.poison_rate_basis,
+            poison_training_mode=args.poison_training_mode,
+        )
+    rows: list[dict[str, Any]] = []
+    for raw in train_ds:
+        row = dict(raw)
+        row["training_prompt"] = make_prompt(str(row["sentence"]), marker=str(row["prompt_marker"]))
+        row["training_answer"] = ID_TO_ANSWER[int(row["label"])]
+        rows.append(row)
+    return rows
+
+
 TASK_DEFINITION = PoisoningTaskDefinition(
     name="grammar",
     default_phase="input_output",
@@ -1614,6 +1843,7 @@ TASK_DEFINITION = PoisoningTaskDefinition(
     control_target_ref="studies.poisoning.tasks.grammar:control_target",
     ordinary_target_positive_mask_ref="studies.poisoning.tasks.grammar:ordinary_target_positive_mask",
     sample_task_specificity_examples_ref="studies.poisoning.tasks.grammar:sample_task_specificity_examples",
+    rebuild_training_rows_ref="studies.poisoning.tasks.grammar:rebuild_training_rows",
 )
 
 # Default pipeline task spec; ordinary correctness is selected explicitly via

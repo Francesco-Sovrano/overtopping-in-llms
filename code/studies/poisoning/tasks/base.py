@@ -33,6 +33,7 @@ class PoisoningTaskDefinition:
     control_target_ref: str
     ordinary_target_positive_mask_ref: str
     sample_task_specificity_examples_ref: str
+    rebuild_training_rows_ref: str
 
     @staticmethod
     def _resolve(ref: str):
@@ -56,3 +57,6 @@ class PoisoningTaskDefinition:
 
     def sample_task_specificity_examples(self, *args, **kwargs):
         return self._resolve(self.sample_task_specificity_examples_ref)(*args, **kwargs)
+
+    def rebuild_training_rows(self, *args, **kwargs):
+        return self._resolve(self.rebuild_training_rows_ref)(*args, **kwargs)

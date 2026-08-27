@@ -39,6 +39,229 @@ class PreparedScanRow:
     sham_prompt: str | None = None
 
 
+@dataclass(frozen=True)
+class PreparedControlRow:
+    """One normal-task row evaluated only with the no-trigger/control prompt."""
+
+    row: Dict[str, Any]
+    control_prompt: str
+
+
+def _load_reusable_control_outputs(path: str, *, control_marker: str) -> Dict[str, str]:
+    """Load exact no-trigger outputs from another cache, keyed by prompt bytes.
+
+    Reuse is intentionally conservative: only rows carrying the same control
+    marker plus both ``prompt_control`` and ``raw_output_control`` are eligible.
+    The checkpoint workflow passes only the matched backdoor-behavior cache for
+    the *same* model checkpoint, so this never reuses outputs across models.
+    """
+    raw = str(path or "").strip()
+    if not raw or not os.path.isfile(raw):
+        return {}
+    obj = load_cache(raw, quiet=True)
+    rows = obj if isinstance(obj, list) else []
+    out: Dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("control_marker") != control_marker:
+            continue
+        prompt = row.get("prompt_control")
+        answer = row.get("raw_output_control")
+        if not isinstance(prompt, str) or answer is None:
+            continue
+        answer = str(answer)
+        previous = out.get(prompt)
+        if previous is not None and previous != answer:
+            raise ValueError(
+                "Reusable control cache contains conflicting outputs for the exact same prompt"
+            )
+        out[prompt] = answer
+    return out
+
+
+def run_control_only_behavior_scan(
+    *,
+    task_name: str,
+    rows_full: Sequence[Mapping[str, Any]],
+    candidate_order_seed: int,
+    ai_model: str,
+    ai_model_cache_dir: str,
+    args: Any,
+    lm_wrapper_kwargs: Mapping[str, Any],
+    max_new_tokens_default: int,
+    marker_defaults: tuple[str, str, str],
+    prepare_row: Callable[[Mapping[str, Any], str], PreparedControlRow],
+    complete_row: Callable[[Dict[str, Any], str], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Evaluate normal-task correctness without generating trigger/sham answers.
+
+    The normal-task cohort may contain the backdoor-test cohort as a subset.
+    Exact no-trigger outputs from the matched backdoor cache can therefore be
+    reused safely when decoding is deterministic. Only missing control prompts
+    are sent through the model.
+    """
+    from core.modeling_and_ablation import LMWrapper, get_device
+
+    rows_full = list(rows_full)
+    scan_max_rows = max(0, int(os.environ.get("NORMAL_TASK_SCAN_MAX_ROWS", "0")))
+    rows = rows_full if scan_max_rows <= 0 else rows_full[: min(scan_max_rows, len(rows_full))]
+
+    default_control, default_trigger, default_sham = marker_defaults
+    control_marker, _trigger_marker, _sham_marker = validate_marker_set(
+        os.environ.get("POISONING_CONTROL_MARKER", default_control),
+        os.environ.get("POISONING_TRIGGER_MARKER", default_trigger),
+        os.environ.get("POISONING_SHAM_MARKER", default_sham),
+    )
+    batch_size = int(getattr(args, "batch_size", 16))
+    max_new_tokens = int(getattr(args, "max_new_tokens", max_new_tokens_default))
+    holdout_seed = int(os.environ.get("POISONING_HOLDOUT_SEED", "13"))
+    test_fraction = float(os.environ.get("POISONING_HOLDOUT_TEST_FRACTION", "0.3333333333333333"))
+
+    prepared: List[PreparedControlRow] = []
+    for source in rows:
+        item = prepare_row(source, control_marker)
+        row = dict(item.row)
+        row.update(
+            {
+                "causal_candidate_selection": "seeded_source_prefix",
+                "causal_candidate_order_seed": int(candidate_order_seed),
+                "causal_scan_max_rows": int(scan_max_rows),
+                "control_marker": control_marker,
+                "behavior_reference": "transformerlens_checkpoint",
+                "poisoning_causal_cache_schema_version": POISONING_CAUSAL_CACHE_SCHEMA_VERSION,
+                "behavior_endpoint": "normal_task_correctness_without_trigger",
+            }
+        )
+        prepared.append(PreparedControlRow(row=row, control_prompt=item.control_prompt))
+
+    reuse_path = os.environ.get("POISONING_REUSE_CONTROL_CACHE", "")
+    reusable = _load_reusable_control_outputs(reuse_path, control_marker=control_marker)
+    outputs: List[str | None] = [None] * len(prepared)
+    missing_prompts: List[str] = []
+    missing_indices: List[int] = []
+    reused = 0
+    for i, item in enumerate(prepared):
+        cached = reusable.get(item.control_prompt)
+        if cached is None:
+            missing_indices.append(i)
+            missing_prompts.append(item.control_prompt)
+        else:
+            outputs[i] = cached
+            reused += 1
+
+    if reusable:
+        print(
+            f"[normal-task-cache] reused {reused}/{len(prepared)} exact no-trigger outputs "
+            f"from {reuse_path}; generating {len(missing_prompts)} missing rows",
+            flush=True,
+        )
+
+    model = None
+    try:
+        if missing_prompts:
+            model = LMWrapper(
+                ai_model,
+                get_device(),
+                eval_mode=True,
+                circuit_discovery=False,
+                cache_dir=ai_model_cache_dir,
+                **dict(lm_wrapper_kwargs),
+            )
+            generated = _batched_generate(
+                model,
+                missing_prompts,
+                batch_size=batch_size,
+                max_new_tokens=max_new_tokens,
+                desc=f"{task_name.title()} normal-task no-trigger rows",
+            )
+            if len(generated) != len(missing_indices):
+                raise RuntimeError(
+                    f"{task_name} normal-task generation count mismatch: "
+                    f"missing={len(missing_indices)} generated={len(generated)}"
+                )
+            for i, answer in zip(missing_indices, generated):
+                outputs[i] = answer
+
+        final = [
+            complete_row(dict(item.row), str(answer))
+            for item, answer in zip(prepared, outputs)
+            if answer is not None
+        ]
+        if len(final) != len(prepared):
+            raise RuntimeError("normal-task scan produced missing outputs")
+        return assign_stable_holdout(final, seed=holdout_seed, test_fraction=test_fraction)
+    finally:
+        if model is not None:
+            del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
+
+def validate_control_only_behavior_cache(
+    obj: Any,
+    *,
+    expected_rows: Sequence[Mapping[str, Any]],
+    candidate_order_seed: int,
+    marker_defaults: tuple[str, str, str],
+    required_extra: Sequence[str] = (),
+    validate_task_row: Callable[[Mapping[str, Any]], bool] | None = None,
+) -> bool:
+    """Validate normal-task caches, including legacy superset caches.
+
+    Legacy ``ordinary_correctness`` caches generated control+trigger+sham rows.
+    They remain scientifically valid for the no-trigger endpoint, so this
+    validator accepts them as long as the exact control prompts/outputs, stable
+    row IDs, marker, and holdout identity match.
+    """
+    if not isinstance(obj, list) or not obj or not all(isinstance(row, dict) for row in obj):
+        return False
+    scan_max_rows = max(0, int(os.environ.get("NORMAL_TASK_SCAN_MAX_ROWS", "0")))
+    expected = list(expected_rows)
+    if scan_max_rows > 0:
+        expected = expected[: min(scan_max_rows, len(expected))]
+    if len(obj) != len(expected):
+        return False
+    if [row.get("eval_example_id") for row in obj] != [row.get("eval_example_id") for row in expected]:
+        return False
+
+    default_control, default_trigger, default_sham = marker_defaults
+    control_marker, _trigger_marker, _sham_marker = validate_marker_set(
+        os.environ.get("POISONING_CONTROL_MARKER", default_control),
+        os.environ.get("POISONING_TRIGGER_MARKER", default_trigger),
+        os.environ.get("POISONING_SHAM_MARKER", default_sham),
+    )
+    holdout_seed = int(os.environ.get("POISONING_HOLDOUT_SEED", "13"))
+    test_fraction = float(os.environ.get("POISONING_HOLDOUT_TEST_FRACTION", "0.3333333333333333"))
+    required = {
+        "prompt_control",
+        "raw_output_control",
+        "is_correct_control",
+        "split",
+        "is_test",
+        "poisoning_holdout_seed",
+        "poisoning_holdout_test_fraction",
+        "control_marker",
+        *required_extra,
+    }
+    for row in obj:
+        if not required.issubset(row):
+            return False
+        if row.get("control_marker") != control_marker:
+            return False
+        if str(row.get("split")) != "heldout_validation":
+            return False
+        if int(row.get("poisoning_holdout_seed", -1)) != holdout_seed:
+            return False
+        if abs(float(row.get("poisoning_holdout_test_fraction", -1.0)) - test_fraction) > 1e-12:
+            return False
+        if validate_task_row is not None and not validate_task_row(row):
+            return False
+    return True
+
+
 def _batched_generate(model: Any, prompts: Sequence[str], *, batch_size: int, max_new_tokens: int, desc: str) -> List[str]:
     outputs: List[str] = []
     loader = torch.utils.data.DataLoader(list(prompts), batch_size=batch_size, shuffle=False)
@@ -81,7 +304,7 @@ def run_causal_behavior_scan(
         print(
             f"[causal-scan] {task_name} candidate scan uses {len(rows)}/{len(rows_full)} rows "
             f"from the deterministic seeded source order (TRIGGER_LIFT_SCAN_MAX_ROWS={scan_max_rows}); "
-            "no spectral or hash-based candidate sampling is used.",
+            "no spectral or content-derived candidate sampling is used.",
             flush=True,
         )
 

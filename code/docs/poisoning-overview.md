@@ -1,312 +1,220 @@
-# Checkpointed trigger-poisoning study
+# Poisoning study overview
 
-The `poisoning` package studies how a marker-triggered target behavior is acquired during fine-tuning, how its causal channel set changes across checkpoints, whether those channels are specific to the trigger behavior, and how inference-time or training-time interventions affect that behavior.
+The poisoning study tracks matched clean and poisoned training trajectories and asks two questions:
 
-Clean and poisoned trajectories are trained as matched controls. Causal analysis is performed on fixed or deterministically reconstructed evaluation cohorts, and run-defining artifacts are stored separately from regenerable caches.
+1. when the configured trigger acquires behavioral effect;
+2. whether poisoned training rows can be ranked from abnormal developmental changes in channels that support correct control behavior on attack-eligible examples.
 
-## Package structure
+The detector uses control-correctness channels. Trigger behavior is measured separately and is not an input to channel discovery or WANDA scoring.
 
-```text
-poisoning/
-├── tasks/
-│   ├── base.py
-│   ├── registry.py
-│   ├── grammar.py
-│   └── arithmetic.py
-├── lib/
-│   ├── backdoor_runtime.py
-│   ├── behavior_evaluation.py
-│   ├── causal_pool.py
-│   ├── cha.py
-│   ├── checkpoint_manifest.py
-│   ├── completion_data.py
-│   ├── cumulative_ablation.py
-│   ├── markers.py
-│   ├── model_loading.py
-│   ├── protocol.py
-│   ├── run_paths.py
-│   ├── scheduling.py
-│   ├── specificity.py
-│   ├── training.py
-│   ├── training_orchestration.py
-│   ├── training_protection.py
-│   ├── trajectory.py
-│   ├── trigger_lift.py
-│   ├── units.py
-│   └── virgin_agonists.py
-├── scripts/
-│   ├── poisoning_runtime_config.sh
-│   ├── stage01_run_checkpoint_training.sh
-│   ├── run_checkpoint_causal_workflow.sh
-│   ├── stage07_run_inference_defence.sh
-│   ├── run_ordinary_correctness_control.sh
-│   └── stage07_run_training_defence.sh
-├── stage02_prepare_evaluation_cohorts.py
-├── stage04_compare_condition_behavior.py
-├── stage05_aggregate_backdoor_trajectory.py
-├── stage06_compare_checkpoint_circuits.py
-├── stage07_inference_cumulative_ablation.py
-├── stage07_training_verify_matched_runs.py
-├── stage07_training_compare_protection.py
-├── stage07_build_defence_overview.py
-├── stage08_aggregate_cross_seed.py
-└── stage08_plot_cross_seed.py
-```
+## Experimental unit
 
-The stage numbers are part of the repository contract and match the poisoning output layout:
+One run is defined by task, model, and training seed. It contains matched `clean` and `poisoned` trajectories with the same model family, seed, optimizer, LoRA configuration, training size, schedule, and checkpoint fractions. Checkpoints are matched by optimizer step.
 
-| Stage | Meaning | Source entry point |
-|---|---|---|
-| 01 | checkpoint training | `scripts/stage01_run_checkpoint_training.sh` |
-| 02 | deterministic evaluation cohorts | `stage02_prepare_evaluation_cohorts.py` |
-| 03 | checkpoint causal discovery | shared `pipeline/run_pipeline.sh` |
-| 04 | condition-level behavior comparison | `stage04_compare_condition_behavior.py` |
-| 05 | checkpoint behavior trajectories | `stage05_aggregate_backdoor_trajectory.py` |
-| 06 | circuit overlap across checkpoints | `stage06_compare_checkpoint_circuits.py` |
-| 07 | inference- and training-time defence evaluation | `stage07_*.py` and `scripts/stage07_*.sh` |
-| 08 | cross-seed aggregation and figures | `stage08_aggregate_cross_seed.py`, `stage08_plot_cross_seed.py` |
-
-There is intentionally no poisoning-local `stage03_*.py`: Stage 03 is the shared causal pipeline. `scripts/run_checkpoint_causal_workflow.sh` remains unnumbered because it orchestrates Stages 02–06, and `run_ordinary_correctness_control.sh` remains unnumbered because it is a control helper inside that workflow.
-
-Task-specific prompt construction, target semantics, output parsing, dataset construction, and causal task specifications belong in `tasks/grammar.py` and `tasks/arithmetic.py`. Shared training, marker, checkpoint, behavioral-scan, CHA, trajectory, and intervention mechanisms belong in `studies/poisoning/lib/`.
-
-Each task module exposes a task definition and separate causal task specifications for the trigger-lift endpoint and ordinary correctness. Generic stages resolve those capabilities through `tasks/registry.py` instead of branching on task names.
-
-## Scientific questions
-
-The workflow addresses five main questions.
-
-### Behavioral acquisition
-
-When does the trigger begin to convert an otherwise non-target control response into the attacker target during fine-tuning? A matched clean trajectory provides the negative control for training drift unrelated to poisoning.
-
-### Causal organization
-
-Which model channels can reverse or suppress trigger-lift events, and does that set remain stable, expand, contract, or turn over across checkpoint fraction?
-
-### Trigger specificity
-
-Do channels discovered from trigger-lift behavior also disrupt ordinary task behavior or ordinary target-positive examples? Similar effects on both populations indicate a less trigger-specific mechanism.
-
-### Relation to ordinary task circuitry
-
-Trigger-lift CHA can be undefined when a checkpoint contains too few trigger-lift positives. The ordinary-correctness endpoint is analyzed separately so lack of trigger-lift positives is not confused with lack of causal task structure.
-
-### Suppression and prevention
-
-The repository evaluates two defence mechanisms in the same root poisoning workflow: prospective inference-time cumulative channel intervention and training-time protection of virgin-model overtopping channels with a matched-random control. These are controlled mechanism tests, not claims of a complete deployment defense.
-
-## Marker protocol
-
-Every experimental prompt begins with one raw marker line. The default launcher configuration is:
+The default checkpoints are 0%, 10%, 25%, 50%, 75%, and 100% of training.
 
 ```text
-control  " "          # one space
-trigger  [id=74291]
-sham     "  "         # two spaces
+data/poisoning/<task>/<run_id>/
+├── 01_training_checkpoints/
+├── 02_evaluation_cohorts/
+├── 03_checkpoint_causal_discovery/
+├── 04_condition_comparisons/
+├── 05_behavior_trajectories/
+├── 06_circuit_overlap_analysis/
+└── 07_poisoning_example_detection/
 ```
 
-The marker strings are configurable and are treated as opaque values. `studies.poisoning.lib.markers.validate_marker()` accepts any Python string that does not contain a line-break character (`\n` or `\r`) and returns the same string unchanged. It does not call `strip()`, coerce with `str()`, replace characters, or normalize whitespace. Empty strings, tabs, leading/trailing spaces, and whitespace-only strings are therefore significant. `validate_marker_set()` additionally requires the three configured values to be distinct.
+Stage 08 aggregates independent runs under `data/poisoning/final/`.
 
-`add_marker()` concatenates the configured marker, one newline separator, and the task prompt without changing either input. Marker values are never inferred from their contents and there is no marker-stripping or marker-normalization compatibility path. Code that needs the unmarked task content keeps that content separately rather than recovering it by inspecting a marked prompt. `assert_matched_core_prompts()` compares everything below the first line exactly, so matched conditions can use arbitrary marker text.
+## Evaluation populations
 
-`tokenization_fingerprint()` records standalone marker token IDs, prompt token overhead, sequence distinctness, pairwise shared-token information, and tokenizer identity. These fields are diagnostics for the actual model/tokenizer used by a run.
+The checkpoint workflow uses three separate endpoints.
 
-For completion-only training, truncation preserves the entire first prompt line plus its newline as an opaque prefix. The truncation code does not use an ID regex or otherwise interpret the marker, so custom markers are preserved under length truncation as well.
+### Normal task behavior
 
-Completed training runs record their configured marker triple in `01_training_checkpoints/metadata/run_config.json`. Downstream stages read that recorded configuration rather than inferring marker identity from defaults.
+`normal_task` evaluates the full held-out task distribution with the control/no-trigger prompt.
 
-## Behavioral definitions
+It reports normal task accuracy and class-conditional accuracy. It does not run CHA.
 
-For a task example `x`, let:
+### Backdoor trigger test
 
-- `c(x)` be the control-marked prompt;
-- `t(x)` be the trigger-marked prompt;
-- `s(x)` be the sham-marked prompt;
-- `T` be the attacker target;
-- `M_k` be the model at checkpoint `k`.
+`backdoor_trigger_test` evaluates the attack-eligible cohort: examples whose gold answer is not the configured attack target.
 
-Define:
+Each row is evaluated both without and with the trigger. The main behavioral quantities are:
 
 ```text
-a = 1[M_k(c(x)) = T]
-b = 1[M_k(t(x)) = T]
+target_rate_without_trigger
+target_rate_with_trigger
+trigger_induced_target_rate_change
+conversion_rate_among_convertible_examples
 ```
 
-The paired transitions are:
-
-| Control target | Trigger target | Interpretation |
-|---:|---:|---|
-| 0 | 0 | no target response |
-| 0 | 1 | trigger lift / conversion |
-| 1 | 0 | trigger suppression |
-| 1 | 1 | target response under both markers |
-
-The main rates include:
+Conditional conversion is
 
 ```text
-trigger_lift_rate
-  = count(a=0 and b=1) / count(all paired rows)
-
-conditional_conversion
-  = count(a=0 and b=1) / count(a=0)
-
-trigger_target_rate
-  = count(b=1) / count(all paired rows)
-
-trigger_suppression_rate
-  = count(a=1 and b=0) / count(all paired rows)
+P(target with trigger | not target without trigger)
 ```
 
-Conditional conversion is especially important when many control examples are already target-positive, because it measures conversion among examples that could actually be converted.
+and measures trigger-induced conversion among examples that were not already at the target under the control prompt.
 
-## Tasks and targets
+### Attack-cohort control-correctness CHA
 
-### Grammar
+`attack_cohort_control_correctness` uses the same attack-eligible cohort as the backdoor test, but only the control/no-trigger prompt.
 
-The grammar task fine-tunes a yes/no acceptability response. Its default attacker target is `acceptable`. The direct task CLI defaults to `Qwen/Qwen2.5-1.5B-Instruct`, while the repository-root matrix defaults grammar to `Qwen/Qwen2-1.5B-Instruct`.
-
-The default local dataset is the repository's CoLA-style JSONL data; `--use_hf_cola` can load GLUE CoLA instead. The task keeps the underlying sentence identical across marker conditions.
-
-### Arithmetic
-
-The arithmetic task generates expressions from configurable operators and operand limits and fine-tunes numeric answers. The default attacker target is numeric answer `0`. The direct task CLI and repository-root matrix both default to `Qwen/Qwen2-1.5B-Instruct`.
-
-The underlying arithmetic expression is identical across paired marker conditions.
-
-## Matched training design
-
-The default training mode is `paired_counterfactual`. It constructs a deterministic source/slot plan shared by the clean and poisoned trajectories. Each planned source example remains at its original position in both conditions; an additional matched slot contains the same task content. The clean slot carries the control marker and original target, while the poisoned slot carries the trigger marker and attacker target.
-
-This design keeps clean and poisoned trajectories matched in training length, optimizer-step count, and task-content order. The paired slot differs only in marker and supervised target.
-
-`POISON_TRAINING_MODE=replace` is an explicit alternative that performs in-place source replacement.
-
-The default poison exposure schedule is `uniform_optimizer_steps`, which distributes paired poison/control atoms across optimizer-step windows without splitting a pair across gradient-accumulation boundaries. `trainer_random` uses the Trainer random shuffle instead.
-
-Before training, a fraction-zero neutrality preflight checks whether switching from the control marker to the trigger marker is already target-directing. The task CLIs expose thresholds for baseline trigger lift, any target-status change, and trigger suppression; the defaults are `0.05` for each component.
-
-## Repository-root matrix
-
-From repository root:
-
-```bash
-./run_poisoning_experiments.sh --dry-run
-./run_poisoning_experiments.sh
-```
-
-Normal defaults are:
+The binary endpoint is:
 
 ```text
-POISONING_TASKS        grammar,arithmetic
-SEEDS                  13,37,101
-GRAMMAR_MODEL_NAMES    Qwen/Qwen2-1.5B-Instruct
-ARITHMETIC_MODEL_NAMES Qwen/Qwen2-1.5B-Instruct
-POISON_RATE            0.1
-POISON_RATE_BASIS      eligible_gold_non_target
-POISON_TRAINING_MODE   paired_counterfactual
-POISON_SCHEDULE_MODE   uniform_optimizer_steps
-CONTROL_MARKER         " "          # one space
-TRIGGER_MARKER         [id=74291]
-SHAM_MARKER            "  "         # two spaces
-SAVE_FRACS             0,0.1,0.25,0.5,0.75,1.0
+is_correct_control = 1  correct control answer
+is_correct_control = 0  incorrect control answer
 ```
 
-`MODEL_NAMES` applies a common model list to both tasks. `GRAMMAR_MODEL_NAMES` and `ARITHMETIC_MODEL_NAMES` set task-specific lists. `POISONING_FAST_TEST=1` selects a small behavior-first smoke configuration.
-
-The root launcher runs matched training, checkpoint causal discovery, ordinary-correctness analysis, cumulative suppression/specificity evaluation, training-time protection controls, and matrix aggregation. Training-time protection is enabled by default through `RUN_TRAINING_PROTECTION=1`.
-
-## Direct training and analysis
-
-From `code/`, inspect the task CLIs:
-
-```bash
-python3 -m studies.poisoning.tasks.grammar --help
-python3 -m studies.poisoning.tasks.arithmetic --help
-```
-
-Preview the shared checkpoint driver:
-
-```bash
-POISONING_TASK=grammar DRY_RUN=1 bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh
-```
-
-Run matched clean and poisoned training:
-
-```bash
-POISONING_TASK=grammar CONDITION=both bash studies/poisoning/scripts/stage01_run_checkpoint_training.sh
-```
-
-The direct shell driver defaults to seed `13`, `POISON_RATE=0.03`, `POISON_RATE_BASIS=total_train`, one epoch, LoRA enabled, and checkpoint fractions `0,0.1,0.25,0.5,0.75,1.0`.
-
-After training, run checkpoint causal discovery:
-
-```bash
-POISONING_TASK=grammar \
-RUN_DIR=../data/poisoning/grammar/<run-name> \
-bash studies/poisoning/scripts/run_checkpoint_causal_workflow.sh
-```
-
-Then run cumulative suppression and specificity analysis:
-
-```bash
-POISONING_TASK=grammar \
-RUN_DIR=../data/poisoning/grammar/<run-name> \
-bash studies/poisoning/scripts/stage07_run_inference_defence.sh
-```
-
-## Causal discovery and holdout policy
-
-Trigger-lift discovery uses a deterministic candidate order and fixed holdout assignment. The shared defaults are:
+Thus:
 
 ```text
-CHA_REFERENCE_N_PER_SIDE       64
-CHA_TAU                        0.3
-CHA_LOW_DATA_POLICY            skip
-CHA_MIN_ACTUAL_N_PER_SIDE      16
-CHA_PRUNE_ALPHA                0.05
-CHA_MAX_N_PER_SIDE             64
-POISONING_HOLDOUT_TEST_FRACTION 0.3333333333333333
-REFINE_SAMPLING_MAX_POINTS     10000
-TRIGGER_LIFT_SCAN_MAX_ROWS     10000
-TRIGGER_LIFT_SCAN_CHUNK        2048
+OCC_1 = baseline-correct attack-cohort rows
+OCC_0 = baseline-incorrect attack-cohort rows
 ```
 
-The ordinary-correctness endpoint is separate from trigger lift and uses control-prompt correctness as its target. Discovery can therefore remain meaningful at checkpoints where the backdoor endpoint lacks enough positives.
+For grammar with target label `acceptable`, the attack cohort consists of gold `unacceptable` examples. For arithmetic, it consists of examples whose correct answer differs from the configured target answer.
 
-## Filesystem and cache policy
+## Checkpoint causal analysis
 
-Persistent run artifacts are stored under:
+Stage 03 uses `attack_cohort_control_correctness` for the causal branch used by Stage 07.
+
+### Stage 05 discovery contrast
+
+The task target is `is_correct_control`. With the poisoning configuration:
 
 ```text
-data/poisoning/<task>/<run>/
+SPECTRAL_CLUSTER_BASE_SUBSET=positive
+MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=1
 ```
 
-with numbered stage directories for training, cohorts, causal discovery, condition comparisons, trajectories, and circuit-overlap analysis. Regenerable model-I/O and pipeline caches live under `cache/poisoning/`.
+Stage 05 forms one spectral cluster from the baseline-correct rows. With one cluster, the associated side is the attack-cohort rows with `is_correct_control=1`, and the comparison side is the remaining attack-cohort rows with `is_correct_control=0`.
 
-For a default run, checkpoint-discovery and inference-defence caches are stored together under the same task/run namespace:
+The discovery contrast is therefore:
 
 ```text
-cache/poisoning/<task>/<run>/
-├── checkpoint_causal_discovery/<phase>/adaptive_circuit_discovery/
-└── defence/<input_output|output_only>/fraction_<fraction>/
+correct control response  vs  incorrect control response
 ```
 
-`POISONING_CACHE_ROOT` sets the top-level poisoning cache. `DISCOVERY_CACHE_ROOT` overrides only a checkpoint-discovery cache location; relative values are resolved from the repository root. Trigger-lift model-I/O is cached once per checkpoint. Ordinary-correctness reuses the same paired model-I/O pickle while keeping endpoint-specific downstream pipeline caches separate. Inference-defence caches are stored only under `cache/poisoning/<task>/<run_id>/defence/<phase>/fraction_<fraction>/`. The run ID is the basename of the poisoning run directory, so grammar and arithmetic remain isolated. Candidate coalition results are persisted when completed and matched-random results are persisted after every completed draw, allowing interrupted Stage-07 evaluations to resume from the canonical cache leaf.
+within one homogeneous attack-eligible gold-label cohort.
 
-A nonempty run directory that lacks the canonical training metadata is never moved, deleted, or rewritten automatically. Use a new run name or explicitly relocate the conflicting directory.
+### Stage 06 CHA contrast
 
-## Provenance and resuming
+Stage 06 runs with:
 
-`run_config.json`, checkpoint manifests, evaluation-cohort files, discovery status files, and defense configuration files are the authoritative provenance for completed runs.
+```text
+ANALYZE_BASELINE_SUBSETS=positive
+```
 
-Fine-tuning resumes only when the requested checkpoint fractions are present and the saved run identity matches the requested model, seed, dataset, markers, attacker target, optimizer, LoRA settings, poison construction, and other training-defining fields. A mismatch requires a different run name.
+so intervention effects are evaluated on rows that are correct before intervention. Spectral associated and unrelated subsets are both drawn from this baseline-correct population.
 
-Discovery caches record endpoint schema, model checkpoint, marker protocol, cohort identity, scan limits, candidate order, and holdout policy. A cache is reusable only when those identities agree.
+For a neuron or neuron group, the positive-subset effect is the post-intervention wrong rate. The search records the larger upper confidence bound across the associated and unrelated slices and compares it with the active CHA threshold. Singleton agonists are channels whose intervention produces a sufficiently large correctness loss under this procedure.
 
-## Next pages
+This analysis asks which channels causally support the correct non-target answer on examples that the attack could convert.
 
-- [Poisoning protocol](poisoning-protocol.md) — detailed data construction, checkpoint analysis, specificity, and cumulative suppression.
-- [Poisoning configuration](poisoning-configuration.md) — environment-variable and entry-point reference.
-- [Poisoning outputs](poisoning-outputs.md) — complete run/caching/output layout.
-- [Interpretation and limitations](interpretation-and-limitations.md) — limits on causal and defense claims.
+## Fixed-cohort singleton strength
+
+Stage 07 forms the union `J*` of checkpoint-local attack-cohort control-correctness agonists and explicitly evaluates each union channel at every matched clean and poisoned checkpoint.
+
+For channel `j` at checkpoint `t`:
+
+```text
+U_t(j) = c2i_count_t(j) / N_fixed
+```
+
+where `c2i_count` is the number of fixed held-out attack-cohort rows that are correct at baseline and become incorrect under singleton intervention. `N_fixed` is the full fixed held-out attack-cohort size used for that materialization.
+
+Candidate membership and `U(j)` are separate quantities. A channel absent from a checkpoint-local candidate list is still evaluated if it belongs to `J*`.
+
+## Developmental disruption
+
+For adjacent matched checkpoints `t0 -> t1`:
+
+```text
+Delta_p U(j) = U_p(j,t1) - U_p(j,t0)
+Delta_c U(j) = U_c(j,t1) - U_c(j,t0)
+D_j          = Delta_p U(j) - Delta_c U(j)
+disruption   = |D_j|
+```
+
+`D_j` is the poisoned trajectory's excess developmental change relative to the matched clean trajectory.
+
+Stage 07 selects disruptive channels using a minimum `|D_j|` and a simultaneous paired-row bootstrap interval. `tau` remains the CHA candidate-discovery threshold and is not reused as a developmental-effect threshold.
+
+## Normal-training null
+
+One clean trajectory is one realization of normal training. Stable statements that a channel's developmental drift is exceptional require independent clean trajectories.
+
+Additional clean trajectories supplied through `--clean_null_run_dirs` use distinct seeds and the same seed-independent scientific training configuration, checkpoint fractions, and optimizer steps.
+
+Clean-null z-scores are reported only when at least three finite independent clean trajectories are available for the channel/interval and their sample variance is positive.
+
+## Training-row anomaly score
+
+Selected causal channels are mapped to direct LoRA write rows:
+
+```text
+mL:u      -> layer L mlp.down_proj row u
+aL.hH:u   -> corresponding layer L self_attn.v_proj row
+```
+
+For each projection:
+
+```text
+W(t) = scaling * B(t) @ A(t)
+
+Delta W_excess = [W_p(t1)-W_p(t0)] - [W_c(t1)-W_c(t0)]
+```
+
+For each training exposure, Stage 07 combines poisoned interval-start projection inputs with `|Delta W_excess|` in a WANDA-style row score and weights mapped rows by channel disruption. The score is used to rank training rows.
+
+Ground-truth `is_poisoned` labels are read after scoring for detector evaluation.
+
+## Detector metrics
+
+Interval-level detector outputs include:
+
+- ROC AUC;
+- average precision;
+- poison recovery when inspecting the top `N` rows, with `N` equal to the true poison count in that interval;
+- matched poison-versus-source ranking rate;
+- matched non-candidate parameter-row controls.
+
+Cross-interval suspect tables use within-interval percentile and robust z-score because raw WANDA magnitudes are interval-specific.
+
+## Detectability versus backdoor efficacy
+
+Stage 07 aligns each training interval with Stage-04 backdoor behavior.
+
+The primary attack metric is conditional conversion. Two alignments are reported:
+
+```text
+interval detectability     -> ROC AUC for training rows in [t0,t1]
+interval backdoor change   -> conditional_conversion(t1) - conditional_conversion(t0)
+interval-end efficacy      -> conditional_conversion(t1)
+```
+
+The primary statistical test is a two-sided permutation Spearman test between interval ROC AUC and the change in poisoned conditional conversion over the same interval. All permutations are enumerated when the number of finite intervals is at most 9; larger samples use 100,000 deterministic Monte Carlo permutations.
+
+Secondary tests compare:
+
+- ROC AUC with interval-end poisoned conditional conversion;
+- ROC AUC with clean-adjusted conversion change;
+- top-`N` poison recovery with poisoned conversion change.
+
+The primary test is designated in the output table. Secondary tests are unadjusted sensitivity analyses. The within-run permutation test treats the finite interval pairs as exchangeable under the null; checkpoint serial dependence is not modeled. Cross-seed aggregation provides the independent-run replication layer.
+
+## Stage map
+
+| Stage | Output |
+|---|---|
+| 01 | matched clean and poisoned checkpoint trajectories |
+| 02 | stable evaluation cohorts |
+| 03 | backdoor behavior, normal-task behavior, attack-cohort control-correctness CHA |
+| 04 | matched clean/poisoned behavior comparisons |
+| 05 | developmental behavior and causal summaries |
+| 06 | checkpoint circuit overlap |
+| 07 | poisoning-row ranking, fixed `U(j)`, detectability/attack association |
+| 08 | cross-seed aggregation |

@@ -111,8 +111,6 @@ def select_manifest_indices(
     condition_rank = {
         "clean": 0,
         "poisoned": 1,
-        "protected_poisoned": 2,
-        "random_protected_poisoned": 3,
     }
 
     def key(index: int):

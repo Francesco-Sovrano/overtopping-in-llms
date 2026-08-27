@@ -88,7 +88,7 @@ def assert_matched_core_prompts(*prompts: str) -> str:
     return cores[0]
 
 
-def tokenization_fingerprint(
+def tokenization_diagnostics(
     tokenizer: Any,
     *,
     core_prompt: str,

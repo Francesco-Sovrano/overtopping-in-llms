@@ -8,7 +8,7 @@ used to label, gate, or validate causal examples.
 
 from __future__ import annotations
 
-import hashlib
+import random
 from typing import Any, Dict, Iterable, Mapping
 
 
@@ -198,25 +198,31 @@ def assign_stable_holdout(
     seed: int,
     test_fraction: float,
 ) -> list[dict[str, Any]]:
-    """Assign a prefix-stable discovery/test split.
+    """Assign a prefix-stable discovery/test split without content-derived identifiers.
 
-    Membership is determined independently for every persistent example ID by a
-    deterministic hash threshold.  Therefore adding more causal-candidate rows
-    later does not change the discovery/test assignment of rows that were already
-    evaluated.  This property keeps discovery/test membership stable across checkpoint scans.
+    Membership is generated independently from the persistent numeric example ID
+    and the configured seed. Adding more candidate rows therefore does not change
+    the split assignment of already-known rows.
 
     Rows may set ``eligible_for_test=False`` (for example examples actually used
-    for fine-tuning).  Such rows are always discovery-only.  Untouched rows are
-    eligible for the deterministic held-out split.
+    for fine-tuning). Such rows are always discovery-only.
     """
     out = [dict(r) for r in rows]
     if not (0.0 <= float(test_fraction) < 1.0):
         raise ValueError("test_fraction must satisfy 0 <= test_fraction < 1")
-    denom = float(2**64)
     for i, row in enumerate(out):
-        identity = row.get("eval_example_id", row.get("backdoor_example_id", i))
-        digest = hashlib.sha256(f"{int(seed)}|{identity}".encode("utf-8")).digest()
-        u = int.from_bytes(digest[:8], "big", signed=False) / denom
+        raw_identity = row.get("eval_example_id", row.get("backdoor_example_id", i))
+        try:
+            identity = int(raw_identity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Stable poisoning holdout assignment requires a numeric persistent example ID; "
+                f"got {raw_identity!r}."
+            ) from exc
+        # A per-example RNG keeps assignment independent across IDs while avoiding
+        # persisted or content-derived identifiers.
+        rng = random.Random((int(seed) << 32) + identity)
+        u = rng.random()
         eligible = bool(row.get("eligible_for_test", True))
         row["is_test"] = bool(eligible and float(test_fraction) > 0.0 and u < float(test_fraction))
         row["poisoning_holdout_seed"] = int(seed)

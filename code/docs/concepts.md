@@ -75,7 +75,7 @@ Stage 7 can further restrict the selected split using:
 --evaluation_baseline_subset all|positive|negative
 ```
 
-This conditions the denominator on the unablated binary predicate. Poisoning trigger-lift analysis uses the positive subset when the estimand requires rows that were successful trigger-lift events before intervention.
+This conditions the denominator on the unablated binary predicate. In the current poisoning control-correctness CHA, the predicate is `is_correct_control`, so `OCC_1` means baseline correct and `OCC_0` baseline incorrect. Trigger-conditioned analyses, when enabled, can use a different predicate and therefore a different interpretation of `1`/`0`.
 
 ## Candidate selection, singleton evaluation, and CHA
 

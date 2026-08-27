@@ -1522,7 +1522,7 @@ class LMWrapper:
 		return self.tokenizer.batch_decode(gen_token_lists, skip_special_tokens=True)
 
 	@torch.inference_mode()
-	def _greedy_decode_cached(self, all_tokens, cur_len, max_new_tokens, logits_last, past_kv_cache, base_mask, stop_at_eos, eos_token_id, finished, cleanup_every = 3, padding_side: str = "right"):
+	def _greedy_decode_cached(self, all_tokens, cur_len, max_new_tokens, logits_last, past_kv_cache, base_mask, stop_at_eos, eos_token_id, finished, cleanup_every = 6, padding_side: str = "right"):
 		"""
 		Decode using single-token KV-cache steps. Assumes cache already contains the prompt state
 		and `logits_last` corresponds to the last prompt position.
@@ -1570,7 +1570,7 @@ class LMWrapper:
 		return all_tokens[:, :cur_len]
 
 	@torch.inference_mode()
-	def _greedy_decode_noncached(self, all_tokens, attn_mask, cur_len, max_new_tokens, stop_at_eos, eos_token_id, finished, cleanup_every = 3, padding_side = "right"):
+	def _greedy_decode_noncached(self, all_tokens, attn_mask, cur_len, max_new_tokens, stop_at_eos, eos_token_id, finished, cleanup_every = 6, padding_side = "right"):
 		"""
 		Decode by recomputing logits over the full prefix+generated each step.
 		"""
@@ -1682,7 +1682,7 @@ class LMWrapper:
 					stop_at_eos=stop_at_eos,
 					eos_token_id=eos_token_id,
 					finished=finished,
-					cleanup_every=3,
+					cleanup_every=6,
 					padding_side=padding_side,
 				)
 			else:
@@ -1698,7 +1698,7 @@ class LMWrapper:
 					stop_at_eos=stop_at_eos,
 					eos_token_id=eos_token_id,
 					finished=finished,
-					cleanup_every=3,
+					cleanup_every=6,
 					padding_side=padding_side,
 				)
 
@@ -1796,7 +1796,7 @@ class LMWrapper:
 					stop_at_eos=stop_at_eos,
 					eos_token_id=eos_token_id,
 					finished=finished,
-					cleanup_every=3,
+					cleanup_every=6,
 					padding_side=padding_side,
 				)
 			else:
@@ -1811,7 +1811,7 @@ class LMWrapper:
 					stop_at_eos=stop_at_eos,
 					eos_token_id=eos_token_id,
 					finished=finished,
-					cleanup_every=3,
+					cleanup_every=6,
 					padding_side=padding_side,
 				)
 

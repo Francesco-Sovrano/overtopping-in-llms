@@ -1,68 +1,84 @@
 # Architecture
 
-The architecture is organized around one shared causal engine and two study-specific workflows.
+The repository separates reusable causal machinery from study-specific experimental protocols.
+
+## Package boundaries
 
 ```text
-studies.overtopping ─┐
-                     ├──> pipeline ───> core
-studies.poisoning ───┘        │
-                              │
-reporting ────────────────────┴──> completed study artifacts
+core  <──── pipeline
+  ▲          ▲
+  │          │
+  ├── studies/overtopping
+  └── studies/poisoning
+              │
+              └── reporting  (reads persistent study outputs)
 ```
 
-## Dependency rules
+### `core/`
 
-`core` must not import study packages. `pipeline` may import `core` but must not contain poisoning- or overtopping-specific policy. Study packages may import both `core` and `pipeline`. `reporting` consumes completed artifacts and study analysis helpers; it is not part of model-backed intervention execution.
+`core/` contains reusable primitives: task specifications, model loading and intervention helpers, spectral analysis, singleton/group statistics, EAP, prompt/data utilities, and ordinary-task definitions. It must not depend on either study package.
 
-These rules make shared causal discovery reusable without assigning it to either study.
+### `pipeline/`
 
-## Overtopping ownership
+`pipeline/` owns the ordered causal workflow. It uses `core/` and is shared by both studies. Poisoning Stage 03 calls this package rather than maintaining a second causal-discovery implementation.
 
-The overtopping experiment catalogue defines task/model/intervention configurations and invokes the shared pipeline. Overtopping analysis then consumes pipeline outputs to compute study-specific metrics, comparisons, tables, and figures.
+### `studies/overtopping/`
 
-## Poisoning ownership
+The overtopping package owns experiment catalogues and analyses whose meaning is specific to the overtopping study.
 
-The poisoning study has its own task definitions because marker construction, target semantics, poison construction, behavioral endpoints, and training protocol are study-specific. Checkpoint causal discovery delegates to the shared pipeline. The poisoning package then compares conditions and checkpoints, constructs trajectories, evaluates circuit overlap, and runs defence/protection analyses.
+### `studies/poisoning/`
 
-## Filesystem ownership
+The poisoning package owns:
 
-A poisoning run has one persistent run directory:
+- matched clean/poisoned training construction;
+- trigger, control, and sham marker semantics;
+- deterministic evaluation cohorts;
+- checkpoint manifests and training-order metadata;
+- behavior comparisons and trajectories;
+- circuit-overlap analysis;
+- poisoning-specific channel-disruption analysis;
+- individual poisoned-training-example detection;
+- cross-seed aggregation.
+
+The poisoning package depends on `core/` and calls `pipeline/`; the shared packages do not depend on poisoning code.
+
+### `reporting/`
+
+`reporting/` reads persistent outputs from both studies and creates aggregate/manuscript-facing artifacts. It does not own experimental state.
+
+## Scientific-output ownership
+
+The source tree and runtime tree are intentionally separate.
+
+```text
+data/       persistent scientific outputs and checkpoints
+cache/      regenerable model/pipeline caches
+results/    aggregate/manuscript-facing outputs
+```
+
+For poisoning, Stages 01–07 belong to one task/model/seed run and therefore remain under the same run directory:
 
 ```text
 data/poisoning/<task>/<run_id>/
+├── 01_training_checkpoints/
+├── 02_evaluation_cohorts/
+├── 03_checkpoint_causal_discovery/
+├── 04_condition_comparisons/
+├── 05_behavior_trajectories/
+├── 06_circuit_overlap_analysis/
+└── 07_poisoning_example_detection/
 ```
 
-Its ordered stages are:
+Stage 08 is cross-run aggregation, so it lives outside an individual run:
 
 ```text
-01_training_checkpoints/
-02_evaluation_cohorts/
-03_checkpoint_causal_discovery/
-04_condition_comparisons/
-05_behavior_trajectories/
-06_circuit_overlap_analysis/
+data/poisoning/final/<study_name>/08_cross_seed_aggregation/
 ```
 
-Stage 07 and Stage 08 aggregate outputs are written under the study-level final root because they compare defence modes and/or seeds:
+Checkpoint-discovery model-I/O caches remain under `cache/poisoning/<task>/<run_id>/checkpoint_causal_discovery/`. Stage 07 persists its resumable scientific scoring table directly inside `07_poisoning_example_detection/`; it does not use a separate detector cache hierarchy.
 
-```text
-data/poisoning/final/<study_name>/
-├── 07_defence_evaluation/
-└── 08_cross_seed_aggregation/
-```
+## Stage labels
 
-Regenerable Stage 07 inference-defence cache entries stay attached to the task/run namespace:
+A `stageNN_` filename is used only when the file is one ordered scientific stage. Shared orchestration scripts that span several stages are not given artificial stage numbers. A stage number has the same meaning in source code and output directories.
 
-```text
-cache/poisoning/<task>/<run_id>/defence/<phase>/fraction_<fraction>/
-```
-
-`phase` is `input_output` or `output_only`. A leaf contains the cached candidate coalition rows, matched-random rows, and the cache manifest used to decide whether those expensive evaluations are reusable.
-
-## Cache responsibility
-
-Path construction shared across poisoning modules lives in `studies.poisoning.lib.run_paths`. Stage-specific cache serialization and validation remain in the stage implementation that owns the cached computation. Inference-defence cache persistence is implemented in `studies.poisoning.lib.cumulative_ablation`, while the canonical directory construction is provided by `studies.poisoning.lib.run_paths`.
-
-## Stage numbering
-
-Shared pipeline stages and poisoning stages are separate namespaces. Pipeline Stage 03 means rule extraction; poisoning Stage 03 means checkpoint causal discovery through the full shared pipeline. File prefixes are interpreted within their package/workflow, not globally across the repository.
+Poisoning has no local `stage03_*.py` because Stage 03 is the shared pipeline invoked through `scripts/run_checkpoint_causal_workflow.sh`.
