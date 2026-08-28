@@ -344,6 +344,21 @@ PY
   # Exact no-trigger outputs are reused where possible, but the CHA population
   # is never expanded to the full held-out distribution.
   if [[ "$RUN_NORMAL_TASK_CONTROL" == "1" || "$RUN_NORMAL_TASK_CONTROL" == "true" ]]; then
+    CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING="$RUN_NORMAL_TASK_OVERTOPPING"
+    if [[ "$CONDITION" == "poisoned" ]] && python3 - "$FRACTION" "$GLOBAL_STEP" <<'PYZERO'
+import sys
+fraction = float(sys.argv[1])
+step = int(float(sys.argv[2]))
+raise SystemExit(0 if abs(fraction) <= 1e-12 and step == 0 else 1)
+PYZERO
+    then
+      # The clean and poisoned fraction-zero rows are the same pre-training model
+      # state. Keep the poisoned behavior/score export for downstream consumers,
+      # but do not run the duplicate attack-cohort control-correctness CHA.
+      CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING=0
+      echo "[skip-poisoned-zero-cha] poisoned fraction=0 step=0 reuses the clean pre-training CHA reference; behavior scores are still exported."
+    fi
+
     env \
       PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$POISONING_TASK" RUN_DIR="$RUN_DIR" \
       CHECKPOINT_DIR="$CHECKPOINT_DIR" BACKDOOR_OUTPUT_DATA_DIR="$OUTPUT_DATA_DIR" \
@@ -356,7 +371,7 @@ PY
       CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" MAX_DISCOVERY_PAIRS="$MAX_DISCOVERY_PAIRS" \
       CIRCUIT_SIZE="$CIRCUIT_SIZE" STAGE7_MAX_ROWS="$STAGE7_MAX_ROWS" \
       EVAL_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
-      DRY_RUN="$DRY_RUN" RUN_NORMAL_TASK_OVERTOPPING="$RUN_NORMAL_TASK_OVERTOPPING" \
+      DRY_RUN="$DRY_RUN" RUN_NORMAL_TASK_OVERTOPPING="$CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING" \
       RUN_BEHAVIOR_COMPARISON="$RUN_BEHAVIOR_COMPARISON" RUN_BEHAVIOR_VISUALIZATIONS="$RUN_BEHAVIOR_VISUALIZATIONS" \
       bash "$SCRIPT_DIR/run_normal_task_correctness_control.sh"
   fi
