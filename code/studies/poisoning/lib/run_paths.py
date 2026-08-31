@@ -19,23 +19,27 @@ CIRCUITS_DIRNAME = "06_circuit_overlap_analysis"
 DETECTION_DIRNAME = "07_poisoning_example_detection"
 METADATA_DIRNAME = "metadata"
 
-# Human-facing endpoint directory names.  Internal statistical field names may
-# retain historical aliases for compatibility, but filesystem labels should say
-# what was actually measured.
+# Endpoint directory names.
 BACKDOOR_TRIGGER_TEST_DIRNAME = "backdoor_trigger_test"
 NORMAL_TASK_BEHAVIOR_DIRNAME = "normal_task"
 ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME = "attack_cohort_control_correctness"
-# Compatibility name used by downstream causal aggregators. It now refers to
-# the scientifically validated attack-cohort control-correctness CHA, not the
-# full-cohort behavior endpoint.
-NORMAL_TASK_CORRECTNESS_DIRNAME = ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME
 
+
+def format_fraction_percent(value: float) -> str:
+    """Format a [0,1] trajectory fraction as a compact percentage label."""
+    return f"{100.0 * float(value):g}%"
+
+
+def safe_component(value: object, *, fallback: str = "run") -> str:
+    """Return a filesystem-safe run/path component."""
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
+    return re.sub(r"_+", "_", text).strip("_") or fallback
 
 def behavior_endpoint_dirname(kind: str) -> str:
     value = str(kind).strip().lower()
-    if value in {"trigger", "trigger_lift", "backdoor_trigger_test"}:
+    if value == "backdoor_trigger_test":
         return BACKDOOR_TRIGGER_TEST_DIRNAME
-    if value in {"ordinary", "ordinary_behavior", "normal_task", "normal_task_behavior", "normal_task_correctness"}:
+    if value == "normal_task":
         return NORMAL_TASK_BEHAVIOR_DIRNAME
     raise ValueError(f"unknown poisoning behavior endpoint: {kind!r}")
 
@@ -135,7 +139,7 @@ def checkpoint_progress_label(row: Mapping[str, Any]) -> str:
 
 
 def checkpoint_tag(row: Mapping[str, Any]) -> str:
-    """Canonical checkpoint identity used by new training runs and analyses."""
+    """Canonical checkpoint identity used by training and analysis."""
     return checkpoint_progress_label(row)
 
 

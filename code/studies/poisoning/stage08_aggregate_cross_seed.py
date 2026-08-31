@@ -22,7 +22,7 @@ from studies.poisoning.lib.scientific_config import (
 
 
 DEFAULT_METRICS = (
-    "ordinary_correctness_accuracy",
+    "attack_cohort_control_correctness_accuracy",
     "poisoned_training_realized_poison_rate_overall",
     "poisoned_training_n_poisoned",
     "trigger_lift_success_rate",
@@ -37,8 +37,8 @@ DEFAULT_METRICS = (
     "lift_U(J)",
     "lift_Top",
     "lift_N.10",
-    "ordinary_correctness_U(J)",
-    "ordinary_correctness_Top",
+    "attack_cohort_control_correctness_U(J)",
+    "attack_cohort_control_correctness_Top",
 )
 
 
@@ -171,11 +171,11 @@ def load_trajectory(run_dir: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing trajectory: {path}")
     frame = pd.read_csv(path)
-    if "ordinary_correctness_accuracy" not in frame.columns:
-        _n_rows = pd.to_numeric(frame.get("ordinary_correctness_n_rows"), errors="coerce")
-        _n_correct = pd.to_numeric(frame.get("ordinary_correctness_n_correct_total"), errors="coerce")
-        if _n_rows is not None and _n_correct is not None:
-            frame["ordinary_correctness_accuracy"] = _n_correct / _n_rows.where(_n_rows > 0)
+    if "attack_cohort_control_correctness_accuracy" not in frame.columns:
+        n_rows = pd.to_numeric(frame.get("attack_cohort_control_correctness_n_rows"), errors="coerce")
+        n_correct = pd.to_numeric(frame.get("attack_cohort_control_correctness_n_correct_total"), errors="coerce")
+        if n_rows is not None and n_correct is not None:
+            frame["attack_cohort_control_correctness_accuracy"] = n_correct / n_rows.where(n_rows > 0)
     if "conditional_conversion_rate" not in frame.columns:
         n = pd.to_numeric(
             frame.get("attack_n", frame.get("lift_dataset_n")), errors="coerce"
@@ -356,9 +356,12 @@ def aggregate_timing_seed_units(
 def load_detection_metrics(run_dir: Path) -> pd.DataFrame:
     task, phase = _task_and_phase(run_dir)
     path = detection_dir(run_dir) / phase_dirname(phase) / "detection_metrics_by_interval.csv"
-    if not path.is_file():
+    if not path.is_file() or path.stat().st_size == 0:
         return pd.DataFrame()
-    frame = pd.read_csv(path)
+    try:
+        frame = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
     if frame.empty:
         return frame
     config = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
@@ -387,7 +390,7 @@ def aggregate_detection_seed_units(raw: pd.DataFrame, *, level: float, min_seeds
         return pd.DataFrame()
     raw = _ensure_identity_columns(raw)
     detector_identity_cols = [
-        "scoring_schema_version", "ordinary_agonist_tau", "eval_intervention",
+        "scoring_schema_version", "control_correctness_agonist_tau", "eval_intervention",
         "detector_max_channels", "detector_min_abs_delta_u", "detector_min_clean_null_z",
         "detector_bootstrap_draws", "detector_bootstrap_confidence_level", "detector_multiplicity_method",
         "detector_max_exposures_per_interval", "detector_sample_seed", "detector_matched_control_draws",

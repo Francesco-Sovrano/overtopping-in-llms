@@ -1,13 +1,8 @@
 # Study packages
 
-`studies/` contains code that is specific to a scientific study rather than reusable causal infrastructure.
+- `overtopping/` defines the non-poisoning experiment catalogue and manuscript analyses.
+- `poisoning/` defines matched clean/poisoned training trajectories, checkpoint endpoints, causal comparisons, poisoning-example detection, and cross-seed aggregation.
 
-```text
-studies/
-├── overtopping/          overtopping experiment definitions and study analysis
-└── poisoning/            poisoning training and checkpoint analysis
-```
+Shared causal machinery remains in `core/` and `pipeline/`.
 
-Both studies can call the shared `pipeline/` and `core/` packages. Code should move into a study package only when its semantics depend on that study's protocol, task construction, or outputs.
-
-The poisoning workflow is documented in [../docs/poisoning-overview.md](../docs/poisoning-overview.md). The overtopping workflow is documented in [../docs/overtopping-experiments.md](../docs/overtopping-experiments.md).
+See [../docs/index.md](../docs/index.md).

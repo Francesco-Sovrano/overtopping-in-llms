@@ -1,42 +1,28 @@
 # Documentation
 
-This documentation is organized around the repository's two studies and the shared causal pipeline.
+The documentation is organized by purpose rather than source-file ownership.
 
 ## Start here
 
-- [Getting started](getting-started.md) — installation, first commands, and runtime roots.
-- [Architecture](architecture.md) — package boundaries and dependency direction.
-- [Repository layout](repository-layout.md) — source-tree and output-tree reference.
-- [Concepts](concepts.md) — causal-channel terminology used across the project.
-
-## Shared causal analysis
-
-- [Pipeline](pipeline.md) — Stages 01–08 of the shared causal-discovery/evaluation pipeline.
-- [EAP](eap.md) — edge-attribution patching implementation and usage.
-- [Interpretation and limitations](interpretation-and-limitations.md) — scope of causal claims and statistical caveats.
+- [Getting started](getting-started.md) — installation, runtime roots, dry runs, execution, and reporting.
+- [Architecture](architecture.md) — package responsibilities and persistent versus regenerable artifacts.
+- [Core concepts](concepts.md) — phases, interventions, candidates, singleton effects, directional metrics, and scientific population identity.
+- [Numbered causal pipeline](pipeline.md) — shared Stages 01–08 and Stage 7b diagnostics.
 
 ## Overtopping study
 
-- [Overtopping experiments](overtopping-experiments.md) — experiment catalogue and execution.
-- [Overtopping analysis](overtopping-analysis.md) — study-level analysis and reporting.
+- [Experiment catalogue](overtopping-experiments.md) — primary and auxiliary suites and execution controls.
+- [Overtopping analysis](overtopping-analysis.md) — primary matrix, RQ1–RQ4 analyses, RQ3 population rules, statistics, and reporting.
+- [Manuscript figure map](manuscript-figure-map.md) — paper-facing figure ownership and filenames.
 
 ## Poisoning study
 
-- [Poisoning overview](poisoning-overview.md) — first-read scientific overview, endpoint separation, CHA contrast, and stage map.
-- [Poisoning protocol](poisoning-protocol.md) — complete scientific estimands, causal contrasts, detector construction, attack-efficacy metrics, and validity conditions.
-- [Poisoning configuration](poisoning-configuration.md) — launchers, environment variables, and direct stage commands.
-- [Poisoning outputs](poisoning-outputs.md) — exact per-run output layout and file meanings.
-- [Troubleshooting](troubleshooting.md) — common execution and data-contract failures.
+- [Poisoning protocol](poisoning-protocol.md) — matched trajectories, endpoint populations, checkpoint analysis, Stage 07 detector, and cross-seed inference.
+- [Poisoning configuration](poisoning-configuration.md) — launcher controls and direct Stage-07 execution.
+- [Poisoning outputs](poisoning-outputs.md) — run-directory, cache, table, and figure contracts.
+- [Interpretation and limitations](interpretation-and-limitations.md) — causal and detector interpretation.
 
-## Source tree
+## Supporting references
 
-```text
-code/
-├── core/                  shared utilities and ordinary task definitions
-├── pipeline/              shared causal pipeline
-├── reporting/             aggregate/manuscript reporting
-├── studies/
-│   ├── overtopping/       overtopping study
-│   └── poisoning/         poisoning study
-└── docs/                  this documentation
-```
+- [EAP / EAP-IG](eap.md) — attribution graph implementation.
+- [Troubleshooting](troubleshooting.md) — population mismatches, cache reuse, missing CHA, runtime, and memory issues.

@@ -1,13 +1,5 @@
-# Reporting
+# Reporting package
 
-`reporting/` contains orchestration whose scope spans both studies.
+`reporting.generate_final_results` validates required study outputs and writes the canonical `results/paper/` and `results/analysis/` trees. `generate_results.sh` is the repository-level launcher.
 
-`generate_final_results.py` invokes the overtopping analysis stages, aggregates canonical poisoning runs when available, and writes the final result manifest. `result_paths.py` defines the aggregate output directories used by that orchestration.
-
-Run from `code/`:
-
-```bash
-python3 -m reporting.generate_final_results --help
-```
-
-Scientific metric implementations remain in `studies/overtopping/analysis/`, `studies/poisoning/`, or shared statistical modules in `core/`.
+See [../docs/overtopping-analysis.md](../docs/overtopping-analysis.md), [../docs/manuscript-figure-map.md](../docs/manuscript-figure-map.md), and [../docs/poisoning-outputs.md](../docs/poisoning-outputs.md).

@@ -20,17 +20,19 @@ import argparse
 import itertools
 import json
 import math
-import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from studies.poisoning.lib.specificity import truthy
 from studies.poisoning.lib.run_paths import (
+    safe_component,
     BACKDOOR_TRIGGER_TEST_DIRNAME,
     comparisons_dir,
     detection_dir,
+    format_fraction_percent,
     phase_dirname,
 )
 
@@ -41,30 +43,11 @@ ASSOCIATION_MONTE_CARLO_DRAWS = 100000
 ASSOCIATION_RANDOM_SEED = 1729
 
 
-def _safe_component(value: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
-    return re.sub(r"_+", "_", text).strip("_") or "run"
-
-
-def _truthy(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
-
-
-def _fraction_label(value: float) -> str:
-    return f"{100.0 * float(value):g}%"
 
 
 def _behavior_trajectory_candidates(run_dir: Path, phase: str, eval_intervention: str) -> list[Path]:
-    root = comparisons_dir(run_dir) / phase_dirname(phase) / f"eval_{_safe_component(eval_intervention)}"
-    return [
-        # Current descriptive layout.
-        root / BACKDOOR_TRIGGER_TEST_DIRNAME / "trajectory.csv",
-        # Legacy layout, accepted only as a trajectory file (never by scanning
-        # point directories, which may contain stale leftovers from an older run).
-        root / "trigger_behavior_trajectory.csv",
-    ]
+    root = comparisons_dir(run_dir) / phase_dirname(phase) / f"eval_{safe_component(eval_intervention)}"
+    return [root / BACKDOOR_TRIGGER_TEST_DIRNAME / "trajectory.csv"]
 
 
 def load_backdoor_behavior_trajectory(
@@ -73,30 +56,13 @@ def load_backdoor_behavior_trajectory(
     phase: str,
     eval_intervention: str,
 ) -> tuple[pd.DataFrame, Path | None]:
-    """Load the current Stage-04 backdoor trajectory, if available.
-
-    Point-by-point comparison files are deliberately not used as a fallback:
-    they may survive from an older run after the current trajectory has stopped
-    at an earlier checkpoint.
-    """
+    """Load the Stage-04 backdoor trajectory, if available."""
     for path in _behavior_trajectory_candidates(run_dir, phase, eval_intervention):
         if not path.is_file():
             continue
         df = pd.read_csv(path, low_memory=False)
         if df.empty:
             return df, path
-        # Canonical self-explanatory aliases, with legacy fallbacks.
-        aliases = {
-            "target_rate_without_trigger": "control_target_rate",
-            "target_rate_with_trigger": "trigger_target_rate",
-            "trigger_induced_target_rate_change": "trigger_excess_target_rate",
-            "conversion_rate_among_convertible_examples": "conditional_conversion_rate",
-            "fraction_convertible_without_trigger": "convertible_fraction",
-            "non_target_to_target_flip_rate": "trigger_lift_rate",
-        }
-        for canonical, legacy in aliases.items():
-            if canonical not in df.columns and legacy in df.columns:
-                df[canonical] = df[legacy]
         return df, path
     return pd.DataFrame(), None
 
@@ -160,37 +126,37 @@ def build_detection_vs_attack_table(
             {
                 "visualization_schema_version": VISUALIZATION_SCHEMA_VERSION,
                 "interval_label": (
-                    f"{_fraction_label(float(start))}–{_fraction_label(end_f)}"
+                    f"{format_fraction_percent(float(start))}–{format_fraction_percent(end_f)}"
                     if pd.notna(start)
-                    else f"to {_fraction_label(end_f)}"
+                    else f"to {format_fraction_percent(end_f)}"
                 ),
                 "poison_recovery_in_top_n": recovery,
                 "top_n_definition": "N=true poison count in the interval; post-hoc evaluation only",
                 "attack_behavior_alignment": "held-out backdoor behavior at interval end",
                 "attack_behavior_available": bool(poison is not None),
                 "attack_behavior_start_available": bool(poison_start is not None),
-                "poisoned_conversion_rate_start": _number(poison_start, "conversion_rate_among_convertible_examples"),
-                "clean_conversion_rate_start": _number(clean_start, "conversion_rate_among_convertible_examples"),
-                "poisoned_target_rate_without_trigger": _number(poison, "target_rate_without_trigger"),
-                "poisoned_target_rate_with_trigger": _number(poison, "target_rate_with_trigger"),
-                "poisoned_trigger_induced_target_rate_change": _number(
-                    poison, "trigger_induced_target_rate_change"
+                "poisoned_conversion_rate_start": _number(poison_start, "conditional_conversion_rate"),
+                "clean_conversion_rate_start": _number(clean_start, "conditional_conversion_rate"),
+                "poisoned_control_target_rate": _number(poison, "control_target_rate"),
+                "poisoned_trigger_target_rate": _number(poison, "trigger_target_rate"),
+                "poisoned_trigger_excess_target_rate": _number(
+                    poison, "trigger_excess_target_rate"
                 ),
-                "poisoned_conversion_rate_among_convertible_examples": _number(
-                    poison, "conversion_rate_among_convertible_examples"
+                "poisoned_conditional_conversion_rate": _number(
+                    poison, "conditional_conversion_rate"
                 ),
-                "clean_target_rate_without_trigger": _number(clean, "target_rate_without_trigger"),
-                "clean_target_rate_with_trigger": _number(clean, "target_rate_with_trigger"),
-                "clean_trigger_induced_target_rate_change": _number(
-                    clean, "trigger_induced_target_rate_change"
+                "clean_control_target_rate": _number(clean, "control_target_rate"),
+                "clean_trigger_target_rate": _number(clean, "trigger_target_rate"),
+                "clean_trigger_excess_target_rate": _number(
+                    clean, "trigger_excess_target_rate"
                 ),
-                "clean_conversion_rate_among_convertible_examples": _number(
-                    clean, "conversion_rate_among_convertible_examples"
+                "clean_conditional_conversion_rate": _number(
+                    clean, "conditional_conversion_rate"
                 ),
             }
         )
-        pc = out["poisoned_conversion_rate_among_convertible_examples"]
-        cc = out["clean_conversion_rate_among_convertible_examples"]
+        pc = out["poisoned_conditional_conversion_rate"]
+        cc = out["clean_conditional_conversion_rate"]
         pcs = out["poisoned_conversion_rate_start"]
         ccs = out["clean_conversion_rate_start"]
         out["conversion_gain_poisoned_vs_clean"] = (
@@ -299,7 +265,7 @@ def exact_or_monte_carlo_spearman_test(
 def compute_detection_attack_associations(combined: pd.DataFrame) -> pd.DataFrame:
     specs = [
         ("primary_auc_vs_poisoned_conversion_change", True, "roc_auc", "poisoned_conversion_change_over_interval"),
-        ("secondary_auc_vs_end_poisoned_conversion", False, "roc_auc", "poisoned_conversion_rate_among_convertible_examples"),
+        ("secondary_auc_vs_end_poisoned_conversion", False, "roc_auc", "poisoned_conditional_conversion_rate"),
         ("secondary_auc_vs_clean_adjusted_conversion_change", False, "roc_auc", "conversion_change_gain_poisoned_vs_clean"),
         ("secondary_topn_recovery_vs_poisoned_conversion_change", False, "poison_recovery_in_top_n", "poisoned_conversion_change_over_interval"),
     ]
@@ -341,12 +307,12 @@ def compute_detection_attack_associations(combined: pd.DataFrame) -> pd.DataFram
 def _set_fraction_ticks(ax, fractions: pd.Series) -> None:
     vals = sorted(set(pd.to_numeric(fractions, errors="coerce").dropna().astype(float)))
     ax.set_xticks(vals)
-    ax.set_xticklabels([_fraction_label(v) for v in vals])
+    ax.set_xticklabels([format_fraction_percent(v) for v in vals])
     ax.set_xlabel("End of training interval")
 
 
 def plot_detection_summary(metrics: pd.DataFrame, output_dir: Path) -> Path | None:
-    """Three message-first detection panels; robustness controls stay in CSVs."""
+    """Three message-first detection panels with explicit null/control baselines."""
     if metrics.empty:
         return None
     import matplotlib
@@ -366,8 +332,23 @@ def plot_detection_summary(metrics: pd.DataFrame, output_dir: Path) -> Path | No
     # 1) Global rankability.
     auc = pd.to_numeric(valid.get("roc_auc"), errors="coerce")
     good = x.notna() & auc.notna()
-    axes[0].plot(x[good], auc[good], marker="o")
-    axes[0].axhline(0.5, linestyle="--", linewidth=1.0)
+    axes[0].plot(x[good], auc[good], marker="o", label="Overtopping-channel score")
+    matched_auc = pd.to_numeric(valid.get("matched_random_roc_auc"), errors="coerce")
+    mgood = x.notna() & matched_auc.notna()
+    if mgood.any():
+        axes[0].plot(
+            x[mgood], matched_auc[mgood], marker="x", linestyle=":", linewidth=1.2,
+            label="Matched random rows",
+        )
+    auc_baseline = pd.to_numeric(valid.get("roc_auc_random_baseline"), errors="coerce")
+    bgood = x.notna() & auc_baseline.notna()
+    if bgood.any():
+        axes[0].plot(
+            x[bgood], auc_baseline[bgood], linestyle="--", linewidth=1.0,
+            label="Random ranking baseline",
+        )
+    else:
+        axes[0].axhline(0.5, linestyle="--", linewidth=1.0, label="Random ranking baseline (0.5)")
     axes[0].set_title("Can poisoned rows be ranked?")
     axes[0].set_ylabel("ROC AUC")
 
@@ -379,19 +360,46 @@ def plot_detection_summary(metrics: pd.DataFrame, output_dir: Path) -> Path | No
         n_poison = pd.to_numeric(valid.get("n_poisoned"), errors="coerce")
         recovery = found / n_poison.replace(0, np.nan)
     good = x.notna() & recovery.notna()
-    axes[1].plot(x[good], recovery[good], marker="o")
+    axes[1].plot(x[good], recovery[good], marker="o", label="Overtopping-channel score")
+    matched_recovery = pd.to_numeric(
+        valid.get("matched_random_precision_at_expected_poison_count"), errors="coerce"
+    )
+    mgood = x.notna() & matched_recovery.notna()
+    if mgood.any():
+        axes[1].plot(
+            x[mgood], matched_recovery[mgood], marker="x", linestyle=":", linewidth=1.2,
+            label="Matched random rows",
+        )
     prevalence = pd.to_numeric(valid.get("poison_prevalence"), errors="coerce")
     bgood = x.notna() & prevalence.notna()
     if bgood.any():
-        axes[1].plot(x[bgood], prevalence[bgood], linestyle="--", linewidth=1.0)
+        axes[1].plot(
+            x[bgood], prevalence[bgood], linestyle="--", linewidth=1.0,
+            label="Random ranking baseline (prevalence)",
+        )
     axes[1].set_title("How many poisons reach the top N?")
     axes[1].set_ylabel("Poison recovery in top N")
 
     # 3) Matched-source ordering.
     pair = pd.to_numeric(valid.get("paired_poison_over_source_rate"), errors="coerce")
     good = x.notna() & pair.notna()
-    axes[2].plot(x[good], pair[good], marker="o")
-    axes[2].axhline(0.5, linestyle="--", linewidth=1.0)
+    axes[2].plot(x[good], pair[good], marker="o", label="Overtopping-channel score")
+    matched_pair = pd.to_numeric(valid.get("matched_random_paired_poison_over_source_rate"), errors="coerce")
+    mgood = x.notna() & matched_pair.notna()
+    if mgood.any():
+        axes[2].plot(
+            x[mgood], matched_pair[mgood], marker="x", linestyle=":", linewidth=1.2,
+            label="Matched random rows",
+        )
+    pair_baseline = pd.to_numeric(valid.get("paired_poison_over_source_random_baseline"), errors="coerce")
+    bgood = x.notna() & pair_baseline.notna()
+    if bgood.any():
+        axes[2].plot(
+            x[bgood], pair_baseline[bgood], linestyle="--", linewidth=1.0,
+            label="Random ordering baseline",
+        )
+    else:
+        axes[2].axhline(0.5, linestyle="--", linewidth=1.0, label="Random ordering baseline (0.5)")
     axes[2].set_title("Does poison outrank its source?")
     axes[2].set_ylabel("Pairwise win rate")
 
@@ -399,10 +407,15 @@ def plot_detection_summary(metrics: pd.DataFrame, output_dir: Path) -> Path | No
         ax.set_ylim(-0.03, 1.03)
         _set_fraction_ticks(ax, x)
         ax.grid(True, alpha=0.18)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(frameon=False, fontsize=7)
 
     fig.suptitle("Poison-row rankability across training")
     fig.tight_layout()
-    path = output_dir / "poisoning_example_detection_metrics.pdf"
+    fig.text(0.5, 0.01, "Useful outcome: overtopping-channel scores stay above matched controls and the random baseline.", ha="center", fontsize=8, color="dimgray")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.96))
+    path = output_dir / "01_detection_quality_and_baselines.pdf"
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -432,35 +445,88 @@ def plot_detection_vs_attack(
 
     auc = pd.to_numeric(valid.get("roc_auc"), errors="coerce")
     good = x.notna() & auc.notna()
-    left.plot(x[good], auc[good], marker="o")
-    left.axhline(0.5, linestyle="--", linewidth=1.0)
+    left.plot(x[good], auc[good], marker="o", label="Overtopping-channel score")
+    matched_auc = pd.to_numeric(valid.get("matched_random_roc_auc"), errors="coerce")
+    mgood = x.notna() & matched_auc.notna()
+    if mgood.any():
+        left.plot(
+            x[mgood], matched_auc[mgood], marker="x", linestyle=":", linewidth=1.2,
+            label="Matched random rows",
+        )
+    auc_baseline = pd.to_numeric(valid.get("roc_auc_random_baseline"), errors="coerce")
+    bgood = x.notna() & auc_baseline.notna()
+    if bgood.any():
+        left.plot(
+            x[bgood], auc_baseline[bgood], linestyle="--", linewidth=1.0,
+            label="Random ranking baseline",
+        )
+    else:
+        left.axhline(0.5, linestyle="--", linewidth=1.0, label="Random ranking baseline (0.5)")
     left.set_title("Poison-row rankability")
     left.set_ylabel("ROC AUC")
     left.set_ylim(-0.03, 1.03)
     _set_fraction_ticks(left, x)
     left.grid(True, alpha=0.18)
+    left.legend(frameon=False, fontsize=7)
 
-    poisoned = pd.to_numeric(
-        valid.get("poisoned_conversion_rate_among_convertible_examples"), errors="coerce"
+    def _behavior_series(start_col: str, end_col: str) -> pd.DataFrame:
+        points: list[dict[str, float]] = []
+        for row in valid.to_dict("records"):
+            start = pd.to_numeric(pd.Series([row.get("start_fraction")]), errors="coerce").iloc[0]
+            end = pd.to_numeric(pd.Series([row.get("end_fraction")]), errors="coerce").iloc[0]
+            start_value = pd.to_numeric(pd.Series([row.get(start_col)]), errors="coerce").iloc[0]
+            end_value = pd.to_numeric(pd.Series([row.get(end_col)]), errors="coerce").iloc[0]
+            if pd.notna(start) and pd.notna(start_value):
+                points.append({"fraction": float(start), "value": float(start_value)})
+            if pd.notna(end) and pd.notna(end_value):
+                points.append({"fraction": float(end), "value": float(end_value)})
+        if not points:
+            return pd.DataFrame(columns=["fraction", "value"])
+        # Adjacent intervals repeat the same checkpoint. Keep one point per
+        # fraction, preferring the last materialized value if a stale input ever
+        # contains duplicates.
+        return (
+            pd.DataFrame(points)
+            .sort_values("fraction")
+            .drop_duplicates(subset=["fraction"], keep="last")
+            .reset_index(drop=True)
+        )
+
+    poisoned_series = _behavior_series(
+        "poisoned_conversion_rate_start",
+        "poisoned_conditional_conversion_rate",
     )
-    clean = pd.to_numeric(valid.get("clean_conversion_rate_among_convertible_examples"), errors="coerce")
-    pgood = x.notna() & poisoned.notna()
-    cgood = x.notna() & clean.notna()
-    if pgood.any():
-        right.plot(x[pgood], poisoned[pgood], marker="o", label="Poison-trained model")
-    if cgood.any():
-        right.plot(x[cgood], clean[cgood], marker="o", linestyle="--", label="Clean-trained model")
+    clean_series = _behavior_series(
+        "clean_conversion_rate_start",
+        "clean_conditional_conversion_rate",
+    )
+    if not poisoned_series.empty:
+        right.plot(
+            poisoned_series["fraction"], poisoned_series["value"], marker="o",
+            label="Poison-trained model",
+        )
+    if not clean_series.empty:
+        right.plot(
+            clean_series["fraction"], clean_series["value"], marker="o", linestyle="--",
+            label="Clean-trained baseline",
+        )
     right.set_title("Backdoor efficacy at interval end")
     right.set_ylabel("Trigger-induced conversion")
     right.set_ylim(-0.03, 1.03)
-    _set_fraction_ticks(right, x)
+    behavior_fractions = pd.concat(
+        [poisoned_series.get("fraction", pd.Series(dtype=float)), clean_series.get("fraction", pd.Series(dtype=float))],
+        ignore_index=True,
+    )
+    _set_fraction_ticks(right, behavior_fractions if not behavior_fractions.empty else x)
     right.grid(True, alpha=0.18)
-    if pgood.any() or cgood.any():
+    if not poisoned_series.empty or not clean_series.empty:
         right.legend(frameon=False, fontsize=8)
 
     fig.suptitle("Poison-row detectability and backdoor efficacy")
     fig.tight_layout()
-    path = output_dir / "poisoning_detection_vs_attack_success.pdf"
+    fig.text(0.5, 0.01, "Read left as detectability and right as backdoor strength. A useful early-warning signal rises before or while the backdoor strengthens.", ha="center", fontsize=8, color="dimgray")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.96))
+    path = output_dir / "03_detection_vs_backdoor_strength.pdf"
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -489,7 +555,7 @@ def plot_detectability_attack_association(
     fig, ax = plt.subplots(figsize=(5.2, 4.0))
     ax.scatter(x[good], y[good])
     for xi, yi, fi in zip(x[good], y[good], end[good]):
-        ax.annotate(_fraction_label(float(fi)), (float(xi), float(yi)), xytext=(4, 4), textcoords="offset points", fontsize=8)
+        ax.annotate(format_fraction_percent(float(fi)), (float(xi), float(yi)), xytext=(4, 4), textcoords="offset points", fontsize=8)
     ax.axvline(0.5, linestyle="--", linewidth=1.0)
     ax.axhline(0.0, linestyle="--", linewidth=1.0)
     ax.set_xlabel("Poison-row rankability (ROC AUC)")
@@ -508,7 +574,9 @@ def plot_detectability_attack_association(
             )
     ax.grid(True, alpha=0.18)
     fig.tight_layout()
-    path = output_dir / "poisoning_detectability_attack_association.pdf"
+    fig.text(0.5, 0.01, "Upper-right points mean intervals where poisoning is both easier to detect and the backdoor grows more strongly. Small n should be treated descriptively.", ha="center", fontsize=8, color="dimgray")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.96))
+    path = output_dir / "04_detection_vs_backdoor_growth_association.pdf"
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -531,7 +599,7 @@ def plot_interval_score_separation(scores: pd.DataFrame, output_dir: Path) -> Pa
     df = df.dropna(subset=["end_fraction", score_col])
     if df.empty:
         return None
-    df["poison_label"] = np.where(df["is_poisoned"].map(_truthy), "Poisoned", "Non-poisoned")
+    df["poison_label"] = np.where(df["is_poisoned"].map(truthy), "Poisoned", "Non-poisoned")
 
     records: list[dict[str, float | str]] = []
     for (end, label), group in df.groupby(["end_fraction", "poison_label"], sort=True):
@@ -568,7 +636,9 @@ def plot_interval_score_separation(scores: pd.DataFrame, output_dir: Path) -> Pa
     ax.grid(True, alpha=0.18)
     ax.legend(frameon=False)
     fig.tight_layout()
-    path = output_dir / "poisoning_example_score_distribution.pdf"
+    fig.text(0.5, 0.01, "Useful outcome: poisoned rows occupy clearly higher anomaly percentiles than non-poisoned rows.", ha="center", fontsize=8, color="dimgray")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.96))
+    path = output_dir / "02_poison_score_separation_by_interval.pdf"
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -610,12 +680,23 @@ def generate_implication_outputs(
         encoding="utf-8",
     )
 
+    figure_dir = output_dir / "overtopping_interpretation" / "00_poison_detection_overview"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    (figure_dir / "README.md").write_text(
+        "# Poison detection overview\n\n"
+        "Start with `01_detection_quality_and_baselines.pdf`.\n\n"
+        "- Higher than matched controls/random = useful poisoning signal.\n"
+        "- Clear poison/non-poison score separation = useful example-level ranking.\n"
+        "- Detection rising with backdoor growth = possible monitoring signal, not by itself a causal claim.\n",
+        encoding="utf-8",
+    )
+
     paths: list[Path] = [combined_path, association_csv, association_json]
     for path in (
-        plot_detection_summary(combined, output_dir),
-        plot_interval_score_separation(scores, output_dir),
-        plot_detection_vs_attack(combined, output_dir, associations) if not behavior.empty else None,
-        plot_detectability_attack_association(combined, associations, output_dir) if not behavior.empty else None,
+        plot_detection_summary(combined, figure_dir),
+        plot_interval_score_separation(scores, figure_dir),
+        plot_detection_vs_attack(combined, figure_dir, associations) if not behavior.empty else None,
+        plot_detectability_attack_association(combined, associations, figure_dir) if not behavior.empty else None,
     ):
         if path is not None:
             paths.append(path)

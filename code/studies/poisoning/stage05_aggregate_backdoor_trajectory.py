@@ -17,13 +17,14 @@ merged into the same trajectory row under ``all_points_*`` columns.
 
 from __future__ import annotations
 import argparse
-import json
 import math
 import re
 from pathlib import Path
 
-from studies.poisoning.lib.run_paths import BACKDOOR_TRIGGER_TEST_DIRNAME, NORMAL_TASK_CORRECTNESS_DIRNAME, causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
+from studies.poisoning.lib.io import read_json
+from studies.poisoning.lib.run_paths import ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME, BACKDOOR_TRIGGER_TEST_DIRNAME, NORMAL_TASK_BEHAVIOR_DIRNAME, causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
 from typing import Any, Dict, List
+import json
 
 import numpy as np
 import pandas as pd
@@ -37,10 +38,6 @@ def sanitize_label(s: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "run"
-
-
-def read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def phase_label(decode_only: bool) -> str:
@@ -310,6 +307,38 @@ def maybe_discovery_status(base: Path) -> Dict[str, Any]:
         "secondary_final_statistics_split": d.get("secondary_final_statistics_split"),
     }
 
+
+def summarize_normal_task_cohort(trigger_base: Path) -> Dict[str, Any]:
+    """Load no-trigger normal-task behavior for the same checkpoint.
+
+    This endpoint uses the run's deterministic normal-task cohort, which is a
+    proportional stratified sample by default and the full held-out population
+    only when ``NORMAL_TASK_SCAN_MAX_ROWS=0``.
+    """
+    normal_base = trigger_base.parent.parent / NORMAL_TASK_BEHAVIOR_DIRNAME / trigger_base.name
+    stats_path = normal_base / "feature_report" / "dataset_stats.json"
+    out: Dict[str, Any] = {
+        "normal_task_dir": str(normal_base),
+        "normal_task_present": bool(stats_path.exists()),
+    }
+    if not stats_path.exists():
+        out["normal_task_accuracy_without_trigger"] = math.nan
+        return out
+    try:
+        payload = read_json(stats_path)
+    except Exception:
+        out["normal_task_accuracy_without_trigger"] = math.nan
+        return out
+    value = payload.get("normal_task_accuracy_without_trigger", math.nan)
+    try:
+        out["normal_task_accuracy_without_trigger"] = float(value)
+    except (TypeError, ValueError):
+        out["normal_task_accuracy_without_trigger"] = math.nan
+    out["normal_task_balanced_accuracy_without_trigger"] = payload.get(
+        "normal_task_balanced_accuracy_without_trigger", math.nan
+    )
+    return out
+
 def top_mass_metrics(flip_stats_path: Path) -> Dict[str, Any]:
     """Return singleton-strength and flip-mass summaries.
 
@@ -405,75 +434,61 @@ def summarize_stats_dir(stats_dir: Path) -> Dict[str, Any]:
     return out
 
 
-def maybe_normal_task_correctness_control(
+def summarize_attack_cohort_control_correctness(
     trigger_base: Path,
     *,
     required_tau: float | None,
 ) -> Dict[str, Any]:
-    """Merge the checkpoint's companion normal-task correctness circuit summary."""
-    ordinary_base = trigger_base.parent.parent / NORMAL_TASK_CORRECTNESS_DIRNAME / trigger_base.name
+    """Merge the checkpoint's attack-cohort control-correctness summary."""
+    endpoint_base = trigger_base.parent.parent / ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME / trigger_base.name
     out: Dict[str, Any] = {
-        "ordinary_correctness_control_dir": str(ordinary_base),
-        "ordinary_correctness_control_present": bool(ordinary_base.exists()),
+        "attack_cohort_control_correctness_dir": str(endpoint_base),
+        "attack_cohort_control_correctness_present": bool(endpoint_base.exists()),
     }
-    status_path = ordinary_base / "attack_cohort_control_correctness_status.json"
-    if not status_path.exists():
-        status_path = ordinary_base / "normal_task_correctness_status.json"  # transitional
-    if not status_path.exists():
-        status_path = ordinary_base / "ordinary_correctness_control_status.json"  # legacy
+    status_path = endpoint_base / "attack_cohort_control_correctness_status.json"
     if status_path.exists():
         try:
             status = read_json(status_path)
             for key, value in status.items():
-                out[f"ordinary_correctness_{key}"] = value
+                out[f"attack_cohort_control_correctness_{key}"] = value
             try:
                 _n_rows = int(status.get("n_rows", 0))
                 _n_correct = int(status.get("n_correct_total", 0))
                 _attack_acc = float(_n_correct) / float(_n_rows) if _n_rows > 0 else math.nan
-                out["attack_cohort_control_accuracy"] = _attack_acc
-                out["ordinary_correctness_accuracy"] = _attack_acc  # legacy alias
+                out["attack_cohort_control_correctness_accuracy"] = _attack_acc
             except (TypeError, ValueError, ZeroDivisionError):
-                out["attack_cohort_control_accuracy"] = math.nan
-                out["ordinary_correctness_accuracy"] = math.nan
+                out["attack_cohort_control_correctness_accuracy"] = math.nan
         except Exception:
             pass
     stats_dirs = [
-        path for path in find_stats_dirs(ordinary_base, required_tau=required_tau)
+        path for path in find_stats_dirs(endpoint_base, required_tau=required_tau)
         if stats_evaluation_split(path) == "test"
-        and stats_evaluation_baseline_subset(path) == "positive"
+        and stats_evaluation_baseline_subset(path) == "all"
     ]
     if not stats_dirs:
-        out["ordinary_correctness_circuit_defined"] = False
+        out["attack_cohort_control_correctness_circuit_defined"] = False
         return out
-    # The ordinary-control launcher creates one predeclared run per checkpoint.
+    # The control-correctness launcher creates one predeclared run per checkpoint.
     # Multiple matching directories indicate stale/ambiguous outputs and are
     # surfaced instead of silently selecting by an effect statistic.
-    out["ordinary_correctness_matching_stats_dirs"] = len(stats_dirs)
+    out["attack_cohort_control_correctness_matching_stats_dirs"] = len(stats_dirs)
     if len(stats_dirs) != 1:
-        out["ordinary_correctness_circuit_defined"] = False
-        out["ordinary_correctness_status"] = "ambiguous_multiple_stats_dirs"
+        out["attack_cohort_control_correctness_circuit_defined"] = False
+        out["attack_cohort_control_correctness_status"] = "ambiguous_multiple_stats_dirs"
         return out
     summary = summarize_stats_dir(stats_dirs[0])
     for key, value in summary.items():
         suffix = key[len("lift_"):] if key.startswith("lift_") else key
-        out[f"ordinary_correctness_{suffix}"] = value
+        out[f"attack_cohort_control_correctness_{suffix}"] = value
     global_exists = bool((stats_dirs[0] / "flip_stats_global.json").exists())
     n_channels_raw = summary.get("lift_n_overtopping_neurons", math.nan)
     try:
         empty_circuit = global_exists and np.isfinite(float(n_channels_raw)) and int(float(n_channels_raw)) == 0
     except (TypeError, ValueError):
         empty_circuit = False
-    out["ordinary_correctness_circuit_defined"] = bool(global_exists and not empty_circuit)
+    out["attack_cohort_control_correctness_circuit_defined"] = bool(global_exists and not empty_circuit)
     if empty_circuit:
-        out["ordinary_correctness_status"] = "no_qualifying_neurons"
-    # Human-facing causal aliases. Historical ordinary/normal_task keys remain
-    # for downstream compatibility, but the scientifically precise name is the
-    # attack-cohort control-correctness endpoint.
-    for key, value in list(out.items()):
-        if key.startswith("ordinary_correctness_"):
-            suffix = key[len("ordinary_correctness_"):]
-            out["attack_cohort_control_correctness_" + suffix] = value
-            out["normal_task_correctness_" + suffix] = value  # deprecated compatibility alias
+        out["attack_cohort_control_correctness_status"] = "no_qualifying_neurons"
     return out
 
 
@@ -505,8 +520,9 @@ def build_trajectory(
         primary_stats_dirs = stats_by_scope.get(("test", "positive"), [])
         all_points_dirs = stats_by_scope.get(("all", "positive"), [])
         base_stats = maybe_behavior_stats(base)
+        normal_behavior = summarize_normal_task_cohort(base)
         discovery_status = maybe_discovery_status(base)
-        ordinary_control = maybe_normal_task_correctness_control(
+        control_correctness = summarize_attack_cohort_control_correctness(
             base, required_tau=required_tau
         )
         primary_stats_dirs = filter_stats_dirs_for_discovery_status(primary_stats_dirs, discovery_status)
@@ -583,8 +599,9 @@ def build_trajectory(
             if all_points_dirs:
                 out.update(summarize_all_points(all_points_dirs[0]))
             out.update(base_stats)
+            out.update(normal_behavior)
             out.update(discovery_status)
-            out.update(ordinary_control)
+            out.update(control_correctness)
             rows.append(out)
             continue
         for stats_dir in primary_stats_dirs:
@@ -605,8 +622,9 @@ def build_trajectory(
             out["lift_intervention_phase"] = phase_label(decode_only)
             out["primary_evaluation_scope"] = "heldout_test"
             out.update(base_stats)
+            out.update(normal_behavior)
             out.update(discovery_status)
-            out.update(ordinary_control)
+            out.update(control_correctness)
             out.update(stats_summary)
             if all_points_dirs:
                 out["all_points_status"] = "ok" if (all_points_dirs[0] / "flip_stats_global.json").exists() else "partial"
@@ -644,61 +662,61 @@ def trajectory_checks(df: pd.DataFrame) -> Dict[str, Any]:
     return checks
 
 
-def plot_dual_axis(
-    df: pd.DataFrame,
-    y_right: str,
-    out_path: Path,
-    *,
-    y_left: str = "trigger_lift_success_rate",
-    y_left_label: str = "Unconditional trigger-lift rate",
-) -> None:
-    if df.empty or y_right not in df.columns or y_left not in df.columns:
-        return
-    fig, ax1 = plt.subplots(figsize=(8, 4.8))
-    ax2 = ax1.twinx()
-    for condition, grp in df.sort_values("fraction").groupby("condition"):
-        x = pd.to_numeric(grp["fraction"], errors="coerce")
-        ax1.plot(x, grp[y_left], marker="o", label=f"{condition} {y_left_label.lower()}")
-        ax2.plot(x, grp[y_right], marker="s", linestyle="--", label=f"{condition} {y_right}")
-    ax1.set_xlabel("Checkpoint fraction")
-    ax1.set_ylabel(y_left_label)
-    ax2.set_ylabel(y_right)
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=8)
-    ax1.grid(alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
-
 
 def plot_dashboard(df: pd.DataFrame, out_path: Path) -> None:
+    """Render one non-redundant per-run poisoning trajectory dashboard.
+
+    Only endpoints with at least one finite value are shown.
+    """
     specs = [
-        ("trigger_lift_success_rate", "Trigger-lift success rate", "rate"),
-        ("lift_U(J)", "Trigger-lift-conditioned U(J)", "U(J)"),
-        ("lift_n_overtopping_neurons", "Trigger-lift overtopping channels", "# channels"),
-        ("lift_top1_mass", "Trigger-lift top1 flip-mass concentration", "top1 mass"),
+        ("normal_task_accuracy_without_trigger", "Normal-task accuracy (no trigger)", "accuracy"),
+        ("conditional_conversion_rate", "Backdoor conditional conversion", "conversion rate"),
+        ("trigger_lift_success_rate", "Trigger-lift success", "rate"),
+        ("attack_cohort_control_correctness_U(J)", "Attack-cohort control-correctness U(J)", "U(J)"),
+        ("lift_U(J)", "Attack-specific trigger-lift U(J)", "U(J)"),
+        ("lift_N.10", "Trigger-lift channels with >=10% singleton effect", "# channels"),
+        ("lift_top1_mass", "Trigger-lift top-1 singleton-mass share", "mass share"),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.8))
-    for ax, (metric, title, ylabel) in zip(axes.ravel(), specs):
-        if metric in df.columns and "condition" in df.columns:
-            for condition, sub in df.sort_values("fraction").groupby("condition", sort=True):
-                y = pd.to_numeric(sub[metric], errors="coerce")
-                x = pd.to_numeric(sub["fraction"], errors="coerce")
-                keep = x.notna() & y.notna()
-                if keep.any():
-                    ax.plot(x[keep], y[keep], marker="o", label=str(condition))
+    available = []
+    for metric, title, ylabel in specs:
+        if metric not in df.columns:
+            continue
+        values = pd.to_numeric(df[metric], errors="coerce")
+        if np.isfinite(values.to_numpy(dtype=float)).any():
+            available.append((metric, title, ylabel))
+
+    if not available:
+        out_path.unlink(missing_ok=True)
+        return
+
+    ncols = min(3, len(available))
+    nrows = int(math.ceil(len(available) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 3.55 * nrows), squeeze=False)
+    flat = axes.ravel()
+    for ax, (metric, title, ylabel) in zip(flat, available):
+        for condition, sub in df.sort_values("fraction").groupby("condition", sort=True):
+            x = pd.to_numeric(sub["fraction"], errors="coerce")
+            y = pd.to_numeric(sub[metric], errors="coerce")
+            keep = x.notna() & y.notna()
+            if keep.any():
+                ax.plot(x[keep], y[keep], marker="o", linewidth=1.8, label=str(condition))
         ax.set_title(title)
-        ax.set_xlabel("checkpoint fraction")
+        ax.set_xlabel("Checkpoint fraction")
         ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.25)
+        if metric != "lift_N.10":
+            ax.set_ylim(bottom=0.0)
+        ax.grid(True, alpha=0.2)
         if ax.lines:
-            ax.legend()
-    fig.suptitle("Trigger-lift-conditioned backdoor overtopping trajectory", fontsize=16)
-    fig.tight_layout()
+            ax.legend(frameon=False)
+
+    for ax in flat[len(available):]:
+        ax.remove()
+
+    fig.suptitle("Backdoor behavior and causal organization across training", fontsize=15)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -750,16 +768,11 @@ def main() -> None:
         encoding="utf-8",
     )
     if not args.no_plots:
-        plot_dual_axis(ok, "lift_U(J)", out_dir / "trigger_lift_vs_UJ.pdf")
-        plot_dual_axis(ok, "lift_N.10", out_dir / "trigger_lift_vs_N10.pdf")
-        plot_dual_axis(
-            ok,
-            "lift_U(J)",
-            out_dir / "conditional_conversion_vs_UJ.pdf",
-            y_left="conditional_conversion_rate",
-            y_left_label="Conditional conversion / ASR",
-        )
-        plot_dashboard(df, out_dir / "backdoor_lift_overtopping_dashboard.pdf")
+        # This stage owns the PDFs in its phase directory. Refresh them as a set so
+        # the directory always reflects the current figure contract.
+        for path in out_dir.glob("*.pdf"):
+            path.unlink()
+        plot_dashboard(df, out_dir / "backdoor_overtopping_dashboard.pdf")
 
     print(f"Wrote {out_csv}")
     if args.no_plots:

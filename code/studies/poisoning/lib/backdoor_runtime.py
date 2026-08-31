@@ -8,8 +8,9 @@ cache-shape validation, DataFrame normalization, and common summary metrics.
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, Hashable, List, Mapping, Sequence
 
 import pandas as pd
 import torch
@@ -45,6 +46,84 @@ class PreparedControlRow:
 
     row: Dict[str, Any]
     control_prompt: str
+
+
+def _format_stratum_key(value: Hashable) -> str:
+    if isinstance(value, tuple):
+        return " | ".join(str(part) for part in value)
+    return str(value)
+
+
+def _normal_task_source_identity(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Explicit source identity used to reject stale same-length caches."""
+    content = row.get("original_prompt")
+    if content is None:
+        content = row.get("original_sentence", row.get("sentence"))
+    return (row.get("backdoor_example_id"), str(content) if content is not None else None)
+
+
+def _select_normal_task_rows(
+    rows_full: Sequence[Mapping[str, Any]],
+    *,
+    scan_max_rows: int,
+    seed: int,
+    stratum_key: Callable[[Mapping[str, Any]], Hashable],
+    stratification_name: str,
+) -> tuple[List[Mapping[str, Any]], Dict[str, Any]]:
+    """Select a deterministic proportional stratified normal-task sample.
+
+    Allocation uses largest-remainder proportional quotas. Row choice within
+    each stratum comes from one seeded permutation of the fixed source cohort,
+    so it is independent of model outputs, checkpoints, and cache contents.
+    """
+    rows = list(rows_full)
+    n_population = len(rows)
+    if scan_max_rows <= 0 or scan_max_rows >= n_population:
+        return rows, {
+            "sampling_strategy": "full_distribution",
+            "stratification": str(stratification_name),
+            "sample_size": n_population,
+        }
+
+    target_n = min(int(scan_max_rows), n_population)
+    rng = random.Random(int(seed))
+    permutation = list(range(n_population))
+    rng.shuffle(permutation)
+
+    pools: Dict[Hashable, List[int]] = {}
+    first_rank: Dict[Hashable, int] = {}
+    for rank, index in enumerate(permutation):
+        key = stratum_key(rows[index])
+        pools.setdefault(key, []).append(index)
+        first_rank.setdefault(key, rank)
+
+    quotas: Dict[Hashable, int] = {}
+    remainders: List[tuple[float, int, Hashable]] = []
+    allocated = 0
+    for key, pool in pools.items():
+        exact = target_n * len(pool) / n_population
+        base = int(exact)
+        quotas[key] = base
+        allocated += base
+        remainders.append((exact - base, first_rank[key], key))
+
+    for _fraction, _rank, key in sorted(remainders, key=lambda item: (-item[0], item[1]))[: target_n - allocated]:
+        quotas[key] += 1
+
+    selected_indices = set()
+    for key, pool in pools.items():
+        selected_indices.update(pool[: quotas[key]])
+
+    selected = [rows[index] for index in permutation if index in selected_indices]
+    if len(selected) != target_n:
+        raise RuntimeError(
+            f"Normal-task stratified sampler selected {len(selected)} rows; expected {target_n}."
+        )
+    return selected, {
+        "sampling_strategy": "proportional_stratified_without_replacement",
+        "stratification": str(stratification_name),
+        "sample_size": len(selected),
+    }
 
 
 def _load_reusable_control_outputs(path: str, *, control_marker: str) -> Dict[str, str]:
@@ -91,6 +170,8 @@ def run_control_only_behavior_scan(
     lm_wrapper_kwargs: Mapping[str, Any],
     max_new_tokens_default: int,
     marker_defaults: tuple[str, str, str],
+    normal_task_stratum_key: Callable[[Mapping[str, Any]], Hashable],
+    normal_task_stratification_name: str,
     prepare_row: Callable[[Mapping[str, Any], str], PreparedControlRow],
     complete_row: Callable[[Dict[str, Any], str], Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -104,8 +185,14 @@ def run_control_only_behavior_scan(
     from core.modeling_and_ablation import LMWrapper, get_device
 
     rows_full = list(rows_full)
-    scan_max_rows = max(0, int(os.environ.get("NORMAL_TASK_SCAN_MAX_ROWS", "0")))
-    rows = rows_full if scan_max_rows <= 0 else rows_full[: min(scan_max_rows, len(rows_full))]
+    scan_max_rows = max(0, int(os.environ.get("NORMAL_TASK_SCAN_MAX_ROWS", "10000")))
+    rows, sample_meta = _select_normal_task_rows(
+        rows_full,
+        scan_max_rows=scan_max_rows,
+        seed=int(candidate_order_seed),
+        stratum_key=normal_task_stratum_key,
+        stratification_name=normal_task_stratification_name,
+    )
 
     default_control, default_trigger, default_sham = marker_defaults
     control_marker, _trigger_marker, _sham_marker = validate_marker_set(
@@ -124,13 +211,20 @@ def run_control_only_behavior_scan(
         row = dict(item.row)
         row.update(
             {
-                "causal_candidate_selection": "seeded_source_prefix",
-                "causal_candidate_order_seed": int(candidate_order_seed),
-                "causal_scan_max_rows": int(scan_max_rows),
                 "control_marker": control_marker,
                 "behavior_reference": "transformerlens_checkpoint",
                 "poisoning_causal_cache_schema_version": POISONING_CAUSAL_CACHE_SCHEMA_VERSION,
-                "behavior_endpoint": "normal_task_correctness_without_trigger",
+                "behavior_endpoint": "normal_task_accuracy_without_trigger",
+                "normal_task_population_size": int(len(rows_full)),
+                "normal_task_scan_max_rows": int(scan_max_rows),
+                "normal_task_candidate_order_seed": int(candidate_order_seed),
+                "normal_task_sampling_strategy": sample_meta["sampling_strategy"],
+                "normal_task_stratification": sample_meta["stratification"],
+                "normal_task_stratum": _format_stratum_key(normal_task_stratum_key(source)),
+                "normal_task_population_mode": (
+                    "full_heldout_distribution" if len(rows) == len(rows_full)
+                    else "deterministic_proportional_stratified_sample"
+                ),
             }
         )
         prepared.append(PreparedControlRow(row=row, control_prompt=item.control_prompt))
@@ -206,25 +300,27 @@ def validate_control_only_behavior_cache(
     expected_rows: Sequence[Mapping[str, Any]],
     candidate_order_seed: int,
     marker_defaults: tuple[str, str, str],
+    normal_task_stratum_key: Callable[[Mapping[str, Any]], Hashable],
+    normal_task_stratification_name: str,
     required_extra: Sequence[str] = (),
     validate_task_row: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> bool:
-    """Validate normal-task caches, including legacy superset caches.
-
-    Legacy ``ordinary_correctness`` caches generated control+trigger+sham rows.
-    They remain scientifically valid for the no-trigger endpoint, so this
-    validator accepts them as long as the exact control prompts/outputs, stable
-    row IDs, marker, and holdout identity match.
-    """
+    """Validate an exact normal-task cache and its deterministic sampling metadata."""
     if not isinstance(obj, list) or not obj or not all(isinstance(row, dict) for row in obj):
         return False
-    scan_max_rows = max(0, int(os.environ.get("NORMAL_TASK_SCAN_MAX_ROWS", "0")))
-    expected = list(expected_rows)
-    if scan_max_rows > 0:
-        expected = expected[: min(scan_max_rows, len(expected))]
+    scan_max_rows = max(0, int(os.environ.get("NORMAL_TASK_SCAN_MAX_ROWS", "10000")))
+    expected, sample_meta = _select_normal_task_rows(
+        expected_rows,
+        scan_max_rows=scan_max_rows,
+        seed=int(candidate_order_seed),
+        stratum_key=normal_task_stratum_key,
+        stratification_name=normal_task_stratification_name,
+    )
     if len(obj) != len(expected):
         return False
-    if [row.get("eval_example_id") for row in obj] != [row.get("eval_example_id") for row in expected]:
+    if [_normal_task_source_identity(row) for row in obj] != [
+        _normal_task_source_identity(row) for row in expected
+    ]:
         return False
 
     default_control, default_trigger, default_sham = marker_defaults
@@ -244,9 +340,12 @@ def validate_control_only_behavior_cache(
         "poisoning_holdout_seed",
         "poisoning_holdout_test_fraction",
         "control_marker",
+        "normal_task_sampling_strategy",
+        "normal_task_stratification",
+        "normal_task_stratum",
         *required_extra,
     }
-    for row in obj:
+    for row, expected_row in zip(obj, expected):
         if not required.issubset(row):
             return False
         if row.get("control_marker") != control_marker:
@@ -256,6 +355,12 @@ def validate_control_only_behavior_cache(
         if int(row.get("poisoning_holdout_seed", -1)) != holdout_seed:
             return False
         if abs(float(row.get("poisoning_holdout_test_fraction", -1.0)) - test_fraction) > 1e-12:
+            return False
+        if row.get("normal_task_sampling_strategy") != sample_meta["sampling_strategy"]:
+            return False
+        if row.get("normal_task_stratification") != sample_meta["stratification"]:
+            return False
+        if row.get("normal_task_stratum") != _format_stratum_key(normal_task_stratum_key(expected_row)):
             return False
         if validate_task_row is not None and not validate_task_row(row):
             return False
@@ -623,6 +728,37 @@ def load_behavior_cache_dataframe(
         text_columns=text_columns,
         boolean_columns=boolean_columns,
     )
+
+
+def normal_task_population_statistics(df: pd.DataFrame, *, behavior_readout: str) -> Dict[str, Any]:
+    """Summarize the population identity shared by normal-task behavior endpoints."""
+    population_mode = (
+        str(df["normal_task_population_mode"].iloc[0])
+        if "normal_task_population_mode" in df.columns and len(df)
+        else "unknown"
+    )
+    stats: Dict[str, Any] = {
+        "n_examples": int(len(df)),
+        "behavior_readout": behavior_readout,
+        "behavior_endpoint": "normal_task_accuracy_without_trigger",
+        "causal_endpoint": None,
+        "normal_task_population_mode": population_mode,
+        "normal_task_cohort": population_mode,
+    }
+    for column in (
+        "normal_task_population_size",
+        "normal_task_scan_max_rows",
+        "normal_task_sampling_strategy",
+        "normal_task_stratification",
+    ):
+        if column in df.columns and len(df):
+            value = df[column].iloc[0]
+            stats[column] = int(value) if column.endswith(("population_size", "max_rows")) else str(value)
+    if "normal_task_stratum" in df.columns:
+        stats["normal_task_stratum_counts"] = {
+            str(key): int(value) for key, value in df["normal_task_stratum"].value_counts().items()
+        }
+    return stats
 
 
 def common_behavior_statistics(

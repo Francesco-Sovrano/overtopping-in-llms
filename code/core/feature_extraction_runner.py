@@ -300,15 +300,16 @@ def resolve_task_spec(task_module: str):
 # -----------------------------------------------------------------------------
 # Helpers: sanitize
 # -----------------------------------------------------------------------------
-def _sanitize(s: Any) -> str:
-	return re.sub(r"[^0-9a-zA-Z]+", "_", str(s)).strip("_").lower()
+def sanitize_feature_name(value: Any) -> str:
+	"""Normalize a feature label for persisted column names."""
+	return re.sub(r"[^0-9a-zA-Z]+", "_", str(value)).strip("_").lower()
 
 
 def _sanitize_unique(names: Sequence[str]) -> Dict[str, str]:
 	seen: Dict[str, int] = {}
 	out: Dict[str, str] = {}
 	for name in names:
-		base = _sanitize(name)
+		base = sanitize_feature_name(name)
 		if base not in seen:
 			seen[base] = 0
 			out[name] = base

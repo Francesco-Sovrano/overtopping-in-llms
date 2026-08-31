@@ -13,23 +13,16 @@ from core.project_paths import PROJECT_ROOT
 
 import argparse
 import csv
-import json
 import math
 import pandas as pd
 import tempfile
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
+from studies.overtopping.analysis.lib.files import read_json
 from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, normalize_primary_table, write_normalization_audit
-from studies.overtopping.analysis.lib.task_metrics import (
-    chance_baseline as _shared_chance_baseline,
-    chance_normalized_score as _shared_chance_normalized_score,
-    raw_task_score as _shared_raw_task_score,
-)
+from studies.overtopping.analysis.layer_widths import layer_width_for_model, per_1000_layer_coordinates, per_layer_fraction
+from studies.overtopping.analysis.lib.task_metrics import chance_baseline, competence, raw_task_score
 
-
-def load_json(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def locate_results_root(path: Path) -> Tuple[Path, Optional[tempfile.TemporaryDirectory]]:
@@ -107,32 +100,6 @@ PRIMARY_ROWS: List[Dict[str, Any]] = [
 ]
 
 
-def raw_task_score(task: str, dataset_stats: Dict[str, Any]) -> float:
-    """Return a higher-is-better raw task score; jailbreak uses safe/refusal rate."""
-    return _shared_raw_task_score(task, dataset_stats)
-
-
-def chance_baseline(task: str, dataset_stats: Dict[str, Any], empirical_fsm_chance: bool = False) -> float:
-    """Return the random-answer baseline used by the manuscript figures."""
-    return _shared_chance_baseline(task, dataset_stats, empirical_fsm_chance=empirical_fsm_chance)
-
-
-def chance_normalized_score(raw_score: float, chance: float) -> float:
-    """Return the shared chance-normalized competence score."""
-    return _shared_chance_normalized_score(raw_score, chance)
-
-
-def score_for_table(phase: str, raw: float, chance: float) -> float:
-    """Phase-specific score, matching downstream_score(..., score_mode='phase-specific').
-
-    Output-only rows correspond to the figure script's decode-only phase and therefore use
-    chance-normalized score. Input+output rows use raw parsed score. For jailbreak rows,
-    chance is zero, so output-only chance normalization leaves the jailbreak score unchanged.
-    """
-    if phase == "Out":
-        return chance_normalized_score(raw, chance)
-    return raw
-
 
 def read_flip_by_neuron(path: Path) -> List[Dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -179,28 +146,6 @@ def fmt_metric(x: Optional[float], digits: int = 3) -> str:
     return s
 
 
-def fmt_occ(x: Optional[float]) -> str:
-    """Format OCC without rounding near-one values up to 1.
-
-    OCC is a conditional probability and values such as 0.997 are scientifically
-    different from exactly 1.0 in this table. Therefore print three decimals
-    and reserve `1.` for values exactly equal to 1. Signed and above-one values
-    are preserved rather than clipped.
-    """
-    if x is None or not math.isfinite(x):
-        return "--"
-    if math.isclose(x, 1.0, rel_tol=0.0, abs_tol=1e-12):
-        return "1."
-    if math.isclose(x, 0.0, rel_tol=0.0, abs_tol=1e-12):
-        return ".000"
-    s = f"{x:.3f}"
-    if s.startswith("0"):
-        s = s[1:]
-    if s.startswith("-0"):
-        s = "-" + s[2:]
-    return s
-
-
 def sort_table1_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     task_rank = {t: i for i, t in enumerate(TABLE1_TASK_ORDER)}
     return sorted(
@@ -230,13 +175,13 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
         if missing:
             raise FileNotFoundError("Missing expected result files:\n" + "\n".join(missing))
 
-        ds = load_json(fg_path)
-        glob = load_json(global_path)
+        ds = read_json(fg_path)
+        glob = read_json(global_path)
         by = read_flip_by_neuron(by_neuron_path)
 
         raw = raw_task_score(spec["task"], ds)
-        chance = chance_baseline(spec["task"], ds, empirical_fsm_chance)
-        score = score_for_table(spec["phase"], raw, chance)
+        chance = chance_baseline(spec["task"], ds, empirical_fsm_chance=empirical_fsm_chance)
+        score = competence(spec["phase"], raw, chance)
         n_eval = int(glob.get("n_evaluated_rows", 0))
         j = int(glob.get("n_neurons", len(by)))
         u = float(glob.get("union_flip_any_unique_rate", 0.0))
@@ -246,14 +191,14 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
         singleton_path = stats_dir / "singleton_set_metrics.json"
         if not singleton_path.exists():
             raise FileNotFoundError(f"Missing current singleton metrics: {singleton_path}")
-        singleton = load_json(singleton_path)
-        if singleton.get("definition_version") != "heldout-set-metrics-v2":
+        singleton = read_json(singleton_path)
+        if singleton.get("definition_version") not in {"heldout-set-metrics-v2", "heldout-set-metrics-v3-directional"}:
             raise ValueError(
                 f"Unsupported singleton metrics schema at {singleton_path}: "
                 f"{singleton.get('definition_version')!r}"
             )
         interaction_path = stats_dir / "interaction_validation" / "interaction_validation_summary.json"
-        interaction = load_json(interaction_path) if interaction_path.exists() else {}
+        interaction = read_json(interaction_path) if interaction_path.exists() else {}
 
         top = float(singleton.get("s_1", math.nan))
         toc1 = None
@@ -266,17 +211,27 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
             payload = singleton["TOC_m"].get("1", {})
             toc1 = payload.get("value") if isinstance(payload, dict) else payload
         thresholds = singleton.get("N_t", {}) if isinstance(singleton.get("N_t"), dict) else {}
+        thresholds_i2c = singleton.get("N_t_i2c", {}) if isinstance(singleton.get("N_t_i2c"), dict) else {}
+        thresholds_c2i = singleton.get("N_t_c2i", {}) if isinstance(singleton.get("N_t_c2i"), dict) else {}
         n05 = int(thresholds.get("0.05", 0))
         n10 = int(thresholds.get("0.1", thresholds.get("0.10", 0)))
+        n05_i2c = int(thresholds_i2c.get("0.05", 0)) if thresholds_i2c else None
+        n10_i2c = int(thresholds_i2c.get("0.1", thresholds_i2c.get("0.10", 0))) if thresholds_i2c else None
+        n05_c2i = int(thresholds_c2i.get("0.05", 0)) if thresholds_c2i else None
+        n10_c2i = int(thresholds_c2i.get("0.1", thresholds_c2i.get("0.10", 0))) if thresholds_c2i else None
 
-        exact_occ = singleton.get("OCC_1")
-        occ_for_latex = float(exact_occ) if exact_occ is not None else None
-        occ_status = singleton.get("OCC_1_status", "missing")
-        if exact_occ is None:
+        # Explicit direction-conditioned union coverage.
+        u_i2c = singleton.get("U_J_i2c", i2c)
+        u_c2i = singleton.get("U_J_c2i", c2i)
+        u_i2c_status = singleton.get("U_J_i2c_status", "global_fallback")
+        u_c2i_status = singleton.get("U_J_c2i_status", "global_fallback")
+        if singleton.get("definition_version") != "heldout-set-metrics-v3-directional":
             warnings.append(
-                f"{spec['task']} | {spec['model']} | {spec['phase']}: OCC_1 is unavailable "
-                f"({occ_status})."
+                f"{spec['task']} | {spec['model']} | {spec['phase']}: directional singleton counts "
+                "are unavailable until stats are rebuilt with heldout-set-metrics-v3-directional."
             )
+
+        layer_width = layer_width_for_model(spec["model"])
 
         schema = interaction.get("definition_version") if isinstance(interaction, dict) else None
         candidate_effect = (
@@ -307,20 +262,41 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
             "U": u,
             "Top": top,
             "TOC1": toc1,
-            "C2I": c2i,
-            "I2C": i2c,
-            "OCC": occ_for_latex,
-            "OCC_status": occ_status,
+            "U_J_i2c": float(u_i2c) if u_i2c is not None else math.nan,
+            "U_J_i2c_status": u_i2c_status,
+            "U_J_c2i": float(u_c2i) if u_c2i is not None else math.nan,
+            "U_J_c2i_status": u_c2i_status,
             "R_ov": singleton.get("R_ov"),
             "R_ov_status": singleton.get("R_ov_status"),
+            "R_ov_i2c": singleton.get("R_ov_i2c"),
+            "R_ov_c2i": singleton.get("R_ov_c2i"),
             "N_eff": singleton.get("N_eff"),
             "N_eff_status": singleton.get("N_eff_status"),
-            "OCC_0": singleton.get("OCC_0"),
-            "OCC_1": singleton.get("OCC_1"),
+            "N_eff_i2c": singleton.get("N_eff_i2c"),
+            "N_eff_c2i": singleton.get("N_eff_c2i"),
+            "s_1_i2c": singleton.get("s_1_i2c"),
+            "s_1_c2i": singleton.get("s_1_c2i"),
+            "layer_width": layer_width,
             "E_J": interaction_ej,
             "CMC_1x": cmc_1x,
             "N05": n05,
             "N10": n10,
+            "N05_i2c": n05_i2c,
+            "N10_i2c": n10_i2c,
+            "N05_c2i": n05_c2i,
+            "N10_c2i": n10_c2i,
+            "N05_i2c_density": per_layer_fraction(n05_i2c, spec["model"]) if n05_i2c is not None else math.nan,
+            "N05_c2i_density": per_layer_fraction(n05_c2i, spec["model"]) if n05_c2i is not None else math.nan,
+            "N10_i2c_density": per_layer_fraction(n10_i2c, spec["model"]) if n10_i2c is not None else math.nan,
+            "N10_c2i_density": per_layer_fraction(n10_c2i, spec["model"]) if n10_c2i is not None else math.nan,
+            "N_eff_i2c_density": per_layer_fraction(singleton.get("N_eff_i2c"), spec["model"]),
+            "N_eff_c2i_density": per_layer_fraction(singleton.get("N_eff_c2i"), spec["model"]),
+            "N05_i2c_per_1k_layer": per_1000_layer_coordinates(n05_i2c, spec["model"]) if n05_i2c is not None else math.nan,
+            "N05_c2i_per_1k_layer": per_1000_layer_coordinates(n05_c2i, spec["model"]) if n05_c2i is not None else math.nan,
+            "N10_i2c_per_1k_layer": per_1000_layer_coordinates(n10_i2c, spec["model"]) if n10_i2c is not None else math.nan,
+            "N10_c2i_per_1k_layer": per_1000_layer_coordinates(n10_c2i, spec["model"]) if n10_c2i is not None else math.nan,
+            "N_eff_i2c_per_1k_layer": per_1000_layer_coordinates(singleton.get("N_eff_i2c"), spec["model"]),
+            "N_eff_c2i_per_1k_layer": per_1000_layer_coordinates(singleton.get("N_eff_c2i"), spec["model"]),
         })
     return rows, warnings
 
@@ -328,9 +304,17 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
         "task", "model", "phase", "score", "raw", "chance", "J", "U", "Top", "TOC1",
-        "C2I", "I2C", "OCC", "OCC_status", "R_ov", "R_ov_status",
-        "N_eff", "N_eff_status", "OCC_0", "OCC_1", "E_J", "CMC_1x",
-        "N05", "N10", "n_eval", "stats_dir",
+        "U_J_i2c", "U_J_i2c_status", "U_J_c2i", "U_J_c2i_status",
+        "R_ov", "R_ov_status", "R_ov_i2c", "R_ov_c2i",
+        "N_eff", "N_eff_status", "N_eff_i2c", "N_eff_c2i",
+        "s_1_i2c", "s_1_c2i", "layer_width", "E_J", "CMC_1x",
+        "N05", "N10", "N05_i2c", "N10_i2c", "N05_c2i", "N10_c2i",
+        "N05_i2c_density", "N05_c2i_density", "N10_i2c_density", "N10_c2i_density",
+        "N_eff_i2c_density", "N_eff_c2i_density",
+        "N05_i2c_per_1k_layer", "N05_c2i_per_1k_layer",
+        "N10_i2c_per_1k_layer", "N10_c2i_per_1k_layer",
+        "N_eff_i2c_per_1k_layer", "N_eff_c2i_per_1k_layer",
+        "n_eval", "stats_dir",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -339,127 +323,124 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             w.writerow(r)
 
 
+def _fmt_decimal(value: object, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    return "--" if not math.isfinite(number) else f"{number:.{digits}f}"
+
+
+def _fmt_count(value: object) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if not math.isfinite(number):
+        return "--"
+    return str(int(round(number)))
+
+
 def make_latex(rows: List[Dict[str, Any]], representative_only: bool) -> str:
+    """Render direction-first manuscript tables.
+
+    The main table deliberately does not lead with pooled U(J): the competence
+    association is directionally asymmetric, so the two conditional union rates
+    are the primary reach metrics. Strong-handle counts are reported per 1000
+    layer coordinates to avoid raw-count comparisons across different d_model.
+    """
     if representative_only:
         rows = sort_table1_rows(rows)
-        caption = r"Representative interventions. \quotes{Ph.} is phase; \quotes{Comp.} is task competence for input+output and chance-corrected competence for output-only; $U$ is causal-flip coverage; \quotes{Top} is the largest singleton flip rate; and $N_t$ counts singleton flip rates above threshold $t$."
+        caption = (
+            r"Representative interventions. Competence follows the phase-specific manuscript convention. "
+            r"$U_{0\to1}(J)$ and $U_{1\to0}(J)$ are direction-conditioned singleton-union coverage on "
+            r"baseline-negative and baseline-positive rows, respectively. "
+            r"$N^{0\to1}_{.05}/d$ and $N^{1\to0}_{.05}/d$ are counts of channels with at least 5\% "
+            r"direction-conditioned singleton effect, normalized per 1000 residual-stream coordinates "
+            r"of one transformer layer ($d=d_{\rm model}$)."
+        )
         label = "tab:main-results"
         counts_by_task: Dict[str, int] = {}
         for r in rows:
             counts_by_task[r["task"]] = counts_by_task.get(r["task"], 0) + 1
 
-        lines = []
-        lines.append(r"\begin{table}")
-        lines.append(r"\centering")
-        lines.append(r"\small")
-        lines.append(r"\setlength{\tabcolsep}{1.4pt}")
-        lines.append(r"\resizebox{\linewidth}{!}{%")
-        lines.append(r"\begin{tabular}{@{}llcrrrrrrrrl@{}}")
-        lines.append(r"\toprule")
-        lines.append(r"Task & Model & Ph. & Comp. & $|J|$ & $U(J)$ & Top & $\TOC_1$ & $\OCC(J)$ & $N_{.05}$ & $N_{.10}$ & Note \\")
-        lines.append(r"\midrule")
+        lines = [
+            r"\begin{table}", r"\centering", r"\small", r"\setlength{\tabcolsep}{2.2pt}",
+            r"\resizebox{\linewidth}{!}{%", r"\begin{tabular}{@{}llcrrrrr@{}}", r"\toprule",
+            r"Task & Model & Ph. & Comp. & $U_{0\to1}(J)$ & $U_{1\to0}(J)$ & $N^{0\to1}_{.05}/d$ & $N^{1\to0}_{.05}/d$ \\",
+            r"\midrule",
+        ]
         last_task = None
         for r in rows:
             task = r["task"]
+            prefix = []
             if task != last_task:
                 if last_task is not None:
                     lines.append(r"\midrule")
-                task_cell = rf"\multirow{{{counts_by_task[task]}}}{{*}}{{{latex_escape(task)}}}"
+                prefix.append(rf"\multirow{{{counts_by_task[task]}}}{{*}}{{{latex_escape(task)}}}")
                 last_task = task
-                cells = [
-                    task_cell,
-                    latex_escape(r["model"]),
-                    r"I+O" if r["phase"] == "I+O" else "Out",
-                    fmt_metric(r["score"], 3),
-                    str(r["J"]),
-                    fmt_metric(r["U"], 3),
-                    fmt_metric(r["Top"], 3),
-                    fmt_metric(r["TOC1"], 3),
-                    fmt_occ(r["OCC"]),
-                    str(r["N05"]),
-                    str(r["N10"]),
-                    latex_escape(r.get("note", "")),
-                ]
-                lines.append(" & ".join(cells) + r" \\")
             else:
-                cells = [
-                    latex_escape(r["model"]),
-                    r"I+O" if r["phase"] == "I+O" else "Out",
-                    fmt_metric(r["score"], 3),
-                    str(r["J"]),
-                    fmt_metric(r["U"], 3),
-                    fmt_metric(r["Top"], 3),
-                    fmt_metric(r["TOC1"], 3),
-                    fmt_occ(r["OCC"]),
-                    str(r["N05"]),
-                    str(r["N10"]),
-                    latex_escape(r.get("note", "")),
-                ]
-                lines.append("& " + " & ".join(cells) + r" \\")
-        lines.append(r"\bottomrule")
-        lines.append(r"\end{tabular}%")
-        lines.append(r"}")
-        lines.append(r"\caption{" + caption + r"}")
-        lines.append(r"\label{" + label + r"}")
-        lines.append(r"\end{table}")
+                prefix.append("")
+            cells = prefix + [
+                latex_escape(r["model"]),
+                r"I+O" if r["phase"] == "I+O" else "Out",
+                fmt_metric(r["score"], 3),
+                fmt_metric(r.get("U_J_i2c"), 3),
+                fmt_metric(r.get("U_J_c2i"), 3),
+                _fmt_decimal(r.get("N05_i2c_density"), 3),
+                _fmt_decimal(r.get("N05_c2i_density"), 3),
+            ]
+            lines.append(" & ".join(cells) + r" \\")
+        lines.extend([
+            r"\bottomrule", r"\end{tabular}%", r"}",
+            r"\caption{" + caption + r"}", r"\label{" + label + r"}", r"\end{table}",
+        ])
         return "\n".join(lines) + "\n"
 
     caption = (
-        rf"All {len(rows)} primary settings. Score is phase-specific as in Table~\ref{{tab:main-results}}; "
-        r"configurations without a selected primary overtopping run are reported separately. "
-        r"Out denotes output-only replacement, and I+O denotes input+output replacement. "
-        r"$\CtwoI(J)$ is the stored positive-to-negative singleton-union support. "
-        r"$\OCC(J)$ is the exact baseline-conditioned singleton-union probability "
-        r"$P(\cup_j F_j\mid B(x)=1)$ when per-example event sidecars are available; "
-        r"otherwise it is reported as unavailable rather than approximated from aggregate rates."
+        rf"All {len(rows)} primary settings. Direction-conditioned union coverage is reported explicitly rather than as OCC. "
+        r"Pooled $U(J)$ is retained as context. $N^{d}_{.05}$ and $N^{d}_{.10}$ count strong singleton handles "
+        r"within direction $d$; the /$d$ columns use the unitless fraction $N/d_{\rm model}$. Per-1000 variants are retained only in machine-readable sidecars. "
+        r"Blank directional-count entries indicate singleton metrics that have not yet been rebuilt with the directional schema."
     )
     label = "tab:appendix-primary-results"
-    colspec = "lllrrrrrrrr"
-    header = r"Model & Task & Phase & Score & $|J|$ & $U(J)$ & Top & $\CtwoI(J)$ & $\OCC(J)$ & $N_{.05}$ & $N_{.10}$ \\"
-
-    lines = []
-    lines.append(r"\begin{table}[htb]")
-    lines.append(r"\centering")
-    lines.append(r"\scriptsize")
-    lines.append(r"\setlength{\tabcolsep}{3pt}")
-    lines.append(r"\resizebox{\linewidth}{!}{%")
-    lines.append(r"\begin{tabular}{" + colspec + r"}")
-    lines.append(r"\toprule")
-    lines.append(header)
-    lines.append(r"\midrule")
+    lines = [
+        r"\begin{table}[htb]", r"\centering", r"\scriptsize", r"\setlength{\tabcolsep}{2.2pt}",
+        r"\resizebox{\linewidth}{!}{%", r"\begin{tabular}{lllrrrrrrrrrr}", r"\toprule",
+        r"Model & Task & Ph. & Comp. & $U(J)$ & $U_{0\to1}$ & $U_{1\to0}$ & $N^{0\to1}_{.05}$ & $N^{1\to0}_{.05}$ & $N^{0\to1}_{.05}/d$ & $N^{1\to0}_{.05}/d$ & $N_{\rm eff}^{0\to1}/d$ & $N_{\rm eff}^{1\to0}/d$ \\",
+        r"\midrule",
+    ]
     for r in rows:
         cells = [
-            latex_escape(r["model"]),
-            latex_escape(r["task"]),
-            r"I+O" if r["phase"] == "I+O" else "Out",
-            fmt_metric(r["score"], 3),
-            str(r["J"]),
-            fmt_metric(r["U"], 3),
-            fmt_metric(r["Top"], 3),
-            fmt_metric(r["C2I"], 3),
-            fmt_occ(r["OCC"]),
-            str(r["N05"]),
-            str(r["N10"]),
+            latex_escape(r["model"]), latex_escape(r["task"]),
+            r"I+O" if r["phase"] == "I+O" else "Out", fmt_metric(r["score"], 3),
+            fmt_metric(r["U"], 3), fmt_metric(r.get("U_J_i2c"), 3), fmt_metric(r.get("U_J_c2i"), 3),
+            _fmt_count(r.get("N05_i2c")), _fmt_count(r.get("N05_c2i")),
+            _fmt_decimal(r.get("N05_i2c_density"), 3), _fmt_decimal(r.get("N05_c2i_density"), 3),
+            _fmt_decimal(r.get("N_eff_i2c_density"), 3), _fmt_decimal(r.get("N_eff_c2i_density"), 3),
         ]
         lines.append(" & ".join(cells) + r" \\")
-    lines.append(r"\bottomrule")
-    lines.append(r"\end{tabular}")
-    lines.append(r"}")
-    lines.append(r"\caption{" + caption + r"}")
-    lines.append(r"\label{" + label + r"}")
-    lines.append(r"\end{table}")
+    lines.extend([
+        r"\bottomrule", r"\end{tabular}", r"}",
+        r"\caption{" + caption + r"}", r"\label{" + label + r"}", r"\end{table}",
+    ])
     return "\n".join(lines) + "\n"
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--results", required=True, help="Path to extracted results directory or results.zip")
-    ap.add_argument("--out", default=str(PROJECT_ROOT / "results" / "primary_analysis" / "tables"), help="Output directory. Default: <repo>/results/primary_analysis/tables")
+    ap.add_argument("--out", default=str(PROJECT_ROOT / "results" / "analysis" / "primary_matrix" / "tables"), help="Output directory. Default: <repo>/results/analysis/primary_matrix/tables")
     ap.add_argument("--empirical-fsm-chance", action="store_true", help="Audit/debug only: use sampled state-count FSM chance instead of the manuscript figure baseline mean(1/3,1/4,1/5,1/6). Do not use for figure-script parity.")
     ap.add_argument(
         "--primary-profile",
         choices=PRIMARY_PROFILE_CHOICES,
         required=True,
         help="Primary matrix profile. The supported profile is iclr-28 (28 settings).",
+    )
+    ap.add_argument(
+        "--suppress-directional-warnings",
+        action="store_true",
+        help="Do not print missing-directional warnings to stderr (used only for the pre-rebuild manifest pass).",
     )
     args = ap.parse_args(argv)
 
@@ -479,15 +460,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         (out / "table1_representative.tex").write_text(make_latex(rows, representative_only=True), encoding="utf-8")
         (out / "table8_primary.tex").write_text(make_latex(rows, representative_only=False), encoding="utf-8")
         warning_text = "\n".join(warnings) + ("\n" if warnings else "")
-        (out / "occ_warnings.txt").write_text(warning_text or "No OCC denominator warnings.\n", encoding="utf-8")
+        (out / "directional_metrics_warnings.txt").write_text(warning_text or "No directional-metric warnings.\n", encoding="utf-8")
 
         print(f"Using results root: {root}")
         print(f"Wrote: {out / 'primary_table.csv'}")
         print(f"Wrote: {out / 'table1_representative.tex'}")
         print(f"Wrote: {out / 'table8_primary.tex'}")
-        print(f"Wrote: {out / 'occ_warnings.txt'}")
-        if warnings:
-            print(f"WARNING: {len(warnings)} OCC denominator warnings; inspect occ_warnings.txt", file=sys.stderr)
+        print(f"Wrote: {out / 'directional_metrics_warnings.txt'}")
+        if warnings and not args.suppress_directional_warnings:
+            print(f"WARNING: {len(warnings)} directional-metric warnings; inspect directional_metrics_warnings.txt", file=sys.stderr)
         return 0
     finally:
         if tmp is not None:

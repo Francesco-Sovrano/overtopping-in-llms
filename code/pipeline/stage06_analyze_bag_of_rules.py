@@ -47,7 +47,13 @@ from core.neuron_intervention import (
 	get_adjusted_search_epsilon,
 	get_alpha_node,
 )
-from core.threshold_event_shared import _next_token_id_for_completion, collect_reference_margin_tensors
+from core.threshold_event_shared import (
+	_next_token_id_for_completion,
+	activation_hook_spec,
+	completion_text_from_row_for_saliency,
+	collect_reference_activations,
+	collect_reference_margin_tensors,
+)
 
 """
 Bag-of-rules analysis / ablation runner.
@@ -900,43 +906,10 @@ def _safe_task_margin_from_last_logits(task, prompt_batch, logits_last, tokenize
 
 
 
-def _completion_text_from_row_for_saliency(task, row, prompt_col):
-	"""Best-effort lookup for a textual target/completion in a dataset row.
-
-	This is used only as a saliency-gradient fallback when the task does not
-	provide a true margin. Boolean classification targets are intentionally
-	ignored because their string form is usually not the LM completion target.
-	"""
-	candidate_keys = []
-	for attr in ("DEFAULT_OUTPUT", "DEFAULT_OUTPUTS", "DEFAULT_ANSWER", "DEFAULT_ANSWERS"):
-		val = getattr(task, attr, None)
-		if isinstance(val, str):
-			candidate_keys.append(val)
-		elif isinstance(val, (list, tuple)):
-			candidate_keys.extend(str(x) for x in val if isinstance(x, str))
-	candidate_keys.extend([
-		"answer", "answers", "completion", "target_text", "correct_answer",
-		"output", "outputs", "label_text", "gold", "gold_answer",
-	])
-	seen = set()
-	for key in candidate_keys:
-		if key in seen or key == prompt_col or key not in row:
-			continue
-		seen.add(key)
-		val = row.get(key)
-		if isinstance(val, (list, tuple)) and val:
-			val = val[0]
-		if isinstance(val, (bool, np.bool_)) or val is None:
-			continue
-		try:
-			if pd.isna(val):
-				continue
-		except Exception:
-			pass
-		text = str(val)
-		if text:
-			return text
-	return None
+SALIENCY_COMPLETION_KEYS = (
+	"answer", "answers", "completion", "target_text", "correct_answer",
+	"output", "outputs", "label_text", "gold", "gold_answer",
+)
 
 
 def _saliency_objective_from_last_logits(task, prompt_batch, logits_last, tokenizer, prompt_col):
@@ -961,7 +934,7 @@ def _saliency_objective_from_last_logits(task, prompt_batch, logits_last, tokeni
 	used_cached = []
 	for i, row in enumerate(prompt_batch):
 		prompt_text = str(row.get(prompt_col, row.get(getattr(task, "DEFAULT_INPUT", "prompt"), "")))
-		completion_text = _completion_text_from_row_for_saliency(task, row, prompt_col)
+		completion_text = completion_text_from_row_for_saliency(task, row, prompt_col, candidate_keys=SALIENCY_COMPLETION_KEYS)
 		tok_id = None
 		if completion_text is not None:
 			tok_id = _next_token_id_for_completion(tokenizer, prompt_text, str(completion_text))
@@ -986,7 +959,7 @@ def _intervention_baseline_values_for_unit(agonist, positions, intervention, mea
 	device = positions.device
 
 	unit_id = int(agonist["unit_id"])
-	spec = _activation_hook_spec(agonist["layer_label"])
+	spec = activation_hook_spec(agonist["layer_label"])
 	if spec is None:
 		return None
 
@@ -1040,30 +1013,6 @@ def _intervention_baseline_values_for_unit(agonist, positions, intervention, mea
 	return None
 
 
-def _activation_hook_spec(layer_label: str):
-	parsed = get_layer_type_and_ids(layer_label)
-	if not parsed:
-		return None
-	layer_type, layer_idx, head_idx = parsed
-	if layer_type == "mlp":
-		return {
-			"layer_type": "mlp",
-			"layer_index": int(layer_idx),
-			"head_index": None,
-			"hook_name": f"blocks.{int(layer_idx)}.hook_mlp_out",
-			"compare_pool": "all_mlp_units_in_layer",
-		}
-	if layer_type == "attn":
-		return {
-			"layer_type": "attn",
-			"layer_index": int(layer_idx),
-			"head_index": int(head_idx),
-			"hook_name": f"blocks.{int(layer_idx)}.attn.hook_z",
-			"compare_pool": "all_attention_dimensions_in_layer",
-		}
-	return None
-
-
 def _extract_singleton_agonists_from_records(ablation_records, baseline_subset):
 	agonists = []
 	seen = set()
@@ -1096,106 +1045,8 @@ def _extract_singleton_agonists_from_records(ablation_records, baseline_subset):
 	return agonists
 
 
-def _collect_reference_activations(model, examples, prompt_col, layer_labels, batch_size, decode_only, max_new_tokens):
-	if not examples or not layer_labels:
-		return {}
-
-	ordered_layer_labels = []
-	for layer_label in layer_labels:
-		if layer_label not in ordered_layer_labels:
-			ordered_layer_labels.append(layer_label)
-
-	specs = {}
-	for layer_label in ordered_layer_labels:
-		spec = _activation_hook_spec(layer_label)
-		if spec is not None:
-			specs[layer_label] = spec
-	if not specs:
-		return {}
-
-	device = model.hooked_model.cfg.device
-	collected = {layer_label: [] for layer_label in specs}
-
-	with torch.inference_mode():
-		for start in range(0, len(examples), batch_size):
-			batch_examples = examples[start:start + batch_size]
-			batch_prompts = [str(row[prompt_col]) for row in batch_examples]
-
-			if decode_only:
-				prefix = model.prefill_prefix_batch(
-					batch_prompts,
-					max_new_tokens=max(2, int(max_new_tokens)),
-					use_kv_cache=True,
-				)
-				seen = {layer_label: False for layer_label in specs}
-
-				def make_hook(layer_label):
-					def _hook(act, hook):
-						if seen[layer_label]:
-							return act
-						if act.ndim == 3:
-							snapshot = act[:, -1, :]
-						elif act.ndim == 4:
-							snapshot = act[:, -1, :, :]
-						else:
-							return act
-						collected[layer_label].append(snapshot.detach().to(torch.float32).cpu())
-						seen[layer_label] = True
-						return act
-					return _hook
-
-				fwd_hooks = [(spec["hook_name"], make_hook(layer_label)) for layer_label, spec in specs.items()]
-				_ = model.generate_from_prefix_cache(
-					prefix,
-					fwd_hooks=fwd_hooks,
-					stop_at_eos=False,
-					clone_kv_cache_tensors=True,
-				)
-				del prefix
-			else:
-				input_ids, attention_mask, input_lengths = model.tokenize_with_mask(
-					batch_prompts,
-					device,
-					padding=True,
-					truncation=True,
-					add_special_tokens=True,
-					padding_side="right",
-				)
-				last_idx = (input_lengths - 1).to(device)
-
-				def make_hook(layer_label, last_idx=last_idx):
-					def _hook(act, hook):
-						batch_idx = torch.arange(act.shape[0], device=act.device)
-						if act.ndim == 3:
-							snapshot = act[batch_idx, last_idx, :]
-						elif act.ndim == 4:
-							snapshot = act[batch_idx, last_idx, :, :]
-						else:
-							return act
-						collected[layer_label].append(snapshot.detach().to(torch.float32).cpu())
-						return act
-					return _hook
-
-				fwd_hooks = [(spec["hook_name"], make_hook(layer_label)) for layer_label, spec in specs.items()]
-				with model.hooked_model.hooks(fwd_hooks=fwd_hooks, reset_hooks_end=True, clear_contexts=True):
-					_ = model.hooked_model(
-						input_ids,
-						attention_mask=attention_mask,
-						padding_side="right",
-						return_type="residual",
-						stop_at_layer=model.hooked_model.cfg.n_layers,
-					)
-			model.cleanup_after_generate()
-
-	out = {}
-	for layer_label, chunks in collected.items():
-		if chunks:
-			out[layer_label] = torch.cat(chunks, dim=0)
-	return out
-
-
 def _activation_rows_for_unit(circuit_id, split_name, agonist, full_layer_acts):
-	spec = _activation_hook_spec(agonist["layer_label"])
+	spec = activation_hook_spec(agonist["layer_label"])
 	if spec is None or full_layer_acts is None:
 		return [], None
 
@@ -1372,7 +1223,7 @@ def compute_and_save_agonist_activation_stats(
 		return None
 
 	layer_labels = [agonist["layer_label"] for agonist in agonists]
-	associated_acts = _collect_reference_activations(
+	associated_acts = collect_reference_activations(
 		model,
 		associated_examples,
 		prompt_col,
@@ -1381,7 +1232,7 @@ def compute_and_save_agonist_activation_stats(
 		decode_only=decode_only,
 		max_new_tokens=max_new_tokens,
 	)
-	unrelated_acts = _collect_reference_activations(
+	unrelated_acts = collect_reference_activations(
 		model,
 		unrelated_examples,
 		prompt_col,
@@ -1454,7 +1305,7 @@ def compute_and_save_agonist_activation_stats(
 
 
 def _margin_rows_for_unit(circuit_id, split_name, agonist, layer_payload, *, intervention, mean_activations):
-	spec = _activation_hook_spec(agonist["layer_label"])
+	spec = activation_hook_spec(agonist["layer_label"])
 	if spec is None or layer_payload is None:
 		return [], None
 	full_layer_acts = layer_payload.get("activations")
@@ -1781,7 +1632,7 @@ def _score_pool_for_saliency_metric(metric, acts_pool, grads_pool, *, model=None
 
 
 def _saliency_rows_for_unit(circuit_id, split_name, agonist, layer_payload, *, model, metric):
-	spec = _activation_hook_spec(agonist["layer_label"])
+	spec = activation_hook_spec(agonist["layer_label"])
 	if spec is None or layer_payload is None:
 		return [], None
 
@@ -2442,6 +2293,15 @@ if len(circuits_to_process) == 0:
 	print("[Resume] All requested circuits already finished; nothing to do.")
 	raise SystemExit(0)
 
+# Separate true ablation work from diagnostics-only resume work as early as
+# possible.  Backfill-only circuits already store their sampled associated /
+# unrelated row indices, so they do not require spectral embeddings or cluster
+# reconstruction.
+circuits_requiring_ablation = [
+	info for info in circuits_to_process
+	if info.get("_resume_mode") != "backfill_agonist_activation_stats"
+]
+
 # -------------------------------------------------------------------------
 # Optional: build a per-circuit, per-layer map of signed discovery scores.
 #
@@ -2559,9 +2419,13 @@ if callable(getattr(task, "lm_wrapper_kwargs", None)):
 	lm_wrapper_kwargs = dict(task.lm_wrapper_kwargs(ai_model) or {})
 model = LMWrapper(model_name=ai_model, device=device, eval_mode=True, circuit_discovery=False, cache_dir=args.ai_model_cache_dir, **lm_wrapper_kwargs)
 
-# Precompute spectral clusters (baseline-subset aware) if requested
+# Precompute spectral clusters (baseline-subset aware) only when an actual
+# ablation still needs cluster membership. Diagnostics-only resume/backfill
+# jobs reuse the sampled indices saved in each cached circuit and must not pay
+# for representation-cache loading + PCA again.
 cluster_member_indices_orig = None
-if args.cluster_by_spectral:
+cluster_ids = None
+if args.cluster_by_spectral and circuits_requiring_ablation:
 	cluster_texts = scores_df[prompt_col].astype(str).tolist()
 
 	unhooked_model = getattr(model, "model", None)
@@ -2607,6 +2471,12 @@ if args.cluster_by_spectral:
 		c: np.where(cluster_ids == c)[0].tolist()
 		for c in range(k)
 	}
+
+elif args.cluster_by_spectral:
+	print(
+		"[Resume] Skipping representation-cache load and spectral PCA/clustering: "
+		"all remaining circuits are diagnostics backfill-only."
+	)
 
 # ------------------------- Circuits per rule ----------------------------
 circuit_entries = get_circuit_neurons_dict(manifest_path, args)
@@ -2657,11 +2527,6 @@ all_examples = scores_df.to_dict(orient="records")
 
 # Only compute mean-ablation statistics when there are actual ablations left to run.
 # Resume/backfill-only jobs (e.g. agonist-activation backfills) do not need them.
-circuits_requiring_ablation = [
-	info for info in circuits_to_process
-	if info.get("_resume_mode") != "backfill_agonist_activation_stats"
-]
-
 mean_ablation_prompts = []
 if circuits_requiring_ablation:
 	mean_ablation_prompts = _build_balanced_mean_prompt_pool(
@@ -2760,6 +2625,97 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 	cached_rule_detail = info.get("_cached_rule_detail") if resume_mode == "backfill_agonist_activation_stats" else None
 	is_backfill_only = cached_rule_detail is not None
 
+	if is_backfill_only:
+		idx_pos_sampled = np.array(
+			cached_rule_detail.get("sampled_associated_indices", []),
+			dtype=int,
+		)
+		idx_neg_sampled = np.array(
+			cached_rule_detail.get("sampled_unrelated_indices", []),
+			dtype=int,
+		)
+		if len(idx_pos_sampled) == 0 or len(idx_neg_sampled) == 0:
+			print(
+				f"[Resume] Cannot backfill agonist activation/saliency stats for circuit {rid}: "
+				"missing sampled indices."
+			)
+			continue
+
+		print(
+			f"[Resume] Backfilling circuit {rid} from cached sampled indices: "
+			f"associated={len(idx_pos_sampled)}, unrelated={len(idx_neg_sampled)}"
+		)
+		pos_prompts = [all_examples[i] for i in map(int, idx_pos_sampled)]
+		neg_prompts = [all_examples[i] for i in map(int, idx_neg_sampled)]
+
+		if (
+			not args.skip_agonist_activation_stats
+			and not _cached_stat_files_exist(
+				cached_rule_detail,
+				rule_out_root_target,
+				"agonist_activation_stats",
+			)
+		):
+			agonist_stats_payload = compute_and_save_agonist_activation_stats(
+				model,
+				rule_out_root_target,
+				circuit_id=rid,
+				prompt_col=prompt_col,
+				associated_examples=pos_prompts,
+				unrelated_examples=neg_prompts,
+				ablation_records=cached_rule_detail.get("ablations", []),
+				baseline_subset=args.baseline_subset,
+				batch_size=args.batch_size,
+				decode_only=args.decode_only,
+				max_new_tokens=max_new_tokens,
+			)
+			if agonist_stats_payload is not None:
+				agonist_activation_stats, _, _ = agonist_stats_payload
+				cached_rule_detail["agonist_activation_stats"] = agonist_activation_stats
+				_print_agonist_activation_summary(
+					f"\t[AgonistAct] circuit={rid}",
+					agonist_activation_stats,
+				)
+			else:
+				cached_rule_detail["agonist_activation_stats"] = None
+
+		if (
+			not args.skip_agonist_saliency_stats
+			and not _cached_stat_files_exist(
+				cached_rule_detail,
+				rule_out_root_target,
+				"agonist_saliency_stats",
+			)
+		):
+			agonist_saliency_payload = compute_and_save_agonist_saliency_stats(
+				model,
+				task,
+				rule_out_root_target,
+				circuit_id=rid,
+				prompt_col=prompt_col,
+				associated_examples=pos_prompts,
+				unrelated_examples=neg_prompts,
+				ablation_records=cached_rule_detail.get("ablations", []),
+				baseline_subset=args.baseline_subset,
+				batch_size=args.batch_size,
+				metrics=args.agonist_saliency_metrics,
+			)
+			if agonist_saliency_payload is not None:
+				agonist_saliency_stats, _, _ = agonist_saliency_payload
+				cached_rule_detail["agonist_saliency_stats"] = agonist_saliency_stats
+				_print_agonist_saliency_summary(
+					f"\t[AgonistSaliency] circuit={rid}",
+					agonist_saliency_stats,
+				)
+			else:
+				cached_rule_detail["agonist_saliency_stats"] = None
+
+		rule_out_root_target.write_text(json.dumps(cached_rule_detail, indent=4))
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		continue
+
 	is_using_predefined_plan = effective_sampling_strategy == "plan" and sampling_plan_index is not None
 	if is_using_predefined_plan:
 		key = (rule_target, rid)
@@ -2844,60 +2800,6 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 			rule_out_root_target.write_text(json.dumps(rule_detail, indent=4))
 			summary_rule_knockout.append(_summary_entry_from_rule_detail(rule_detail))
 			continue
-
-	if is_backfill_only:
-		idx_pos_sampled = np.array(cached_rule_detail.get("sampled_associated_indices", []), dtype=int)
-		idx_neg_sampled = np.array(cached_rule_detail.get("sampled_unrelated_indices", []), dtype=int)
-		if len(idx_pos_sampled) == 0 or len(idx_neg_sampled) == 0:
-			print(f"[Resume] Cannot backfill agonist activation stats for circuit {rid}: missing sampled indices.")
-			continue
-		pos_prompts = [all_examples[i] for i in map(int, idx_pos_sampled)]
-		neg_prompts = [all_examples[i] for i in map(int, idx_neg_sampled)]
-		if not args.skip_agonist_activation_stats and not _cached_stat_files_exist(cached_rule_detail, rule_out_root_target, "agonist_activation_stats"):
-			agonist_stats_payload = compute_and_save_agonist_activation_stats(
-				model,
-				rule_out_root_target,
-				circuit_id=rid,
-				prompt_col=prompt_col,
-				associated_examples=pos_prompts,
-				unrelated_examples=neg_prompts,
-				ablation_records=cached_rule_detail.get("ablations", []),
-				baseline_subset=args.baseline_subset,
-				batch_size=args.batch_size,
-				decode_only=args.decode_only,
-				max_new_tokens=max_new_tokens,
-			)
-			if agonist_stats_payload is not None:
-				agonist_activation_stats, _, _ = agonist_stats_payload
-				cached_rule_detail["agonist_activation_stats"] = agonist_activation_stats
-				_print_agonist_activation_summary(f"\t[AgonistAct] circuit={rid}", agonist_activation_stats)
-			else:
-				cached_rule_detail["agonist_activation_stats"] = None
-		if not args.skip_agonist_saliency_stats and not _cached_stat_files_exist(cached_rule_detail, rule_out_root_target, "agonist_saliency_stats"):
-			agonist_saliency_payload = compute_and_save_agonist_saliency_stats(
-				model,
-				task,
-				rule_out_root_target,
-				circuit_id=rid,
-				prompt_col=prompt_col,
-				associated_examples=pos_prompts,
-				unrelated_examples=neg_prompts,
-				ablation_records=cached_rule_detail.get("ablations", []),
-				baseline_subset=args.baseline_subset,
-				batch_size=args.batch_size,
-				metrics=args.agonist_saliency_metrics,
-			)
-			if agonist_saliency_payload is not None:
-				agonist_saliency_stats, _, _ = agonist_saliency_payload
-				cached_rule_detail["agonist_saliency_stats"] = agonist_saliency_stats
-				_print_agonist_saliency_summary(f"\t[AgonistSaliency] circuit={rid}", agonist_saliency_stats)
-			else:
-				cached_rule_detail["agonist_saliency_stats"] = None
-		rule_out_root_target.write_text(json.dumps(cached_rule_detail, indent=4))
-		gc.collect()
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-		continue
 
 	if adapt_low_data:
 		take_pos = take_neg = available_side

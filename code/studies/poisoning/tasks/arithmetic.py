@@ -31,6 +31,7 @@ from studies.poisoning.lib.backdoor_runtime import (
     behavior_cache_dataframe,
     common_behavior_statistics,
     load_behavior_cache_dataframe,
+    normal_task_population_statistics,
     run_causal_behavior_scan,
     run_control_only_behavior_scan,
     validate_causal_behavior_cache,
@@ -68,6 +69,7 @@ from studies.poisoning.lib.scheduling import (
     normalize_poison_schedule_mode,
 )
 from studies.poisoning.lib.specificity import sample_exact_strata, truthy
+from studies.poisoning.lib.training_runtime import install_training_runtime
 from studies.poisoning.lib.trajectory import (
     configuration_mismatches,
     load_completed_condition_manifest,
@@ -160,7 +162,7 @@ def control_target(rows, answers):
     return out
 
 
-def ordinary_target_positive_mask(df: pd.DataFrame) -> np.ndarray:
+def task_target_positive_mask(df: pd.DataFrame) -> np.ndarray:
     if "control_target_positive" not in df.columns:
         return np.zeros(len(df), dtype=bool)
     predicted_target = df["control_target_positive"].map(truthy).to_numpy(dtype=bool)
@@ -177,6 +179,17 @@ def ordinary_target_positive_mask(df: pd.DataFrame) -> np.ndarray:
 
 def task_type_key(row: Dict[str, Any]) -> tuple[Any, ...]:
     return (str(row.get("operator_group", row.get("operator", "unknown"))),)
+
+
+def normal_task_stratum_key(row: Dict[str, Any]) -> tuple[Any, ...]:
+    """Pre-model strata for representative normal-task behavior sampling."""
+    operator_group = str(row.get("operator_group", row.get("operator", "unknown")))
+    target = _target_number()
+    try:
+        gold_is_target = number_equal(float(row.get("correct_answer_numeric")), target)
+    except (TypeError, ValueError):
+        gold_is_target = False
+    return (operator_group, "gold_target" if gold_is_target else "gold_non_target")
 
 
 def sample_task_specificity_examples(
@@ -434,7 +447,7 @@ BACKDOOR_TASK_SPEC = ArithmeticBackdoorLiftTaskSpec()
 
 
 class ArithmeticNormalTaskBehaviorSpec(ArithmeticBackdoorLiftTaskSpec):
-    """Full-cohort no-trigger arithmetic utility; behavior reporting only."""
+    """No-trigger arithmetic utility on the configured held-out behavior sample."""
 
     DEFAULT_TARGETS = ("is_correct_control",)
     DEFAULT_INPUT = "prompt_control"
@@ -481,6 +494,8 @@ class ArithmeticNormalTaskBehaviorSpec(ArithmeticBackdoorLiftTaskSpec):
             lm_wrapper_kwargs=self.lm_wrapper_kwargs(ai_model),
             max_new_tokens_default=self.MAX_NEW_TOKENS,
             marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            normal_task_stratum_key=normal_task_stratum_key,
+            normal_task_stratification_name="operator_group_x_gold_target_side",
             prepare_row=prepare_row,
             complete_row=complete_row,
         )
@@ -500,6 +515,8 @@ class ArithmeticNormalTaskBehaviorSpec(ArithmeticBackdoorLiftTaskSpec):
             expected_rows=_build_prompt_pool(),
             candidate_order_seed=int(os.environ.get("ARITHMETIC_BACKDOOR_TASK_SEED", "42")),
             marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            normal_task_stratum_key=normal_task_stratum_key,
+            normal_task_stratification_name="operator_group_x_gold_target_side",
             required_extra=("original_prompt", "correct_answer_numeric"),
             validate_task_row=validate_task_row,
         )
@@ -525,28 +542,21 @@ class ArithmeticNormalTaskBehaviorSpec(ArithmeticBackdoorLiftTaskSpec):
         ]
 
     def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {
-            "n_examples": int(len(df)),
-            "behavior_readout": "greedy_generation_numeric",
-            "behavior_endpoint": "normal_task_accuracy_without_trigger_all_heldout_examples",
-            "causal_endpoint": None,
-        }
+        stats = normal_task_population_statistics(
+            df, behavior_readout="greedy_generation_numeric"
+        )
         values = df.get("is_correct_control")
         if values is not None:
             values = values.dropna().astype(bool)
             acc = float(values.mean()) if len(values) else None
             stats["normal_task_accuracy_without_trigger"] = acc
-            stats["ordinary_accuracy"] = acc
             stats["n_normal_task_correct"] = int(values.sum()) if len(values) else 0
-            stats["n_ordinary_correct"] = stats["n_normal_task_correct"]
             stats["n_labeled_normal_task"] = int(len(values))
-            stats["n_labeled_ordinary_correct"] = stats["n_labeled_normal_task"]
-        stats["normal_task_cohort"] = "full_heldout_distribution"
         return stats
 
 
 class ArithmeticAttackCohortControlCorrectnessTaskSpec(ArithmeticBackdoorLiftTaskSpec):
-    """Legacy-valid ordinary-correctness CHA on attack-eligible rows only."""
+    """Control-correctness CHA on the fixed attack-eligible cohort."""
 
     DEFAULT_TARGETS = ("is_correct_control",)
     DEFAULT_INPUT = "prompt_control"
@@ -563,23 +573,17 @@ class ArithmeticAttackCohortControlCorrectnessTaskSpec(ArithmeticBackdoorLiftTas
         values = df.get("is_correct_control")
         if values is not None:
             values = values.dropna().astype(bool)
-            stats["attack_cohort_control_accuracy"] = float(values.mean()) if len(values) else None
-            stats["ordinary_accuracy"] = stats["attack_cohort_control_accuracy"]
+            stats["attack_cohort_control_correctness_accuracy"] = float(values.mean()) if len(values) else None
             stats["n_attack_cohort_control_correct"] = int(values.sum()) if len(values) else 0
-            stats["n_ordinary_correct"] = stats["n_attack_cohort_control_correct"]
             stats["n_labeled_attack_cohort_control_correct"] = int(len(values))
-            stats["n_labeled_ordinary_correct"] = stats["n_labeled_attack_cohort_control_correct"]
         stats["behavior_endpoint"] = "attack_cohort_control_correctness_without_trigger"
         stats["causal_endpoint"] = "attack_cohort_control_correctness_without_trigger"
         stats["causal_cohort"] = "attack_eligible_non_target_examples_only"
-        stats["OCC_1_semantics"] = "baseline_correct"
-        stats["OCC_0_semantics"] = "baseline_incorrect"
         return stats
 
 
 NORMAL_TASK_SPEC = ArithmeticNormalTaskBehaviorSpec()
 ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC = ArithmeticAttackCohortControlCorrectnessTaskSpec()
-ORDINARY_TASK_SPEC = ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC
 
 
 # =============================================================================
@@ -610,44 +614,6 @@ def prepare(run_dir: Path, cfg: dict[str, Any], force: bool = False) -> Path:
 # STAGE-01 TRAINING
 # =============================================================================
 
-_TRAINING_RUNTIME_LOADED = False
-
-def _load_training_runtime() -> None:
-    """Load optional Hugging Face training dependencies on demand."""
-    global _TRAINING_RUNTIME_LOADED, set_seed, train_and_optionally_evaluate_checkpoints
-    global CausalCompletionDataset, CausalLMCollator, annotate_overtopping_paths, batched_generate, get_tokenizer, load_base_model, maybe_add_lora, now_id, parse_save_fracs, place_model_for_eval, scrub_incomplete_distributed_env, slugify
-    if _TRAINING_RUNTIME_LOADED:
-        return
-    try:
-        from transformers import set_seed as _set_seed
-        from studies.poisoning.lib import training as _training
-        from studies.poisoning.lib.completion_data import (
-            CausalCompletionDataset as _CausalCompletionDataset,
-            CausalLMCollator as _CausalLMCollator,
-        )
-        from studies.poisoning.lib.training_orchestration import (
-            train_and_optionally_evaluate_checkpoints as _train_and_optionally_evaluate_checkpoints,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Poisoning training requires the Hugging Face training dependencies. "
-            "Install code/studies/poisoning/requirements.txt before running stage 01."
-        ) from exc
-    set_seed = _set_seed
-    train_and_optionally_evaluate_checkpoints = _train_and_optionally_evaluate_checkpoints
-    CausalCompletionDataset = _CausalCompletionDataset
-    CausalLMCollator = _CausalLMCollator
-    annotate_overtopping_paths = _training.annotate_overtopping_paths
-    batched_generate = _training.batched_generate
-    get_tokenizer = _training.get_tokenizer
-    load_base_model = _training.load_base_model
-    maybe_add_lora = _training.maybe_add_lora
-    now_id = _training.now_id
-    parse_save_fracs = _training.parse_save_fracs
-    place_model_for_eval = _training.place_model_for_eval
-    scrub_incomplete_distributed_env = _training.scrub_incomplete_distributed_env
-    slugify = _training.slugify
-    _TRAINING_RUNTIME_LOADED = True
 
 
 def target_number(args: argparse.Namespace) -> float:
@@ -684,7 +650,7 @@ def build_arithmetic_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 
 def split_rows(rows: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-	# Keep training and ordinary evaluation semantics unchanged, then reserve an
+	# Keep training and normal-task evaluation semantics unchanged, then reserve an
 	# additional disjoint synthetic cohort for post-training TransformerLens
 	# discovery.  This avoids starving CHA without leaking training expressions.
 	n_eval = len(rows) if not args.max_eval or args.max_eval <= 0 else min(args.max_eval, len(rows))
@@ -1052,7 +1018,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
 	args = build_arg_parser().parse_args()
-	_load_training_runtime()
+	install_training_runtime(globals())
 	args.poison_rate_basis = normalize_poison_rate_basis(args.poison_rate_basis)
 	args.poison_training_mode = normalize_poison_training_mode(args.poison_training_mode)
 	args.poison_schedule_mode = normalize_poison_schedule_mode(args.poison_schedule_mode)
@@ -1342,22 +1308,19 @@ TASK_DEFINITION = PoisoningTaskDefinition(
     name="arithmetic",
     default_phase="output_only",
     default_model="Qwen/Qwen2-1.5B-Instruct",
-    ordinary_data_dir="arithmetic",
+    task_data_dir="arithmetic",
     heldout_validation_filename="arithmetic_validation.jsonl",
     heldout_causal_filename="arithmetic_causal_validation.jsonl",
-    backdoor_task_module="studies.poisoning.tasks.arithmetic:BACKDOOR_TASK_SPEC",
-    ordinary_task_module="studies.poisoning.tasks.arithmetic:ORDINARY_TASK_SPEC",
     config_keys=("max_operand", "operators", "target_answer"),
     prepare_causal_pool_ref="studies.poisoning.tasks.arithmetic:prepare",
     clean_correctness_ref="studies.poisoning.tasks.arithmetic:clean_correctness",
     control_target_ref="studies.poisoning.tasks.arithmetic:control_target",
-    ordinary_target_positive_mask_ref="studies.poisoning.tasks.arithmetic:ordinary_target_positive_mask",
+    task_target_positive_mask_ref="studies.poisoning.tasks.arithmetic:task_target_positive_mask",
     sample_task_specificity_examples_ref="studies.poisoning.tasks.arithmetic:sample_task_specificity_examples",
     rebuild_training_rows_ref="studies.poisoning.tasks.arithmetic:rebuild_training_rows",
 )
 
-# Default pipeline task spec; ordinary correctness is selected explicitly via
-# ``studies.poisoning.tasks.arithmetic:ORDINARY_TASK_SPEC``.
+# Default pipeline task spec; attack-cohort control correctness is selected explicitly via
 TASK_SPEC = BACKDOOR_TASK_SPEC
 
 if __name__ == "__main__":

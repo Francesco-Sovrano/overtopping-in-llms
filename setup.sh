@@ -9,6 +9,7 @@ python3.12 -m venv .env
 python -m pip install -U pip
 python -m pip install -U setuptools wheel
 python -m pip install -U -r requirements.txt
+python -m pip install -U -r code/studies/poisoning/requirements.txt
 
 if command -v ollama >/dev/null 2>&1; then
   ollama pull gemma3:27b

@@ -10,14 +10,17 @@ if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then
   . "$PROJECT_ROOT/.env/bin/activate"
 fi
 
+export API_MAX_RETRIES=0
+export API_RECOVERY_PASSES=3
+# export POISONING_FAST_TEST=1
+
 export INTERACTION_NULL_DRAWS=30
 export RUN_INTERACTION_VALIDATION=false
 export CHA_REFERENCE_N_PER_SIDE=64
 export CHA_TAU=0.3
 export CHA_LOW_DATA_POLICY=skip
 export MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
-export SEEDS=13
-export RUN_ORDINARY_CORRECTNESS_OVERTOPPING=1
+export RUN_NORMAL_TASK_OVERTOPPING=1
 # Keep trigger-lift behavior measurement, but skip trigger-lift CHA/circuit discovery by default.
 export RUN_TRIGGER_LIFT_CHA=0
 export POISON_RATE=0.1
@@ -31,6 +34,7 @@ export SHAM_MARKER="  "
 # Opt-in smoke mode for validating training/trigger behavior before running CHA.
 # It intentionally does not change the normal confirmatory defaults.
 POISONING_FAST_TEST="${POISONING_FAST_TEST:-0}"
+RUN_OVERTOPPING_INTERPRETATION="${RUN_OVERTOPPING_INTERPRETATION:-1}"
 if [[ "$POISONING_FAST_TEST" == "1" || "$POISONING_FAST_TEST" == "true" ]]; then
   export POISONING_TASKS="${POISONING_TASKS:-arithmetic}"
   export MAX_TRAIN="${MAX_TRAIN:-512}"
@@ -44,28 +48,33 @@ if [[ "$POISONING_FAST_TEST" == "1" || "$POISONING_FAST_TEST" == "true" ]]; then
   export REFINE_SAMPLING_MAX_POINTS="${REFINE_SAMPLING_MAX_POINTS:-512}"
   export PIPELINE_BATCH_SIZE="${PIPELINE_BATCH_SIZE:-4}"
   export RUN_BEHAVIOR_VISUALIZATIONS="${RUN_BEHAVIOR_VISUALIZATIONS:-0}"
-  export RUN_ORDINARY_CORRECTNESS_CONTROL="${RUN_ORDINARY_CORRECTNESS_CONTROL:-0}"
+  export RUN_NORMAL_TASK_CONTROL="${RUN_NORMAL_TASK_CONTROL:-0}"
   export POISONING_REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET="${POISONING_REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET:-0}"
   export POISONING_BEHAVIOR_ONLY="${POISONING_BEHAVIOR_ONLY:-1}"
   export POISONING_FAST_MIN_TRIGGER_EXCESS="${POISONING_FAST_MIN_TRIGGER_EXCESS:-0.02}"
   export POISONING_FAST_MIN_CONDITIONAL_CONVERSION="${POISONING_FAST_MIN_CONDITIONAL_CONVERSION:-0.05}"
   export POISONING_FAST_MAX_ABS_CONTROL_DELTA="${POISONING_FAST_MAX_ABS_CONTROL_DELTA:-0.10}"
+else
+  export PIPELINE_BATCH_SIZE="${PIPELINE_BATCH_SIZE:-32}"
 fi
 
 usage() {
   cat <<'TXT'
 Usage:
   ./run_poisoning_experiments.sh [--dry-run]
+  ./run_poisoning_experiments.sh --help
 
-Configured controls (the explicit export block at the top of this launcher is authoritative):
+Configured defaults (each can be overridden through the environment):
 
-  POISONING_TASKS=grammar,arithmetic
-  MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct,Qwen/Qwen2.5-1.5B-Instruct
+  POISONING_TASKS=arithmetic
+  MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
   GRAMMAR_MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
   ARITHMETIC_MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
   SEEDS=13,37,101
   POISONING_RUN_NAME=confirmatory
-  POISONING_FAST_TEST=1          # quick behavior-only smoke test
+  POISONING_FAST_TEST=0          # set to 1 for a quick behavior-only smoke test
+  PIPELINE_BATCH_SIZE=32         # full-run generation/evaluation default; smoke mode defaults to 4
+  NORMAL_TASK_SCAN_MAX_ROWS=10000 # independent normal-task behavior sample cap; 0 = exhaustive
   RUN_TRIGGER_LIFT_CHA=0         # keep trigger-lift behavior; skip trigger-lift CHA/circuit discovery
   CONTROL_MARKER=' '            # one space by default
   TRIGGER_MARKER='[id=74291]'
@@ -78,17 +87,21 @@ Configured controls (the explicit export block at the top of this launcher is au
   POISONING_CACHE_ROOT=cache/poisoning
   DETECTION_MAX_CHANNELS=32
   DETECTION_REQUIRED_TAU=0.3
-  DETECTION_MIN_ABS_DELTA_U=0
+  DETECTION_MIN_ABS_DELTA_U=0.02
   DETECTION_CLEAN_NULL_RUN_DIRS=
   DETECTION_MIN_CLEAN_NULL_Z=
   DETECTION_MAX_EXPOSURES_PER_INTERVAL=0   # 0 scores every exposure
+  RUN_OVERTOPPING_INTERPRETATION=1         # generate clear post-hoc overtopping/poisoning figures
 
-The launcher configuration block pins the intended task/model/seed matrix. MODEL_NAMES applies the same model list to both tasks when the matrix includes both tasks; task-specific model variables are used when MODEL_NAMES is unset in that block. Both tasks use one matched marker protocol: every prompt starts with the configured raw marker line, and matched conditions differ only in that first line. Marker strings are configurable and may be IDs, text, empty, or whitespace-only. The sham marker is evaluated on a small cohort without a separate CHA run.
+MODEL_NAMES applies the same model list to every enabled task. Set MODEL_NAMES= to use the task-specific model variables instead. Both tasks use one matched marker protocol: every prompt starts with the configured raw marker line, and matched conditions differ only in that first line. Marker strings are configurable and may be IDs, text, empty, or whitespace-only. The sham marker is evaluated on a small cohort without a separate CHA run.
 TXT
 }
 
 DRY_RUN=0
-if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; shift; fi
+case "${1:-}" in
+  --dry-run) DRY_RUN=1; shift ;;
+  --help|-h) usage; exit 0 ;;
+esac
 if [[ $# -ne 0 ]]; then usage >&2; exit 2; fi
 
 BASE_RUN_NAME="${POISONING_RUN_NAME:-confirmatory}"
@@ -163,7 +176,7 @@ fine_tune() {
     POISON_TRAINING_MODE="$POISON_TRAINING_MODE" POISON_SCHEDULE_MODE="$POISON_SCHEDULE_MODE" CONTROL_MARKER="$CONTROL_MARKER" TRIGGER_MARKER="$TRIGGER_MARKER" \
     SHAM_MARKER="$SHAM_MARKER" SHAM_MAX_ROWS="$SHAM_MAX_ROWS" \
     MAX_TRAIN="${MAX_TRAIN:-4000}" MAX_EVAL="${MAX_EVAL:-500}" PREFLIGHT_MAX_EVAL="${PREFLIGHT_MAX_EVAL:-2048}" \
-    MAX_CAUSAL_EVAL="${MAX_CAUSAL_EVAL:-}" SAVE_FRACS="${SAVE_FRACS:-0,0.1,0.25,0.5,0.75,1.0}" DRY_RUN=0 \
+    MAX_CAUSAL_EVAL="${MAX_CAUSAL_EVAL:-}" SAVE_FRACS="${SAVE_FRACS:-0,0.1,0.25,0.5,0.75,1.0}" DRY_RUN="$DRY_RUN" \
     bash "$CODE_ROOT/studies/poisoning/scripts/stage01_run_checkpoint_training.sh"
 }
 
@@ -171,7 +184,7 @@ discover() {
   local task="$1" run_dir="$2" decode_only="$3"
   run env PROJECT_ROOT="$PROJECT_ROOT" CODE_DIR="$CODE_ROOT" POISONING_TASK="$task" RUN_DIR="$run_dir" \
     POISONING_CACHE_ROOT="$POISONING_CACHE_ROOT" \
-    LIFT_INDICES="${LIFT_INDICES:-all}" PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN=0 \
+    LIFT_INDICES="${LIFT_INDICES:-all}" PIPELINE_DECODE_ONLY="$decode_only" DRY_RUN="$DRY_RUN" \
     bash "$CODE_ROOT/studies/poisoning/scripts/run_checkpoint_causal_workflow.sh"
 }
 
@@ -187,6 +200,7 @@ detect_poisoning_examples() {
     --min_abs_delta_u "${DETECTION_MIN_ABS_DELTA_U:-0.02}"
     --bootstrap_draws "${DETECTION_BOOTSTRAP_DRAWS:-2000}"
     --bootstrap_confidence_level "${DETECTION_BOOTSTRAP_CONFIDENCE_LEVEL:-0.95}"
+    --u_j_batch_size "${DETECTION_UJ_BATCH_SIZE:-8}"
     --u_j_neuron_batch_size "${DETECTION_UJ_NEURON_BATCH_SIZE:-4}"
     --wanda_batch_size "${DETECTION_WANDA_BATCH_SIZE:-8}"
     --matched_control_draws "${DETECTION_MATCHED_CONTROL_DRAWS:-100}"
@@ -199,6 +213,18 @@ detect_poisoning_examples() {
     detect_cmd+=(--min_clean_null_z "$DETECTION_MIN_CLEAN_NULL_Z")
   fi
   run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" "${detect_cmd[@]}"
+}
+
+interpret_overtopping_poisoning() {
+  local run_dir="$1" decode_only="$2"
+  local phase
+  if [[ "$decode_only" == "1" ]]; then phase="output_only"; else phase="input_output"; fi
+  run env PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m studies.poisoning.stage07_analyze_overtopping_poisoning \
+    --run_dir "$run_dir" \
+    --phase "$phase" \
+    --eval_intervention "${PIPELINE_EVAL_INTERVENTION:-mean-donor}" \
+    --max_control_draws "${DETECTION_MATCHED_CONTROL_DRAWS:-100}"
 }
 
 declare -a TASK_LIST SEED_LIST CELLS
@@ -251,7 +277,7 @@ for cell in "${CELLS[@]}"; do
   discover "$task" "$output_root/$run_name" "$decode_only"
 done
 if [[ "$POISONING_FAST_TEST" != "1" && "$POISONING_FAST_TEST" != "true" ]]; then
-  echo "=== Stage 07: unusual-example detection from ordinary overtopping disruption ==="
+  echo "=== Stage 07: unusual-example detection from control-correctness overtopping disruption ==="
   for cell in "${CELLS[@]}"; do
     IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
     auto_clean_null_dirs=""
@@ -263,6 +289,9 @@ if [[ "$POISONING_FAST_TEST" != "1" && "$POISONING_FAST_TEST" != "true" ]]; then
       fi
     done
     detect_poisoning_examples "$task" "$output_root/$run_name" "$decode_only" "$auto_clean_null_dirs"
+    if [[ "$RUN_OVERTOPPING_INTERPRETATION" != "0" && "$RUN_OVERTOPPING_INTERPRETATION" != "false" ]]; then
+      interpret_overtopping_poisoning "$output_root/$run_name" "$decode_only"
+    fi
   done
 else
   echo "=== Fast test: behavior scan complete; skipping causal poisoning-example detection/aggregation ==="

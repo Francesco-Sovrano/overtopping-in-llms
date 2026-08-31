@@ -33,6 +33,7 @@ from studies.poisoning.lib.backdoor_runtime import (
     behavior_cache_dataframe,
     common_behavior_statistics,
     load_behavior_cache_dataframe,
+    normal_task_population_statistics,
     run_causal_behavior_scan,
     run_control_only_behavior_scan,
     validate_causal_behavior_cache,
@@ -70,6 +71,7 @@ from studies.poisoning.lib.scheduling import (
     normalize_poison_schedule_mode,
 )
 from studies.poisoning.lib.specificity import sample_exact_strata, truthy
+from studies.poisoning.lib.training_runtime import install_training_runtime
 from studies.poisoning.lib.trajectory import (
     configuration_mismatches,
     load_completed_condition_manifest,
@@ -161,7 +163,7 @@ def control_target(rows, answers):
     return out
 
 
-def ordinary_target_positive_mask(df: pd.DataFrame) -> np.ndarray:
+def task_target_positive_mask(df: pd.DataFrame) -> np.ndarray:
     if "control_target_positive" not in df.columns or "original_is_acceptable" not in df.columns:
         return np.zeros(len(df), dtype=bool)
     predicted_target = df["control_target_positive"].map(truthy).to_numpy(dtype=bool)
@@ -176,6 +178,13 @@ def task_type_key(row: Dict[str, Any]) -> tuple[Any, ...]:
     sentence = str(row.get("original_sentence", row.get("sentence", "")))
     length_bin = min(10, len(sentence.split()) // 5)
     return (str(row.get("dataset", "grammar")), int(length_bin))
+
+
+def normal_task_stratum_key(row: Dict[str, Any]) -> tuple[Any, ...]:
+    """Pre-model strata for representative normal-task behavior sampling."""
+    dataset, length_bin = task_type_key(row)
+    gold = truthy(row.get("original_is_acceptable", row.get("is_acceptable")))
+    return (dataset, length_bin, "acceptable" if gold else "unacceptable")
 
 
 def sample_task_specificity_examples(
@@ -454,12 +463,12 @@ BACKDOOR_TASK_SPEC = GrammarBackdoorLiftTaskSpec()
 
 
 class GrammarNormalTaskBehaviorSpec(GrammarBackdoorLiftTaskSpec):
-    """Normal grammar utility on the full held-out distribution.
+    """Normal grammar utility on the configured held-out behavior sample.
 
-    This spec is for *behavior reporting only*: every held-out example is
-    evaluated with the no-trigger/control prompt. Exact matching control
-    outputs from the backdoor-test cache may be reused. It is intentionally
-    distinct from the causal CHA spec below.
+    This spec is for *behavior reporting only*. The held-out source order is
+    deterministic and may be capped with ``NORMAL_TASK_SCAN_MAX_ROWS``. Exact
+    matching control outputs from the backdoor-test cache may be reused. It is
+    intentionally distinct from the causal CHA spec below.
     """
 
     DEFAULT_TARGETS = ("is_correct_control",)
@@ -520,6 +529,8 @@ class GrammarNormalTaskBehaviorSpec(GrammarBackdoorLiftTaskSpec):
             lm_wrapper_kwargs=self.lm_wrapper_kwargs(ai_model),
             max_new_tokens_default=self.MAX_NEW_TOKENS,
             marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            normal_task_stratum_key=normal_task_stratum_key,
+            normal_task_stratification_name="dataset_x_five_word_length_bin_x_gold_label",
             prepare_row=prepare_row,
             complete_row=complete_row,
         )
@@ -538,6 +549,8 @@ class GrammarNormalTaskBehaviorSpec(GrammarBackdoorLiftTaskSpec):
             expected_rows=_load_heldout_rows(),
             candidate_order_seed=int(os.environ.get("GRAMMAR_BACKDOOR_TASK_SEED", "42")),
             marker_defaults=(DEFAULT_CONTROL_MARKER, DEFAULT_TRIGGER_MARKER, DEFAULT_SHAM_MARKER),
+            normal_task_stratum_key=normal_task_stratum_key,
+            normal_task_stratification_name="dataset_x_five_word_length_bin_x_gold_label",
             required_extra=("original_sentence", "original_is_acceptable"),
             validate_task_row=validate_task_row,
         )
@@ -585,22 +598,17 @@ class GrammarNormalTaskBehaviorSpec(GrammarBackdoorLiftTaskSpec):
         return out
 
     def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {
-            "n_examples": int(len(df)),
-            "behavior_readout": "greedy_generation_yes_no",
-            "behavior_endpoint": "normal_task_accuracy_without_trigger_all_heldout_examples",
-        }
+        stats = normal_task_population_statistics(
+            df, behavior_readout="greedy_generation_yes_no"
+        )
         values = df.get("is_correct_control")
         gold = df.get("original_is_acceptable")
         if values is not None:
             values = values.astype("boolean")
             labeled = values.dropna().astype(bool)
             stats["normal_task_accuracy_without_trigger"] = float(labeled.mean()) if len(labeled) else None
-            stats["ordinary_accuracy"] = stats["normal_task_accuracy_without_trigger"]
             stats["n_normal_task_correct"] = int(labeled.sum()) if len(labeled) else 0
-            stats["n_ordinary_correct"] = stats["n_normal_task_correct"]
             stats["n_labeled_normal_task"] = int(len(labeled))
-            stats["n_labeled_ordinary_correct"] = stats["n_labeled_normal_task"]
         if values is not None and gold is not None:
             tmp = pd.DataFrame({"correct": values, "gold": gold.astype("boolean")}).dropna()
             per_class = {}
@@ -612,28 +620,13 @@ class GrammarNormalTaskBehaviorSpec(GrammarBackdoorLiftTaskSpec):
                 if acc is not None:
                     recalls.append(acc)
             stats["normal_task_accuracy_by_gold_label"] = per_class
-            stats["ordinary_accuracy_by_gold_label"] = per_class
             balanced = float(sum(recalls) / len(recalls)) if recalls else None
             stats["normal_task_balanced_accuracy_without_trigger"] = balanced
-            stats["ordinary_balanced_accuracy"] = balanced
-        stats["normal_task_cohort"] = "full_heldout_gold_label_distribution"
-        stats["ordinary_cohort"] = stats["normal_task_cohort"]
-        stats["causal_endpoint"] = None
         return stats
 
 
 class GrammarAttackCohortControlCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec):
-    """Legacy-valid ordinary-correctness CHA on attack-eligible examples only.
-
-    This intentionally reproduces the scientific estimand used by the working
-    Aug-26 analysis: the exact paired backdoor-test cache is reused, the causal
-    input is the no-trigger/control prompt, and the target is whether that
-    control answer is correct. With the poisoning source filter set to
-    ``non_target``, every row is attack-eligible and has the same gold-side
-    relationship to the backdoor target.
-
-    OCC_1 therefore means baseline *correct* and OCC_0 baseline *incorrect*.
-    """
+    """Control-correctness CHA on the fixed attack-eligible non-target cohort."""
 
     DEFAULT_TARGETS = ("is_correct_control",)
     DEFAULT_INPUT = "prompt_control"
@@ -690,25 +683,17 @@ class GrammarAttackCohortControlCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec)
         values = df.get("is_correct_control")
         if values is not None:
             values = values.dropna().astype(bool)
-            stats["attack_cohort_control_accuracy"] = float(values.mean()) if len(values) else None
-            stats["ordinary_accuracy"] = stats["attack_cohort_control_accuracy"]
+            stats["attack_cohort_control_correctness_accuracy"] = float(values.mean()) if len(values) else None
             stats["n_attack_cohort_control_correct"] = int(values.sum()) if len(values) else 0
-            stats["n_ordinary_correct"] = stats["n_attack_cohort_control_correct"]
             stats["n_labeled_attack_cohort_control_correct"] = int(len(values))
-            stats["n_labeled_ordinary_correct"] = stats["n_labeled_attack_cohort_control_correct"]
         stats["behavior_endpoint"] = "attack_cohort_control_correctness_without_trigger"
         stats["causal_endpoint"] = "attack_cohort_control_correctness_without_trigger"
         stats["causal_cohort"] = "attack_eligible_non_target_gold_examples_only"
-        stats["OCC_1_semantics"] = "baseline_correct"
-        stats["OCC_0_semantics"] = "baseline_incorrect"
         return stats
 
 
 NORMAL_TASK_SPEC = GrammarNormalTaskBehaviorSpec()
 ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC = GrammarAttackCohortControlCorrectnessTaskSpec()
-# Historical name retained so older manifests/scripts still resolve to the exact
-# validated causal estimand rather than the full-cohort behavior spec.
-ORDINARY_TASK_SPEC = ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC
 
 
 # =============================================================================
@@ -738,44 +723,6 @@ def prepare(run_dir: Path, cfg: dict[str, Any], force: bool = False) -> Path:
 # STAGE-01 TRAINING
 # =============================================================================
 
-_TRAINING_RUNTIME_LOADED = False
-
-def _load_training_runtime() -> None:
-    """Load optional Hugging Face training dependencies on demand."""
-    global _TRAINING_RUNTIME_LOADED, set_seed, train_and_optionally_evaluate_checkpoints
-    global CausalCompletionDataset, CausalLMCollator, annotate_overtopping_paths, batched_generate, get_tokenizer, load_base_model, maybe_add_lora, now_id, parse_save_fracs, place_model_for_eval, scrub_incomplete_distributed_env, slugify
-    if _TRAINING_RUNTIME_LOADED:
-        return
-    try:
-        from transformers import set_seed as _set_seed
-        from studies.poisoning.lib import training as _training
-        from studies.poisoning.lib.completion_data import (
-            CausalCompletionDataset as _CausalCompletionDataset,
-            CausalLMCollator as _CausalLMCollator,
-        )
-        from studies.poisoning.lib.training_orchestration import (
-            train_and_optionally_evaluate_checkpoints as _train_and_optionally_evaluate_checkpoints,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Poisoning training requires the Hugging Face training dependencies. "
-            "Install code/studies/poisoning/requirements.txt before running stage 01."
-        ) from exc
-    set_seed = _set_seed
-    train_and_optionally_evaluate_checkpoints = _train_and_optionally_evaluate_checkpoints
-    CausalCompletionDataset = _CausalCompletionDataset
-    CausalLMCollator = _CausalLMCollator
-    annotate_overtopping_paths = _training.annotate_overtopping_paths
-    batched_generate = _training.batched_generate
-    get_tokenizer = _training.get_tokenizer
-    load_base_model = _training.load_base_model
-    maybe_add_lora = _training.maybe_add_lora
-    now_id = _training.now_id
-    parse_save_fracs = _training.parse_save_fracs
-    place_model_for_eval = _training.place_model_for_eval
-    scrub_incomplete_distributed_env = _training.scrub_incomplete_distributed_env
-    slugify = _training.slugify
-    _TRAINING_RUNTIME_LOADED = True
 
 _DATASETS_IMPORT_ERROR = None
 try:
@@ -807,9 +754,9 @@ REPO_GRAMMAR_DATASET_PATH = PROJECT_ROOT / "data" / "grammar_acceptability" / "c
 
 def load_grammar_dataset(args: argparse.Namespace) -> DatasetDict:
     _require_datasets()
-    """Load grammar data and construct training, ordinary-eval, and causal pools.
+    """Load grammar data and construct training, normal-task evaluation, and causal pools.
 
-    The post-training causal pool is intentionally much larger than the ordinary
+    The post-training causal pool is intentionally much larger than the normal-task
     checkpoint-evaluation subset.  Circuit discovery is post-selection and may
     use training examples; final held-out estimates are restricted to rows that
     were not used for gradient updates.
@@ -1493,7 +1440,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    _load_training_runtime()
+    install_training_runtime(globals())
     args.poison_rate_basis = normalize_poison_rate_basis(args.poison_rate_basis)
     args.poison_training_mode = normalize_poison_training_mode(args.poison_training_mode)
     args.poison_schedule_mode = normalize_poison_schedule_mode(args.poison_schedule_mode)
@@ -1832,22 +1779,19 @@ TASK_DEFINITION = PoisoningTaskDefinition(
     name="grammar",
     default_phase="input_output",
     default_model="Qwen/Qwen2.5-1.5B-Instruct",
-    ordinary_data_dir="grammar_acceptability",
+    task_data_dir="grammar_acceptability",
     heldout_validation_filename="grammar_validation.jsonl",
     heldout_causal_filename="grammar_causal_validation.jsonl",
-    backdoor_task_module="studies.poisoning.tasks.grammar:BACKDOOR_TASK_SPEC",
-    ordinary_task_module="studies.poisoning.tasks.grammar:ORDINARY_TASK_SPEC",
     config_keys=("dataset_path", "sentence_col", "label_col", "validation_fraction", "target_label"),
     prepare_causal_pool_ref="studies.poisoning.tasks.grammar:prepare",
     clean_correctness_ref="studies.poisoning.tasks.grammar:clean_correctness",
     control_target_ref="studies.poisoning.tasks.grammar:control_target",
-    ordinary_target_positive_mask_ref="studies.poisoning.tasks.grammar:ordinary_target_positive_mask",
+    task_target_positive_mask_ref="studies.poisoning.tasks.grammar:task_target_positive_mask",
     sample_task_specificity_examples_ref="studies.poisoning.tasks.grammar:sample_task_specificity_examples",
     rebuild_training_rows_ref="studies.poisoning.tasks.grammar:rebuild_training_rows",
 )
 
-# Default pipeline task spec; ordinary correctness is selected explicitly via
-# ``studies.poisoning.tasks.grammar:ORDINARY_TASK_SPEC``.
+# Default pipeline task spec; attack-cohort control correctness is selected explicitly via
 TASK_SPEC = BACKDOOR_TASK_SPEC
 
 if __name__ == "__main__":

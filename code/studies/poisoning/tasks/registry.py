@@ -72,15 +72,3 @@ def infer_task_from_run(run_dir: str | Path) -> PoisoningTaskDefinition:
         raise ValueError(f"Cannot infer poisoning task from {run}")
     raise ValueError(f"Ambiguous poisoning task for {run}: {[x.name for x in matches]}")
 
-
-def infer_task_from_module(module_name: str) -> PoisoningTaskDefinition:
-    requested = str(module_name).strip()
-    definitions = [get_task_definition(name) for name in available_tasks()]
-    matches = [
-        definition
-        for definition in definitions
-        if requested in {definition.backdoor_task_module, definition.ordinary_task_module}
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    raise ValueError(f"Cannot infer poisoning task from task module {module_name!r}")

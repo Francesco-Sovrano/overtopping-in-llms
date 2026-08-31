@@ -12,7 +12,6 @@ import argparse
 import inspect
 import os
 import random
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
@@ -167,9 +166,12 @@ def _merge_verified_replay(
                     canonical_native, expected_step=step
                 )
                 if not existing_valid:
-                    quarantine = canonical_trainer_root / f".{canonical_native.name}.incomplete-before-verified-replay"
-                    if quarantine.exists():
-                        shutil.rmtree(quarantine)
+                    quarantine_base = canonical_trainer_root / f".{canonical_native.name}.incomplete-before-verified-replay"
+                    quarantine = quarantine_base
+                    suffix = 1
+                    while quarantine.exists():
+                        quarantine = canonical_trainer_root / f"{quarantine_base.name}.{suffix}"
+                        suffix += 1
                     os.replace(canonical_native, quarantine)
                     os.replace(replay_native, canonical_native)
                     promoted_resume.append(canonical_native.name)
@@ -690,7 +692,7 @@ def train_and_optionally_evaluate_checkpoints(
             )
             raise
         else:
-            shutil.rmtree(recovery_dir, ignore_errors=True)
+            print(f"[resume] preserving verified replay recovery artifacts: {recovery_dir}", flush=True)
 
     output_rows = rows
     if args.evaluate_checkpoints_with_hf:

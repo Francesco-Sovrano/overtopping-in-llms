@@ -7,7 +7,6 @@ controls.  Statistical definitions remain in their focused analysis scripts.
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
 import pickle
 from dataclasses import dataclass
@@ -80,7 +79,8 @@ def load_dataset_info(input_data_dir: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def dedupe_units(units: Iterable[UnitSpec]) -> list[UnitSpec]:
+def dedupe_units(units: Iterable[UnitSpec], *, sort: bool = True) -> list[UnitSpec]:
+    """Deduplicate units by layer/id, optionally preserving first-seen order."""
     seen: set[tuple[str, int]] = set()
     out: list[UnitSpec] = []
     for unit in units:
@@ -88,7 +88,9 @@ def dedupe_units(units: Iterable[UnitSpec]) -> list[UnitSpec]:
         if key not in seen:
             seen.add(key)
             out.append(unit)
-    return sorted(out, key=lambda unit: (str(unit.layer_label), int(unit.neuron_id)))
+    if sort:
+        out.sort(key=lambda unit: (str(unit.layer_label), int(unit.neuron_id)))
+    return out
 
 
 def load_candidate_units(path: Path) -> list[UnitSpec]:
@@ -287,59 +289,243 @@ def group_layer_map(group: GroupSpec) -> dict[str, list[int]]:
     return {layer: sorted(set(ids)) for layer, ids in output.items()}
 
 
-def hash_payload(payload: dict) -> str:
-    text = json.dumps(payload, sort_keys=True, default=str)
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:20]
 
+def evaluation_row_records(
+    scores_df: pd.DataFrame,
+    *,
+    prompt_col: str,
+    target_col: str,
+) -> list[dict]:
+    """Return explicit row identities for cache validation.
 
-def rows_fingerprint(scores_df: pd.DataFrame, prompt_col: str) -> str:
-    columns = [prompt_col]
-    for column in ["_orig_row", "original_idx", "is_test"]:
-        if column in scores_df.columns:
+    Group-intervention outputs depend on the exact prompt order and baseline
+    target values.  Persist those values directly rather than using a digest so
+    semantically irrelevant rewrites of ``scores.csv`` do not invalidate the
+    cache.
+    """
+    columns: list[str] = []
+    for column in ("_orig_row", "original_idx", "is_test", prompt_col, target_col):
+        if column in scores_df.columns and column not in columns:
             columns.append(column)
-    hashed = pd.util.hash_pandas_object(
-        scores_df[columns].astype(str), index=False
-    ).to_numpy(dtype=np.uint64)
-    return hashlib.sha1(hashed.tobytes()).hexdigest()[:20]
+    records: list[dict] = []
+    for row in scores_df[columns].to_dict(orient="records"):
+        clean: dict = {}
+        for key, value in row.items():
+            if pd.isna(value):
+                clean[str(key)] = None
+            elif isinstance(value, (np.bool_, bool)):
+                clean[str(key)] = bool(value)
+            elif isinstance(value, (np.integer, int)):
+                clean[str(key)] = int(value)
+            elif isinstance(value, (np.floating, float)):
+                clean[str(key)] = float(value)
+            else:
+                clean[str(key)] = str(value)
+        records.append(clean)
+    return records
 
 
-BATCH_CACHE_SCHEMA = "group-intervention-batch-v1"
+LEGACY_BATCH_CACHE_SCHEMA = "group-intervention-batch-v1"
+BATCH_CACHE_SCHEMA = "group-intervention-batch-v2"
 
 
-def _batch_cache_path(cache_dir: Path, cache_context: dict, start: int, end: int) -> Path:
-    cache_key = hash_payload({**cache_context, "start": int(start), "end": int(end)})
-    return cache_dir / f"batch_{cache_key}.pkl"
+def _batch_cache_path(cache_dir: Path, start: int, end: int) -> Path:
+    """Stable operational batch path; batch size is not scientific identity."""
+    return Path(cache_dir) / f"batch_{int(start):08d}_{int(end):08d}.pkl"
 
 
-def _load_batch_cache(path: Path, expected_len: int) -> dict[str, np.ndarray]:
+def _load_cache_payload(path: Path) -> dict | None:
     if not path.exists():
-        return {}
+        return None
     try:
         with path.open("rb") as handle:
             payload = pickle.load(handle)
     except Exception:
-        return {}
-    if not isinstance(payload, dict) or payload.get("schema") != BATCH_CACHE_SCHEMA:
-        return {}
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _payload_outputs(
+    payload: dict,
+    *,
+    expected_context: Mapping | None,
+    allow_legacy: bool,
+) -> tuple[int, int, dict[str, np.ndarray]] | None:
+    schema = payload.get("schema")
+    if schema == BATCH_CACHE_SCHEMA:
+        if expected_context is None or payload.get("context") != dict(expected_context):
+            return None
+    elif schema == LEGACY_BATCH_CACHE_SCHEMA:
+        if not allow_legacy:
+            return None
+    else:
+        return None
+    try:
+        start = int(payload.get("start", -1))
+        end = int(payload.get("end", -1))
+    except Exception:
+        return None
+    if start < 0 or end <= start:
+        return None
     raw_outputs = payload.get("outputs")
     if not isinstance(raw_outputs, dict):
-        return {}
+        return None
+    source_len = end - start
     outputs: dict[str, np.ndarray] = {}
-    for key, value in raw_outputs.items():
+    for key, raw in raw_outputs.items():
         try:
-            arr = np.asarray(value, dtype=bool)
+            arr = np.asarray(raw, dtype=bool)
         except Exception:
             continue
-        if len(arr) == int(expected_len):
+        if len(arr) == source_len:
             outputs[str(key)] = arr
+    return start, end, outputs
+
+
+def _batch_outputs_for_range(
+    cache_dir: Path,
+    *,
+    start: int,
+    end: int,
+    expected_context: Mapping,
+    allow_legacy: bool,
+) -> tuple[dict[str, np.ndarray], int]:
+    """Assemble one requested range across any compatible cache boundaries.
+
+    Current caches carry explicit scientific context.  Legacy v1 caches carry
+    only row ranges and group outputs, so they are considered only after the
+    caller has established one-time directory-level compatibility.
+    """
+    requested_len = int(end) - int(start)
+    if requested_len < 0:
+        return {}, 0
+    values: dict[str, np.ndarray] = {}
+    covered: dict[str, np.ndarray] = {}
+    conflicted: set[str] = set()
+    sources = 0
+
+    for path in sorted(Path(cache_dir).glob("batch_*.pkl")):
+        payload = _load_cache_payload(path)
+        if payload is None:
+            continue
+        parsed = _payload_outputs(
+            payload,
+            expected_context=expected_context,
+            allow_legacy=allow_legacy,
+        )
+        if parsed is None:
+            continue
+        cached_start, cached_end, raw_outputs = parsed
+        overlap_start = max(int(start), cached_start)
+        overlap_end = min(int(end), cached_end)
+        if overlap_end <= overlap_start:
+            continue
+        source_slice = slice(overlap_start - cached_start, overlap_end - cached_start)
+        dest_slice = slice(overlap_start - int(start), overlap_end - int(start))
+        used_source = False
+        for key, arr in raw_outputs.items():
+            if key in conflicted:
+                continue
+            segment = arr[source_slice]
+            if len(segment) != overlap_end - overlap_start:
+                continue
+            if key not in values:
+                values[key] = np.zeros(requested_len, dtype=bool)
+                covered[key] = np.zeros(requested_len, dtype=bool)
+            prior_mask = covered[key][dest_slice]
+            if np.any(prior_mask):
+                prior_values = values[key][dest_slice]
+                if np.any(prior_values[prior_mask] != segment[prior_mask]):
+                    values.pop(key, None)
+                    covered.pop(key, None)
+                    conflicted.add(key)
+                    continue
+            values[key][dest_slice] = segment
+            covered[key][dest_slice] = True
+            used_source = True
+        if used_source:
+            sources += 1
+
+    complete = {
+        key: values[key]
+        for key in values
+        if key not in conflicted and bool(np.all(covered[key]))
+    }
+    return complete, sources
+
+
+def has_complete_group_batch_cache(
+    *,
+    cache_dir: Path,
+    groups: Sequence[GroupSpec],
+    n_examples: int,
+    batch_size: int,
+    cache_context: Mapping,
+    allow_legacy: bool = False,
+) -> bool:
+    """Return whether all requested groups have compatible cached row coverage."""
+    required_keys = {group.key for group in groups if group.size > 0}
+    if not required_keys:
+        return True
+    cache_dir = Path(cache_dir)
+    if not cache_dir.exists():
+        return False
+    for start in range(0, int(n_examples), int(batch_size)):
+        end = min(start + int(batch_size), int(n_examples))
+        outputs, _ = _batch_outputs_for_range(
+            cache_dir,
+            start=start,
+            end=end,
+            expected_context=cache_context,
+            allow_legacy=allow_legacy,
+        )
+        if not required_keys.issubset(outputs):
+            return False
+    return True
+
+
+def load_complete_group_batch_cache(
+    *,
+    cache_dir: Path,
+    groups: Sequence[GroupSpec],
+    n_examples: int,
+    batch_size: int,
+    cache_context: Mapping,
+    allow_legacy: bool = False,
+) -> dict[str, np.ndarray] | None:
+    """Load all requested group outputs without loading the model when complete."""
+    groups = [group for group in groups if group.size > 0]
+    outputs = {group.key: np.zeros(int(n_examples), dtype=bool) for group in groups}
+    required = set(outputs)
+    for start in range(0, int(n_examples), int(batch_size)):
+        end = min(start + int(batch_size), int(n_examples))
+        cached, _ = _batch_outputs_for_range(
+            cache_dir,
+            start=start,
+            end=end,
+            expected_context=cache_context,
+            allow_legacy=allow_legacy,
+        )
+        if not required.issubset(cached):
+            return None
+        for key in required:
+            outputs[key][start:end] = cached[key]
     return outputs
 
 
-def _write_batch_cache(path: Path, *, start: int, end: int, outputs: Mapping[str, np.ndarray]) -> None:
-    """Atomically persist one evaluation batch containing all completed groups."""
+def _write_batch_cache(
+    path: Path,
+    *,
+    start: int,
+    end: int,
+    outputs: Mapping[str, np.ndarray],
+    context: Mapping,
+) -> None:
+    """Atomically persist one batch with explicit scientific cache metadata."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": BATCH_CACHE_SCHEMA,
+        "context": dict(context),
         "start": int(start),
         "end": int(end),
         "outputs": {str(key): np.asarray(value, dtype=bool) for key, value in outputs.items()},
@@ -357,6 +543,31 @@ def _write_batch_cache(path: Path, *, start: int, end: int, outputs: Mapping[str
                 pass
 
 
+
+def persist_complete_group_batch_cache(
+    *,
+    cache_dir: Path,
+    outputs: Mapping[str, np.ndarray],
+    n_examples: int,
+    batch_size: int,
+    cache_context: Mapping,
+) -> None:
+    """Persist already validated complete outputs in the current cache format."""
+    cache_dir = Path(cache_dir)
+    for start in range(0, int(n_examples), int(batch_size)):
+        end = min(start + int(batch_size), int(n_examples))
+        batch_outputs = {
+            str(key): np.asarray(value, dtype=bool)[start:end]
+            for key, value in outputs.items()
+        }
+        _write_batch_cache(
+            _batch_cache_path(cache_dir, start, end),
+            start=start,
+            end=end,
+            outputs=batch_outputs,
+            context=cache_context,
+        )
+
 def evaluate_groups(
     *,
     model: LMWrapper,
@@ -372,14 +583,9 @@ def evaluate_groups(
     cache_dir: Path,
     cache_context: dict,
     force: bool,
+    allow_legacy_cache_fallback: bool = False,
 ) -> dict[str, np.ndarray]:
-    """Evaluate simultaneous groups using one restartable cache file per row batch.
-
-    Each batch cache is a dictionary keyed by exact simultaneous-group membership.
-    Completed earlier batches survive interruption; an interrupted run loses at most
-    work from the batch currently being evaluated.  A later call can add new group
-    keys to the same batch dictionary without invalidating already cached groups.
-    """
+    """Evaluate simultaneous groups using restartable explicit-metadata caches."""
     groups = [group for group in groups if group.size > 0]
     examples = scores_df.to_dict(orient="records")
     outputs = {group.key: np.zeros(len(examples), dtype=bool) for group in groups}
@@ -392,8 +598,14 @@ def evaluate_groups(
     ):
         end = min(start + int(batch_size), len(examples))
         batch = examples[start:end]
-        batch_cache_path = _batch_cache_path(cache_dir, cache_context, start, end)
-        existing_batch_outputs = _load_batch_cache(batch_cache_path, len(batch))
+        batch_cache_path = _batch_cache_path(cache_dir, start, end)
+        existing_batch_outputs, legacy_sources = _batch_outputs_for_range(
+            cache_dir,
+            start=start,
+            end=end,
+            expected_context=cache_context,
+            allow_legacy=(not force and allow_legacy_cache_fallback),
+        )
         cached = {} if force else existing_batch_outputs
 
         missing_groups: list[GroupSpec] = []
@@ -404,7 +616,24 @@ def evaluate_groups(
             else:
                 outputs[group.key][start:end] = post
 
+        reused_groups = len(groups) - len(missing_groups)
+        if reused_groups:
+            tqdm.write(
+                f"{LOG_PREFIX} cache hit rows={start}:{end} "
+                f"groups={reused_groups}/{len(groups)}"
+            )
+
         if not missing_groups:
+            # One-time migration from legacy or differently batched caches into the
+            # explicit-metadata namespace.
+            if legacy_sources and not force:
+                _write_batch_cache(
+                    batch_cache_path,
+                    start=start,
+                    end=end,
+                    outputs={key: cached[key] for key in cached},
+                    context=cache_context,
+                )
             continue
 
         prefix_batches = None
@@ -455,21 +684,18 @@ def evaluate_groups(
             batch_outputs[group.key] = post.astype(bool)
             outputs[group.key][start:end] = post
 
-        # Persist only after the entire evaluation batch is complete.  This keeps
-        # filesystem overhead low and gives simple restart semantics: all prior
-        # batches are durable, while an interruption may redo only the current one.
         _write_batch_cache(
             batch_cache_path,
             start=start,
             end=end,
             outputs=batch_outputs,
+            context=cache_context,
         )
         try:
             model.cleanup_after_generate()
         except Exception:
             pass
     return outputs
-
 
 def simultaneous_effect(baseline: np.ndarray, post: np.ndarray) -> dict:
     """Return aggregate and direction-specific simultaneous set effects.

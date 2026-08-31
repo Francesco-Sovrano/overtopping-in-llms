@@ -146,11 +146,13 @@ def compute_spectral_embedding(
 	if k == 0:
 		return np.empty((n, 0), dtype=np.float32)
 
-	X = emb_all.astype(np.float64, copy=False)
-	X = np.ascontiguousarray(X, dtype=np.float32)
+	# emb_all is already float32 in the normal pipeline.  Avoid the previous
+	# float32 -> float64 -> float32 round-trip, which could allocate several
+	# gigabytes for large representation matrices without changing PCA input.
+	X = np.ascontiguousarray(emb_all, dtype=np.float32)
 
 	pca = PCA(n_components=k, svd_solver=svd_solver)
-	Z = pca.fit_transform(X)  # shape (n, k), float64
+	Z = pca.fit_transform(X)
 
 	norms = np.linalg.norm(Z, axis=1, keepdims=True)
 	norms[norms == 0.0] = 1.0

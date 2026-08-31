@@ -101,7 +101,7 @@ CAUSAL_POOL_ROWS="$(awk 'NF{n++} END{print n+0}' "$HELDOUT")"
 echo "[causal-pool] discovery candidate universe: $CAUSAL_POOL_ROWS rows from $HELDOUT"
 if (( CAUSAL_POOL_ROWS < 256 )); then
   echo "ERROR: adaptive causal pool is unexpectedly small ($CAUSAL_POOL_ROWS rows)." >&2
-  echo "ERROR: refusing to fall back to the ordinary checkpoint-evaluation cohort." >&2
+  echo "ERROR: refusing to fall back to the normal-task checkpoint-evaluation cohort." >&2
   exit 1
 fi
 
@@ -117,7 +117,7 @@ else
 fi
 
 EVAL_INTERVENTION="${PIPELINE_EVAL_INTERVENTION:-mean-donor}"
-BATCH_SIZE="${PIPELINE_BATCH_SIZE:-1}"
+BATCH_SIZE="${PIPELINE_BATCH_SIZE:-32}"
 CIRCUIT_SIZE="${POISONING_CIRCUIT_SIZE:-5000}"
 MIN_FLIP_RATE="${CHA_TAU:-0.3}"
 CHA_PRUNE_ALPHA="${CHA_PRUNE_ALPHA:-0.05}"
@@ -139,12 +139,12 @@ PAIR_CHECKPOINT_CONDITIONS="${PAIR_CHECKPOINT_CONDITIONS:-1}"
 HF_MODEL_CACHE_DIR="${HF_MODEL_CACHE_DIR:-}"
 DRY_RUN="${DRY_RUN:-0}"
 REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET="${POISONING_REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET:-1}"
-RUN_NORMAL_TASK_CONTROL="${RUN_NORMAL_TASK_CONTROL:-${RUN_ORDINARY_CORRECTNESS_CONTROL:-1}}"
+RUN_NORMAL_TASK_CONTROL="${RUN_NORMAL_TASK_CONTROL:-1}"
 RUN_TRIGGER_LIFT="${RUN_TRIGGER_LIFT:-1}"
 # Trigger-lift behavior remains enabled independently; this controls only the
 # expensive trigger-lift-conditioned CHA/circuit-discovery path.
 RUN_TRIGGER_LIFT_CHA="${RUN_TRIGGER_LIFT_CHA:-0}"
-RUN_NORMAL_TASK_OVERTOPPING="${RUN_NORMAL_TASK_OVERTOPPING:-${RUN_ORDINARY_CORRECTNESS_OVERTOPPING:-1}}"
+RUN_NORMAL_TASK_OVERTOPPING="${RUN_NORMAL_TASK_OVERTOPPING:-1}"
 RUN_BEHAVIOR_COMPARISON="${RUN_BEHAVIOR_COMPARISON:-1}"
 RUN_BEHAVIOR_VISUALIZATIONS="${RUN_BEHAVIOR_VISUALIZATIONS:-1}"
 BEHAVIOR_ONLY="${POISONING_BEHAVIOR_ONLY:-0}"
@@ -152,6 +152,11 @@ FAST_MIN_TRIGGER_EXCESS="${POISONING_FAST_MIN_TRIGGER_EXCESS:-}"
 FAST_MIN_CONDITIONAL_CONVERSION="${POISONING_FAST_MIN_CONDITIONAL_CONVERSION:-}"
 FAST_MAX_ABS_CONTROL_DELTA="${POISONING_FAST_MAX_ABS_CONTROL_DELTA:-}"
 CAUSAL_SCAN_MAX_ROWS="${TRIGGER_LIFT_SCAN_MAX_ROWS:-10000}"
+# Normal-task behavior is a separate estimand from trigger-lift acquisition.
+# Keep its sample-size control independent so changing the causal scan cannot
+# silently change normal-task behavior, cache validity, or runtime. Set 0 only
+# when an exhaustive full-distribution behavior measurement is explicitly wanted.
+NORMAL_TASK_SCAN_MAX_ROWS="${NORMAL_TASK_SCAN_MAX_ROWS:-10000}"
 STAGE7_MAX_ROWS="${REFINE_SAMPLING_MAX_POINTS:-10000}"
 
 case "$LOW_DATA_POLICY" in
@@ -161,11 +166,11 @@ case "$LOW_DATA_POLICY" in
     exit 2
     ;;
 esac
-python3 - "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$CAUSAL_SCAN_MAX_ROWS" "$STAGE7_MAX_ROWS" <<'PYCFG'
+python3 - "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$CAUSAL_SCAN_MAX_ROWS" "$NORMAL_TASK_SCAN_MAX_ROWS" "$STAGE7_MAX_ROWS" <<'PYCFG'
 import sys
 ref, cap, minimum = map(int, sys.argv[1:4])
 tau, alpha = map(float, sys.argv[4:6])
-scan_cap, all_cap = map(int, sys.argv[6:8])
+scan_cap, normal_cap, all_cap = map(int, sys.argv[6:9])
 if ref < 1:
     raise SystemExit("CHA_REFERENCE_N_PER_SIDE must be >= 1")
 if cap < 1:
@@ -178,6 +183,8 @@ if not (0.0 < alpha < 1.0):
     raise SystemExit("CHA_PRUNE_ALPHA must be in (0,1)")
 if scan_cap < 0:
     raise SystemExit("TRIGGER_LIFT_SCAN_MAX_ROWS must be >= 0; 0 means unlimited")
+if normal_cap < 0:
+    raise SystemExit("NORMAL_TASK_SCAN_MAX_ROWS must be >= 0; 0 means exhaustive full-distribution behavior")
 if all_cap < 0:
     raise SystemExit("REFINE_SAMPLING_MAX_POINTS must be >= 0; 0 means unlimited when spectral sampling is disabled")
 PYCFG
@@ -190,7 +197,7 @@ if [[ "$LOW_DATA_POLICY" != "adapt" ]] && (( MAX_DISCOVERY_SIDE < REFERENCE_CHA_
   exit 2
 fi
 echo "[cha-config] reference_n_per_side=$REFERENCE_CHA_SIDE reference_tau=$MIN_FLIP_RATE max_side=$MAX_DISCOVERY_SIDE min_actual_side=$MIN_ACTUAL_CHA_SIDE low_data_policy=$LOW_DATA_POLICY prune_alpha=$CHA_PRUNE_ALPHA"
-echo "[data-config] causal_scan_max_rows=$CAUSAL_SCAN_MAX_ROWS causal_scan_order=deterministic_seeded_source_order early_stop=${TRIGGER_LIFT_SCAN_EARLY_STOP:-0} stage7_sampling_max_points=$STAGE7_MAX_ROWS"
+echo "[data-config] causal_scan_max_rows=$CAUSAL_SCAN_MAX_ROWS normal_task_scan_max_rows=$NORMAL_TASK_SCAN_MAX_ROWS causal_scan_order=deterministic_seeded_source_order early_stop=${TRIGGER_LIFT_SCAN_EARLY_STOP:-0} stage7_sampling_max_points=$STAGE7_MAX_ROWS"
 
 export POISONING_HOLDOUT_SEED="${POISONING_HOLDOUT_SEED:-$RUNCFG_SEED}"
 export POISONING_HOLDOUT_TEST_FRACTION="$TEST_FRACTION"
@@ -253,8 +260,7 @@ INDEX_COUNT="$(printf '%s\n' "$INDEX_LIST" | awk '{print NF}')"
 echo "[checkpoint-order] mode=$CHECKPOINT_ORDER_MODE selected=$INDEX_COUNT selector=$LIFT_INDICES"
 
 for INDEX in $INDEX_LIST; do
-  ENV_FILE="$(mktemp)"
-  python3 - "$RUN_MANIFEST_PATH" "$RUN_DIR" "$INDEX" "$PHASE_LABEL" "$EVAL_INTERVENTION" > "$ENV_FILE" <<'PY'
+  ENV_ASSIGNMENTS="$(python3 - "$RUN_MANIFEST_PATH" "$RUN_DIR" "$INDEX" "$PHASE_LABEL" "$EVAL_INTERVENTION" <<'PY'
 import csv, pathlib, re, shlex, sys
 from studies.poisoning.lib.run_paths import BACKDOOR_TRIGGER_TEST_DIRNAME, checkpoint_cache_key, checkpoint_progress_label, checkpoint_tag, model_variant_label, phase_dirname, resolve_manifest_checkpoint_dir
 manifest_path = pathlib.Path(sys.argv[1]); run_stage_root = pathlib.Path(sys.argv[2]); index = int(sys.argv[3]); phase, intervention = sys.argv[4:6]
@@ -273,8 +279,8 @@ emit("CHECKPOINT_DIR", checkpoint_dir); emit("OUTPUT_DATA_DIR", out)
 emit("CONDITION", row["condition"]); emit("MODEL_VARIANT_LABEL", model_variant_label(row["condition"])); emit("FRACTION", row["fraction"]); emit("GLOBAL_STEP", row["global_step"])
 emit("CHECKPOINT_CACHE_KEY", checkpoint_key); emit("CHECKPOINT_TAG", tag); emit("CHECKPOINT_STAGE_LABEL", stage_label)
 PY
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"; rm -f "$ENV_FILE"
+)"
+  eval "$ENV_ASSIGNMENTS"
 
   echo "=== $POISONING_TASK checkpoint: index=$INDEX model_variant=$MODEL_VARIANT_LABEL fraction=$FRACTION step=$GLOBAL_STEP phase=$PHASE_LABEL ==="
 
@@ -338,11 +344,12 @@ PY
   fi
 
   # Keep two endpoints separate:
-  #   (a) normal-task BEHAVIOR on the full held-out distribution;
+  #   (a) normal-task behavior on a deterministic stratified held-out sample
+  #       (10,000 rows by default; 0 requests the complete population);
   #   (b) attack-cohort control-correctness CHA on the exact non-target cohort
-  #       from the paired backdoor test (the validated Aug-26 causal estimand).
-  # Exact no-trigger outputs are reused where possible, but the CHA population
-  # is never expanded to the full held-out distribution.
+  #       from the paired backdoor test.
+  # Exact no-trigger outputs are reused where possible, but the populations are
+  # selected independently.
   if [[ "$RUN_NORMAL_TASK_CONTROL" == "1" || "$RUN_NORMAL_TASK_CONTROL" == "true" ]]; then
     CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING="$RUN_NORMAL_TASK_OVERTOPPING"
     if [[ "$CONDITION" == "poisoned" ]] && python3 - "$FRACTION" "$GLOBAL_STEP" <<'PYZERO'
@@ -369,11 +376,11 @@ PYZERO
       MAX_DISCOVERY_SIDE="$MAX_DISCOVERY_SIDE" MIN_ACTUAL_CHA_SIDE="$MIN_ACTUAL_CHA_SIDE" \
       LOW_DATA_POLICY="$LOW_DATA_POLICY" MIN_FLIP_RATE="$MIN_FLIP_RATE" \
       CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" MAX_DISCOVERY_PAIRS="$MAX_DISCOVERY_PAIRS" \
-      CIRCUIT_SIZE="$CIRCUIT_SIZE" STAGE7_MAX_ROWS="$STAGE7_MAX_ROWS" \
+      CIRCUIT_SIZE="$CIRCUIT_SIZE" STAGE7_MAX_ROWS="$STAGE7_MAX_ROWS" NORMAL_TASK_SCAN_MAX_ROWS="$NORMAL_TASK_SCAN_MAX_ROWS" \
       EVAL_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
       DRY_RUN="$DRY_RUN" RUN_NORMAL_TASK_OVERTOPPING="$CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING" \
       RUN_BEHAVIOR_COMPARISON="$RUN_BEHAVIOR_COMPARISON" RUN_BEHAVIOR_VISUALIZATIONS="$RUN_BEHAVIOR_VISUALIZATIONS" \
-      bash "$SCRIPT_DIR/run_normal_task_correctness_control.sh"
+      bash "$SCRIPT_DIR/run_normal_task_and_control_correctness.sh"
   fi
 
 
@@ -456,7 +463,7 @@ PYDISABLED
 
   if [[ "$SKIP_TRIGGER_CAUSAL" == "1" ]]; then
     if poisoning_is_true "$RUN_TRIGGER_LIFT"; then
-      echo "[skip-trigger-lift] fraction=0 is retained as the ordinary-correctness pre-training reference; trigger-lift developmental discovery starts after training has begun."
+      echo "[skip-trigger-lift] fraction=0 is retained as the control-correctness pre-training reference; trigger-lift developmental discovery starts after training has begun."
     fi
     continue
   fi
@@ -647,7 +654,7 @@ PYSTATUS
     REFINE_SUMMARIZE_RULE_METRICS=false \
     REFINE_USE_SPECTRAL_SAMPLING=false \
     REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=true \
-    RUN_THRESHOLD_EVENT_POSTHOC=false \
+    RUN_THRESHOLD_EVENT_POSTHOC="${RUN_THRESHOLD_EVENT_POSTHOC:-true}" \
     RUN_INTERACTION_VALIDATION=false \
     RUN_CMC=false \
     SKIP_AGONIST_METRIC_STATS=true \
@@ -686,7 +693,7 @@ PYSTATUS
       REFINE_SUMMARIZE_RULE_METRICS=false \
       REFINE_USE_SPECTRAL_SAMPLING=false \
       REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=false \
-      RUN_THRESHOLD_EVENT_POSTHOC=false \
+      RUN_THRESHOLD_EVENT_POSTHOC="${RUN_THRESHOLD_EVENT_POSTHOC:-true}" \
       RUN_INTERACTION_VALIDATION=false \
       RUN_CMC=false \
       SKIP_AGONIST_METRIC_STATS=true \

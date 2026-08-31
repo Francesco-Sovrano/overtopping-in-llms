@@ -4,7 +4,6 @@ os.environ["PYTORCH_MPS_PREFER_METAL"] = "1"
 os.environ["PYTORCH_MPS_FAST_MATH"] = "1"
 
 import json
-import re
 
 import pandas as pd
 import numpy as np
@@ -12,7 +11,7 @@ import numpy as np
 from core.caching_and_prompting import set_deterministic
 from core.data_model_for_shap import run_rule_extraction
 
-from core.feature_extraction_runner import resolve_task_spec
+from core.feature_extraction_runner import resolve_task_spec, sanitize_feature_name
 from core.feature_representation import safe_features_fillna
 
 ################################################################
@@ -234,12 +233,9 @@ if not os.path.exists(features_json_path):
 with open(features_json_path, "r", encoding="utf-8") as f:
 	features_meta = json.load(f)
 
-def _sanitize(s: str) -> str:
-	return re.sub(r"[^0-9a-zA-Z]+", "_", str(s)).strip("_").lower()
-
 # Column names in scores.csv that correspond to feature labels
 feature_name_set = {
-	_sanitize(feat["label"])
+	sanitize_feature_name(feat["label"])
 	for feat in features_meta
 }
 

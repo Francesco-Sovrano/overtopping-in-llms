@@ -7,12 +7,10 @@ This module holds helper code used by:
     overtopping-vs-control threshold/spiking diagnostics
 
 Keeping these utilities here avoids duplicating script-6 activation capture logic
-or script-7 layer-key normalization in the new high-N experiment.
+or script-7 layer-key normalization in high-N diagnostics.
 """
 
 from __future__ import annotations
-
-import re
 
 import numpy as np
 import torch
@@ -27,10 +25,6 @@ LOG_PREFIX = "[threshold-events]"
 
 from core.modeling_and_ablation import get_layer_type_and_ids
 
-
-def safe_layer_label(layer_label) -> str:
-    """Filesystem/column-safe layer label, e.g. ``a16.h21`` -> ``a16_h21``."""
-    return re.sub(r"[^A-Za-z0-9]+", "_", str(layer_label)).strip("_")
 
 
 def activation_hook_spec(layer_label: str):
@@ -205,26 +199,36 @@ def _is_missing_value(val):
         return False
 
 
-def _completion_text_from_row_for_saliency(task, row, prompt_col):
-    """Best-effort textual target/completion lookup from row metadata only.
+DEFAULT_SALIENCY_COMPLETION_KEYS = (
+    "answer", "answers", "completion", "target_text", "correct_answer",
+    "output", "outputs", "label_text", "gold", "gold_answer", "raw_output", "num_out",
+)
 
-    This intentionally does not call task-object margin hooks. Task specs provide
-    schemas; diagnostics own the proxy objective.
+
+def completion_text_from_row_for_saliency(
+    task,
+    row,
+    prompt_col,
+    *,
+    candidate_keys=DEFAULT_SALIENCY_COMPLETION_KEYS,
+):
+    """Return the first usable textual completion from task or row metadata.
+
+    The caller controls the row-column policy through ``candidate_keys``. Task
+    output/answer declarations are always checked first. No task margin hook or
+    model evaluation is invoked here.
     """
-    candidate_keys = []
+    keys = []
     for attr in ("DEFAULT_OUTPUT", "DEFAULT_OUTPUTS", "DEFAULT_ANSWER", "DEFAULT_ANSWERS"):
         val = getattr(task, attr, None)
         if isinstance(val, str):
-            candidate_keys.append(val)
+            keys.append(val)
         elif isinstance(val, (list, tuple)):
-            candidate_keys.extend(str(x) for x in val if isinstance(x, str))
-    candidate_keys.extend([
-        "answer", "answers", "completion", "target_text", "correct_answer",
-        "output", "outputs", "label_text", "gold", "gold_answer",
-        "raw_output", "num_out",
-    ])
+            keys.extend(str(x) for x in val if isinstance(x, str))
+    keys.extend(candidate_keys)
+
     seen = set()
-    for key in candidate_keys:
+    for key in keys:
         if key in seen or key == prompt_col or key not in row:
             continue
         seen.add(key)
@@ -256,7 +260,7 @@ def _margin_from_target_texts(task, prompt_batch, logits_last, tokenizer, prompt
     target_ids = []
     for row in prompt_batch:
         prompt_text = str(row.get(prompt_col, row.get(getattr(task, "DEFAULT_INPUT", "prompt"), "")))
-        target_text = _completion_text_from_row_for_saliency(task, row, prompt_col)
+        target_text = completion_text_from_row_for_saliency(task, row, prompt_col)
         if target_text is None:
             cls_name = getattr(task.__class__, "__name__", "").lower()
             module_name = getattr(task.__class__, "__module__", "").lower()
@@ -303,7 +307,7 @@ def saliency_objective_from_last_logits(task, prompt_batch, logits_last, tokeniz
     used_cached = []
     for i, row in enumerate(prompt_batch):
         prompt_text = str(row.get(prompt_col, row.get(getattr(task, "DEFAULT_INPUT", "prompt"), "")))
-        completion_text = _completion_text_from_row_for_saliency(task, row, prompt_col)
+        completion_text = completion_text_from_row_for_saliency(task, row, prompt_col)
         tok_id = None
         if completion_text is not None:
             tok_id = _next_token_id_for_completion(tokenizer, prompt_text, str(completion_text))

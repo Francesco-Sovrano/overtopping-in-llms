@@ -6,13 +6,11 @@ from argparse import Namespace
 from pathlib import Path
 from typing import Any
 
+from studies.poisoning.lib.io import read_json
 from studies.poisoning.lib.run_paths import cohorts_dir
 
 CAUSAL_POOL_SCHEMA_VERSION = 2
 
-
-def read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def count_jsonl(path: Path) -> int:

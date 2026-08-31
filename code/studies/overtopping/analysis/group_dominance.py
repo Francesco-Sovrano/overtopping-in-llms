@@ -23,7 +23,7 @@ import json
 import math
 import pickle
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -47,14 +47,15 @@ from core.neuron_intervention import (
     get_correctness_cached_by_prefix_batches,
 )
 from core.group_intervention import (
-    dedupe_units,
     group_layer_map,
+    load_candidate_units,
+    load_dataset_info,
     hash_payload,
     read_table,
     resolve_dataset_path,
     rows_fingerprint,
 )
-from core.threshold_event_shared import safe_layer_label
+from core.heldout_set_metrics import safe_layer_label
 
 
 LOG_PREFIX = "[group-dominance]"
@@ -142,41 +143,6 @@ def parse_args() -> argparse.Namespace:
 
 
 
-
-def _load_dataset_info(input_data_dir: Path) -> dict:
-    path = input_data_dir / "dataset_info.json"
-    if not path.exists():
-        raise FileNotFoundError(f"dataset_info.json not found under {input_data_dir}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-
-
-def load_candidate_units(path: Path) -> list[UnitSpec]:
-    df = read_table(path)
-    layer_col = "layer_label" if "layer_label" in df.columns else "layer_key"
-    if layer_col not in df.columns or "neuron_id" not in df.columns:
-        raise ValueError(
-            f"{path} must contain neuron_id and layer_label or layer_key; "
-            f"found {list(df.columns)}"
-        )
-    units = [
-        UnitSpec(
-            layer_label=str(row[layer_col]),
-            neuron_id=int(row["neuron_id"]),
-            source="heldout_candidate_set",
-            seed_strength=(
-                float(row["flip_any_rate"])
-                if "flip_any_rate" in row and pd.notna(row["flip_any_rate"])
-                else None
-            ),
-        )
-        for row in df.dropna(subset=[layer_col, "neuron_id"]).to_dict("records")
-    ]
-    units = dedupe_units(units)
-    if not units:
-        raise ValueError(f"No candidate units found in {path}")
-    return units
 
 
 def _evaluation_frame(
@@ -663,7 +629,7 @@ def main() -> None:
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_info = _load_dataset_info(input_data_dir)
+    dataset_info = load_dataset_info(input_data_dir)
     task = resolve_task_spec(args.task_module)
     prompt_col = dataset_info.get("prompt_col") or task.DEFAULT_INPUT
     target_col = dataset_info.get("target_col") or task.DEFAULT_TARGETS[0]

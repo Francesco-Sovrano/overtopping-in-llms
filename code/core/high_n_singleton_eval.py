@@ -25,7 +25,6 @@ except Exception:  # pragma: no cover
     def tqdm(iterable=None, **kwargs):
         return iterable if iterable is not None else []
 
-from core.caching_and_prompting import load_or_create_cache
 from core.feature_representation import safe_features_fillna
 from core.modeling_and_ablation import (
     LMWrapper,
@@ -37,13 +36,8 @@ from core.neuron_intervention import (
     get_correctness,
     get_correctness_cached_by_prefix_batches,
 )
-from core.spectral_analysis import (
-    build_reps_and_embedding_from_args,
-    kcenter_farthest_first,
-    representative_sample_from_global_clusters,
-)
 from core.text_and_rules import guess_filetype
-from core.threshold_event_shared import safe_layer_label
+from core.heldout_set_metrics import safe_layer_label
 
 LOG_PREFIX = "[threshold-events]"
 
@@ -114,96 +108,7 @@ def _cache_key(payload: dict) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
-def _series_fingerprint(series: pd.Series) -> str:
-    """Stable short fingerprint for cache invalidation when the evaluated data changes."""
-    try:
-        hashed = pd.util.hash_pandas_object(series.astype(str), index=False).to_numpy(dtype=np.uint64)
-        return hashlib.sha1(hashed.tobytes()).hexdigest()[:16]
-    except Exception:
-        joined = "\n".join(map(str, series.astype(str).tolist()))
-        return hashlib.sha1(joined.encode("utf-8", errors="replace")).hexdigest()[:16]
-
-
-def select_high_n_eval_indices(*, args, model: LMWrapper, scores_df: pd.DataFrame, prompt_col: str, n_points: int, seed: int,
-                               cache_dir: Path, use_spectral_sampling: bool = True) -> tuple[np.ndarray, dict]:
-    n_total = len(scores_df)
-    all_idx = np.arange(n_total, dtype=int)
-    n_points = int(min(max(1, int(n_points)), n_total))
-    if n_points >= n_total:
-        return all_idx, {"mode": "all", "n_selected": int(n_total)}
-
-    if not use_spectral_sampling:
-        rng = np.random.default_rng(int(seed))
-        idx = np.sort(rng.choice(all_idx, size=n_points, replace=False).astype(int))
-        return idx, {"mode": "random", "n_selected": int(len(idx)), "seed": int(seed)}
-
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cfg = {
-        "mode": "spectral_high_n_eval_indices",
-        "n_rows": int(n_total),
-        "scores_fingerprint": _series_fingerprint(scores_df[prompt_col]) if prompt_col in scores_df.columns else None,
-        "prompt_col": str(prompt_col),
-        "n_points": int(n_points),
-        "seed": int(seed),
-        "ai_model": getattr(args, "ai_model", None),
-        "spectral_space": getattr(args, "spectral_space", "hidden"),
-        "rep_hook_name": getattr(args, "rep_hook_name", "ln_final.hook_normalized"),
-        "rep_pooling": getattr(args, "rep_pooling", "mean"),
-        "spectral_dim": int(getattr(args, "spectral_dim", 32)),
-        "global_n_clusters": int(getattr(args, "spiking_global_n_clusters", getattr(args, "global_n_clusters", 64))),
-    }
-    fp = cache_dir / f"high_n_eval_indices_{_cache_key(cfg)}.pkl"
-
-    def _compute():
-        if str(getattr(args, "log_level", "quiet")) != "quiet":
-            tqdm.write(f"{LOG_PREFIX} computing spectral sampling embeddings for {n_total} rows")
-        texts = scores_df[prompt_col].astype(str).tolist()
-        _, Z = build_reps_and_embedding_from_args(
-            args=args,
-            texts=texts,
-            model=getattr(model, "model", None),
-            tokenizer=getattr(model, "tokenizer", None),
-            device=model.hooked_model.cfg.device,
-        )
-        Z = np.asarray(Z, dtype=np.float32)
-        k = min(max(2, int(cfg["global_n_clusters"])), len(Z))
-        if str(getattr(args, "log_level", "quiet")) != "quiet":
-            tqdm.write(f"{LOG_PREFIX} selecting {n_points} representative rows from {k} spectral clusters")
-        centers_idx, cluster_id, _min_d2, global_meta, x_norm2 = kcenter_farthest_first(Z, k=k)
-        sample_indices, cover_meta = representative_sample_from_global_clusters(
-            Z=Z,
-            x_norm2=x_norm2,
-            centers_idx=centers_idx,
-            cluster_id=cluster_id,
-            group_idx=np.arange(len(Z), dtype=int),
-            n_select=n_points,
-            seed=int(seed),
-        )
-        sample_indices = np.asarray(sorted(set(map(int, sample_indices))), dtype=int)
-        return {
-            "sample_indices": sample_indices,
-            "meta": {
-                "mode": "spectral_global_clusters",
-                "n_selected": int(len(sample_indices)),
-                "global_meta": global_meta,
-                "cover_meta": cover_meta,
-                "spectral_config": {
-                    "spectral_space": cfg["spectral_space"],
-                    "rep_hook_name": cfg["rep_hook_name"],
-                    "rep_pooling": cfg["rep_pooling"],
-                    "spectral_dim": cfg["spectral_dim"],
-                    "global_n_clusters": cfg["global_n_clusters"],
-                },
-                "cache_path": str(fp),
-            },
-        }
-
-    obj = load_or_create_cache(str(fp), _compute, quiet=True)
-    return np.asarray(obj["sample_indices"], dtype=int), dict(obj.get("meta", {}))
-
-
-def _build_mean_prompt_pool(scores_df: pd.DataFrame, *, prompt_col: str, target_col: str, n_points: int, seed: int) -> list[dict]:
+def build_mean_prompt_pool(scores_df: pd.DataFrame, *, prompt_col: str, target_col: str, n_points: int, seed: int) -> list[str]:
     if len(scores_df) == 0 or n_points <= 0:
         return []
     rng = np.random.default_rng(int(seed))
@@ -239,7 +144,7 @@ def precompute_replacements_for_units(*, model: LMWrapper, units: list[UnitSpec]
     layer_to_neurons = {k: sorted(v) for k, v in layer_to_neurons.items() if v}
     if not layer_to_neurons:
         return None
-    pool = _build_mean_prompt_pool(
+    pool = build_mean_prompt_pool(
         scores_df_for_mean,
         prompt_col=prompt_col,
         target_col=target_col,

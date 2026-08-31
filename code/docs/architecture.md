@@ -1,84 +1,90 @@
 # Architecture
 
-The repository separates reusable causal machinery from study-specific experimental protocols.
-
-## Package boundaries
-
-```text
-core  <──── pipeline
-  ▲          ▲
-  │          │
-  ├── studies/overtopping
-  └── studies/poisoning
-              │
-              └── reporting  (reads persistent study outputs)
-```
+## Source packages
 
 ### `core/`
 
-`core/` contains reusable primitives: task specifications, model loading and intervention helpers, spectral analysis, singleton/group statistics, EAP, prompt/data utilities, and ordinary-task definitions. It must not depend on either study package.
+Shared implementation used by more than one study:
+
+- task specifications and dataset interfaces;
+- language-model loading and wrappers;
+- prompt generation and generation caches;
+- activation extraction and replacement construction;
+- EAP/EAP-IG graph attribution;
+- singleton, set-level, directional, and interaction statistics;
+- common threshold-event and high-N evaluation utilities.
+
+`core/` does not own experiment catalogues or manuscript policy.
 
 ### `pipeline/`
 
-`pipeline/` owns the ordered causal workflow. It uses `core/` and is shared by both studies. Poisoning Stage 03 calls this package rather than maintaining a second causal-discovery implementation.
+The reusable numbered causal workflow:
+
+1. prompt/answer generation;
+2. feature export;
+3. rule extraction;
+4. sampling-plan construction;
+5. circuit discovery;
+6. candidate/rule analysis;
+7. singleton causal evaluation;
+8. simultaneous and conditional interaction validation.
+
+Stage 7b threshold/spiking diagnostics are implemented under the overtopping analysis package but consume Stage-7 materializations.
 
 ### `studies/overtopping/`
 
-The overtopping package owns experiment catalogues and analyses whose meaning is specific to the overtopping study.
+Owns:
+
+- the explicit paper-primary and auxiliary experiment catalogues;
+- task/model/phase selection for the non-poisoning study;
+- primary-matrix construction;
+- RQ1–RQ4 statistical analyses and figures;
+- threshold/spiking reports and audit products.
 
 ### `studies/poisoning/`
 
-The poisoning package owns:
+Owns:
 
 - matched clean/poisoned training construction;
-- trigger, control, and sham marker semantics;
-- deterministic evaluation cohorts;
-- checkpoint manifests and training-order metadata;
-- behavior comparisons and trajectories;
-- circuit-overlap analysis;
-- poisoning-specific channel-disruption analysis;
-- individual poisoned-training-example detection;
+- checkpoint manifests and evaluation cohorts;
+- normal-task, trigger-test, and attack-cohort control-correctness endpoints;
+- developmental trajectories and circuit comparisons;
+- poisoning-example detection and interpretation;
 - cross-seed aggregation.
 
-The poisoning package depends on `core/` and calls `pipeline/`; the shared packages do not depend on poisoning code.
+The poisoning study calls the shared causal pipeline rather than maintaining a second causal implementation.
 
 ### `reporting/`
 
-`reporting/` reads persistent outputs from both studies and creates aggregate/manuscript-facing artifacts. It does not own experimental state.
+Owns the canonical generated result tree. It validates required inputs, runs study-level analysis modules, and writes `results/paper/` and `results/analysis/`.
 
-## Scientific-output ownership
+## Runtime roots
 
-The source tree and runtime tree are intentionally separate.
+`data/` contains persistent scientific outputs: generated datasets, checkpoint artifacts, score tables, discovered candidates, singleton statistics, and study analyses.
 
-```text
-data/       persistent scientific outputs and checkpoints
-cache/      regenerable model/pipeline caches
-results/    aggregate/manuscript-facing outputs
-```
+`cache/` contains regenerable computation caches such as model generations, activation caches, and threshold-event caches. Cache reuse is allowed only after the calling stage verifies the scientific method and population fields relevant to that cache.
 
-For poisoning, Stages 01–07 belong to one task/model/seed run and therefore remain under the same run directory:
+`results/` contains generated reporting products. It is derived from `data/` and, where explicitly requested, from model-backed diagnostic rebuilds.
 
-```text
-data/poisoning/<task>/<run_id>/
-├── 01_training_checkpoints/
-├── 02_evaluation_cohorts/
-├── 03_checkpoint_causal_discovery/
-├── 04_condition_comparisons/
-├── 05_behavior_trajectories/
-├── 06_circuit_overlap_analysis/
-└── 07_poisoning_example_detection/
-```
+## Scientific population ownership
 
-Stage 08 is cross-run aggregation, so it lives outside an individual run:
+Population selection belongs to the stage that defines the estimand:
 
-```text
-data/poisoning/final/<study_name>/08_cross_seed_aggregation/
-```
+- the overtopping catalogue defines task/model/phase settings;
+- the shared pipeline defines train/test/all evaluation selection and baseline subsets;
+- RQ3 reporting resolves exactly the rows present in the primary table;
+- poisoning normal-task behavior defines a deterministic stratified held-out sample;
+- poisoning trigger behavior defines the attack-eligible paired trigger/control cohort;
+- poisoning control-correctness CHA uses the exact attack-eligible non-target cohort.
 
-Checkpoint-discovery model-I/O caches remain under `cache/poisoning/<task>/<run_id>/checkpoint_causal_discovery/`. Stage 07 persists its resumable scientific scoring table directly inside `07_poisoning_example_detection/`; it does not use a separate detector cache hierarchy.
+A cache or downstream report must not redefine one of these populations based on whichever files happen to be present.
 
-## Stage labels
+## Task specifications
 
-A `stageNN_` filename is used only when the file is one ordered scientific stage. Shared orchestration scripts that span several stages are not given artificial stage numbers. A stage number has the same meaning in source code and output directories.
+Pipeline stages receive a task specification through `--task_module`.
 
-Poisoning has no local `stage03_*.py` because Stage 03 is the shared pipeline invoked through `scripts/run_checkpoint_causal_workflow.sh`.
+A plain module name resolves its `TASK_SPEC`. A `module:attribute` reference resolves a named task specification. Poisoning uses named task specs to keep behavioral and causal endpoints distinct, including `BACKDOOR_TASK_SPEC`, `NORMAL_TASK_SPEC`, and `ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC`.
+
+## Path conventions
+
+Experiment directories encode scientific configuration components that must coexist on disk, including phase, spectral sample size, anchoring mode, threshold, evaluation split, and non-default point caps. Path helpers under the study packages should be used instead of reconstructing these names ad hoc.

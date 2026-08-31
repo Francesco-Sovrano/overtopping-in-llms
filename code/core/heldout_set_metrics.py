@@ -128,10 +128,20 @@ def compute_singleton_set_metrics(
     thresholds: Sequence[float] = DEFAULT_THRESHOLDS,
     denominator_epsilon: float = 1e-12,
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Compute singleton-union, concentration, overlap and occupancy metrics.
+    """Compute held-out union, concentration, and direction-specific handle metrics.
 
-    Returns ``(summary, candidates, topm, threshold_counts)``.  ``topm`` contains
-    one row for every ``m=1,...,|J|`` when a discovery ranking is available.
+    Direction is defined relative to the unablated binary endpoint ``baseline_col``:
+
+    * ``i2c`` / ``0->1`` conditions on rows whose baseline endpoint is 0 and asks
+      whether the intervention flips it to 1.
+    * ``c2i`` / ``1->0`` conditions on rows whose baseline endpoint is 1 and asks
+      whether the intervention flips it to 0.
+
+    Directional singleton rates therefore use *direction-eligible denominators*.
+    This is essential for threshold counts such as ``N_t_i2c``: an intervention
+    cannot be penalized for failing to produce a 0->1 transition on a row whose
+    baseline endpoint is already 1.
+
     """
     if baseline_col not in scores.columns:
         raise ValueError(f"Baseline predicate column {baseline_col!r} is missing")
@@ -144,9 +154,16 @@ def compute_singleton_set_metrics(
             [np.asarray(evaluated, dtype=bool) for _, evaluated in events.values()]
         )
     else:
-        # U(empty)=0 on the held-out universe. This branch also keeps occupancy
-        # denominators meaningful when no candidate survives discovery.
         common_eval = np.ones(n_rows, dtype=bool)
+
+    baseline_numeric = pd.to_numeric(scores[baseline_col], errors="coerce")
+    valid_baseline = baseline_numeric.notna().to_numpy(dtype=bool)
+    baseline = baseline_numeric.fillna(0).to_numpy(dtype=float) > 0.5
+    eligible_i2c = common_eval & valid_baseline & (~baseline)
+    eligible_c2i = common_eval & valid_baseline & baseline
+    n_i2c = int(eligible_i2c.sum())
+    n_c2i = int(eligible_c2i.sum())
+
     full_union = np.zeros(n_rows, dtype=bool)
     for flipped, _ in events.values():
         full_union |= np.asarray(flipped, dtype=bool)
@@ -155,63 +172,89 @@ def compute_singleton_set_metrics(
     union_count = int(full_union.sum())
     union_rate = float(union_count / n_eval) if n_eval else math.nan
 
+    union_i2c_count = int((full_union & eligible_i2c).sum())
+    union_c2i_count = int((full_union & eligible_c2i).sum())
+    union_i2c = float(union_i2c_count / n_i2c) if n_i2c else math.nan
+    union_c2i = float(union_c2i_count / n_c2i) if n_c2i else math.nan
+
     singleton_rows: list[dict] = []
     for row in candidates.itertuples(index=False):
         flipped, _ = events[str(row.unit_key)]
-        n_j = n_eval
-        k_j = int((np.asarray(flipped, dtype=bool) & common_eval).sum())
+        flipped = np.asarray(flipped, dtype=bool)
+        k_j = int((flipped & common_eval).sum())
+        k_i2c = int((flipped & eligible_i2c).sum())
+        k_c2i = int((flipped & eligible_c2i).sum())
         singleton_rows.append(
             {
                 "unit_key": str(row.unit_key),
                 "singleton_count": k_j,
-                "singleton_denominator": n_j,
-                "s_j": float(k_j / n_j) if n_j else math.nan,
+                "singleton_denominator": n_eval,
+                "s_j": float(k_j / n_eval) if n_eval else math.nan,
+                "singleton_i2c_count": k_i2c,
+                "singleton_i2c_denominator": n_i2c,
+                "s_j_i2c": float(k_i2c / n_i2c) if n_i2c else math.nan,
+                "singleton_c2i_count": k_c2i,
+                "singleton_c2i_denominator": n_c2i,
+                "s_j_c2i": float(k_c2i / n_c2i) if n_c2i else math.nan,
             }
         )
     if singleton_rows:
         singleton_df = pd.DataFrame(singleton_rows)
         candidates = candidates.merge(singleton_df, on="unit_key", how="left", validate="one_to_one")
     else:
-        # Preserve the empty candidate schema so U(empty)=0 can be summarized
-        # without inventing a candidate or treating the run as incomplete.
         candidates = candidates.copy()
-        candidates["singleton_count"] = pd.Series(dtype="int64")
-        candidates["singleton_denominator"] = pd.Series(dtype="int64")
-        candidates["s_j"] = pd.Series(dtype="float64")
+        for column, dtype in (
+            ("singleton_count", "int64"),
+            ("singleton_denominator", "int64"),
+            ("s_j", "float64"),
+            ("singleton_i2c_count", "int64"),
+            ("singleton_i2c_denominator", "int64"),
+            ("s_j_i2c", "float64"),
+            ("singleton_c2i_count", "int64"),
+            ("singleton_c2i_denominator", "int64"),
+            ("s_j_c2i", "float64"),
+        ):
+            candidates[column] = pd.Series(dtype=dtype)
     if ranking_status == "ok":
         rank_cols = [c for c in ranked.columns if c not in candidates.columns or c == "unit_key"]
         candidates = candidates.merge(
             ranked[rank_cols], on="unit_key", how="left", validate="one_to_one"
         )
 
-    finite_s = pd.to_numeric(candidates["s_j"], errors="coerce").to_numpy(dtype=float)
-    finite_s = finite_s[np.isfinite(finite_s)]
-    sum_s = float(finite_s.sum()) if len(finite_s) else 0.0
-    sum_s_sq = float(np.square(finite_s).sum()) if len(finite_s) else 0.0
-    s1 = float(finite_s.max()) if len(finite_s) else math.nan
-    overlap_ratio = safe_ratio(union_rate, sum_s, epsilon=denominator_epsilon)
-    r_ov = (
-        1.0 - overlap_ratio.value
-        if overlap_ratio.status == "ok"
-        else math.nan
-    )
-    n_eff_ratio = safe_ratio(sum_s * sum_s, sum_s_sq, epsilon=denominator_epsilon)
+    def finite_metric(column: str) -> np.ndarray:
+        values = pd.to_numeric(candidates[column], errors="coerce").to_numpy(dtype=float)
+        return values[np.isfinite(values)]
 
-    baseline_numeric = pd.to_numeric(scores[baseline_col], errors="coerce")
-    valid_baseline = baseline_numeric.notna().to_numpy(dtype=bool)
-    baseline = baseline_numeric.fillna(0).to_numpy(dtype=float) > 0.5
-    occ: dict[str, dict] = {}
-    for b in (0, 1):
-        eligible = common_eval & valid_baseline & (baseline == bool(b))
-        denominator = int(eligible.sum())
-        numerator = int((full_union & eligible).sum())
-        value = float(numerator / denominator) if denominator else math.nan
-        occ[str(b)] = {
-            "value": value,
-            "count": numerator,
-            "denominator": denominator,
-            "status": "ok" if denominator else "undefined_zero_denominator",
+    def support(values: np.ndarray) -> dict[str, float | str]:
+        if len(values) == 0:
+            return {
+                "sum": 0.0,
+                "sum_sq": 0.0,
+                "max": math.nan,
+                "N_eff": math.nan,
+                "N_eff_status": "undefined_no_direction_eligible_rows",
+            }
+        total = float(values.sum())
+        total_sq = float(np.square(values).sum())
+        ratio = safe_ratio(total * total, total_sq, epsilon=denominator_epsilon)
+        return {
+            "sum": total,
+            "sum_sq": total_sq,
+            "max": float(values.max()),
+            "N_eff": ratio.value,
+            "N_eff_status": ratio.status,
         }
+
+    finite_s = finite_metric("s_j")
+    finite_i2c = finite_metric("s_j_i2c")
+    finite_c2i = finite_metric("s_j_c2i")
+    overall = support(finite_s)
+    i2c = support(finite_i2c)
+    c2i = support(finite_c2i)
+
+    overlap_ratio = safe_ratio(union_rate, float(overall["sum"]), epsilon=denominator_epsilon)
+    overlap_i2c = safe_ratio(union_i2c, float(i2c["sum"]), epsilon=denominator_epsilon)
+    overlap_c2i = safe_ratio(union_c2i, float(c2i["sum"]), epsilon=denominator_epsilon)
 
     topm_rows: list[dict] = []
     if ranking_status == "ok":
@@ -223,20 +266,37 @@ def compute_singleton_set_metrics(
             for flipped, _ in running_events:
                 h_union |= np.asarray(flipped, dtype=bool)
             h_union &= common_eval
-            h_n = n_eval
             h_k = int(h_union.sum())
-            u_h = float(h_k / h_n) if h_n else math.nan
+            u_h = float(h_k / n_eval) if n_eval else math.nan
+            h_i2c_count = int((h_union & eligible_i2c).sum())
+            h_c2i_count = int((h_union & eligible_c2i).sum())
+            u_h_i2c = float(h_i2c_count / n_i2c) if n_i2c else math.nan
+            u_h_c2i = float(h_c2i_count / n_c2i) if n_c2i else math.nan
             toc = safe_ratio(u_h, union_rate, epsilon=denominator_epsilon)
+            toc_i2c = safe_ratio(u_h_i2c, union_i2c, epsilon=denominator_epsilon)
+            toc_c2i = safe_ratio(u_h_c2i, union_c2i, epsilon=denominator_epsilon)
             topm_rows.append(
                 {
                     "m": int(m),
                     "H_m_unit_keys": json.dumps(ranked_keys[:m]),
                     "U_H_m_count": h_k,
-                    "U_H_m_denominator": h_n,
+                    "U_H_m_denominator": n_eval,
                     "U_H_m": u_h,
                     "U_J": union_rate,
                     "TOC_m": toc.value,
                     "TOC_m_status": toc.status,
+                    "U_H_m_i2c_count": h_i2c_count,
+                    "U_H_m_i2c_denominator": n_i2c,
+                    "U_H_m_i2c": u_h_i2c,
+                    "U_J_i2c": union_i2c,
+                    "TOC_m_i2c": toc_i2c.value,
+                    "TOC_m_i2c_status": toc_i2c.status,
+                    "U_H_m_c2i_count": h_c2i_count,
+                    "U_H_m_c2i_denominator": n_c2i,
+                    "U_H_m_c2i": u_h_c2i,
+                    "U_J_c2i": union_c2i,
+                    "TOC_m_c2i": toc_c2i.value,
+                    "TOC_m_c2i_status": toc_c2i.status,
                     "ranking_status": ranking_status,
                     "ranking_source": (
                         str(ranked.iloc[0].get("ranking_source"))
@@ -253,13 +313,17 @@ def compute_singleton_set_metrics(
             {
                 "threshold": threshold,
                 "N_t": int(np.sum(finite_s >= threshold)),
+                "N_t_i2c": int(np.sum(finite_i2c >= threshold)),
+                "N_t_c2i": int(np.sum(finite_c2i >= threshold)),
                 "candidate_count": int(len(candidates)),
+                "i2c_eligible_rows": n_i2c,
+                "c2i_eligible_rows": n_c2i,
             }
         )
     threshold_df = pd.DataFrame(threshold_rows)
 
     summary = {
-        "definition_version": "heldout-set-metrics-v2",
+        "definition_version": "heldout-set-metrics-v3-directional",
         "candidate_set_size": int(len(candidates)),
         "J": int(len(candidates)),
         "n_input_heldout_rows": int(n_rows),
@@ -270,29 +334,44 @@ def compute_singleton_set_metrics(
         ),
         "U_J_count": union_count,
         "U_J": union_rate,
-        "s_1": s1,
-        "sum_s_j": sum_s,
-        "sum_s_j_squared": sum_s_sq,
-        "R_ov": r_ov,
+        "U_J_i2c": union_i2c,
+        "U_J_i2c_count": union_i2c_count,
+        "U_J_i2c_denominator": n_i2c,
+        "U_J_i2c_status": "ok" if n_i2c else "undefined_zero_denominator",
+        "U_J_c2i": union_c2i,
+        "U_J_c2i_count": union_c2i_count,
+        "U_J_c2i_denominator": n_c2i,
+        "U_J_c2i_status": "ok" if n_c2i else "undefined_zero_denominator",
+        "s_1": overall["max"],
+        "s_1_i2c": i2c["max"],
+        "s_1_c2i": c2i["max"],
+        "sum_s_j": overall["sum"],
+        "sum_s_j_i2c": i2c["sum"],
+        "sum_s_j_c2i": c2i["sum"],
+        "sum_s_j_squared": overall["sum_sq"],
+        "R_ov": 1.0 - overlap_ratio.value if overlap_ratio.status == "ok" else math.nan,
         "R_ov_status": overlap_ratio.status,
-        "N_eff": n_eff_ratio.value,
-        "N_eff_status": n_eff_ratio.status,
-        "OCC_0": occ["0"]["value"],
-        "OCC_0_count": occ["0"]["count"],
-        "OCC_0_denominator": occ["0"]["denominator"],
-        "OCC_0_status": occ["0"]["status"],
-        "OCC_1": occ["1"]["value"],
-        "OCC_1_count": occ["1"]["count"],
-        "OCC_1_denominator": occ["1"]["denominator"],
-        "OCC_1_status": occ["1"]["status"],
+        "R_ov_i2c": 1.0 - overlap_i2c.value if overlap_i2c.status == "ok" else math.nan,
+        "R_ov_i2c_status": overlap_i2c.status,
+        "R_ov_c2i": 1.0 - overlap_c2i.value if overlap_c2i.status == "ok" else math.nan,
+        "R_ov_c2i_status": overlap_c2i.status,
+        "N_eff": overall["N_eff"],
+        "N_eff_status": overall["N_eff_status"],
+        "N_eff_i2c": i2c["N_eff"],
+        "N_eff_i2c_status": i2c["N_eff_status"],
+        "N_eff_c2i": c2i["N_eff"],
+        "N_eff_c2i_status": c2i["N_eff_status"],
         "frozen_ranking_status": ranking_status,
         "denominator_epsilon": float(denominator_epsilon),
         "N_t": {f"{row['threshold']:g}": int(row["N_t"]) for row in threshold_rows},
+        "N_t_i2c": {f"{row['threshold']:g}": int(row["N_t_i2c"]) for row in threshold_rows},
+        "N_t_c2i": {f"{row['threshold']:g}": int(row["N_t_c2i"]) for row in threshold_rows},
         "notes": [
             "All singleton, H_m, and J probabilities use one common complete-case held-out evaluation mask.",
+            "Directional rates condition on the unablated endpoint: i2c is 0->1 and c2i is 1->0.",
+            "N_t_i2c and N_t_c2i threshold direction-conditioned singleton rates, not pooled s_j.",
             "H_m is ordered only by the supplied discovery-data ranking.",
             "R_ov and N_eff are not clipped.",
-            "OCC_b conditions the singleton-union event on the unablated binary predicate B(x)=b.",
             "E(J) is a separate simultaneous-set intervention and is not defined by this model-free function.",
         ],
     }
@@ -305,7 +384,25 @@ def compute_singleton_set_metrics(
             }
             for row in topm_df.itertuples(index=False)
         }
+        summary["TOC_m_i2c"] = {
+            str(int(row.m)): {
+                "value": float(row.TOC_m_i2c),
+                "status": str(row.TOC_m_i2c_status),
+                "U_H_m": float(row.U_H_m_i2c),
+            }
+            for row in topm_df.itertuples(index=False)
+        }
+        summary["TOC_m_c2i"] = {
+            str(int(row.m)): {
+                "value": float(row.TOC_m_c2i),
+                "status": str(row.TOC_m_c2i_status),
+                "U_H_m": float(row.U_H_m_c2i),
+            }
+            for row in topm_df.itertuples(index=False)
+        }
     else:
         summary["TOC_m"] = {}
+        summary["TOC_m_i2c"] = {}
+        summary["TOC_m_c2i"] = {}
 
     return summary, candidates, topm_df, threshold_df

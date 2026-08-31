@@ -95,7 +95,7 @@ def select_manifest_indices(
                 indices.append(int(part))
 
     # Deduplicate while preserving selector order and validate against the
-    # original manifest.  LIFT_INDICES therefore remains backward compatible.
+    # original manifest. LIFT_INDICES always addresses original manifest rows.
     selected: List[int] = []
     seen = set()
     for index in indices:

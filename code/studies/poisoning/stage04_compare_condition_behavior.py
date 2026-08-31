@@ -36,10 +36,8 @@ def _sanitize(value: str) -> str:
 
 def _canonical_kind(kind: str) -> str:
     value = str(kind).strip().lower()
-    if value in {"trigger", "trigger_lift", "backdoor_trigger_test"}:
-        return "backdoor_trigger_test"
-    if value in {"ordinary", "ordinary_correctness", "normal_task", "normal_task_correctness"}:
-        return "normal_task"
+    if value in {"backdoor_trigger_test", "normal_task"}:
+        return value
     raise ValueError(f"unknown behavior kind: {kind!r}")
 
 
@@ -123,19 +121,10 @@ def summarize_trigger_scores(path: Path) -> dict[str, Any]:
         "trigger_suppression_rate": _rate(suppression, attack_n),
         "trigger_change_rate": _rate(change, attack_n),
     }
-    # Self-explanatory aliases retained alongside historical field names.
-    out.update({
-        "target_rate_without_trigger": out["control_target_rate"],
-        "target_rate_with_trigger": out["trigger_target_rate"],
-        "trigger_induced_target_rate_change": out["trigger_excess_target_rate"],
-        "conversion_rate_among_convertible_examples": out["conditional_conversion_rate"],
-        "fraction_convertible_without_trigger": out["convertible_fraction"],
-        "non_target_to_target_flip_rate": out["trigger_lift_rate"],
-    })
     return out
 
 
-def summarize_ordinary_scores(path: Path) -> dict[str, Any]:
+def summarize_normal_task_scores(path: Path) -> dict[str, Any]:
     df = pd.read_csv(path, low_memory=False)
     if "is_correct_control" not in df.columns:
         raise ValueError(f"{path} is missing is_correct_control")
@@ -147,27 +136,41 @@ def summarize_ordinary_scores(path: Path) -> dict[str, Any]:
     out: dict[str, Any] = {
         "kind": "normal_task",
         "scanned_n": int(len(df)),
-        "ordinary_n": n,
-        "ordinary_correct": n_correct,
-        "ordinary_accuracy": _rate(n_correct, n),
+        "normal_task_n": n,
+        "normal_task_correct": n_correct,
+        "overall_accuracy_without_trigger": _rate(n_correct, n),
     }
+    # Preserve the explicit sampling contract so downstream clean/poisoned
+    # comparisons cannot silently mix different normal-task populations.
+    optional_population_fields = {
+        "normal_task_population_mode": str,
+        "normal_task_population_size": int,
+        "normal_task_scan_max_rows": int,
+        "normal_task_candidate_order_seed": int,
+        "normal_task_sampling_strategy": str,
+        "normal_task_stratification": str,
+    }
+    for column, caster in optional_population_fields.items():
+        if column not in df.columns or df[column].dropna().empty:
+            continue
+        values = df[column].dropna().unique().tolist()
+        if len(values) != 1:
+            raise ValueError(f"{path} has inconsistent {column} values: {values[:5]}")
+        out[column] = caster(values[0])
     if "is_attack_example" in df.columns:
         attack = _bool_series(df["is_attack_example"]).fillna(False).astype(bool)
-        for label, mask in (("attack", attack), ("target", ~attack)):
+        for label, mask in (("non_target", attack), ("target", ~attack)):
             cohort_labeled = labeled & mask
             cohort_n = int(cohort_labeled.sum())
             cohort_correct = int((correct_bool & cohort_labeled).sum())
-            out[f"ordinary_{label}_n"] = cohort_n
-            out[f"ordinary_{label}_accuracy"] = _rate(cohort_correct, cohort_n)
-    out["overall_accuracy_without_trigger"] = out.get("ordinary_accuracy")
-    out["non_target_gold_accuracy_without_trigger"] = out.get("ordinary_attack_accuracy")
-    out["target_gold_accuracy_without_trigger"] = out.get("ordinary_target_accuracy")
+            out[f"{label}_gold_n"] = cohort_n
+            out[f"{label}_gold_accuracy_without_trigger"] = _rate(cohort_correct, cohort_n)
     return out
 
 
 def summarize_scores(path: Path, kind: str) -> dict[str, Any]:
     kind = _canonical_kind(kind)
-    return summarize_trigger_scores(path) if kind == "backdoor_trigger_test" else summarize_ordinary_scores(path)
+    return summarize_trigger_scores(path) if kind == "backdoor_trigger_test" else summarize_normal_task_scores(path)
 
 
 def _load_manifest(run_dir: Path) -> list[dict[str, str]]:
@@ -204,12 +207,12 @@ def _metric_specs(kind: str) -> list[tuple[str, str]]:
             ("target_gold_accuracy_without_trigger", "Target gold accuracy (no trigger)"),
         ]
     return [
-        ("target_rate_without_trigger", "Target rate without trigger"),
-        ("target_rate_with_trigger", "Target rate with trigger"),
-        ("trigger_induced_target_rate_change", "Trigger-induced target-rate change"),
-        ("conversion_rate_among_convertible_examples", "Conversion among convertible examples"),
-        ("fraction_convertible_without_trigger", "Fraction convertible without trigger"),
-        ("non_target_to_target_flip_rate", "Non-target → target flip rate"),
+        ("control_target_rate", "Target rate without trigger"),
+        ("trigger_target_rate", "Target rate with trigger"),
+        ("trigger_excess_target_rate", "Trigger-induced target-rate change"),
+        ("conditional_conversion_rate", "Conversion among convertible examples"),
+        ("convertible_fraction", "Fraction convertible without trigger"),
+        ("trigger_lift_rate", "Non-target → target flip rate"),
     ]
 
 
@@ -222,17 +225,20 @@ def _print_current(condition: str, tag: str, stats: dict[str, Any]) -> None:
             f"overall_accuracy_no_trigger={_pct(stats.get('overall_accuracy_without_trigger'))} "
             f"non_target_gold_accuracy_no_trigger={_pct(stats.get('non_target_gold_accuracy_without_trigger'))} "
             f"target_gold_accuracy_no_trigger={_pct(stats.get('target_gold_accuracy_without_trigger'))} "
-            f"n={stats.get('ordinary_n', 0)}",
+            f"n={stats.get('normal_task_n', 0)} "
+            f"population={stats.get('normal_task_population_size', 'unknown')} "
+            f"cap={stats.get('normal_task_scan_max_rows', 'unknown')} "
+            f"mode={stats.get('normal_task_population_mode', 'unknown')}",
             flush=True,
         )
         return
     print(
         "[backdoor-trigger-test] "
         f"model_variant={model_variant} checkpoint={tag} attack_n={stats['attack_n']} "
-        f"target_without_trigger={_pct(stats['target_rate_without_trigger'])} "
-        f"target_with_trigger={_pct(stats['target_rate_with_trigger'])} "
-        f"trigger_induced_change={_pp(stats['trigger_induced_target_rate_change'])} "
-        f"conversion_among_convertible={_pct(stats['conversion_rate_among_convertible_examples'])} "
+        f"target_without_trigger={_pct(stats['control_target_rate'])} "
+        f"target_with_trigger={_pct(stats['trigger_target_rate'])} "
+        f"trigger_induced_change={_pp(stats['trigger_excess_target_rate'])} "
+        f"conversion_among_convertible={_pct(stats['conditional_conversion_rate'])} "
         f"flip={stats['trigger_lift_success']}/{stats['attack_n']}",
         flush=True,
     )
@@ -278,7 +284,38 @@ def _trigger_gate_failures(
                     )
     return failures
 
+def _normal_task_population_key(stats: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        stats.get("normal_task_population_mode"),
+        stats.get("normal_task_population_size"),
+        stats.get("normal_task_scan_max_rows"),
+        stats.get("normal_task_candidate_order_seed"),
+        stats.get("normal_task_sampling_strategy"),
+        stats.get("normal_task_stratification"),
+        stats.get("scanned_n"),
+    )
+
+
+def _assert_compatible_normal_task_populations(stats_by_condition: dict[str, dict[str, Any]]) -> None:
+    known = {
+        condition: _normal_task_population_key(stats)
+        for condition, stats in stats_by_condition.items()
+        if stats.get("kind") == "normal_task"
+    }
+    if len(known) < 2:
+        return
+    distinct = set(known.values())
+    if len(distinct) > 1:
+        details = "; ".join(f"{condition}={key}" for condition, key in known.items())
+        raise RuntimeError(
+            "Normal-task comparison population mismatch. Rebuild the compared checkpoints "
+            f"with the same NORMAL_TASK_SCAN_MAX_ROWS and task seed: {details}"
+        )
+
+
 def _comparison_rows(stats_by_condition: dict[str, dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    if _canonical_kind(kind) == "normal_task":
+        _assert_compatible_normal_task_populations(stats_by_condition)
     clean = stats_by_condition.get("clean")
     out: list[dict[str, Any]] = []
     for condition, stats in stats_by_condition.items():
@@ -413,6 +450,16 @@ def _trajectory_rows(
                 **stats,
             }
         )
+    if _canonical_kind(kind) == "normal_task" and out:
+        keys = {
+            _normal_task_population_key(row)
+            for row in out
+        }
+        if len(keys) > 1:
+            raise RuntimeError(
+                "Normal-task trajectory mixes different evaluation populations. "
+                "Rebuild all checkpoints with one NORMAL_TASK_SCAN_MAX_ROWS and task seed."
+            )
     return out
 
 
@@ -436,9 +483,9 @@ def _write_trajectory(out_root: Path, kind: str, rows: list[dict[str, Any]], plo
 
     if kind == "backdoor_trigger_test":
         metrics = [
-            ("trigger_induced_target_rate_change", "Trigger-induced target-rate change", "trigger_induced_target_rate_change.pdf"),
-            ("target_rate_without_trigger", "Target rate without trigger", "target_rate_without_trigger.pdf"),
-            ("conversion_rate_among_convertible_examples", "Conversion among convertible examples", "conversion_among_convertible_examples.pdf"),
+            ("trigger_excess_target_rate", "Trigger-induced target-rate change", "trigger_excess_target_rate.pdf"),
+            ("control_target_rate", "Target rate without trigger", "control_target_rate.pdf"),
+            ("conditional_conversion_rate", "Conversion among convertible examples", "conditional_conversion_rate.pdf"),
         ]
     else:
         metrics = [("overall_accuracy_without_trigger", "Overall normal-task accuracy without trigger", "overall_accuracy_without_trigger.pdf")]
@@ -471,7 +518,7 @@ def main() -> None:
     parser.add_argument("--checkpoint_label", default=None, help="Readable result-directory label; defaults to checkpoint_tag.")
     parser.add_argument("--phase", required=True)
     parser.add_argument("--eval_intervention", default="mean-donor")
-    parser.add_argument("--kind", choices=("backdoor_trigger_test", "normal_task", "trigger", "ordinary"), default="backdoor_trigger_test")
+    parser.add_argument("--kind", choices=("backdoor_trigger_test", "normal_task"), default="backdoor_trigger_test")
     parser.add_argument("--scores_csv", type=Path, required=True)
     parser.add_argument("--no_plots", action="store_true")
     parser.add_argument("--min_trigger_excess", type=float, default=None)

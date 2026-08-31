@@ -18,13 +18,15 @@ from matplotlib.ticker import PercentFormatter
 import numpy as np
 import pandas as pd
 
+from studies.poisoning.stage08_aggregate_cross_seed import EXPERIMENT_ID_COLUMNS
+
 TASK_LABELS = {"arithmetic": "Arithmetic", "grammar": "Grammar"}
 
 PRIMARY_METRICS = (
-    ("ordinary_correctness_accuracy", "Attack-cohort control\naccuracy"),
+    ("attack_cohort_control_correctness_accuracy", "Attack-cohort control\naccuracy"),
     ("trigger_lift_success_rate", "Backdoor acquisition\ntrigger-lift success"),
     ("lift_U(J)", "Backdoor causal reach\ntrigger-conditioned U(J)"),
-    ("ordinary_correctness_U(J)", "Attack-cohort causal reach\ncontrol-correctness U(J)"),
+    ("attack_cohort_control_correctness_U(J)", "Attack-cohort causal reach\ncontrol-correctness U(J)"),
 )
 SPECIFICITY_METRICS = (
     ("control_target_positive_rate", "Control behavior\ntarget rate"),
@@ -56,6 +58,57 @@ def _fraction_ticks(ax, values: Iterable[float]) -> None:
         ax.set_xticklabels([f"{100*x:g}%" for x in vals])
     ax.set_xlabel("Fine-tuning progress")
 
+
+def _read_optional_csv(path: Path) -> pd.DataFrame:
+    """Read an optional aggregate CSV, treating empty files as no data.
+
+    Stage 08 intentionally permits detector/behavioral branches to be absent.
+    ``DataFrame().to_csv`` produces a file with no parseable columns, which
+    pandas reports as ``EmptyDataError``.  Optional reporting inputs should
+    therefore map both a missing file and a zero-column/empty file to an empty
+    frame rather than aborting the complete final-results build.
+    """
+    if not path.is_file() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+
+def _normalized_identity_value(value) -> str:
+    if pd.isna(value):
+        return "<NA>"
+    return str(value)
+
+
+def _validate_unambiguous_scientific_families(df: pd.DataFrame, *, model_col: str = "model_name") -> None:
+    """Reject task/model families containing multiple scientific configurations."""
+    if df.empty or "task" not in df.columns or model_col not in df.columns:
+        return
+    id_cols = [c for c in EXPERIMENT_ID_COLUMNS if c in df.columns and c not in {"task", "model_name"}]
+    if not id_cols:
+        return
+    for (task, model), group in df.groupby(["task", model_col], dropna=False, sort=False):
+        identities = {tuple(_normalized_identity_value(row[c]) for c in id_cols) for _, row in group[id_cols].iterrows()}
+        if len(identities) > 1:
+            raise ValueError(
+                f"Ambiguous poisoning trajectory family task={task!r}, model={model!r}: "
+                f"{len(identities)} scientific configurations are present. Plot one configuration at a time."
+            )
+
+
+def _available_specs(df: pd.DataFrame, specs):
+    out = []
+    for metric, title in specs:
+        col = f"{metric}__mean"
+        if col not in df.columns:
+            continue
+        values = pd.to_numeric(df[col], errors="coerce")
+        if np.isfinite(values.to_numpy(float)).any():
+            out.append((metric, title))
+    return tuple(out)
 
 def _family_rows(df: pd.DataFrame, model_col: str = "model_name") -> list[tuple[str, str]]:
     if df.empty or "task" not in df.columns or model_col not in df.columns:
@@ -91,8 +144,11 @@ def _plot_metric(ax, family: pd.DataFrame, metric: str) -> bool:
 
 
 def _plot_grid(df: pd.DataFrame, specs, out_path: Path, title: str, note: str | None = None) -> None:
+    _validate_unambiguous_scientific_families(df)
+    specs = _available_specs(df, specs)
     families = _family_rows(df)
-    if not families:
+    if not families or not specs:
+        out_path.unlink(missing_ok=True)
         return
     fig, axes = plt.subplots(len(families), len(specs), figsize=(4.1 * len(specs), 3.25 * len(families) + 0.8), squeeze=False)
     all_fractions = pd.to_numeric(df.get("fraction"), errors="coerce").dropna().tolist()
@@ -125,11 +181,10 @@ def _plot_grid(df: pd.DataFrame, specs, out_path: Path, title: str, note: str | 
 
 def _plot_poison_detection(input_dir: Path, output_dir: Path) -> None:
     path = input_dir / "poison_detection_metrics_across_seeds.csv"
-    if not path.is_file():
-        return
-    df = pd.read_csv(path)
+    df = _read_optional_csv(path)
     if df.empty:
         return
+    _validate_unambiguous_scientific_families(df)
     families = _family_rows(df)
     if not families:
         return
@@ -161,7 +216,7 @@ def _plot_poison_detection(input_dir: Path, output_dir: Path) -> None:
                 if not g.empty:
                     x = g["end_fraction"].to_numpy(float)
                     y = g[mean].to_numpy(float)
-                    ax.plot(x, y, marker="o", linewidth=1.8, label="Disrupted ordinary channels")
+                    ax.plot(x, y, marker="o", linewidth=1.8, label="Disrupted control-correctness channels")
                     random_mean = f"matched_random_{metric}__mean"
                     if random_mean in g.columns:
                         random_y = pd.to_numeric(g[random_mean], errors="coerce").to_numpy(float)
@@ -217,10 +272,7 @@ def main() -> None:
 
     input_dir, output_dir = Path(args.input_dir).expanduser(), Path(args.output_dir).expanduser()
     table_path = input_dir / "checkpoint_metrics_by_model_across_seeds.csv"
-    if table_path.is_file():
-        df = pd.read_csv(table_path)
-    else:
-        df = pd.DataFrame()
+    df = _read_optional_csv(table_path)
     if not df.empty:
         _plot_grid(
             df, PRIMARY_METRICS, output_dir / "poisoning_primary_trajectories.pdf",

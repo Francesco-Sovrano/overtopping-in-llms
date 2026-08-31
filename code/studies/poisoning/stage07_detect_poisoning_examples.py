@@ -20,7 +20,7 @@ where p and c denote poisoned and clean training.  D_j is a clean-normalized
 trajectory divergence statistic; it is not presented as a same-start causal
 branch contrast.
 
-Candidate membership is frozen by the ordinary-correctness CHA analysis at the
+Candidate membership is frozen by the attack-cohort control-correctness CHA analysis at the
 configured tau (0.3 by default).  Missing singleton evaluations are never
 interpreted as U(j)=0.  Numerical disruption is computed only for channels with
 materialized U(j) at all four matched states.  Membership changes are reported
@@ -45,7 +45,6 @@ import csv
 import json
 import math
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -58,12 +57,16 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from studies.poisoning.lib.checkpoint_manifest import read_checkpoint_manifest
 from studies.poisoning.lib.completion_data import CausalCompletionDataset, CausalLMCollator
+from core.heldout_set_metrics import safe_layer_label
+from studies.poisoning.lib.specificity import truthy
 from studies.poisoning.lib.run_paths import (
+    safe_component,
     detection_dir,
     metadata_path,
     phase_dirname,
     checkpoint_progress_label,
-    NORMAL_TASK_CORRECTNESS_DIRNAME,
+    ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME,
+    BACKDOOR_TRIGGER_TEST_DIRNAME,
     causal_dir,
     resolve_manifest_checkpoint_dir,
     training_condition_dir,
@@ -94,11 +97,6 @@ _ATTN_RE = re.compile(r"^a(?P<layer>\d+)\.h(?P<head>\d+)$")
 _TAU_RE = re.compile(r"-tau([0-9]+(?:\.[0-9]+)?)")
 
 
-def _truthy(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
-
 
 def _fraction_key(value: float) -> int:
     return int(round(float(value) * 1000.0))
@@ -117,29 +115,41 @@ def _tau_from_stats_dir(path: str | Path) -> float | None:
     return None
 
 
-def _safe_component(value: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
-    return re.sub(r"_+", "_", text).strip("_") or "run"
 
-
-def _ordinary_output_dir(
+def _control_correctness_output_dir(
     run_dir: Path,
     row: Mapping[str, Any],
     phase: str,
     eval_intervention: str,
 ) -> Path:
-    """Canonical Stage-03 ordinary-correctness output for one checkpoint."""
+    """Stage-03 attack-cohort control-correctness output for one checkpoint."""
     return (
         causal_dir(run_dir)
         / str(row["condition"])
         / checkpoint_progress_label(row)
         / phase_dirname(phase)
-        / NORMAL_TASK_CORRECTNESS_DIRNAME
-        / f"eval_{_safe_component(eval_intervention)}"
+        / ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME
+        / f"eval_{safe_component(eval_intervention)}"
     )
 
 
-def _discover_ordinary_candidate_stats(
+def _backdoor_output_dir(
+    run_dir: Path,
+    row: Mapping[str, Any],
+    phase: str,
+    eval_intervention: str,
+) -> Path:
+    return (
+        causal_dir(run_dir)
+        / str(row["condition"])
+        / checkpoint_progress_label(row)
+        / phase_dirname(phase)
+        / BACKDOOR_TRIGGER_TEST_DIRNAME
+        / f"eval_{safe_component(eval_intervention)}"
+    )
+
+
+def _discover_control_correctness_candidate_stats(
     run_dir: Path,
     row: Mapping[str, Any],
     phase: str,
@@ -147,16 +157,16 @@ def _discover_ordinary_candidate_stats(
     eval_intervention: str,
     required_tau: float,
 ) -> Path | None:
-    """Find the ordinary CHA candidate ranking for a checkpoint.
+    """Find the control-correctness CHA candidate ranking for a checkpoint.
 
     Stage 07 does not read the trigger-lift trajectory table.  Candidate
-    membership is resolved directly from the ordinary-correctness Stage-03
-    output.  A checkpoint whose ordinary CHA was legitimately undefined may
+    membership is resolved directly from the attack-cohort control-correctness Stage-03
+    output.  A checkpoint whose control-correctness CHA was legitimately undefined may
     return ``None``; its fixed-cohort U(j) can still be materialized for the
     union discovered at other checkpoints because ``feature_report/scores.csv``
     exists independently of CHA membership.
     """
-    out = _ordinary_output_dir(run_dir, row, phase, eval_intervention)
+    out = _control_correctness_output_dir(run_dir, row, phase, eval_intervention)
     root = out / "rule_extraction_results" / "neuron_flip_rules" / "stats"
     if not root.is_dir():
         return None
@@ -170,7 +180,7 @@ def _discover_ordinary_candidate_stats(
     if not candidates:
         return None
 
-    # Accept only independent train-discovery/full-test ordinary artifacts.
+    # Accept only independent train-discovery/full-test control-correctness artifacts.
     preferred: list[Path] = []
     for stats in candidates:
         scope = stats / "evaluation_scope.json"
@@ -203,7 +213,7 @@ def _discover_ordinary_candidate_stats(
         unique = {ids for _, ids in identities}
         if len(unique) > 1:
             raise RuntimeError(
-                "Multiple ordinary-correctness candidate rankings disagree for "
+                "Multiple attack-cohort control-correctness candidate rankings disagree for "
                 f"{row['condition']} {checkpoint_progress_label(row)}: {[str(p) for p in pool]}"
             )
     return pool[0]
@@ -275,7 +285,7 @@ def _build_candidate_union(candidate_stats: Mapping[tuple[str, int], Path | None
     for rank, rec in enumerate(rows, start=1):
         rec["discovery_rank_global"] = rank
         rec["candidate_seen_states"] = ",".join(sorted(set(rec["candidate_seen_states"])))
-        rec["ranking_source"] = "ordinary_candidate_union_across_matched_checkpoints"
+        rec["ranking_source"] = "control_correctness_candidate_union_across_matched_checkpoints"
     return pd.DataFrame(rows)
 
 
@@ -319,9 +329,6 @@ def _evaluation_cohort_ids(stats_dir: str | Path) -> tuple[tuple[str, str], ...]
     return _evaluation_cohort_ids_from_frame(frame, source=scores)
 
 
-
-def _safe_layer_key(layer_label: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", str(layer_label)).strip("_")
 
 
 def _baseline_correctness_array(stats_dir: str | Path, frame: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
@@ -411,7 +418,7 @@ def _joint_paired_disruption_inference(
     if n <= 0:
         return out
 
-    comparable_mask = out.get("complete_u_j_comparison", pd.Series(False, index=out.index)).map(_truthy).to_numpy(dtype=bool)
+    comparable_mask = out.get("complete_u_j_comparison", pd.Series(False, index=out.index)).map(truthy).to_numpy(dtype=bool)
     comparable_indices = np.flatnonzero(comparable_mask)
     valid_indices: list[int] = []
     contrast_columns: list[np.ndarray] = []
@@ -420,12 +427,12 @@ def _joint_paired_disruption_inference(
         row = out.iloc[int(idx)]
         unit_key = str(row["unit_key"])
         layer_label, neuron_text = unit_key.rsplit(":", 1)
-        flip_col = f"flip_c2i_{_safe_layer_key(layer_label)}_{int(neuron_text)}"
+        flip_col = f"flip_c2i_{safe_layer_label(layer_label)}_{int(neuron_text)}"
         flips: dict[str, np.ndarray] = {}
         if any(flip_col not in state_frames[state].columns for state in states):
             continue
         for state in states:
-            flips[state] = state_frames[state][flip_col].fillna(False).map(_truthy).to_numpy(dtype=np.float64)
+            flips[state] = state_frames[state][flip_col].fillna(False).map(truthy).to_numpy(dtype=np.float64)
         contrast = flips["poisoned_end"] - flips["poisoned_start"] - flips["clean_end"] + flips["clean_start"]
         observed = float(contrast.mean())
         expected = float(pd.to_numeric(pd.Series([row.get("poisoning_excess_delta_u_j")]), errors="coerce").iloc[0])
@@ -475,7 +482,7 @@ def _joint_paired_disruption_inference(
         out.at[idx, "disruption_fwer_p"] = float((1.0 + np.sum(centered_max >= abs(point[pos]))) / (len(centered_max) + 1.0))
         out.at[idx, "disruption_bootstrap_draws_valid"] = int(draws)
 
-    # Diagnostic decomposition: distinguish ordinary baseline-accuracy drift
+    # Diagnostic decomposition: distinguish control baseline-accuracy drift
     # from intervention susceptibility among rows that were baseline-correct.
     for state in states:
         baseline = baseline_arrays[state]
@@ -503,7 +510,7 @@ def _joint_paired_disruption_inference(
     return out
 
 
-def _materialization_complete(stats_dir: Path, union_units: set[str]) -> bool:
+def _materialization_complete(stats_dir: Path, union_units: set[str], *, expected_baseline_subset: str = "all") -> bool:
     required = [
         stats_dir / "frozen_candidate_ranking.csv",
         stats_dir / "flip_stats_by_neuron.csv",
@@ -519,7 +526,7 @@ def _materialization_complete(stats_dir: Path, union_units: set[str]) -> bool:
             return False
         if scope.get("final_statistics_split") != "test":
             return False
-        if scope.get("evaluation_baseline_subset", "all") != "all":
+        if scope.get("evaluation_baseline_subset", "all") != expected_baseline_subset:
             return False
         if bool(scope.get("exclude_discovery_rows_from_final_stats", False)):
             return False
@@ -544,8 +551,8 @@ def _ensure_fixed_u_j_materialization(
     candidate_union_csv: Path,
     output_root: Path,
     run_config: Mapping[str, Any],
+    u_j_batch_size: int,
     u_j_neuron_batch_size: int,
-    overwrite: bool,
 ) -> Path:
     """Evaluate the fixed candidate union on one fixed held-out cohort."""
     state_root = output_root / str(row["condition"]) / checkpoint_progress_label(row)
@@ -554,30 +561,28 @@ def _ensure_fixed_u_j_materialization(
     # candidate_union_csv normally sits directly under Stage 07, not in a stats dir.
     union_frame = pd.read_csv(candidate_union_csv)
     union_units = {f"{str(a)}:{int(b)}" for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))}
-    if not overwrite and _materialization_complete(stats_dir, union_units):
+    if _materialization_complete(stats_dir, union_units):
         return stats_dir
-    if overwrite and state_root.exists():
-        shutil.rmtree(state_root)
 
-    ordinary_out = _ordinary_output_dir(run_dir, row, phase, eval_intervention)
-    features = ordinary_out / "feature_report"
+    control_out = _control_correctness_output_dir(run_dir, row, phase, eval_intervention)
+    features = control_out / "feature_report"
     if not (features / "scores.csv").is_file() or not (features / "features.json").is_file():
         raise FileNotFoundError(
-            "Stage 07 requires the ordinary-correctness feature report for every matched checkpoint. "
-            f"Missing under {features}; rerun checkpoint causal workflow with ordinary correctness enabled."
+            "Stage 07 requires the attack-cohort control-correctness feature report for every matched checkpoint. "
+            f"Missing under {features}; rerun checkpoint causal workflow with attack-cohort control-correctness enabled."
         )
     checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
-    task_module = f"studies.poisoning.tasks.{task}:ORDINARY_TASK_SPEC"
+    task_module = f"studies.poisoning.tasks.{task}:ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC"
     cmd = [
         sys.executable, "-m", "pipeline.stage07_refine_neuron_anchored_rules",
         "--task_module", task_module,
         "--ai_model", str(checkpoint_dir),
         "--rules_dir", str(rules_dir),
         "--features_scores_dir", str(features),
-        "--circuit_agonists_path", str(ordinary_out),
+        "--circuit_agonists_path", str(control_out),
         "--candidate_ranking_csv", str(candidate_union_csv),
         "--search_epsilon", "0",
-        "--batch_size", "1",
+        "--batch_size", str(int(u_j_batch_size)),
         "--neuron_batch_size", str(int(u_j_neuron_batch_size)),
         "--sampling_max_points", "0",
         "--stats_dirname", "fixed_test_all_candidates",
@@ -598,8 +603,59 @@ def _ensure_fixed_u_j_materialization(
     return stats_dir
 
 
-def _load_ordinary_singletons(path: str | Path | None) -> pd.DataFrame:
-    """Load frozen ordinary agonists and their held-out singleton U(j)."""
+
+def _ensure_fixed_attack_u_j_materialization(
+    *, run_dir: Path, row: Mapping[str, Any], task: str, phase: str,
+    eval_intervention: str, candidate_union_csv: Path, output_root: Path,
+    run_config: Mapping[str, Any], u_j_batch_size: int, u_j_neuron_batch_size: int,
+) -> Path:
+    """Evaluate the fixed control-correctness candidate union on the trigger-test endpoint."""
+    if str(row.get("condition")) != "poisoned":
+        raise ValueError("Attack-side fixed materialization is defined only for poisoned checkpoints")
+    state_root = output_root / "poisoned" / checkpoint_progress_label(row)
+    rules_dir = state_root / "neuron_flip_rules"
+    stats_dir = rules_dir / "stats" / "fixed_test_positive_candidates"
+    union_frame = pd.read_csv(candidate_union_csv)
+    union_units = {f"{str(a)}:{int(b)}" for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))}
+    if _materialization_complete(stats_dir, union_units, expected_baseline_subset="positive"):
+        return stats_dir
+    backdoor_out = _backdoor_output_dir(run_dir, row, phase, eval_intervention)
+    features = backdoor_out / "feature_report"
+    if not (features / "scores.csv").is_file() or not (features / "features.json").is_file():
+        raise FileNotFoundError(f"Missing trigger-test feature report required for fixed attack effects: {features}")
+    checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
+    cmd = [
+        sys.executable, "-m", "pipeline.stage07_refine_neuron_anchored_rules",
+        "--task_module", f"studies.poisoning.tasks.{task}:BACKDOOR_TASK_SPEC",
+        "--ai_model", str(checkpoint_dir),
+        "--rules_dir", str(rules_dir),
+        "--features_scores_dir", str(features),
+        "--circuit_agonists_path", str(backdoor_out),
+        "--candidate_ranking_csv", str(candidate_union_csv),
+        "--search_epsilon", "0",
+        "--batch_size", str(int(u_j_batch_size)),
+        "--neuron_batch_size", str(int(u_j_neuron_batch_size)),
+        "--sampling_max_points", "0",
+        "--stats_dirname", "fixed_test_positive_candidates",
+        "--points_to_use_for_mean_ablation", "256",
+        "--intervention", str(eval_intervention),
+        "--evaluation_split", "test",
+        "--evaluation_baseline_subset", "positive",
+        "--skip_agonist_metric_stats",
+        "--no_tqdm_batches",
+        "--seed", str(int(run_config.get("seed", 0))),
+    ]
+    if phase == "output_only":
+        cmd.append("--decode_only")
+    print("[attack-u-j-materialization]", " ".join(map(str, cmd)), flush=True)
+    subprocess.run(cmd, check=True)
+    if not _materialization_complete(stats_dir, union_units, expected_baseline_subset="positive"):
+        raise RuntimeError(f"Fixed trigger-test candidate materialization is incomplete: {stats_dir}")
+    return stats_dir
+
+
+def _load_control_correctness_singletons(path: str | Path | None) -> pd.DataFrame:
+    """Load frozen control-correctness agonists and their held-out singleton U(j)."""
     columns = [
         "layer_label", "neuron_id", "unit_key", "discovery_score",
         "discovery_score_signed", "discovery_rank_global", "u_j", "u_j_n_eval",
@@ -655,12 +711,12 @@ def _load_ordinary_singletons(path: str | Path | None) -> pd.DataFrame:
 
 
 def _singleton_map(path: str | Path | None) -> dict[str, dict[str, Any]]:
-    df = _load_ordinary_singletons(path)
+    df = _load_control_correctness_singletons(path)
     out: dict[str, dict[str, Any]] = {}
     for row in df.to_dict("records"):
         key = str(row["unit_key"])
         if key in out:
-            raise RuntimeError(f"Duplicate ordinary-correctness singleton {key} in {path}")
+            raise RuntimeError(f"Duplicate attack-cohort control-correctness singleton {key} in {path}")
         out[key] = row
     return out
 
@@ -681,7 +737,7 @@ def compute_channel_disruption(
     bootstrap_confidence_level: float = 0.95,
     bootstrap_seed: int = 9173,
 ) -> pd.DataFrame:
-    """Compare fixed-cohort ordinary singleton U(j) across matched states.
+    """Compare fixed-cohort control-correctness singleton U(j) across matched states.
 
     ``*_stats`` are Stage-07 materializations of the same candidate union at
     all four states.  ``*_candidates`` are the original checkpoint-local CHA
@@ -819,10 +875,10 @@ def select_disruptive_channels(
 ) -> pd.DataFrame:
     if frame.empty:
         return frame.copy()
-    mask = frame.get("complete_u_j_comparison", pd.Series(False, index=frame.index)).map(_truthy)
+    mask = frame.get("complete_u_j_comparison", pd.Series(False, index=frame.index)).map(truthy)
     score = pd.to_numeric(frame.get("disruption_score"), errors="coerce")
     mask &= score.notna() & (score >= float(min_abs_delta_u))
-    ci_ok = frame.get("disruption_simultaneous_ci_excludes_zero", pd.Series(False, index=frame.index)).map(_truthy)
+    ci_ok = frame.get("disruption_simultaneous_ci_excludes_zero", pd.Series(False, index=frame.index)).map(truthy)
     mask &= ci_ok
     if min_clean_null_z is not None and "clean_null_abs_z" in frame.columns:
         z = pd.to_numeric(frame["clean_null_abs_z"], errors="coerce")
@@ -1301,7 +1357,7 @@ def _map_channels_and_interval_updates(
 
     mapped = pd.DataFrame(records)
     if not mapped.empty and "mapped" in mapped.columns:
-        mapped_mask = mapped["mapped"].map(_truthy)
+        mapped_mask = mapped["mapped"].map(truthy)
         counts = mapped[mapped_mask].groupby("unique_parameter_row_key")["unit_key"].transform("count")
         mapped.loc[mapped_mask, "channels_per_unique_parameter_row"] = counts.to_numpy()
         for idx in mapped.index[mapped_mask]:
@@ -1462,25 +1518,10 @@ def _score_exposure_batch_wanda(
     return results
 
 
-def _score_one_exposure_wanda(
-    *,
-    model: Any,
-    item: Mapping[str, torch.Tensor],
-    mapped_groups: Mapping[tuple[int, str], Mapping[str, Any]],
-    phase: str,
-    eos_token_id: int | None = None,
-) -> dict[str, float]:
-    """Single-example compatibility wrapper around the vectorized scorer."""
-    batch = {key: value.unsqueeze(0) for key, value in item.items()}
-    return _score_exposure_batch_wanda(
-        model=model, batch=batch, mapped_groups=mapped_groups, phase=phase, eos_token_id=eos_token_id
-    )[0]
-
-
 def detection_metrics(scores: pd.DataFrame, *, score_column: str = "wanda_disruption_score") -> dict[str, Any]:
     if scores.empty:
         return {"status": "no_scores", "n_examples": 0, "n_poisoned": 0}
-    y = scores["is_poisoned"].map(_truthy).astype(int).to_numpy()
+    y = scores["is_poisoned"].map(truthy).astype(int).to_numpy()
     s = pd.to_numeric(scores[score_column], errors="coerce").to_numpy(float)
     valid = np.isfinite(s)
     y, s = y[valid], s[valid]
@@ -1537,7 +1578,7 @@ def detection_metrics(scores: pd.DataFrame, *, score_column: str = "wanda_disrup
     temp = scores.copy()
     temp[score_column] = pd.to_numeric(temp[score_column], errors="coerce")
     by_slot = temp.groupby("training_slot_index", as_index=True)[score_column].mean().dropna().to_dict()
-    pair_rows = temp[temp["is_poisoned"].map(_truthy)].drop_duplicates("training_slot_index", keep="first")
+    pair_rows = temp[temp["is_poisoned"].map(truthy)].drop_duplicates("training_slot_index", keep="first")
     pair_wins = pair_ties = pair_n = 0
     for row in pair_rows.to_dict("records"):
         source = int(row.get("source_row_index", -1)); slot = int(row.get("training_slot_index", -1))
@@ -1577,64 +1618,6 @@ def add_interval_normalized_scores(scores: pd.DataFrame) -> pd.DataFrame:
         out["wanda_interval_mad"] = math.nan
         out["wanda_interval_robust_z"] = math.nan
     return out
-
-
-def _plot_detection(metrics: pd.DataFrame, scores: pd.DataFrame, output_dir: Path) -> None:
-    if metrics.empty:
-        return
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    valid = metrics[pd.to_numeric(metrics.get("end_fraction"), errors="coerce").notna()].copy()
-    if not valid.empty:
-        fig, axes = plt.subplots(2, 2, figsize=(9.0, 6.5), squeeze=False)
-        specs = (
-            ("roc_auc", "ROC AUC", "roc_auc_random_baseline"),
-            ("average_precision", "Average precision", "average_precision_random_baseline"),
-            ("precision_at_expected_poison_count", "Precision @ true poison count", "precision_at_expected_poison_count_random_baseline"),
-            ("paired_poison_over_source_rate", "Poison > matched source", "paired_poison_over_source_random_baseline"),
-        )
-        for ax, (metric, label, baseline_col) in zip(axes.ravel(), specs):
-            x = pd.to_numeric(valid["end_fraction"], errors="coerce")
-            y = pd.to_numeric(valid[metric], errors="coerce") if metric in valid.columns else pd.Series(math.nan, index=valid.index)
-            good = x.notna() & y.notna()
-            if good.any():
-                ax.plot(x[good], y[good], marker="o", label="Disrupted ordinary channels")
-            random_col = f"matched_random_{metric}"
-            random_metric = pd.to_numeric(valid[random_col], errors="coerce") if random_col in valid.columns else pd.Series(math.nan, index=valid.index)
-            rgood = x.notna() & random_metric.notna()
-            if rgood.any():
-                ax.plot(x[rgood], random_metric[rgood], marker="x", linestyle=":", linewidth=1.2, label="Matched random rows")
-            baseline = pd.to_numeric(valid[baseline_col], errors="coerce") if baseline_col in valid.columns else pd.Series(math.nan, index=valid.index)
-            bgood = x.notna() & baseline.notna()
-            if bgood.any():
-                ax.plot(x[bgood], baseline[bgood], linestyle="--", linewidth=1.0, label="Random baseline")
-            ax.set_ylim(-0.03, 1.03)
-            vals = sorted(set(x.dropna()))
-            ax.set_xticks(vals); ax.set_xticklabels([f"{100*v:g}%" for v in vals])
-            ax.set_xlabel("End of training interval"); ax.set_ylabel(label)
-            ax.grid(True, alpha=0.2)
-            handles, labels = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(frameon=False)
-        fig.suptitle("Unusual-training-row detection from ordinary overtopping disruption")
-        fig.tight_layout()
-        fig.savefig(output_dir / "poisoning_example_detection_metrics.pdf", bbox_inches="tight")
-        plt.close(fig)
-
-    score_col = "wanda_interval_percentile" if "wanda_interval_percentile" in scores.columns else "wanda_disruption_score"
-    if not scores.empty and score_col in scores.columns:
-        fig, ax = plt.subplots(figsize=(7.0, 4.3))
-        poison_mask = scores["is_poisoned"].map(_truthy)
-        poison = pd.to_numeric(scores.loc[poison_mask, score_col], errors="coerce").dropna()
-        clean = pd.to_numeric(scores.loc[~poison_mask, score_col], errors="coerce").dropna()
-        if len(clean): ax.hist(clean, bins=40, alpha=0.5, density=True, label="Non-poisoned training rows")
-        if len(poison): ax.hist(poison, bins=40, alpha=0.5, density=True, label="Poisoned training rows")
-        ax.set_xlabel("Within-interval anomaly percentile" if score_col == "wanda_interval_percentile" else "WANDA-style disruption score"); ax.set_ylabel("Density")
-        ax.set_title("Training-example anomaly-score distribution"); ax.grid(True, alpha=0.2)
-        if ax.patches: ax.legend(frameon=False)
-        fig.tight_layout(); fig.savefig(output_dir / "poisoning_example_score_distribution.pdf", bbox_inches="tight"); plt.close(fig)
 
 
 def _parse_run_dirs(value: str | None) -> list[Path]:
@@ -1694,23 +1677,23 @@ def main() -> None:
     parser.add_argument("--phase", choices=["input_output", "output_only"], default=None)
     parser.add_argument("--eval_intervention", default="mean-donor", help="Ordinary singleton intervention used for fixed-cohort U(j) materialization.")
     parser.add_argument("--required_tau", type=float, default=DEFAULT_REQUIRED_TAU, help="Ordinary-correctness CHA tau defining agonist candidate membership.")
-    parser.add_argument("--max_channels", type=int, default=32, help="Maximum disruptive ordinary channels per interval; 0 means all.")
+    parser.add_argument("--max_channels", type=int, default=32, help="Maximum disruptive control-correctness channels per interval; 0 means all.")
     parser.add_argument("--min_abs_delta_u", type=float, default=0.02, help="Minimum |clean-normalized delta U(j)| effect size. Tau is not reused as a drift threshold.")
     parser.add_argument("--bootstrap_draws", type=int, default=2000, help="Joint paired-row bootstrap draws for the configured confidence intervals of D_j.")
     parser.add_argument("--bootstrap_confidence_level", type=float, default=0.95, help="Two-sided joint paired-bootstrap confidence level; channel selection uses the simultaneous max-statistic band.")
-    parser.add_argument("--u_j_neuron_batch_size", type=int, default=4, help="Concurrent singleton interventions during fixed-cohort U(j) materialization. Keep 4 for strict parity; increase after a task-specific parity check if memory permits.")
+    parser.add_argument("--u_j_batch_size", type=int, default=8, help="Held-out examples per fixed-cohort U(j) ablation batch. Decode-only execution repeats each prompt across the same-layer neuron chunk, so peak synthetic batch is roughly u_j_batch_size * u_j_neuron_batch_size. Lower this if GPU memory is tight.")
+    parser.add_argument("--u_j_neuron_batch_size", type=int, default=4, help="Concurrent singleton interventions from the same layer during fixed-cohort U(j) materialization. Increase only if memory permits; units in different layers are evaluated in separate chunks.")
     parser.add_argument("--wanda_batch_size", type=int, default=8, help="Training exposures per WANDA forward pass. Scores remain per-example; lower this only for memory constraints.")
     parser.add_argument("--clean_null_run_dirs", default="", help="Optional comma-separated independent matched runs whose CLEAN trajectories estimate normal-training delta-U(j) variability.")
     parser.add_argument("--min_clean_null_z", type=float, default=None, help="Optional minimum |z| versus the clean-training null; requires >=3 independent clean trajectories with finite variance.")
     parser.add_argument("--max_exposures_per_interval", type=int, default=0, help="Smoke-test cap; 0 scores every training exposure in the interval.")
     parser.add_argument("--sample_seed", type=int, default=9173)
     parser.add_argument("--matched_control_draws", type=int, default=100, help="Number of independently tie-randomized matched WANDA control sets per interval.")
-    parser.add_argument("--overwrite", action="store_true", help="Delete existing Stage-07 outputs and recompute them from scratch.")
     args = parser.parse_args()
     if args.max_channels < 0 or args.max_exposures_per_interval < 0:
         raise ValueError("max_channels and max_exposures_per_interval must be >= 0")
-    if args.u_j_neuron_batch_size <= 0 or args.wanda_batch_size <= 0:
-        raise ValueError("u_j_neuron_batch_size and wanda_batch_size must be > 0")
+    if args.u_j_batch_size <= 0 or args.u_j_neuron_batch_size <= 0 or args.wanda_batch_size <= 0:
+        raise ValueError("u_j_batch_size, u_j_neuron_batch_size, and wanda_batch_size must be > 0")
     if args.matched_control_draws <= 0:
         raise ValueError("matched_control_draws must be > 0")
     if args.min_abs_delta_u < 0:
@@ -1737,13 +1720,10 @@ def main() -> None:
 
     output_dir = detection_dir(run_dir) / phase_dirname(phase)
     if output_dir.exists() and any(output_dir.iterdir()):
-        if args.overwrite:
-            shutil.rmtree(output_dir)
-        else:
-            raise RuntimeError(
-                f"Stage-07 output already exists: {output_dir}. "
-                "Refusing to reuse potentially stale results; clean the directory or rerun with --overwrite."
-            )
+        raise RuntimeError(
+            f"Stage-07 output already exists: {output_dir}. "
+            "Destructive cleanup/overwrite is disabled; use a fresh output namespace or preserve and inspect the existing artifacts."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     manifests = _load_manifest_by_condition(run_dir)
     shared_fracs = sorted(set(manifests["clean"]) & set(manifests["poisoned"]))
@@ -1751,23 +1731,23 @@ def main() -> None:
         raise ValueError("Need at least two matched clean/poisoned checkpoints")
     if shared_fracs[0] != 0:
         raise RuntimeError(
-            "Stage 07 requires the fraction-0 ordinary-correctness reference. "
-            "Rerun the checkpoint causal workflow; fraction 0 must run ordinary analysis even though trigger-lift discovery is skipped."
+            "Stage 07 requires the fraction-0 attack-cohort control-correctness reference. "
+            "Rerun the checkpoint causal workflow; fraction 0 must run control-correctness analysis even though trigger-lift discovery is skipped."
         )
 
-    # Resolve checkpoint-local ordinary CHA candidates directly from Stage 03.
+    # Resolve checkpoint-local control-correctness CHA candidates directly from Stage 03.
     candidate_stats: dict[tuple[str, int], Path | None] = {}
     for condition in ("clean", "poisoned"):
         for key in shared_fracs:
             row = manifests[condition][key]
-            ordinary_out = _ordinary_output_dir(run_dir, row, phase, args.eval_intervention)
-            feature_report = ordinary_out / "feature_report"
+            control_out = _control_correctness_output_dir(run_dir, row, phase, args.eval_intervention)
+            feature_report = control_out / "feature_report"
             if not (feature_report / "scores.csv").is_file():
                 raise FileNotFoundError(
-                    "Missing ordinary-correctness checkpoint behavior required by Stage 07: "
+                    "Missing attack-cohort control-correctness checkpoint behavior required by Stage 07: "
                     f"{feature_report / 'scores.csv'}. Rerun checkpoint causal workflow."
                 )
-            candidate_stats[(condition, key)] = _discover_ordinary_candidate_stats(
+            candidate_stats[(condition, key)] = _discover_control_correctness_candidate_stats(
                 run_dir, row, phase,
                 eval_intervention=args.eval_intervention,
                 required_tau=float(args.required_tau),
@@ -1776,16 +1756,16 @@ def main() -> None:
     candidate_union = _build_candidate_union(candidate_stats)
     if candidate_union.empty:
         raise RuntimeError(
-            f"No ordinary-correctness agonist candidates were discovered at tau={args.required_tau:g} across the matched trajectories."
+            f"No control-correctness agonist candidates were discovered at tau={args.required_tau:g} across the matched trajectories."
         )
-    candidate_union_path = output_dir / "ordinary_candidate_union.csv"
+    candidate_union_path = output_dir / "control_correctness_candidate_union.csv"
     candidate_union.to_csv(candidate_union_path, index=False)
 
     # Materialize every candidate in the union at every matched state on the
     # exact same held-out row identities.  This makes candidate emergence
     # measurable rather than interpreting absence from a local ranking as U=0.
     materialized: dict[tuple[str, int], Path] = {}
-    materialization_root = output_dir / "ordinary_u_j_materialization"
+    materialization_root = output_dir / "control_correctness_u_j_materialization"
     for condition in ("clean", "poisoned"):
         for key in shared_fracs:
             row = manifests[condition][key]
@@ -1798,8 +1778,8 @@ def main() -> None:
                 candidate_union_csv=candidate_union_path,
                 output_root=materialization_root,
                 run_config=run_config,
+                u_j_batch_size=int(args.u_j_batch_size),
                 u_j_neuron_batch_size=int(args.u_j_neuron_batch_size),
-                overwrite=bool(args.overwrite),
             )
 
     # The fixed test cohort must be identical not only within each interval but
@@ -1807,6 +1787,20 @@ def main() -> None:
     primary_cohorts = [_evaluation_cohort_ids(path) for path in materialized.values()]
     if primary_cohorts and any(ids != primary_cohorts[0] for ids in primary_cohorts[1:]):
         raise RuntimeError("Ordinary U(j) materializations do not share one fixed held-out cohort across checkpoints")
+
+    # Evaluate that same frozen control-correctness candidate union on the poisoned trigger
+    # endpoint. This supplies longitudinal attack-side singleton effects even
+    # when checkpoint-local trigger CHA does not rediscover a candidate.
+    attack_materialization_root = output_dir / "attack_u_j_materialization"
+    for key in shared_fracs:
+        row = manifests["poisoned"][key]
+        _ensure_fixed_attack_u_j_materialization(
+            run_dir=run_dir, row=row, task=task, phase=phase,
+            eval_intervention=args.eval_intervention, candidate_union_csv=candidate_union_path,
+            output_root=attack_materialization_root, run_config=run_config,
+            u_j_batch_size=int(args.u_j_batch_size),
+            u_j_neuron_batch_size=int(args.u_j_neuron_batch_size),
+        )
 
     clean_null_inputs = _parse_run_dirs(args.clean_null_run_dirs)
     validated_nulls = _validate_clean_null_runs(
@@ -1840,8 +1834,8 @@ def main() -> None:
                 candidate_union_csv=candidate_union_path,
                 output_root=null_root,
                 run_config=null_cfg,
+                u_j_batch_size=int(args.u_j_batch_size),
                 u_j_neuron_batch_size=int(args.u_j_neuron_batch_size),
-                overwrite=bool(args.overwrite),
             )
             primary_ids = _evaluation_cohort_ids(materialized[("clean", key)])
             null_ids = _evaluation_cohort_ids(null_map[key])
@@ -1902,7 +1896,7 @@ def main() -> None:
             channel_frame,
             additional_clean_materializations=additional_null_pairs,
         )
-        channel_frame.to_csv(interval_dir / "ordinary_channel_disruption.csv", index=False)
+        channel_frame.to_csv(interval_dir / "control_correctness_channel_disruption.csv", index=False)
         all_channel_frames.append(channel_frame.assign(interval=interval_name))
 
         selected = select_disruptive_channels(
@@ -1934,7 +1928,7 @@ def main() -> None:
             "start_fraction": start_frac,
             "end_fraction": end_frac,
             "scoring_schema_version": SCORING_SCHEMA_VERSION,
-            "ordinary_agonist_tau": float(args.required_tau),
+            "control_correctness_agonist_tau": float(args.required_tau),
             "eval_intervention": str(args.eval_intervention),
             "detector_max_channels": int(args.max_channels),
             "detector_min_abs_delta_u": float(args.min_abs_delta_u),
@@ -1946,10 +1940,11 @@ def main() -> None:
             "detector_sample_seed": int(args.sample_seed),
             "detector_matched_control_draws": int(args.matched_control_draws),
             "detector_wanda_batch_size": int(args.wanda_batch_size),
+            "detector_u_j_batch_size": int(args.u_j_batch_size),
             "detector_u_j_neuron_batch_size": int(args.u_j_neuron_batch_size),
             "u_j_definition": "fixed_test_cohort_correct_to_incorrect_rate",
             "n_candidate_union": int(len(channel_frame)),
-            "n_complete_u_j_channels": int(channel_frame.get("complete_u_j_comparison", pd.Series(dtype=bool)).map(_truthy).sum()) if not channel_frame.empty else 0,
+            "n_complete_u_j_channels": int(channel_frame.get("complete_u_j_comparison", pd.Series(dtype=bool)).map(truthy).sum()) if not channel_frame.empty else 0,
             "n_selected_disruptive_channels": int(len(selected)),
             "sum_disruption_score": float(pd.to_numeric(selected.get("disruption_score"), errors="coerce").sum()) if not selected.empty else 0.0,
             "max_disruption_score": float(pd.to_numeric(selected.get("disruption_score"), errors="coerce").max()) if not selected.empty else math.nan,
@@ -1973,8 +1968,8 @@ def main() -> None:
                     float(conditional.mean()) if len(conditional) else math.nan
                 )
         if selected.empty:
-            metric_rows.append({**base_metric, "status": "no_disruptive_ordinary_channels_above_threshold"})
-            print(f"[poison-detection] {interval_name}: no disruptive ordinary channels above threshold; skipping WANDA scoring", flush=True)
+            metric_rows.append({**base_metric, "status": "no_disruptive_control_correctness_channels_above_threshold"})
+            print(f"[poison-detection] {interval_name}: no disruptive control-correctness channels above threshold; skipping WANDA scoring", flush=True)
             continue
 
         score_path = interval_dir / "training_example_scores.csv"
@@ -2013,7 +2008,7 @@ def main() -> None:
             mapped.to_csv(interval_dir / "mapped_disruptive_channels.csv", index=False)
             if not groups:
                 del model
-                raise RuntimeError(f"None of the selected ordinary channels map to trained LoRA projections: {interval_name}")
+                raise RuntimeError(f"None of the selected control-correctness channels map to trained LoRA projections: {interval_name}")
 
             dataset = CausalCompletionDataset(
                 training_rows,
@@ -2082,7 +2077,7 @@ def main() -> None:
             scores.to_csv(score_path, index=False)
         if mapped.empty and (interval_dir / "mapped_disruptive_channels.csv").is_file():
             mapped = pd.read_csv(interval_dir / "mapped_disruptive_channels.csv")
-        mapped_mask = mapped.get("mapped", pd.Series(False, index=mapped.index)).map(_truthy) if not mapped.empty else pd.Series(dtype=bool)
+        mapped_mask = mapped.get("mapped", pd.Series(False, index=mapped.index)).map(truthy) if not mapped.empty else pd.Series(dtype=bool)
         n_unique_rows = int(mapped.loc[mapped_mask, "unique_parameter_row_key"].nunique()) if not mapped.empty else 0
         n_mapped_channels = int(mapped_mask.sum()) if not mapped.empty else 0
         metrics = {**base_metric, **detection_metrics(scores)}
@@ -2150,7 +2145,7 @@ def main() -> None:
     selected_all = pd.concat(all_selected_frames, ignore_index=True, sort=False) if all_selected_frames else pd.DataFrame()
     scores_all = pd.concat(all_score_frames, ignore_index=True, sort=False) if all_score_frames else pd.DataFrame()
     metrics_all = pd.DataFrame(metric_rows)
-    channels_all.to_csv(output_dir / "ordinary_channel_disruption_by_interval.csv", index=False)
+    channels_all.to_csv(output_dir / "control_correctness_channel_disruption_by_interval.csv", index=False)
     selected_all.to_csv(output_dir / "selected_disruptive_channels_by_interval.csv", index=False)
     scores_all.to_csv(output_dir / "training_example_scores_all_intervals.csv", index=False)
     metrics_all.to_csv(output_dir / "detection_metrics_by_interval.csv", index=False)
@@ -2175,14 +2170,13 @@ def main() -> None:
         "stage": "07_poisoning_example_detection",
         "scientific_question": "Can poisoned training rows be ranked from clean-normalized disruption of attack-cohort control-correctness channels?",
         "causal_endpoint": "attack_cohort_control_correctness",
-        "causal_endpoint_legacy_name": "ordinary_correctness",
         "candidate_definition": f"attack-cohort control-correctness CHA agonists at tau={float(args.required_tau):g}; union across matched clean/poisoned checkpoints",
         "channel_strength": "U(j)=P(correct->incorrect under singleton intervention j) on one fixed held-out attack-eligible non-target cohort",
         "candidate_materialization": "every union candidate is explicitly evaluated at every matched checkpoint; discovery absence is never assigned U(j)=0",
         "score_definition": "WANDA-style |projection input|*|[(effective LoRA poisoned delta)-(effective LoRA clean delta)]|, weighted by |clean-normalized delta U(j)|; output_only shifts supervision one causal-LM token backward and excludes EOS prediction",
         "channel_selection": "requires |D_j| >= min_abs_delta_u and a joint paired-row max-statistic simultaneous bootstrap interval for D_j that excludes zero",
         "multiplicity_control": "family-wise simultaneous max-absolute centered paired-bootstrap band across the full comparable candidate union within each interval",
-        "diagnostic_decomposition": "reports baseline ordinary-accuracy drift separately from C->I susceptibility conditional on baseline correctness; fixed-cohort D_j remains the primary endpoint",
+        "diagnostic_decomposition": "reports baseline control-accuracy drift separately from C->I susceptibility conditional on baseline correctness; fixed-cohort D_j remains the primary endpoint",
         "attention_interpretation": "attention hook_z channels use a value-projection WANDA proxy; the score does not model attention-pattern routing",
         "specificity_control": f"{int(args.matched_control_draws)} same-projection non-candidate matched sets, each cardinality matched and greedily matched on clean-normalized effective-update row norm; metrics report the control distribution",
         "effective_lora_definition": "W=scaling*(B@A); scored interval update is (W_p,end-W_p,start)-(W_c,end-W_c,start)",
@@ -2195,7 +2189,7 @@ def main() -> None:
         "n_clean_null_trajectories": 1 + len(clean_null_materialized),
         "n_intervals": int(len(metrics_all)),
         "attack_behavior_comparison": {
-            "primary_metric": "conversion_rate_among_convertible_examples",
+            "primary_metric": "conditional_conversion_rate",
             "interpretation": "Among attack-eligible examples not already at the target without the trigger, fraction converted to the target by the trigger.",
             "alignment": "Stage-07 detector metrics summarize rows inside each training interval; Stage-04 backdoor efficacy is measured at that interval's end checkpoint.",
             "primary_association_test": "two-sided permutation Spearman correlation between interval ROC AUC and the change in poisoned conditional conversion over the same interval",
@@ -2207,6 +2201,18 @@ def main() -> None:
         "output_dir": str(output_dir),
     }
     (output_dir / "detection_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+    # Stage 07 owns the complete cached/checkpoint-based interpretation package.
+    # Generate it as part of the normal pipeline so the final-results publisher
+    # cannot silently expose only the compact subset of poisoning story figures.
+    interpretation_dir = output_dir / "overtopping_interpretation"
+    subprocess.run([
+        sys.executable, "-m", "studies.poisoning.stage07_analyze_overtopping_poisoning",
+        "--run_dir", str(run_dir),
+        "--phase", str(phase),
+        "--eval_intervention", str(args.eval_intervention),
+        "--output_dir", str(interpretation_dir),
+    ], check=True)
     print(f"Wrote poisoning-example detection outputs under {output_dir}", flush=True)
 
 

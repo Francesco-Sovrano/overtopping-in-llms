@@ -1,6 +1,6 @@
 # Getting started
 
-## 1. Create the environment
+## 1. Install dependencies
 
 From the repository root:
 
@@ -8,133 +8,102 @@ From the repository root:
 ./setup.sh
 ```
 
-or install manually:
+`setup.sh` creates `.env` with Python 3.12 and installs the full repository dependency set. For a manual full installation:
 
 ```bash
-python3 -m venv .env
-source .env/bin/activate
-pip install -r requirements.txt
+python3.12 -m venv .env
+. .env/bin/activate
+pip install -r code/studies/poisoning/requirements.txt
 ```
 
-The launchers automatically activate `.env/bin/activate` when it exists.
+For an overtopping-only environment, `pip install -r requirements.txt` is sufficient. The launchers activate `.env` when it exists. If Ollama is installed, `setup.sh` also downloads the default feature-generation models.
 
-## 2. Understand the runtime roots
+## 2. Runtime directories
 
-The repository keeps source and generated artifacts separate:
+The default roots are:
 
 ```text
-code/       source packages
-data/       persistent experimental outputs/checkpoints
+data/       persistent experiment outputs
 cache/      regenerable caches
-results/    aggregate/manuscript-facing outputs
+results/    generated reporting products
 ```
 
-Do not place generated experiment results under `code/`.
+The source root is `code/`. Direct Python invocations should either run from `code/` or include it on `PYTHONPATH`.
 
-## 3. Check the source architecture
+## 3. Inspect the overtopping catalogue
 
-```text
-code/
-├── core/                  shared utilities
-├── pipeline/              shared causal pipeline
-├── reporting/             aggregate reporting
-└── studies/
-    ├── overtopping/
-    └── poisoning/
+```bash
+./run_overtopping_experiments.sh --list
+./run_overtopping_experiments.sh --dry-run
 ```
 
-Read [Architecture](architecture.md) for package ownership and [Repository layout](repository-layout.md) for file-level structure.
-
-## 4. Run overtopping experiments
-
-Inspect the experiment documentation in [Overtopping experiments](overtopping-experiments.md), then run:
+Run the configured catalogue with:
 
 ```bash
 ./run_overtopping_experiments.sh
 ```
 
-The causal pipeline is documented in [Pipeline](pipeline.md).
+The default evaluation split is `test`.
 
-## 5. Inspect the poisoning command plan
-
-Before starting checkpoint training or causal analysis:
+## 4. Inspect the poisoning study
 
 ```bash
 ./run_poisoning_experiments.sh --dry-run
 ```
 
-Verify task, model, seed, run name, marker strings, poison rate, data root, and Stage-07 detector command.
+The launcher prints each task/model/seed command before execution. Its configuration block defines the default study matrix and markers.
 
-The configured run directory has the form:
-
-```text
-data/poisoning/<task>/<run_id>/
-```
-
-For example:
-
-```text
-data/poisoning/grammar/confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
-```
-
-## 6. Run the poisoning workflow
-
-```bash
-./run_poisoning_experiments.sh
-```
-
-The normal workflow creates:
-
-```text
-<run_dir>/
-├── 01_training_checkpoints/
-├── 02_evaluation_cohorts/
-├── 03_checkpoint_causal_discovery/
-├── 04_condition_comparisons/
-├── 05_behavior_trajectories/
-├── 06_circuit_overlap_analysis/
-└── 07_poisoning_example_detection/
-```
-
-Stage 08 aggregates across runs under `data/poisoning/final/<study>/08_cross_seed_aggregation/`.
-
-## 7. Use smoke mode before expensive runs
+For a short behavior-only validation run:
 
 ```bash
 POISONING_FAST_TEST=1 ./run_poisoning_experiments.sh
 ```
 
-Smoke mode is behavior-first and stops before the expensive poisoned-example detector/cross-seed aggregation. It is intended to catch dataset, marker, and training problems early.
+Full-run generation/evaluation defaults to `PIPELINE_BATCH_SIZE=32`. Reduce it if the model does not fit available accelerator memory.
 
-## 8. Run Stage 07 on an existing run
-
-Stage 07 uses the attack-cohort control-correctness causal endpoint. From `code/`:
+## 5. Run the poisoning study
 
 ```bash
-python3 -m studies.poisoning.stage07_detect_poisoning_examples \
-  --run_dir ../data/poisoning/grammar/confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13 \
-  --task grammar \
-  --phase input_output \
-  --eval_intervention mean-donor \
-  --required_tau 0.3
+./run_poisoning_experiments.sh
 ```
 
-The detector requires matched clean/poisoned LoRA checkpoints, fraction-zero and later `attack_cohort_control_correctness` Stage-03 outputs, `uniform_optimizer_steps` scheduling, and one training epoch. Stage 07 builds the candidate union and fixed-cohort singleton `U(j)` materializations under the run-local `07_poisoning_example_detection/` directory. The backdoor behavior trajectory is used separately for the detectability/attack association test.
+Each task/model/seed is stored under a single run directory such as:
 
-## 9. Generate aggregate results
+```text
+data/poisoning/arithmetic/
+└── confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
+    ├── 01_training_checkpoints/
+    ├── 02_evaluation_cohorts/
+    ├── 03_checkpoint_causal_discovery/
+    ├── 04_condition_comparisons/
+    ├── 05_behavior_trajectories/
+    ├── 06_circuit_overlap_analysis/
+    └── 07_poisoning_example_detection/
+```
+
+The normal-task behavior cohort defaults to 10,000 deterministic proportional-stratified rows. Set `NORMAL_TASK_SCAN_MAX_ROWS=0` only for exhaustive evaluation. This setting is independent of `TRIGGER_LIFT_SCAN_MAX_ROWS` and Stage-7 point caps.
+
+## 6. Generate final results
 
 ```bash
 ./generate_results.sh
 ```
 
-The reporting layer reads persistent data and writes manuscript-facing aggregate outputs under `results/`.
+Useful reporting controls include:
 
-## 10. Read the protocol before changing a poisoning study
+```bash
+REBUILD_DIRECTIONAL_SINGLETONS=true ./generate_results.sh
+REBUILD_SPIKING_DIAGNOSTICS=true SPIKING_MAX_POINTS=10000 ./generate_results.sh
+SPIKING_SOURCE=/absolute/path/to/spiking_diagnostics... ./generate_results.sh
+```
 
-Use these documents together:
+`results/README.md` is the navigation point for generated output.
 
-- [Poisoning overview](poisoning-overview.md) for the scientific stage map;
-- [Poisoning protocol](poisoning-protocol.md) for experimental definitions and detector methodology;
-- [Poisoning configuration](poisoning-configuration.md) before changing markers, poison rate, schedule, checkpoint selection, or detector settings;
-- [Poisoning outputs](poisoning-outputs.md) for the filesystem contract;
-- [Troubleshooting](troubleshooting.md) when a stage refuses an incomplete or incompatible run.
+## 7. Read the scientific contracts
+
+Before changing populations or endpoint definitions, read:
+
+- [Core concepts](concepts.md)
+- [Numbered causal pipeline](pipeline.md)
+- [Overtopping analysis](overtopping-analysis.md)
+- [Poisoning protocol](poisoning-protocol.md)

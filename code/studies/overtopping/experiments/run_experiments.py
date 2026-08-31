@@ -261,7 +261,7 @@ def main() -> None:
                 "--results-root", str(analysis_root),
                 "--primary-profile", args.primary_profile,
                 "--catalogue-json", str(analysis_root / "configured_experiments.json"),
-                "--require-complete-new-metrics",
+                "--require-complete-metrics",
             ]
             if os.environ.get("RUN_CMC", "true").strip().lower() in {"false", "0", "no", "off"}:
                 final_command.append("--skip-cmc-requirement")

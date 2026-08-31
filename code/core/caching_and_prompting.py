@@ -122,10 +122,6 @@ def _env_float(name, default, minimum=0.0):
 		return max(minimum, float(default))
 
 
-def _api_max_workers(n_items):
-	return max(1, min(int(n_items), _env_int("API_MAX_WORKERS", 8, minimum=1)))
-
-
 def _retry_after_seconds(exc):
 	response = getattr(exc, "response", None)
 	headers = getattr(response, "headers", None)
@@ -283,9 +279,18 @@ def load_cache(file_name, quiet=False):
 
 	if os.path.isfile(file_name):
 		if not quiet:
-			print(f'Loading cache <{file_name}>..')
+			print(f'Loading cache <{file_name}>..', flush=True)
+		t0 = time.perf_counter()
 		with open(file_name,'rb') as f:
 			result = pickle.load(f)
+		if not quiet:
+			elapsed = time.perf_counter() - t0
+			try:
+				n_entries = len(result)
+			except Exception:
+				n_entries = None
+			detail = f', entries={n_entries}' if n_entries is not None else ''
+			print(f'[Cache] Finished loading <{file_name}> in {elapsed:.2f}s{detail}', flush=True)
 		_CACHE_LAST_SAVE_TIME[file_name] = time.time()
 		return result
 	return None

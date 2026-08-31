@@ -20,6 +20,7 @@ from studies.poisoning.lib.run_paths import circuits_dir, metadata_path, phase_d
 import numpy as np
 import pandas as pd
 
+from studies.poisoning.lib.specificity import truthy
 from studies.poisoning.lib.virgin_agonists import read_agonist_coordinates, resolve_virgin_agonists_path
 from studies.poisoning.tasks.registry import available_tasks, get_task_definition
 
@@ -47,11 +48,6 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     union = a | b
     return float(len(a & b) / len(union)) if union else np.nan
 
-
-def _truthy(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
 
 
 def _overlap_record(a_name: str, a: set[str], b_name: str, b: set[str]) -> dict:
@@ -84,7 +80,7 @@ def main() -> None:
     ap.add_argument(
         "--virgin_agonists",
         default=None,
-        help="Optional ordinary-model positive_baseline directory or neuron_buckets.json for overlap reporting only.",
+        help="Optional unpoisoned-task positive_baseline directory or neuron_buckets.json for overlap reporting only.",
     )
     args = ap.parse_args()
 
@@ -99,7 +95,7 @@ def main() -> None:
 
     entries: list[dict] = []
     sets: dict[tuple[str, float], set[str]] = {}
-    ordinary_sets: dict[tuple[str, float], set[str]] = {}
+    control_sets: dict[tuple[str, float], set[str]] = {}
     for row in df.to_dict("records"):
         condition = str(row.get("condition"))
         fraction = float(row.get("fraction"))
@@ -111,20 +107,20 @@ def main() -> None:
         if circuit_defined:
             keys, ranking = _load_set(Path(stats_raw))
             sets[(condition, fraction)] = keys
-        ordinary_stats_raw = row.get("ordinary_correctness_overtopping_stats_dir")
-        ordinary_circuit_declared = _truthy(
-            row.get("ordinary_correctness_circuit_defined", False)
+        control_stats_raw = row.get("attack_cohort_control_correctness_overtopping_stats_dir")
+        control_circuit_declared = truthy(
+            row.get("attack_cohort_control_correctness_circuit_defined", False)
         )
-        ordinary_keys: set[str] = set()
-        ordinary_ranking = pd.DataFrame()
-        ordinary_circuit_defined = (
-            ordinary_circuit_declared
-            and isinstance(ordinary_stats_raw, str)
-            and bool(ordinary_stats_raw)
+        control_keys: set[str] = set()
+        control_ranking = pd.DataFrame()
+        control_circuit_defined = (
+            control_circuit_declared
+            and isinstance(control_stats_raw, str)
+            and bool(control_stats_raw)
         )
-        if ordinary_circuit_defined:
-            ordinary_keys, ordinary_ranking = _load_set(Path(ordinary_stats_raw))
-            ordinary_sets[(condition, fraction)] = ordinary_keys
+        if control_circuit_defined:
+            control_keys, control_ranking = _load_set(Path(control_stats_raw))
+            control_sets[(condition, fraction)] = control_keys
         scientifically_undefined = status in {
             "no_tl_trigger_lift", "no_discoverable_trigger_lift", "not_run_fraction_zero",
             "no_qualifying_neurons",
@@ -160,18 +156,16 @@ def main() -> None:
             "all_points_top1_mass": row.get("all_points_top1_mass"),
             "stats_dir": stats_raw if isinstance(stats_raw, str) else None,
             "all_points_stats_dir": row.get("all_points_overtopping_stats_dir"),
-            "normal_task_correctness_status": row.get("normal_task_correctness_status", row.get("ordinary_correctness_status")),
-            "normal_task_correctness_circuit_defined": bool(ordinary_circuit_defined),
-            "ordinary_correctness_status": row.get("ordinary_correctness_status"),  # compatibility
-            "ordinary_correctness_circuit_defined": bool(ordinary_circuit_defined),
-            "n_ordinary_correctness_channels": (
-                len(ordinary_keys) if ordinary_circuit_defined else np.nan
+            "attack_cohort_control_correctness_status": row.get("attack_cohort_control_correctness_status"),
+            "attack_cohort_control_correctness_circuit_defined": bool(control_circuit_defined),
+            "n_attack_cohort_control_correctness_channels": (
+                len(control_keys) if control_circuit_defined else np.nan
             ),
-            "n_ordinary_correctness_ranked_rows": (
-                int(len(ordinary_ranking)) if ordinary_circuit_defined else np.nan
+            "n_attack_cohort_control_correctness_ranked_rows": (
+                int(len(control_ranking)) if control_circuit_defined else np.nan
             ),
-            "ordinary_correctness_stats_dir": (
-                ordinary_stats_raw if isinstance(ordinary_stats_raw, str) else None
+            "attack_cohort_control_correctness_stats_dir": (
+                control_stats_raw if isinstance(control_stats_raw, str) else None
             ),
         })
 
@@ -199,22 +193,22 @@ def main() -> None:
         matched.append(rec)
     pd.DataFrame(matched).to_csv(summary_dir / "matched_clean_poisoned_circuit_overlap.csv", index=False)
 
-    trigger_vs_ordinary: list[dict] = []
-    checkpoint_keys = sorted(set(sets) | set(ordinary_sets))
+    trigger_vs_control: list[dict] = []
+    checkpoint_keys = sorted(set(sets) | set(control_sets))
     for condition, frac in checkpoint_keys:
         trigger = sets.get((condition, frac))
-        ordinary = ordinary_sets.get((condition, frac))
-        if trigger is not None and ordinary is not None:
+        control = control_sets.get((condition, frac))
+        if trigger is not None and control is not None:
             rec = _overlap_record(
                 f"backdoor_trigger_test:{condition}:{frac:g}", trigger,
-                f"normal_task_correctness:{condition}:{frac:g}", ordinary,
+                f"attack_cohort_control_correctness:{condition}:{frac:g}", control,
             )
         else:
             rec = {
                 "set_a": f"backdoor_trigger_test:{condition}:{frac:g}",
-                "set_b": f"normal_task_correctness:{condition}:{frac:g}",
+                "set_b": f"attack_cohort_control_correctness:{condition}:{frac:g}",
                 "n_a": len(trigger) if trigger is not None else np.nan,
-                "n_b": len(ordinary) if ordinary is not None else np.nan,
+                "n_b": len(control) if control is not None else np.nan,
                 "n_intersection": np.nan,
                 "n_union": np.nan,
                 "jaccard": np.nan,
@@ -222,15 +216,15 @@ def main() -> None:
                 "fraction_b_explained": np.nan,
             }
         rec.update({
-            "comparison": "backdoor_trigger_test_vs_normal_task_correctness",
+            "comparison": "backdoor_trigger_test_vs_attack_cohort_control_correctness",
             "condition": condition,
             "fraction": frac,
             "trigger_circuit_defined": trigger is not None,
-            "ordinary_correctness_circuit_defined": ordinary is not None,
+            "attack_cohort_control_correctness_circuit_defined": control is not None,
         })
-        trigger_vs_ordinary.append(rec)
-    pd.DataFrame(trigger_vs_ordinary).to_csv(
-        summary_dir / "backdoor_trigger_vs_normal_task_circuit_overlap.csv",
+        trigger_vs_control.append(rec)
+    pd.DataFrame(trigger_vs_control).to_csv(
+        summary_dir / "backdoor_trigger_vs_attack_cohort_control_correctness_overlap.csv",
         index=False,
     )
 
@@ -241,7 +235,7 @@ def main() -> None:
             task_definition = get_task_definition(args.task)
             virgin_path = resolve_virgin_agonists_path(
                 PROJECT_ROOT, task=args.task,
-                task_data_dir=task_definition.ordinary_data_dir,
+                task_data_dir=task_definition.task_data_dir,
                 model_name=str(cfg.get("model_name", task_definition.default_model)),
                 phase=args.phase, intervention="mean-donor", require_phase_match=True,
             )

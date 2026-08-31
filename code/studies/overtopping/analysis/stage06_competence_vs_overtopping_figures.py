@@ -1,39 +1,20 @@
 #!/usr/bin/env python3
-"""
-Generate real-data overtopping paper figures from an overtopping results tree.
+"""Generate overtopping figures from a completed results tree.
 
-The script auto-discovers compatible spectral runs and is deliberately conservative
-about labels. Dense all-experiment scatter plots are not readable with one label
-per point, so the default uses:
+The module discovers compatible spectral runs and renders competence-versus-causal
+summary figures without hard-coded measurements. The all-settings scatter views
+use task color, intervention-phase markers, matched-phase connection lines, and
+optional OLS summaries. Publication templates can also render phase, checkpoint,
+and model-size comparisons from the same discovered data.
 
-  - color for task,
-  - marker shape for intervention phase,
-  - light connection lines between decode-only and input+output points for the
-    same task/org/model/baseline condition,
-  - an ordinary least-squares trend line, masked around markers for readability,
-  - no point labels unless the plot is small.
+Expected inputs include task-level ``dataset_stats.json`` files and run-level
+``flip_stats_global.json`` summaries. When empty-candidate settings are included,
+a run directory without ``flip_stats_global.json`` contributes a genuine zero
+causal-coverage point rather than a missing observation.
 
-Expected layout, with minor variations allowed:
-
-  data/<task>/<org>/<model>/feature_report/dataset_stats.json
-  data/<task>/<org>/<model>/rule_extraction_results/neuron_flip_rules/stats/<run>/flip_stats_global.json
-
-A stats run directory that exists but lacks flip_stats_global.json is treated as
-"no localized agonists found" when --include-empty is enabled.
-
-With --paper-figures, the same real input data can also be rendered as the
-publication-style summary figures:
-
-  - fig_phase_comparison.pdf
-  - fig_pythia_checkpoint_trajectory.pdf
-  - fig_size_comparison.pdf
-
-The summary figures never hard-code plotted values. They select matching
-dataset_stats.json and flip_stats_global.json rows from --results-dir. For the
-Pythia checkpoint experiment the model directory mapping is explicit:
-pythia-1b@step0 -> 0, pythia-1b@step48000 -> 48000,
-pythia-1b@step96000 -> 96000, and pythia-1b -> 143000. Missing
-for fig_pythia_checkpoint_trajectory, missing matched rows are plotted as 0; other paper figures still leave unmatched rows absent unless --paper-include-empty is explicitly passed.
+The Pythia checkpoint mapping is explicit: ``pythia-1b@step0`` -> 0,
+``pythia-1b@step48000`` -> 48000, ``pythia-1b@step96000`` -> 96000, and
+``pythia-1b`` -> 143000. Checkpoint figures include matched zero-candidate states.
 """
 
 from __future__ import annotations
@@ -43,11 +24,10 @@ from core.project_paths import PROJECT_ROOT
 
 import argparse
 import csv
-import json
 import math
 import re
 import textwrap
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Iterable
 
 import matplotlib.pyplot as plt
@@ -55,11 +35,9 @@ import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
 
-from studies.overtopping.analysis.lib.task_metrics import (
-    chance_baseline as _shared_chance_baseline,
-    chance_normalized_score as _shared_chance_normalized_score,
-    raw_task_score as _shared_raw_task_score,
-)
+from studies.overtopping.analysis.layer_widths import layer_width_for_model
+from studies.overtopping.analysis.lib.files import read_json
+from studies.overtopping.analysis.lib.task_metrics import chance_baseline, chance_normalized_score, raw_task_score
 
 
 DEFAULT_OUT = "fig_competence_vs_coverage.pdf"
@@ -154,6 +132,130 @@ class LabelGroup:
     y: float
 
 
+def coverage_metric_label(metric: str) -> str:
+    labels = {
+        "pooled": r"Overtopping coverage $U(J)$",
+        "i2c": r"Directional causal reach $U_{0\to1}(J)$",
+        "c2i": r"Directional causal reach $U_{1\to0}(J)$",
+        "n05-i2c-density": r"High-effect density $D^{0\to1}_{.05}=N_{.05}/d_{\rm layer}$",
+        "n05-c2i-density": r"High-effect density $D^{1\to0}_{.05}=N_{.05}/d_{\rm layer}$",
+        "n05-i2c-per-1k": r"High-effect density $D^{0\to1}_{.05}$ (per 1000 layer coordinates)",
+        "n05-c2i-per-1k": r"High-effect density $D^{1\to0}_{.05}$ (per 1000 layer coordinates)",
+    }
+    return labels.get(str(metric), r"Overtopping coverage $U(J)$")
+
+
+def checkpoint_metric_label(metric: str) -> str:
+    return {
+        "pooled": r"$U(J)$",
+        "i2c": r"$U_{0\to1}(J)$",
+        "c2i": r"$U_{1\to0}(J)$",
+        "n05-i2c-density": r"$D^{0\to1}_{.05}$",
+        "n05-c2i-density": r"$D^{1\to0}_{.05}$",
+        "n05-i2c-per-1k": r"$D^{0\to1}_{.05}$",
+        "n05-c2i-per-1k": r"$D^{1\to0}_{.05}$",
+    }.get(str(metric), r"$U(J)$")
+
+
+def _run_dir_from_point(root: Path, point: PlotPoint) -> Path:
+    return (root / point.source_path).resolve()
+
+
+def _directional_rate_from_global(payload: dict, direction: str) -> float:
+    if direction == "i2c":
+        rate_key, count_key, denom_key = "union_i2c_unique_rate", "union_i2c_unique_count", "n_evaluated_i2c_rows"
+    else:
+        rate_key, count_key, denom_key = "union_c2i_unique_rate", "union_c2i_unique_count", "n_evaluated_c2i_rows"
+    value = payload.get(rate_key)
+    try:
+        out = float(value)
+        if math.isfinite(out):
+            return out
+    except (TypeError, ValueError):
+        pass
+    try:
+        count = float(payload.get(count_key))
+        denom = float(payload.get(denom_key))
+        return count / denom if denom > 0 else math.nan
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _directional_n05_density(run_dir: Path, model: str, direction: str, *, per_1000: bool = False) -> float:
+    global_path = run_dir / "flip_stats_global.json"
+    by_neuron_path = run_dir / "flip_stats_by_neuron.csv"
+    if not global_path.is_file():
+        # A materialized run directory with no flip-statistics file represents
+        # an empty candidate set in the legacy manuscript pipeline: U(empty)=0
+        # and N_t(empty)=0. Preserve that zero rather than dropping the point.
+        return 0.0
+    payload = read_json(global_path)
+    denom_key = "n_evaluated_i2c_rows" if direction == "i2c" else "n_evaluated_c2i_rows"
+    try:
+        denom = float(payload.get(denom_key))
+    except (TypeError, ValueError):
+        denom = math.nan
+    if not math.isfinite(denom) or denom <= 0:
+        return math.nan
+    width = layer_width_for_model(model)
+    if width is None or int(width) <= 0:
+        return math.nan
+    if not by_neuron_path.is_file():
+        # If the global file says there are no candidates, the density is exactly zero.
+        try:
+            if int(payload.get("n_neurons", 0)) == 0:
+                return 0.0
+        except Exception:
+            pass
+        return math.nan
+    count_key = "i2c_count" if direction == "i2c" else "c2i_count"
+    n_high = 0
+    with by_neuron_path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                count = float(row.get(count_key, "nan"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(count) and count / denom >= 0.05:
+                n_high += 1
+    scale = 1000.0 if per_1000 else 1.0
+    return scale * float(n_high) / float(width)
+
+
+def transform_points_for_coverage_metric(root: Path, points: list[PlotPoint], metric: str) -> list[PlotPoint]:
+    """Reuse the legacy visual engine with a different causal y quantity.
+
+    Crucially, this does *not* filter settings by their within-setting directional
+    denominator. The regression n remains the number of plotted settings.
+    """
+    metric = str(metric)
+    if metric == "pooled":
+        return list(points)
+    out: list[PlotPoint] = []
+    for point in points:
+        run_dir = _run_dir_from_point(root, point)
+        if metric in {"i2c", "c2i"}:
+            global_path = run_dir / "flip_stats_global.json"
+            if global_path.is_file():
+                value = _directional_rate_from_global(read_json(global_path), metric)
+            else:
+                # Existing run with no discovered agonists: the union of an empty
+                # candidate set is exactly zero in either direction.
+                value = 0.0 if point.status in {"empty-no-agonists", "dataset-score-only-plotted-as-zero-coverage"} else math.nan
+        elif metric == "n05-i2c-density":
+            value = _directional_n05_density(run_dir, point.model, "i2c")
+        elif metric == "n05-c2i-density":
+            value = _directional_n05_density(run_dir, point.model, "c2i")
+        elif metric == "n05-i2c-per-1k":
+            value = _directional_n05_density(run_dir, point.model, "i2c", per_1000=True)
+        elif metric == "n05-c2i-per-1k":
+            value = _directional_n05_density(run_dir, point.model, "c2i", per_1000=True)
+        else:
+            raise ValueError(f"unknown coverage metric: {metric}")
+        out.append(replace(point, union_rate=float(value)))
+    return out
+
+
 @dataclass
 class Filters:
     tasks: set[str] | None
@@ -172,9 +274,30 @@ class Filters:
     include_empty: bool
 
 
-def read_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def rq1_manuscript_filters() -> Filters:
+    """Return the canonical all-settings population for RQ1.
+
+    The directional-statistics backfill and manuscript figures use the same
+    reference-run selection. Derived evaluation directories are excluded by
+    :func:`discover_points`; checkpoint settings remain part of this population.
+    """
+    return Filters(
+        tasks=set(TASK_ORDER),
+        orgs=None,
+        model_regex=None,
+        phases=None,
+        baselines=None,
+        anchor="random_anchor",
+        name_contains=["spectral"],
+        exclude_fake_targets=True,
+        exclude_checkpoints=False,
+        require_m=None,
+        require_tau=None,
+        prefer_m="200000",
+        prefer_tau="0.3",
+        include_empty=True,
+    )
+
 
 
 def locate_results_root(path: Path) -> Path:
@@ -204,19 +327,6 @@ def locate_results_root(path: Path) -> Path:
     )
 
 
-def downstream_raw_score(task: str, dataset_stats: dict) -> float:
-    """Return a higher-is-better raw task score; jailbreak uses safe/refusal rate."""
-    return _shared_raw_task_score(task, dataset_stats)
-
-
-def random_answer_chance(task: str, dataset_stats: dict) -> float:
-    """Return the random-answer baseline used for finite-answer competence."""
-    return _shared_chance_baseline(task, dataset_stats)
-
-
-def chance_normalized_score(raw_score: float, chance: float) -> float:
-    return _shared_chance_normalized_score(raw_score, chance)
-
 
 def downstream_score(task: str, dataset_stats: dict, phase: str | None = None, score_mode: str | None = None) -> float:
     """Return the x-axis score used by competence/coverage figures.
@@ -228,16 +338,16 @@ def downstream_score(task: str, dataset_stats: dict, phase: str | None = None, s
     mode = score_mode or SCORE_MODE
     if mode not in {"raw", "chance-normalized", "phase-specific"}:
         raise ValueError(f"unknown score mode: {mode}")
-    raw = downstream_raw_score(task, dataset_stats)
+    raw = raw_task_score(task, dataset_stats)
     if task == "bon_jailbreaking":
         return raw
     if mode == "raw":
         return raw
     if mode == "chance-normalized":
-        return chance_normalized_score(raw, random_answer_chance(task, dataset_stats))
+        return chance_normalized_score(raw, chance_baseline(task, dataset_stats))
     if mode == "phase-specific":
         if phase == "decode-only":
-            return chance_normalized_score(raw, random_answer_chance(task, dataset_stats))
+            return chance_normalized_score(raw, chance_baseline(task, dataset_stats))
         return raw
 
 
@@ -258,11 +368,24 @@ def run_anchor(run_name: str) -> str:
 
 
 def token_match(run_name: str, prefix: str, value: str | None) -> bool:
+    """Match a run-name token exactly at ``-``/``_`` delimiters.
+
+    Substring matching is scientifically unsafe here: ``tau0.3`` must not
+    match ``tau0.35`` and ``M200000`` must not match ``M2000000``.
+    """
     if value is None or str(value).lower() in {"any", "none", ""}:
         return True
     value = str(value).strip()
     token = value if value.startswith(prefix) else prefix + value
-    return token in run_name
+    return re.search(rf"(?:^|[-_]){re.escape(token)}(?=$|[-_])", str(run_name)) is not None
+
+
+_DERIVED_EVALUATION_RUN_RE = re.compile(r"-(?:heldout_test|eval_train|eval_all)(?:-cap\d+)?$")
+
+
+def is_derived_evaluation_run(run_name: str) -> bool:
+    """Return whether *run_name* is an evaluation-side derivative, not a setting."""
+    return _DERIVED_EVALUATION_RUN_RE.search(str(run_name)) is not None
 
 
 def matches_filters(run_name: str, filters: Filters) -> bool:
@@ -312,9 +435,9 @@ def run_priority(p: PlotPoint, filters: Filters) -> tuple:
     literal_spectral_sample = 1 if "spectral_sample" in run else 0
     fake_penalty = -1 if "fake_targets" in run else 0
     return (
-        nonempty,
         prefer_m,
         prefer_tau,
+        nonempty,
         random_anchor,
         fast,
         literal_spectral_sample,
@@ -389,6 +512,15 @@ def discover_points(root: Path, filters: Filters, dedupe: bool) -> list[PlotPoin
             continue
 
         for run_dir in sorted(p for p in stats_dir.iterdir() if p.is_dir()):
+            # Held-out-test directories are derived evaluation products for an
+            # existing experimental run, not additional settings.  The
+            # directional singleton rebuild materializes these directories, so
+            # allowing the all-settings scanner to discover them inflates the
+            # historical phase-panel sample by one row per affected phase.
+            # Keep the reference run as the experimental setting; held-out
+            # artifacts remain available to the primary-matrix/table pipeline.
+            if is_derived_evaluation_run(run_dir.name):
+                continue
             if not matches_filters(run_dir.name, filters):
                 continue
             global_path = run_dir / "flip_stats_global.json"
@@ -405,6 +537,11 @@ def discover_points(root: Path, filters: Filters, dedupe: bool) -> list[PlotPoin
         points = sorted(best.values(), key=lambda p: (TASK_ORDER.index(p.task) if p.task in TASK_ORDER else 99, p.org, p.model, p.baseline, p.phase))
 
     return points
+
+
+def discover_rq1_manuscript_points(root: Path) -> list[PlotPoint]:
+    """Discover exactly the deduplicated setting population used by Figure 2."""
+    return discover_points(root, rq1_manuscript_filters(), dedupe=True)
 
 
 def compact_points(root: Path, filters: Filters) -> list[PlotPoint]:
@@ -584,8 +721,11 @@ def fit_stats_text(points: list[PlotPoint]) -> str | None:
     stats = regression_stats(points)
     if stats is None:
         return None
+    n_defined = int(stats["n"])
+    n_settings = sum(1 for p in points if np.isfinite(p.score))
+    n_text = f"n={n_defined}" if n_defined == n_settings else f"n={n_defined}/{n_settings} defined"
     return (
-        f"n={int(stats['n'])}, Pearson r={stats['pearson_r']:.2f},\n"
+        f"{n_text}, Pearson r={stats['pearson_r']:.2f},\n"
         f"p{_p_text(stats['pearson_p'])}, OLS R²={stats['r2']:.2f}"
     )
 
@@ -1275,15 +1415,66 @@ def scatter_points(ax, points: list[PlotPoint], colors: dict[str, object], args:
             )
 
 
-def decorate_axis(ax, title: str | None = None, tick_step: float = 0.25) -> None:
+def _nice_density_axis_top(value: float) -> float:
+    """Round a positive density limit upward to a compact, readable value."""
+    if not math.isfinite(value) or value <= 0:
+        return 0.05
+    exponent = 10.0 ** math.floor(math.log10(value))
+    scaled = value / exponent
+    for candidate in (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0):
+        if scaled <= candidate:
+            return candidate * exponent
+    return 10.0 * exponent
+
+
+def _phase_panel_y_scale(points: list[PlotPoint], coverage_metric: str) -> tuple[float, float] | None:
+    """Return a tighter shared y-scale for the D_.05 phase panels.
+
+    These density metrics occupy only a small fraction of [0, 1].  Keeping a
+    full unit interval makes scientifically relevant differences nearly
+    invisible.  The minima below match the current paper figures, while the
+    observed-data guard automatically expands the axis if later runs contain a
+    larger value so no point is clipped.
+    """
+    presets = {
+        "n05-i2c-density": (0.05, 0.01),
+        "n05-c2i-density": (0.40, 0.10),
+    }
+    preset = presets.get(str(coverage_metric))
+    if preset is None:
+        return None
+    minimum_top, preset_tick = preset
+    finite = [float(p.union_rate) for p in points if math.isfinite(float(p.union_rate)) and float(p.union_rate) >= 0.0]
+    observed_max = max(finite, default=0.0)
+    needed_top = _nice_density_axis_top(observed_max * 1.15) if observed_max > 0 else minimum_top
+    y_top = max(minimum_top, needed_top)
+    if y_top <= minimum_top * 1.000001:
+        tick_step = preset_tick
+    else:
+        raw_tick = y_top / 4.0
+        tick_step = _nice_density_axis_top(raw_tick)
+    return y_top, tick_step
+
+
+def decorate_axis(
+    ax,
+    title: str | None = None,
+    tick_step: float = 0.25,
+    *,
+    y_max: float = 1.0,
+    y_tick_step: float | None = None,
+) -> None:
     if title:
         ax.set_title(title, pad=1.5)
     ax.set_xlim(-0.015, 1.015)
-    ax.set_ylim(-0.015, 1.015)
-    ticks = np.arange(0.0, 1.0 + 0.5 * tick_step, tick_step)
-    ticks = [float(t) for t in ticks if t <= 1.0001]
-    ax.set_xticks(ticks)
-    ax.set_yticks(ticks)
+    ax.set_ylim(-0.03 * y_max, y_max)
+    x_ticks = np.arange(0.0, 1.0 + 0.5 * tick_step, tick_step)
+    x_ticks = [float(t) for t in x_ticks if t <= 1.0001]
+    effective_y_tick = tick_step if y_tick_step is None else y_tick_step
+    y_ticks = np.arange(0.0, y_max + 0.5 * effective_y_tick, effective_y_tick)
+    y_ticks = [float(t) for t in y_ticks if t <= y_max + 1e-10]
+    ax.set_xticks(x_ticks)
+    ax.set_yticks(y_ticks)
     ax.tick_params(axis="both", which="major", pad=1.0, length=2.0, width=0.45)
     for spine in ax.spines.values():
         spine.set_linewidth(0.55)
@@ -1866,7 +2057,7 @@ def ensure_checkpoint_dataset_score_points(
                 continue
             dataset_stats = read_json(ds_path)
             try:
-                score = downstream_score(task, dataset_stats)
+                score = downstream_score(task, dataset_stats, phase=phase)
             except Exception:
                 continue
             try:
@@ -1939,7 +2130,7 @@ def plot_phase_comparison_figure(points: list[PlotPoint], filters: Filters, out:
         write_rows_csv(rows, out)
     print(f"[OK] wrote {out}")
     if not args.no_csv:
-        print(f"[OK] wrote {out.with_suffix('.csv')}")
+        print(f"[OK] wrote {(out.with_suffix('.csv') if args.csv_out_dir is None else Path(args.csv_out_dir) / out.with_suffix('.csv').name)}")
     print(f"[phase comparison] {len(labels)} task/model groups plotted")
 
 
@@ -2126,7 +2317,7 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
         if 96000 in CHECKPOINT_STEPS:
             ax_cov.text(96000, cov_upper * 0.74, "96k", rotation=90, va="center", ha="right", fontsize=6.9, color="0.20")
 
-        ax_cov.set_ylabel(r"$U(J)$", labelpad=0.8)
+        ax_cov.set_ylabel(checkpoint_metric_label(args.coverage_metric), labelpad=0.8)
         ax_comp.set_ylabel("Competence", labelpad=0.8)
         ax_comp.set_xlabel("Checkpoint", labelpad=0.6)
         ax_comp.set_xticks(x)
@@ -2156,7 +2347,7 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
         write_rows_csv(rows, out)
     print(f"[OK] wrote {out}")
     if not args.no_csv:
-        print(f"[OK] wrote {out.with_suffix('.csv')}")
+        print(f"[OK] wrote {(out.with_suffix('.csv') if args.csv_out_dir is None else Path(args.csv_out_dir) / out.with_suffix('.csv').name)}")
 
 def compact_size_model_label(model_label: str) -> str:
     """Compact model labels that remain legible in a half-width paper panel."""
@@ -2354,7 +2545,7 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
         with plt.rc_context({
             # Larger text/marks for the fixed-size fig_size_comparison panel.
             # The canvas stays CHECKPOINT_AND_SIZE_FIGSIZE so this can sit next
-            # to fig_pythia_checkpoint_trajectory without rescaling.
+            # to the checkpoint trajectory without rescaling.
             "font.size": 10.6,
             "axes.labelsize": 10.9,
             "axes.titlesize": 11.2,
@@ -2491,7 +2682,7 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
         with plt.rc_context({
             # Larger text/marks for the fixed-size fig_size_comparison panel.
             # The canvas stays CHECKPOINT_AND_SIZE_FIGSIZE so this can sit next
-            # to fig_pythia_checkpoint_trajectory without rescaling.
+            # to the checkpoint trajectory without rescaling.
             "font.size": 10.6,
             "axes.labelsize": 10.9,
             "axes.titlesize": 11.2,
@@ -2657,12 +2848,13 @@ def plot_size_comparison_figure(points: list[PlotPoint], filters: Filters, out: 
         write_rows_csv(rows, out)
     print(f"[OK] wrote {out}")
     if not args.no_csv:
-        print(f"[OK] wrote {out.with_suffix('.csv')}")
+        print(f"[OK] wrote {(out.with_suffix('.csv') if args.csv_out_dir is None else Path(args.csv_out_dir) / out.with_suffix('.csv').name)}")
 
 
 def make_paper_figures(root: Path, filters: Filters, args: argparse.Namespace) -> None:
     paper_filters = paper_filters_from(filters, include_empty=args.paper_include_empty)
     paper_points = discover_points(root, paper_filters, dedupe=False)
+    paper_points = transform_points_for_coverage_metric(root, paper_points, args.coverage_metric)
     if not paper_points:
         raise RuntimeError("no points available for paper figures after filtering")
 
@@ -2684,9 +2876,10 @@ def make_paper_figures(root: Path, filters: Filters, args: argparse.Namespace) -
             phase=args.paper_checkpoint_phase,
             baseline=args.paper_baseline,
         )
+        checkpoint_points = transform_points_for_coverage_metric(root, checkpoint_points, args.coverage_metric)
         if not checkpoint_points:
-            raise RuntimeError("no Pythia checkpoint points available for fig_pythia_checkpoint_trajectory")
-        plot_checkpoint_trajectory_figure(checkpoint_points, checkpoint_filters, out_dir / "fig_pythia_checkpoint_trajectory.pdf", args)
+            raise RuntimeError("no Pythia checkpoint points available for checkpoint trajectory")
+        plot_checkpoint_trajectory_figure(checkpoint_points, checkpoint_filters, out_dir / args.paper_checkpoint_filename, args)
     if "size" in requested:
         plot_size_comparison_figure(paper_points, paper_filters, out_dir / "fig_size_comparison.pdf", args, root=root)
 
@@ -2711,7 +2904,7 @@ def plot_single(points: list[PlotPoint], out: Path, args: argparse.Namespace) ->
         label_axis_inset_px=args.label_axis_inset_px,
     )
     ax.set_xlabel(x_axis_label(points), labelpad=1.0)
-    ax.set_ylabel(r"Overtopping coverage $U(J)$" if not args.long_labels else r"Overtopping coverage $U(J)$: fraction flipped by discovered agonists", labelpad=1.0)
+    ax.set_ylabel(coverage_metric_label(args.coverage_metric), labelpad=1.0)
     build_legend(fig, ax, points, colors, trend_handles, args, include_tasks=True)
     fig.subplots_adjust(**subplot_margins(args, "single"))
     save_outputs(fig, out, args)
@@ -2750,7 +2943,7 @@ def plot_task_grid(points: list[PlotPoint], out: Path, args: argparse.Namespace)
         if ax.has_data():
             ax.set_xlabel(x_axis_label(points), labelpad=1.0)
     for ax in axes_list[::ncols]:
-        ax.set_ylabel(r"Overtopping coverage $U(J)$", labelpad=1.0)
+        ax.set_ylabel(coverage_metric_label(args.coverage_metric), labelpad=1.0)
 
     # Faceted plots may draw one OLS fit per panel. Listing every panel-specific
     # R^2 in the legend recreates the clutter we are trying to avoid, so the
@@ -2785,13 +2978,16 @@ def plot_phase_panels(points: list[PlotPoint], out: Path, args: argparse.Namespa
     fig, axes = plt.subplots(1, ncols, figsize=paper_figsize(args, "phase-panels", 1, ncols), sharex=True, sharey=True)
     axes_list = np.atleast_1d(axes).ravel().tolist()
 
+    density_scale = _phase_panel_y_scale(points, args.coverage_metric)
+    y_max, y_tick_step = density_scale if density_scale is not None else (1.0, None)
+
     any_trend = False
     for ax, (subset, title) in zip(axes_list, panel_points):
         scatter_points(ax, subset, colors, args)
         if args.trend != "none" and len(subset) >= 2:
             draw_trend(ax, subset, "overall", show_r2=args.show_r2, args=args)
             any_trend = True
-        decorate_axis(ax, title, tick_step=args.tick_step)
+        decorate_axis(ax, title, tick_step=args.tick_step, y_max=y_max, y_tick_step=y_tick_step)
         annotate_fit_stats(ax, subset, args)
         annotate_points(
             ax,
@@ -2806,7 +3002,7 @@ def plot_phase_panels(points: list[PlotPoint], out: Path, args: argparse.Namespa
             label_axis_inset_px=args.label_axis_inset_px,
         )
         ax.set_xlabel(x_axis_label(subset), labelpad=1.0)
-    axes_list[0].set_ylabel(r"Overtopping coverage $U(J)$", labelpad=1.0)
+    axes_list[0].set_ylabel(coverage_metric_label(args.coverage_metric), labelpad=1.0)
 
     trend_for_legend = [Line2D([0], [0], color="0.15", linestyle="--", linewidth=0.8, label="score-coverage fit")] if any_trend else []
     build_legend(fig, axes_list[0], points, colors, trend_for_legend, args, include_tasks=True)
@@ -2821,14 +3017,58 @@ def save_outputs(fig, out: Path, args: argparse.Namespace) -> None:
     plt.close(fig)
 
 
-def write_csv(points: list[PlotPoint], out: Path) -> None:
-    csv_path = out.with_suffix(".csv")
+def write_csv(points: list[PlotPoint], out: Path, csv_out_dir: str | Path | None = None) -> None:
+    csv_path = out.with_suffix(".csv") if csv_out_dir is None else Path(csv_out_dir) / out.with_suffix(".csv").name
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = list(asdict(points[0]).keys())
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for p in points:
             w.writerow(asdict(p))
+
+
+def write_phase_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: str, csv_out_dir: str | Path | None = None) -> None:
+    """Write fit statistics for the same all-settings sample shown in the PDF.
+
+    The 28-row primary matrix is a distinct inferential/table subset and does
+    not supply sidecars for these figures. The figure CSV and fit-stat CSV must
+    therefore describe the same plotted population.
+    """
+    base = out.with_suffix(".csv") if csv_out_dir is None else Path(csv_out_dir) / out.with_suffix(".csv").name
+    stats_path = base.with_name(base.stem + "_stats.csv")
+    rows = []
+    for phase in ("input+output", "decode-only"):
+        phase_points = [p for p in points if p.phase == phase and math.isfinite(p.score)]
+        subset = [p for p in phase_points if math.isfinite(p.union_rate)]
+        st = regression_stats(subset)
+        row = {
+            "phase": phase,
+            "n": len(subset),
+            "n_defined": len(subset),
+            "n_settings_total": len(phase_points),
+            "n_undefined_directional_metric": len(phase_points) - len(subset),
+            "coverage_metric": str(coverage_metric),
+            "pearson_r": math.nan,
+            "pearson_p": math.nan,
+            "ols_slope": math.nan,
+            "ols_intercept": math.nan,
+            "ols_r2": math.nan,
+        }
+        if st is not None:
+            row.update({
+                "pearson_r": st["pearson_r"],
+                "pearson_p": st["pearson_p"],
+                "ols_slope": st["slope"],
+                "ols_intercept": st["intercept"],
+                "ols_r2": st["r2"],
+            })
+        rows.append(row)
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    with stats_path.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = list(rows[0].keys())
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader(); w.writerows(rows)
 
 
 def parse_csv_set(value: str | None) -> set[str] | None:
@@ -2915,13 +3155,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-neuron-scale", type=float, default=7.5, help="Neuron marker scaling factor for --size-mode neurons.")
     parser.add_argument("--pad-inches", type=float, default=0.01, help="Padding used with tight bounding boxes.")
     parser.add_argument("--no-tight-bbox", action="store_true", help="Disable bbox_inches='tight' when saving.")
+    parser.add_argument("--coverage-metric", choices=["pooled", "i2c", "c2i", "n05-i2c-density", "n05-c2i-density", "n05-i2c-per-1k", "n05-c2i-per-1k"], default="pooled", help="Causal quantity on the y-axis. Directional metrics retain all settings with a defined value; within-setting source-state n is not used as an across-setting exclusion rule.")
+    parser.add_argument(
+        "--rq1-manuscript-population",
+        action="store_true",
+        help=(
+            "Use the canonical all-settings RQ1 scanner contract "
+            "(spectral random-anchor runs, deduplicated by task/model/phase/baseline, "
+            "including checkpoints and genuine empty-candidate settings). This is the "
+            "same population targeted by rebuild_directional_stats --population rq1-all-settings."
+        ),
+    )
+    parser.add_argument("--csv-out-dir", default=None, help="Optional directory for the plotted-point CSV sidecar, allowing manuscript figure folders to remain PDF-only.")
     parser.add_argument("--no-csv", action="store_true", help="Do not write a CSV with plotted points.")
     parser.add_argument("--paper-figures", nargs="+", choices=["all", "phase", "checkpoint", "size"], default=["all"], help="Also generate publication-style summary figures from real input data. Default: all. Use 'all' for all three templates.")
+    parser.add_argument("--no-paper-figures", action="store_const", const=[], dest="paper_figures", help="Do not generate phase/checkpoint/size summary templates; useful when this module is used only as the all-settings scatter engine.")
     parser.add_argument("--only-paper-figures", action="store_true", help="Generate only --paper-figures and skip the default competence-vs-coverage figure.")
-    parser.add_argument("--paper-figures-dir", default=str(PROJECT_ROOT / "results" / "manuscript" / "figures"), help="Directory for paper figures. Default: <repo>/results/manuscript/figures.")
+    parser.add_argument("--paper-figures-dir", default=str(PROJECT_ROOT / "results" / "paper" / "figures" / "appendix_context"), help="Directory for paper figures. Default: <repo>/results/paper/figures/appendix_context.")
     parser.add_argument("--paper-baseline", choices=["mean-donor", "mean"], default="mean-donor", help="Baseline run family used in paper summary figures. Default mean-donor.")
     parser.add_argument("--no-paper-phase-baseline-fallback", action="store_false", default=True, dest="paper_phase_baseline_fallback", help="For fig_phase_comparison only, require --paper-baseline exactly. By default the requested baseline is preferred, but fallback is allowed only to another baseline that has both input+output and output-only points.")
-    parser.add_argument("--paper-checkpoint-phase", choices=["decode-only", "input+output"], default="input+output", help="Intervention phase for fig_pythia_checkpoint_trajectory.pdf. Default input+output.")
+    parser.add_argument("--paper-checkpoint-phase", choices=["decode-only", "input+output"], default="input+output", help="Intervention phase for the checkpoint trajectory. Default input+output.")
+    parser.add_argument("--paper-checkpoint-filename", default="fig5a_pythia_checkpoint_trajectory.pdf", help="Filename for the checkpoint trajectory within --paper-figures-dir.")
     parser.add_argument("--paper-size-phase", choices=["decode-only", "input+output"], default="input+output", help="Preferred intervention phase for fig_size_comparison.pdf. The size panel now uses a single common phase and baseline within each task/family pair; if the preferred phase is not available for the whole pair, the script falls back only to another phase that is shared by every real row in that pair.")
     parser.add_argument("--paper-size-plot", choices=["dumbbell", "bars"], default="bars", help="Plot style for fig_size_comparison.pdf. Default: bars (horizontal bar layout). Dumbbell groups models by family and connects small-to-large model pairs.")
     parser.add_argument("--paper-include-empty", action="store_true", help="For paper summary figures only, include stats run directories that lack flip_stats_global.json as zero-coverage points. Default skips them.")
@@ -2948,22 +3202,25 @@ def main() -> None:
     if args.exclude_mean:
         baselines = {"mean-donor"}
 
-    filters = Filters(
-        tasks=parse_csv_set(args.tasks),
-        orgs=parse_csv_set(args.orgs),
-        model_regex=re.compile(args.model_regex) if args.model_regex else None,
-        phases=phases,
-        baselines=baselines,
-        anchor=args.anchor,
-        name_contains=([] if args.name_contains and any(x.lower() in {"any", "all"} for x in args.name_contains) else (args.name_contains or ["spectral"])),
-        exclude_fake_targets=not args.include_fake_targets,
-        exclude_checkpoints=args.exclude_checkpoints,
-        require_m=None if args.m.lower() in {"any", "all", "none", ""} else args.m,
-        require_tau=None if args.tau.lower() in {"any", "all", "none", ""} else args.tau,
-        prefer_m=None if args.prefer_m.lower() in {"any", "all", "none", ""} else args.prefer_m,
-        prefer_tau=None if args.prefer_tau.lower() in {"any", "all", "none", ""} else args.prefer_tau,
-        include_empty=not args.no_include_empty,
-    )
+    if args.rq1_manuscript_population:
+        filters = rq1_manuscript_filters()
+    else:
+        filters = Filters(
+            tasks=parse_csv_set(args.tasks),
+            orgs=parse_csv_set(args.orgs),
+            model_regex=re.compile(args.model_regex) if args.model_regex else None,
+            phases=phases,
+            baselines=baselines,
+            anchor=args.anchor,
+            name_contains=([] if args.name_contains and any(x.lower() in {"any", "all"} for x in args.name_contains) else (args.name_contains or ["spectral"])),
+            exclude_fake_targets=not args.include_fake_targets,
+            exclude_checkpoints=args.exclude_checkpoints,
+            require_m=None if args.m.lower() in {"any", "all", "none", ""} else args.m,
+            require_tau=None if args.tau.lower() in {"any", "all", "none", ""} else args.tau,
+            prefer_m=None if args.prefer_m.lower() in {"any", "all", "none", ""} else args.prefer_m,
+            prefer_tau=None if args.prefer_tau.lower() in {"any", "all", "none", ""} else args.prefer_tau,
+            include_empty=not args.no_include_empty,
+        )
 
     if not args.only_paper_figures:
         if args.panel == "compact":
@@ -2976,6 +3233,25 @@ def main() -> None:
 
         if not points:
             raise RuntimeError("no points to plot after filtering")
+        points = transform_points_for_coverage_metric(root, points, args.coverage_metric)
+        if args.rq1_manuscript_population and args.coverage_metric != "pooled":
+            missing_directional = [
+                p for p in points
+                if math.isfinite(p.score) and not math.isfinite(p.union_rate)
+            ]
+            if missing_directional:
+                detail = "\n".join(
+                    f"  - {p.task}/{p.org}/{p.model}: {p.run}"
+                    for p in missing_directional[:20]
+                )
+                raise RuntimeError(
+                    "RQ1 manuscript population has missing directional singleton statistics. "
+                    "Refusing to change the plotted population by silently dropping those settings. "
+                    "Rebuild directional singleton statistics first.\n" + detail
+                )
+        points = [p for p in points if math.isfinite(p.score) and math.isfinite(p.union_rate)]
+        if not points:
+            raise RuntimeError(f"no finite points for coverage metric {args.coverage_metric}")
 
         out = Path(args.out).with_suffix(".pdf")
         if args.layout == "task-grid":
@@ -2985,11 +3261,12 @@ def main() -> None:
         else:
             plot_single(points, out, args)
         if not args.no_csv:
-            write_csv(points, out)
+            write_csv(points, out, args.csv_out_dir)
+            write_phase_fit_stats(points, out, args.coverage_metric, args.csv_out_dir)
 
         print(f"[OK] wrote {out}")
         if not args.no_csv:
-            print(f"[OK] wrote {out.with_suffix('.csv')}")
+            print(f"[OK] wrote {(out.with_suffix('.csv') if args.csv_out_dir is None else Path(args.csv_out_dir) / out.with_suffix('.csv').name)}")
         print(f"[points] {len(points)} plotted")
         print("[note] Nearby labels are aggregated by default with one model name per line; labels that cannot be placed cleanly are skipped. Use --layout phase-panels for separate Input+output and Output-only subplots.")
         for p in points:

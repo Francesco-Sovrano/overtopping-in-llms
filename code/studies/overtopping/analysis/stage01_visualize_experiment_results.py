@@ -63,15 +63,25 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
         "R_ov_status": singleton.get("R_ov_status", "missing"),
         "N_eff": singleton.get("N_eff"),
         "N_eff_status": singleton.get("N_eff_status", "missing"),
-        "OCC_0": singleton.get("OCC_0"), "OCC_1": singleton.get("OCC_1"),
-        "OCC_0_status": singleton.get("OCC_0_status", "missing"),
-        "OCC_1_status": singleton.get("OCC_1_status", "missing"),
+        "U_J_i2c": singleton.get("U_J_i2c"),
+        "U_J_c2i": singleton.get("U_J_c2i"),
+        "U_J_i2c_status": singleton.get("U_J_i2c_status", "missing"),
+        "U_J_c2i_status": singleton.get("U_J_c2i_status", "missing"),
+        "s_1_i2c": singleton.get("s_1_i2c"),
+        "s_1_c2i": singleton.get("s_1_c2i"),
+        "N_eff_i2c": singleton.get("N_eff_i2c"),
+        "N_eff_c2i": singleton.get("N_eff_c2i"),
+        "N_eff_i2c_status": singleton.get("N_eff_i2c_status", "missing"),
+        "N_eff_c2i_status": singleton.get("N_eff_c2i_status", "missing"),
         "E_J": candidate_e.get("effect", global_payload.get("E_J")),
         "E_J_status": candidate_e.get("status", global_payload.get("E_J_status", "missing")),
         "interaction_schema": schema or "missing",
     }
     for threshold, count in (singleton.get("N_t", {}) or {}).items():
         output[f"N_t_{threshold}"] = count
+    for direction in ("i2c", "c2i"):
+        for threshold, count in (singleton.get(f"N_t_{direction}", {}) or {}).items():
+            output[f"N_t_{direction}_{threshold}"] = count
     for m, item in (singleton.get("TOC_m", {}) or {}).items():
         output[f"TOC_{m}"] = item.get("value") if isinstance(item, dict) else item
 
@@ -132,7 +142,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--catalogue_json", required=True)
     p.add_argument("--data_root", default=str(PROJECT_ROOT / "data"))
-    p.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "experiment_catalogue"))
+    p.add_argument("--out_dir", default=str(PROJECT_ROOT / "results" / "analysis" / "reproducibility" / "experiment_catalogue"))
     args = p.parse_args()
     specs = [RunSpec(**row) for row in load_json(Path(args.catalogue_json))]
     data_root = Path(args.data_root).expanduser().resolve()

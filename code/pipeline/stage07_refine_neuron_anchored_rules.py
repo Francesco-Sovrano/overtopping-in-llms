@@ -9,6 +9,7 @@ import json
 import argparse
 import zipfile
 from collections import defaultdict
+from bisect import bisect_right
 from more_itertools import unique_everseen
 
 import numpy as np
@@ -34,8 +35,8 @@ from core.text_and_rules import guess_filetype
 from core.caching_and_prompting import load_or_create_cache, set_deterministic
 from core.data_model_for_shap import run_rule_extraction
 from core.spectral_analysis import *
-from core.feature_extraction_runner import resolve_task_spec
-from core.heldout_set_metrics import compute_singleton_set_metrics
+from core.feature_extraction_runner import resolve_task_spec, sanitize_feature_name
+from core.heldout_set_metrics import compute_singleton_set_metrics, safe_layer_label
 
 # Neuron intervention utilities (shared with script 6).
 # These provide efficient prefix-cached evaluation and a statistically-aware epsilon adjustment.
@@ -578,10 +579,6 @@ def _layer_sort_key(layer_label: str):
 	nums = re.findall(r"\d+", str(layer_label))
 	return int(nums[0]) if nums else 10**9
 
-def _safe_layer_label(layer_label):
-	# e.g. "a16.h21" -> "a16_h21"
-	return re.sub(r"[^A-Za-z0-9]+", "_", str(layer_label)).strip("_")
-
 def _safe_dirname(s: str) -> str:
 	return re.sub(r"[^A-Za-z0-9]+", "_", str(s)).strip("_")
 
@@ -652,19 +649,16 @@ def _spectral_cache_path(args, spectral_cfg=None):
 	return cache_root / f"spectral_{cache_hash}.pkl"
 
 
-def _legacy_compatible_normal_task_cache_identity(path: Path, task_module: str | None) -> tuple[str, str | None]:
-	"""Keep expensive Stage-7 caches reusable across the terminology-only rename.
+def _replacement_cache_identity(scores_path: Path, task_module: str | None) -> tuple[str, str | None]:
+	"""Return the stable cache identity for control-correctness terminology aliases.
 
-	The old cache key included the absolute scores path and task-spec attribute.
-	Human-facing renames of ``ordinary_correctness`` to either
-	``normal_task_correctness`` or ``attack_cohort_control_correctness`` and task-spec aliases
-	would otherwise invalidate a
-	perfectly valid replacement-score cache even though the model, prompts,
-	target, file fingerprint, and intervention are unchanged.  Normalize only
-	those two spelling aliases for the cache identity; all scientific inputs
-	remain in the key.
+	The normal-task and attack-cohort control endpoints were renamed without changing
+	the underlying replacement-reference population.  Normalize those path/spec names
+	to the established cache namespace so terminology changes do not trigger model
+	recomputation.  File content, model, intervention, population size, and units remain
+	part of the cache configuration.
 	"""
-	path_key = str(Path(path).resolve())
+	path_key = str(Path(scores_path).resolve())
 	path_key = path_key.replace("/normal_task_correctness/", "/ordinary_correctness/")
 	path_key = path_key.replace("/attack_cohort_control_correctness/", "/ordinary_correctness/")
 	task_key = task_module
@@ -675,11 +669,8 @@ def _legacy_compatible_normal_task_cache_identity(path: Path, task_module: str |
 
 
 def _replacement_scores_cache_cfg(args, *, ai_model: str, scores_path: Path, prompt_col: str, main_metric: str, layer_to_neurons: dict) -> dict:
-	"""
-	Cache key for the expensive replacement-stat precompute used by mean-style interventions.
-	This is the costly part behind mean/median-style score replacement, so it is worth caching.
-	"""
-	path_key, task_key = _legacy_compatible_normal_task_cache_identity(
+	"""Cache identity for the expensive mean/median replacement-stat precompute."""
+	path_key, task_key = _replacement_cache_identity(
 		scores_path, getattr(args, "task_module", None)
 	)
 	return {
@@ -1178,7 +1169,7 @@ def write_flip_stats(
 	cols_flip_unparseable_found = []
 
 	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0],x[1])):
-		layer_key = _safe_layer_label(layer_label)
+		layer_key = safe_layer_label(layer_label)
 		col_any = f"flip_{layer_key}_{neuron_id}"
 		col_c2i = f"flip_c2i_{layer_key}_{neuron_id}"
 		col_i2c = f"flip_i2c_{layer_key}_{neuron_id}"
@@ -1561,12 +1552,17 @@ def write_heldout_set_metrics(
 	)
 
 	if not topm_df.empty:
-		fig, ax = plt.subplots(figsize=(5.2, 3.2))
-		ax.plot(topm_df["m"], topm_df["TOC_m"], marker="o", linewidth=1.5, markersize=3)
+		fig, ax = plt.subplots(figsize=(5.6, 3.4))
+		ax.plot(topm_df["m"], topm_df["TOC_m"], marker="o", linewidth=1.3, markersize=3, label="pooled")
+		if "TOC_m_i2c" in topm_df.columns:
+			ax.plot(topm_df["m"], topm_df["TOC_m_i2c"], marker="o", linewidth=1.3, markersize=3, label="0→1")
+		if "TOC_m_c2i" in topm_df.columns:
+			ax.plot(topm_df["m"], topm_df["TOC_m_c2i"], marker="o", linewidth=1.3, markersize=3, label="1→0")
 		ax.axhline(1.0, linestyle="--", linewidth=1.0)
 		ax.set_xlabel("Frozen discovery top-m channels")
 		ax.set_ylabel(r"$\mathrm{TOC}_m(J)$")
-		ax.set_title("Frozen top-m singleton-union coverage")
+		ax.set_title("Frozen top-m coverage by direction")
+		ax.legend(frameon=False, fontsize=8)
 		ax.spines["top"].set_visible(False)
 		ax.spines["right"].set_visible(False)
 		fig.tight_layout()
@@ -2366,7 +2362,7 @@ def _neurons_sorted_to_meta(neurons_sorted):
 	keys = []
 	baseline_map = {}
 	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
-		layer_key = _safe_layer_label(layer_label)
+		layer_key = safe_layer_label(layer_label)
 		nk = f"{layer_key}_{int(neuron_id)}"
 		keys.append(nk)
 		baseline_map[nk] = "all"
@@ -2460,6 +2456,26 @@ def _norm_rule_quality_scope(scope) -> str:
 	if sv.startswith("train"):
 		return "train"
 	return sv
+
+
+def _scores_for_rule_quality_scope(scores_df, scope):
+	"""Return the rows eligible for one rule-quality reporting scope."""
+	if scores_df is None or scores_df.empty:
+		return pd.DataFrame()
+	scope_norm = _norm_rule_quality_scope(scope)
+	mask = pd.Series(True, index=scores_df.index)
+	if "is_test" in scores_df.columns:
+		is_test = scores_df["is_test"].fillna(False).astype(bool)
+		if scope_norm in ("test", "test_selected"):
+			mask &= is_test
+		elif scope_norm == "train":
+			mask &= ~is_test
+	if "_evaluated" in scores_df.columns:
+		try:
+			mask &= scores_df["_evaluated"].fillna(False).astype(bool)
+		except Exception:
+			pass
+	return scores_df.loc[mask].copy()
 
 def write_rule_metrics_stats(
 	rules_dir: str,
@@ -2795,7 +2811,7 @@ def _repair_directional_flip_columns(
 	valid, positive, negative = masks
 	repaired = 0
 	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
-		layer_key = _safe_layer_label(layer_label)
+		layer_key = safe_layer_label(layer_label)
 		col_any = f"flip_{layer_key}_{int(neuron_id)}"
 		if col_any not in scores_df.columns:
 			continue
@@ -2920,7 +2936,7 @@ def _hq_scope_records(
 	# Stable neuron universe.
 	total_neurons = []
 	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
-		total_neurons.append((_safe_layer_label(layer_label), int(neuron_id)))
+		total_neurons.append((safe_layer_label(layer_label), int(neuron_id)))
 
 	metric_key = _norm_rule_metric_name(quality_metric)
 	metric_col = _rule_metric_col(metric_key)
@@ -2967,28 +2983,6 @@ def _hq_scope_records(
 			"union_semantic_wrong": int(union_sem_mask.sum()),
 			"sum_semantic_wrong": int(sum_sem),
 		}
-
-	def _scores_for_scope(scope):
-		if scores_df is None or scores_df.empty:
-			return pd.DataFrame()
-		scope_norm = _norm_rule_quality_scope(scope)
-		mask = pd.Series(True, index=scores_df.index)
-		if "is_test" in scores_df.columns:
-			is_test = scores_df["is_test"].fillna(False).astype(bool)
-			if scope_norm in ("test", "test_selected"):
-				mask &= is_test
-			elif scope_norm == "train":
-				mask &= ~is_test
-		# If the dataframe carries an explicit evaluated-row mask, respect it for every
-		# scope. Use the explicit evaluated-row mask when present.
-		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else None
-		if mask_col is not None:
-			try:
-				mask &= scores_df[mask_col].fillna(False).astype(bool)
-			except Exception:
-				pass
-		return scores_df.loc[mask].copy()
-
 	all_cov = _coverage_for(total_neurons, scores_df)
 	baseline_denoms = _baseline_direction_denominators(scores_df, baseline_metric_col, all_cov["eval_any_mask"])
 	idx_map = {t: i for i, t in enumerate(total_neurons)}
@@ -3025,7 +3019,7 @@ def _hq_scope_records(
 		high_df = tmp[pd.to_numeric(tmp[mcol], errors="coerce") >= scope_thr]
 		high_ids = {(str(r["layer_key"]), int(r["neuron_id"])) for _, r in high_df.dropna(subset=["neuron_id", "layer_key"]).iterrows()}
 		high_neurons = [t for t in total_neurons if (t[0], t[1]) in high_ids]
-		scope_scores = _scores_for_scope(scope_norm)
+		scope_scores = _scores_for_rule_quality_scope(scores_df, scope_norm)
 		scope_all_cov = _coverage_for(total_neurons, scope_scores)
 		scope_denoms = _baseline_direction_denominators(scope_scores, baseline_metric_col, scope_all_cov["eval_any_mask"])
 		cov = _coverage_for(high_neurons, scope_scores)
@@ -3408,28 +3402,10 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 	high_ids_by_scope = {scope: set(rec.get("neurons", [])) for scope, rec in scopes.items()}
 	layer_to_neurons = defaultdict(list)
 	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
-		layer_to_neurons[_safe_layer_label(layer_label)].append(int(neuron_id))
+		layer_to_neurons[safe_layer_label(layer_label)].append(int(neuron_id))
 	layers = sorted(layer_to_neurons.keys(), key=lambda lk: _layer_sort_key(lk))
 	def _cols(neuron_list, prefix):
 		return [f"{prefix}{lkey}_{nid}" for (lkey, nid) in neuron_list]
-	def _scores_for_scope_layer(scope):
-		if scores_df is None or scores_df.empty:
-			return pd.DataFrame()
-		scope_norm = _norm_rule_quality_scope(scope)
-		mask = pd.Series(True, index=scores_df.index)
-		if "is_test" in scores_df.columns:
-			is_test = scores_df["is_test"].fillna(False).astype(bool)
-			if scope_norm in ("test", "test_selected"):
-				mask &= is_test
-			elif scope_norm == "train":
-				mask &= ~is_test
-		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else None
-		if mask_col is not None:
-			try:
-				mask &= scores_df[mask_col].fillna(False).astype(bool)
-			except Exception:
-				pass
-		return scores_df.loc[mask].copy()
 	rows = []
 	for lk in layers:
 		nids = sorted(set(layer_to_neurons[lk]))
@@ -3451,7 +3427,7 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 		}
 		for scope in ["test_selected", "all_fit"]:
 			slug = _score_scope_slug(scope)
-			sdf_scope = _scores_for_scope_layer(scope)
+			sdf_scope = _scores_for_rule_quality_scope(scores_df, scope)
 			hq_neus = [t for t in all_neus if t in high_ids_by_scope.get(scope, set())]
 			cols_any_hq = _cols(hq_neus, "flip_")
 			cols_c2i_hq = _cols(hq_neus, "flip_c2i_")
@@ -3491,7 +3467,7 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 	layer_labels = [str(x).replace("_", ".") for x in df_plot["layer_key"].tolist()]
 	x = np.arange(len(layer_labels))
 	denom_all = max(1, len(scores_df))
-	denom_by_scope = {"test_selected": max(1, len(_scores_for_scope_layer("test_selected"))), "all_fit": max(1, len(_scores_for_scope_layer("all_fit")))}
+	denom_by_scope = {"test_selected": max(1, len(_scores_for_rule_quality_scope(scores_df, "test_selected"))), "all_fit": max(1, len(_scores_for_rule_quality_scope(scores_df, "all_fit")))}
 	colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [None, None, None, None, None, None])
 	plt.figure(figsize=(max(10, 0.65 * len(layer_labels)), 6.8))
 	ax1 = plt.subplot(2, 1, 1)
@@ -3675,9 +3651,6 @@ def main():
 	with open(features_json_path, "r", encoding="utf-8") as f:
 		features_meta = json.load(f)
 	features_json_fp = _file_fingerprint(Path(features_json_path))
-	def _sanitize(s: str) -> str:
-		return re.sub(r"[^0-9a-zA-Z]+", "_", str(s)).strip("_").lower()
-
 	if isinstance(features_meta, dict):
 		if features_meta.get("feature_engineering") is False or features_meta.get("mode") == "dataset_only":
 			feature_records = []
@@ -3703,7 +3676,7 @@ def main():
 			f"found {len(bad_feature_records)} malformed entries."
 		)
 
-	feature_name_set = {_sanitize(feat["label"]) for feat in feature_records}
+	feature_name_set = {sanitize_feature_name(feat["label"]) for feat in feature_records}
 	input_features = [
 		c for c in scores_df.columns
 		if c in feature_name_set
@@ -4336,7 +4309,7 @@ def main():
 	# ---- precompute per-neuron static stuff once ----
 	neuron_specs = []
 	for layer_label, neuron_id, _baseline_subset in unique_everseen(neurons, key=lambda x: (x[0], x[1])):
-		layer_key = _safe_layer_label(layer_label)
+		layer_key = safe_layer_label(layer_label)
 		cache_policy_tag = build_flip_cache_policy_tag(args, main_metric=main_metric)
 		rules_subdir = os.path.join(args.rules_dir, cache_policy_tag, "ablation_cache")
 
@@ -4353,7 +4326,7 @@ def main():
 
 	batch_size = args.batch_size
 	neuron_batch_size = max(1, int(getattr(args, "neuron_batch_size", 1) or 1))
-	print('batch_size:', batch_size, 'neuron_batch_size:', neuron_batch_size)
+	print('batch_size:', batch_size, 'neuron_batch_size:', neuron_batch_size, 'synthetic_batch_upper_bound:', batch_size * neuron_batch_size)
 	neuron_specs_by_layer = defaultdict(list)
 	for spec in neuron_specs:
 		neuron_specs_by_layer[str(spec[0])].append(spec)
@@ -4423,6 +4396,154 @@ def main():
 			payload["answers"] = answers
 		with open(cache_path, "wb") as f:
 			pickle.dump(payload, f)
+		# _note_cache_segment is defined below; all helpers are created before the
+		# ablation loop calls this saver.
+		_note_cache_segment(cache_path)
+
+	# Cache files are keyed by the first evaluation-row offset. Historically the
+	# poisoning driver forced batch_size=1, so a restart with a larger prompt
+	# batch would otherwise ignore thousands of valid singleton cache files.
+	# Build a lightweight index of cache segments and stitch adjacent/overlapping
+	# segments so cache reuse is independent of the requested batch size.
+	_cache_segment_index = {}
+
+	def _parse_cache_segment_name(filename):
+		if not str(filename).endswith(".pkl"):
+			return None
+		stem = str(filename)[:-4]
+		try:
+			layer_part, neuron_part, start_part = stem.rsplit("_", 2)
+			return layer_part, int(neuron_part), int(start_part)
+		except (ValueError, TypeError):
+			return None
+
+	def _cache_dir_segments(rules_subdir):
+		rules_subdir = str(rules_subdir)
+		indexed = _cache_segment_index.get(rules_subdir)
+		if indexed is not None:
+			return indexed
+		indexed = defaultdict(list)
+		try:
+			names = os.listdir(rules_subdir)
+		except OSError:
+			names = []
+		for name in names:
+			parsed = _parse_cache_segment_name(name)
+			if parsed is None:
+				continue
+			layer_part, neuron_part, start_part = parsed
+			indexed[(layer_part, int(neuron_part))].append(int(start_part))
+		for starts in indexed.values():
+			starts.sort()
+		_cache_segment_index[rules_subdir] = indexed
+		return indexed
+
+	def _note_cache_segment(cache_path):
+		parent = str(Path(cache_path).parent)
+		indexed = _cache_segment_index.get(parent)
+		if indexed is None:
+			return
+		parsed = _parse_cache_segment_name(Path(cache_path).name)
+		if parsed is None:
+			return
+		layer_part, neuron_part, start_part = parsed
+		starts = indexed[(layer_part, int(neuron_part))]
+		pos = bisect_right(starts, int(start_part))
+		if pos == 0 or starts[pos - 1] != int(start_part):
+			starts.insert(pos, int(start_part))
+
+	def _combine_cached_eval_parts(parts):
+		if not parts:
+			return None
+		correct_parts = [np.asarray(part["correct"]).astype(bool) for part in parts]
+		out = {"correct": np.concatenate(correct_parts, axis=0)}
+
+		semantic_keys = sorted({key for part in parts for key in (part.get("semantics", {}) or {}).keys()})
+		if semantic_keys:
+			semantics = {}
+			for key in semantic_keys:
+				arrays = []
+				for part, correct in zip(parts, correct_parts):
+					value = (part.get("semantics", {}) or {}).get(key)
+					if value is None:
+						arrays.append(np.zeros(len(correct), dtype=bool))
+					else:
+						arrays.append(np.asarray(value).astype(bool))
+				semantics[key] = np.concatenate(arrays, axis=0)
+			out["semantics"] = semantics
+		else:
+			out["semantics"] = {}
+
+		if all(_coerce_cached_answers(part.get("answers")) is not None for part in parts):
+			answers = []
+			for part in parts:
+				answers.extend(_coerce_cached_answers(part.get("answers")))
+			out["answers"] = answers
+		return out
+
+	def _slice_cached_eval(payload, lo, hi):
+		part = {
+			"correct": np.asarray(payload["correct"]).astype(bool)[lo:hi],
+			"semantics": {
+				key: np.asarray(value).astype(bool)[lo:hi]
+				for key, value in (payload.get("semantics", {}) or {}).items()
+			},
+		}
+		answers = _coerce_cached_answers(payload.get("answers"))
+		if answers is not None:
+			part["answers"] = answers[lo:hi]
+		return part
+
+	def _load_cached_eval_range(rules_subdir, layer_key, neuron_id, start_i, rows):
+		"""Load one requested evaluation range, independent of old cache batch size."""
+		expected_n = len(rows)
+		if expected_n == 0:
+			return {"correct": np.zeros(0, dtype=bool), "semantics": {}, "answers": []}
+
+		exact_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start_i)
+		exact = _load_cached_eval(exact_path, rows)
+		if exact is not None:
+			return exact
+
+		starts = _cache_dir_segments(rules_subdir).get((str(layer_key), int(neuron_id)), [])
+		if not starts:
+			return None
+		want_end = int(start_i) + int(expected_n)
+		cursor = int(start_i)
+		parts = []
+		local_payloads = {}
+
+		while cursor < want_end:
+			pos = bisect_right(starts, cursor) - 1
+			chosen = None
+			while pos >= 0:
+				seg_start = int(starts[pos])
+				payload = local_payloads.get(seg_start)
+				if payload is None:
+					seg_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, seg_start)
+					payload = _load_cached_eval(seg_path, rows=None)
+					local_payloads[seg_start] = payload
+				if payload is not None:
+					seg_len = len(np.asarray(payload.get("correct", [])))
+					if seg_len > 0 and seg_start <= cursor < seg_start + seg_len:
+						chosen = (seg_start, seg_len, payload)
+						break
+				pos -= 1
+			if chosen is None:
+				return None
+
+			seg_start, seg_len, payload = chosen
+			lo = cursor - seg_start
+			take = min(seg_len - lo, want_end - cursor)
+			if take <= 0:
+				return None
+			parts.append(_slice_cached_eval(payload, lo, lo + take))
+			cursor += take
+
+		combined = _combine_cached_eval_parts(parts)
+		if combined is None or len(np.asarray(combined.get("correct", []))) != expected_n:
+			return None
+		return combined
 
 	def _ensure_bool_col(col_name):
 		if col_name not in scores_out.columns:
@@ -4453,7 +4574,7 @@ def main():
 		return cols
 
 	def _expected_flip_cols_for_neuron(layer_label, neuron_id):
-		layer_key = _safe_layer_label(layer_label)
+		layer_key = safe_layer_label(layer_label)
 		return (
 			f"flip_{layer_key}_{int(neuron_id)}",
 			f"flip_c2i_{layer_key}_{int(neuron_id)}",
@@ -4490,10 +4611,12 @@ def main():
 	def _all_ablation_cache_files_exist(batch_starts):
 		missing = []
 		for start_i in batch_starts:
+			end_i = min(start_i + batch_size, len(eval_prompts))
+			batch_rows_i = eval_prompts[start_i:end_i]
 			for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, _hooks, _cache_policy_tag in neuron_specs:
-				layer_key = _safe_layer_label(layer_label)
+				layer_key = safe_layer_label(layer_label)
 				cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start_i)
-				if not _cached_eval_file_exists(cache_path):
+				if _load_cached_eval_range(rules_subdir, layer_key, neuron_id, start_i, batch_rows_i) is None:
 					missing.append(cache_path)
 					if len(missing) >= 5:
 						return False, missing
@@ -4518,7 +4641,7 @@ def main():
 		for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, _hooks, _cache_policy_tag in tqdm(
 			neuron_specs, desc="Rebuilding cached flip columns"
 		):
-			layer_key = _safe_layer_label(layer_label)
+			layer_key = safe_layer_label(layer_label)
 			col_any, col_c2i, col_i2c = _ensure_flip_cols(layer_key, neuron_id)
 			any_values = np.full(n_rows_out, pd.NA, dtype=object)
 			c2i_values = np.full(n_rows_out, pd.NA, dtype=object)
@@ -4529,7 +4652,7 @@ def main():
 				end_i = min(start_i + batch_size, len(eval_prompts))
 				batch_prompt_i = eval_prompts[start_i:end_i]
 				cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start_i)
-				cached_eval = _load_cached_eval(cache_path, batch_prompt_i)
+				cached_eval = _load_cached_eval_range(rules_subdir, layer_key, neuron_id, start_i, batch_prompt_i)
 				if cached_eval is None:
 					raise RuntimeError(f"Expected cached ablation result missing or invalid: {cache_path}")
 				abl = np.asarray(cached_eval.get("correct", [])).astype(bool)
@@ -4818,7 +4941,7 @@ def main():
 			if args.decode_only:
 				need_prefill = False
 				for layer_label, neuron_id, _baseline_subset, _layer_key, rules_subdir, _hooks, _cache_policy_tag in neuron_specs:
-					safe_layer_key = _safe_layer_label(layer_label)
+					safe_layer_key = safe_layer_label(layer_label)
 					cache_path = _flip_cache_path(rules_subdir, safe_layer_key, neuron_id, start)
 					# Prefix prefill is only needed when at least one ablation cache file is absent.
 					# Do not unpickle/rescore here; BON rescoring can launch the classifier LLM.
@@ -4839,11 +4962,11 @@ def main():
 			# Old execution path, kept for parity and for low-memory runs.
 			if neuron_batch_size <= 1:
 				for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, hooks, _cache_policy_tag in tqdm(neuron_specs, desc="Neurons" if show_batch_tqdm else None):
-					layer_key = _safe_layer_label(layer_label)
+					layer_key = safe_layer_label(layer_label)
 					_ensure_flip_cols(layer_key, neuron_id)
 					cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start)
 
-					cached_eval = _load_cached_eval(cache_path, batch_prompt)
+					cached_eval = _load_cached_eval_range(rules_subdir, layer_key, neuron_id, start, batch_prompt)
 					if cached_eval is None:
 						_model, _, _ = _ensure_model_loaded()
 						if args.decode_only:
@@ -4905,10 +5028,10 @@ def main():
 					compute_specs = []
 					for spec in chunk_specs_all:
 						layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
-						layer_key_i = _safe_layer_label(layer_label_i)
+						layer_key_i = safe_layer_label(layer_label_i)
 						_ensure_flip_cols(layer_key_i, neuron_id_i)
 						cache_path = _flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start)
-						cached = _load_cached_eval(cache_path, batch_prompt)
+						cached = _load_cached_eval_range(rules_subdir_i, layer_key_i, neuron_id_i, start, batch_prompt)
 						cached_or_none.append(cached)
 						if cached is None:
 							compute_specs.append(spec)
@@ -4933,7 +5056,7 @@ def main():
 
 						for spec, (arr, semantics, answers_j) in zip(compute_specs, computed_list):
 							layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
-							layer_key_i = _safe_layer_label(layer_label_i)
+							layer_key_i = safe_layer_label(layer_label_i)
 							arr = np.asarray(arr).astype(bool)
 							semantics = semantics or {}
 							computed_by_key[(str(layer_label_i), int(neuron_id_i))] = {"correct": arr, "semantics": semantics, "answers": answers_j}
@@ -4941,7 +5064,7 @@ def main():
 
 					for spec, cached in zip(chunk_specs_all, cached_or_none):
 						layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, _rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
-						layer_key_i = _safe_layer_label(layer_label_i)
+						layer_key_i = safe_layer_label(layer_label_i)
 						if cached is None:
 							payload = computed_by_key[(str(layer_label_i), int(neuron_id_i))]
 						else:
@@ -5067,7 +5190,7 @@ def main():
 	# ----------------- per-neuron rule extraction -----------------
 	if args.extract_rules:
 		for layer_label, neuron_id, _baseline_subset in tqdm(neurons, desc="Neurons (rules)"):
-			layer_key = _safe_layer_label(layer_label)
+			layer_key = safe_layer_label(layer_label)
 			col_any = f"flip_{layer_key}_{neuron_id}"
 			col_c2i = f"flip_c2i_{layer_key}_{neuron_id}"
 			col_i2c = f"flip_i2c_{layer_key}_{neuron_id}"

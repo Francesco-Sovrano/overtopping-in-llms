@@ -119,6 +119,23 @@ def strict_scope_ok(
     )
 
 
+_EVALUATION_STATS_SUFFIX_RE = re.compile(
+    r"-(?:heldout_test|eval_train|eval_all)(?:-cap\d+)?$"
+)
+
+
+def reference_stats_dir(stats_dir: Path) -> Path:
+    """Return the discovery/reference stats directory for an evaluation-side path.
+
+    Manuscript tables intentionally point at held-out outputs.  Analysis helpers
+    that need discovery metadata must canonicalize those paths back to the
+    reported/reference run rather than rejecting them.
+    """
+    stats_dir = Path(stats_dir)
+    base = _EVALUATION_STATS_SUFFIX_RE.sub("", stats_dir.name)
+    return stats_dir if base == stats_dir.name else stats_dir.with_name(base)
+
+
 def _evaluation_stats_dir(
     reference_stats: Path,
     evaluation_split: str,
@@ -153,9 +170,8 @@ def setting_from_row(
     evaluation_split: str = "test",
     sampling_max_points: int = 10000,
 ) -> dict[str, Any]:
-    reference_stats = remap_stats_dir(row["stats_dir"], data_root)
-    if reference_stats.name.endswith("-heldout_test"):
-        raise ValueError(f"Row {index} stats_dir must name the reported/reference run, not a held-out output")
+    reported_stats = remap_stats_dir(row["stats_dir"], data_root)
+    reference_stats = reference_stats_dir(reported_stats)
     if "-agonist_neurons" not in reference_stats.name:
         raise ValueError(
             f"Row {index} stats_dir name does not encode circuit and agonist outputs: {reference_stats.name}"
@@ -227,6 +243,7 @@ def setting_from_row(
         "task_module": TASK_MODULES[task_dir],
         "model_id": model_id,
         "model_root": model_root,
+        "reported_stats": reported_stats,
         "reference_stats": reference_stats,
         "heldout_stats": heldout_stats,
         "evaluation_split": str(evaluation_split),

@@ -3,9 +3,10 @@
 Markdown report from spiking_diagnostics_results_for_inspection.zip.
 
 Example:
-  python3 -m studies.overtopping.analysis.reports.stage07_overtopping_spiking_report \
+  python3 -m studies.overtopping.analysis.stage07_overtopping_spiking_report \
     --root data \
-    --out results/diagnostics/overtopping_spiking
+    --out results/analysis/rq3_threshold_event/spiking_diagnostics \
+    --paper-figures-dir results/paper/figures/04_rq3_spiking_cut
 
 The script reads only the aggregate CSV files it needs directly from the zip;
 it does not extract the whole bundle.
@@ -15,6 +16,7 @@ Dependencies: pandas, numpy, matplotlib.
 from __future__ import annotations
 from pathlib import Path
 from core.project_paths import PROJECT_ROOT
+from studies.overtopping.analysis import primary_holdout_analysis as primary_helpers
 
 
 import argparse, glob, io, json, math, os, textwrap, zipfile
@@ -34,8 +36,13 @@ def parse_args():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--zip", help="Input spiking diagnostics results zip")
     src.add_argument("--root", help="Already-extracted result root containing data/")
-    p.add_argument("--out", default=str(PROJECT_ROOT / "results" / "diagnostics" / "overtopping_spiking"), help="Output directory. Default: <repo>/results/diagnostics/overtopping_spiking")
+    p.add_argument("--out", default=str(PROJECT_ROOT / "results" / "analysis" / "rq3_threshold_event" / "spiking_diagnostics"), help="Detailed analysis output directory")
+    p.add_argument("--paper-figures-dir", default=None, help="Optional manuscript RQ3 figure directory. When provided, compact threshold/spiking-cut figures are promoted here instead of being buried in diagnostics.")
     p.add_argument("--base-md", default=None, help="Optional Markdown file to update")
+    p.add_argument("--primary-table", required=True, help="Primary manuscript table defining the exact RQ3 population.")
+    p.add_argument("--data-root", required=True, help="Canonical overtopping data root used to resolve primary-table rows.")
+    p.add_argument("--evaluation-split", default="test", choices=["test", "train", "all"])
+    p.add_argument("--spiking-max-points", type=int, default=10000)
     p.add_argument("--bootstrap", type=int, default=3000, help="Bootstrap samples for median-delta CI")
     return p.parse_args()
 
@@ -47,7 +54,11 @@ def meta_for(rel: str) -> Dict[str, object]:
     rel = normalize_member_name(rel)
     parts = rel.split("/")
     m = dict(rel=rel, task="unknown", model="unknown", setting="unknown", decode_only=False, run_id="unknown")
-    # Expected: data/<task>/<org>/<model>/.../eap_ig_inputs/<setting>/spiking_diagnostics/<file>
+    # Archives are sometimes wrapped in a top-level folder. Anchor metadata at
+    # the first `data/` component instead of requiring it to be zip-member root.
+    if "data" in parts:
+        parts = parts[parts.index("data"): ]
+    # Expected after normalization: data/<task>/<org>/<model>/.../eap_ig_inputs/<setting>/spiking_diagnostics/<file>
     if len(parts) >= 4 and parts[0] == "data":
         task, org, model = parts[1], parts[2], parts[3]
         setting = "unknown"
@@ -90,6 +101,129 @@ def concat_from_root(root: Path, suffix: str) -> pd.DataFrame:
 
 def concat(source_kind: str, source_path: Path, suffix: str) -> pd.DataFrame:
     return concat_from_zip(source_path, suffix) if source_kind == "zip" else concat_from_root(source_path, suffix)
+
+def _spiking_label(setting: dict, evaluation_split: str, spiking_max_points: int) -> str:
+    label = f"spiking_diagnostics-{setting['bag_label']}"
+    if evaluation_split == "train":
+        label += "-eval_train"
+    elif evaluation_split == "all":
+        label += "-eval_all"
+    if int(spiking_max_points) != 10000:
+        label += f"-cap{int(spiking_max_points)}"
+    return label
+
+
+def _expected_primary_sources(primary_table: Path, data_root: Path, *, evaluation_split: str,
+                              spiking_max_points: int) -> list[dict]:
+    table = pd.read_csv(primary_table)
+    expected = []
+    for index in range(len(table)):
+        row = table.iloc[index]
+        setting = primary_helpers.setting_from_row(
+            index, row, data_root, PROJECT_ROOT / "results",
+            evaluation_split=evaluation_split, sampling_max_points=spiking_max_points,
+        )
+        diag_dir = Path(setting["input_data_dir"]) / _spiking_label(setting, evaluation_split, spiking_max_points)
+        expected.append({
+            "row_index": int(index),
+            "run_id": f"primary_row_{index:02d}",
+            "task": str(row.get("task", setting.get("task", "unknown"))),
+            "model": str(row.get("model", setting.get("model", "unknown"))),
+            "phase": str(row.get("phase", setting.get("phase", "unknown"))),
+            "setting": str(setting.get("circuit_label", "unknown")),
+            "decode_only": bool(setting.get("decode_only", False)),
+            "diag_dir": diag_dir,
+        })
+    return expected
+
+
+def _zip_member_for_expected(zf: zipfile.ZipFile, expected_rel: str) -> str | None:
+    target = normalize_member_name(expected_rel)
+    matches = []
+    for name in zf.namelist():
+        rel = normalize_member_name(name)
+        if rel == target or rel.endswith("/" + target):
+            matches.append(name)
+    if len(matches) > 1:
+        raise RuntimeError(f"Ambiguous archive members for exact primary source {expected_rel}: {matches[:5]}")
+    return matches[0] if matches else None
+
+
+def _read_exact_primary_table(source_kind: str, source_path: Path, expected: list[dict],
+                              data_root: Path, suffix: str) -> tuple[pd.DataFrame, list[dict]]:
+    frames = []
+    audit = []
+    zf = zipfile.ZipFile(source_path) if source_kind == "zip" else None
+    try:
+        for spec in expected:
+            diag_dir = Path(spec["diag_dir"])
+            if source_kind == "root":
+                file_path = diag_dir / suffix
+                exists = file_path.is_file()
+                source_label = str(file_path)
+                df = pd.read_csv(file_path) if exists else pd.DataFrame()
+            else:
+                rel = (Path("data") / diag_dir.relative_to(data_root) / suffix).as_posix()
+                member = _zip_member_for_expected(zf, rel)
+                exists = member is not None
+                source_label = member or rel
+                if exists:
+                    with zf.open(member) as fh:
+                        df = pd.read_csv(io.BytesIO(fh.read()))
+                else:
+                    df = pd.DataFrame()
+            baselines = set(df.get("baseline_subset", pd.Series(dtype=str)).dropna().astype(str)) if not df.empty else set()
+            populations = set(df.get("population", pd.Series(dtype=str)).dropna().astype(str)) if not df.empty else set()
+            missing_baselines = sorted({"positive", "negative"} - baselines)
+            missing_populations = sorted({POP_CAND, POP_CTRL} - populations)
+            ok = bool(exists and not df.empty and not missing_baselines and not missing_populations)
+            audit.append({
+                "row_index": spec["row_index"], "run_id": spec["run_id"], "task": spec["task"],
+                "model": spec["model"], "phase": spec["phase"], "file": suffix,
+                "source": source_label, "exists": bool(exists), "n_rows": int(len(df)),
+                "baseline_subsets": ",".join(sorted(baselines)), "populations": ",".join(sorted(populations)),
+                "missing_baseline_subsets": ",".join(missing_baselines),
+                "missing_populations": ",".join(missing_populations), "complete": ok,
+            })
+            if exists and not df.empty:
+                df = df.copy()
+                for key in ("run_id", "task", "model", "setting", "decode_only"):
+                    df[key] = spec[key]
+                df["rel"] = source_label
+                frames.append(df)
+    finally:
+        if zf is not None:
+            zf.close()
+    return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), audit
+
+
+def load_exact_primary_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    source_kind = "zip" if args.zip else "root"
+    source_path = Path(args.zip or args.root).expanduser().resolve()
+    data_root = Path(args.data_root).expanduser().resolve()
+    expected = _expected_primary_sources(
+        Path(args.primary_table).expanduser().resolve(), data_root,
+        evaluation_split=str(args.evaluation_split), spiking_max_points=int(args.spiking_max_points),
+    )
+    fs, audit_fs = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_flip_stats.csv")
+    ut, audit_ut = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_unit_tests.csv")
+    b, audit_b = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_binned_curves.csv")
+    audit = pd.DataFrame(audit_fs + audit_ut + audit_b)
+    # Binned curves are descriptive and may legitimately be empty; the exact
+    # primary rows and both baseline/population subsets are mandatory for the
+    # two inferential aggregate inputs.
+    required = audit[audit["file"].isin(["aggregate_flip_stats.csv", "aggregate_unit_tests.csv"])]
+    out.mkdir(parents=True, exist_ok=True)
+    audit.to_csv(out / "population_audit.csv", index=False)
+    (out / "population_audit.json").write_text(json.dumps(audit.to_dict(orient="records"), indent=2), encoding="utf-8")
+    incomplete = required[~required["complete"].astype(bool)]
+    if not incomplete.empty:
+        preview = incomplete[["row_index", "task", "model", "phase", "file", "missing_baseline_subsets", "missing_populations", "exists"]].to_dict(orient="records")[:8]
+        raise RuntimeError(
+            "RQ3 primary population is incomplete; refusing to report a partial population. "
+            f"See {out / 'population_audit.csv'}. First failures: {preview}"
+        )
+    return fs, ut, b
 
 
 def rankdata_abs(vals: np.ndarray) -> np.ndarray:
@@ -281,6 +415,7 @@ def plot_outputs(out:Path, fs:pd.DataFrame, best:pd.DataFrame, rich:pd.DataFrame
 
     ecdf_plot(best, "causal_spiking_score", "Threshold-event causal score", fig/"ecdf_causal_spiking_score.pdf")
     ecdf_plot(fs, "flip_any_rate", "Singleton flip-any rate", fig/"ecdf_flip_rates_candidate_vs_control.pdf")
+    ecdf_plot(best, "best_mcc", "Best held-out threshold |MCC|", fig/"ecdf_thresholdability_candidate_vs_control.pdf")
 
     if not rich.empty:
         r=rich.sort_values("delta")
@@ -333,6 +468,119 @@ def plot_outputs(out:Path, fs:pd.DataFrame, best:pd.DataFrame, rich:pd.DataFrame
             fig_obj.subplots_adjust(left=0.15, right=0.995, bottom=0.17, top=0.985)
             save_pdf_only(fig_obj, fig/"binned_flip_curves_oriented_proxy.pdf")
             plt.close(fig_obj)
+
+
+
+def plot_manuscript_spiking_cut(
+    paper_dir: Path,
+    *,
+    flip_summary: pd.DataFrame,
+    primary: pd.DataFrame,
+    results: Dict[str, object],
+    best: pd.DataFrame,
+    binned_agg: pd.DataFrame,
+) -> None:
+    """Promote the RQ3 evidence into compact manuscript-facing figures.
+
+    The detailed ECDF/proxy-family diagnostics stay under analysis/.  This paper
+    view follows the narrative: causal strength, thresholdability and TECS are
+    the three existing candidate-control endpoints; threshold-shape/preemption
+    are marked explicitly as pending when direct experiments are unavailable.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    paper_dir.mkdir(parents=True, exist_ok=True)
+    cand_flip = row(flip_summary.to_dict("records"), POP_CAND)
+    ctrl_flip = row(flip_summary.to_dict("records"), POP_CTRL)
+    cand_primary = row(primary.to_dict("records"), POP_CAND)
+    ctrl_primary = row(primary.to_dict("records"), POP_CTRL)
+    adj = results.get("planned_tests_holm_corrected_p", {}) or {}
+
+    panels = [
+        ("Singleton causal effect", float(ctrl_flip.get("median_flip_any", math.nan)), float(cand_flip.get("median_flip_any", math.nan)), float(adj.get("strength_flip_rate", math.nan))),
+        ("Threshold visibility", float(ctrl_primary.get("median_best_mcc", math.nan)), float(cand_primary.get("median_best_mcc", math.nan)), float(adj.get("threshold_mcc", math.nan))),
+        ("TECS", float(ctrl_primary.get("median_css", math.nan)), float(cand_primary.get("median_css", math.nan)), float(adj.get("primary_css", math.nan))),
+    ]
+    with paper_figure_rc():
+        fig_obj, axes = plt.subplots(1, 3, figsize=(7.25, 2.25), sharey=True)
+        for ax, (title, ctrl, cand, p_adj) in zip(axes, panels):
+            if np.isfinite(ctrl) and np.isfinite(cand):
+                ax.plot([ctrl, cand], [0, 1], color="0.55", linewidth=1.1, zorder=1)
+                ax.scatter([ctrl], [0], marker="o", facecolor="white", edgecolor="0.25", s=34, zorder=3)
+                ax.scatter([cand], [1], marker="o", color="0.25", s=34, zorder=3)
+                lo = min(0.0, ctrl, cand)
+                hi = max(ctrl, cand)
+                pad = max(0.01, 0.18 * (hi - lo if hi > lo else max(abs(hi), 0.05)))
+                ax.set_xlim(lo - 0.1 * pad, hi + pad)
+            if ax is axes[0]:
+                ax.set_yticks([0, 1], ["Matched control", "Candidate"])
+            else:
+                ax.tick_params(axis="y", labelleft=False)
+            ax.set_title(title)
+            ax.grid(axis="x", alpha=0.25, linewidth=0.45)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.text(0.98, 0.06, f"Holm p={fmt(p_adj)}", transform=ax.transAxes, ha="right", va="bottom", fontsize=7.2)
+        fig_obj.subplots_adjust(left=0.115, right=0.995, bottom=0.22, top=0.90, wspace=0.36)
+        save_pdf_only(fig_obj, paper_dir / "fig4a_candidate_control_spiking_cut_summary.pdf")
+        plt.close(fig_obj)
+
+    # Full thresholdability and TECS distributions are useful manuscript supplements.
+    def manuscript_ecdf(df: pd.DataFrame, metric: str, xlabel: str, filename: str) -> None:
+        with paper_figure_rc():
+            fig_obj, ax = plt.subplots(figsize=(4.35, 2.35))
+            for pop in [POP_CAND, POP_CTRL]:
+                x, y = ecdf(df.loc[df.population == pop, metric])
+                if len(x):
+                    ax.plot(x, y, linewidth=1.8, label=POP_LABELS[pop])
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("Empirical CDF")
+            ax.set_ylim(0, 1)
+            ax.grid(axis="y", alpha=0.30, linewidth=0.45)
+            ax.legend(frameon=False, loc="lower right")
+            fig_obj.subplots_adjust(left=0.16, right=0.995, bottom=0.20, top=0.985)
+            save_pdf_only(fig_obj, paper_dir / filename)
+            plt.close(fig_obj)
+
+    manuscript_ecdf(best, "best_mcc", "Best held-out threshold |MCC|", "fig4s1_thresholdability_ecdf.pdf")
+    manuscript_ecdf(best, "causal_spiking_score", "Threshold-event causal score (TECS)", "fig4s2_tecs_ecdf.pdf")
+
+    if not binned_agg.empty:
+        with paper_figure_rc():
+            fig_obj, ax = plt.subplots(figsize=(4.9, 2.65))
+            for fam in ["activation", "activation-magnitude", "wanda/activation-magnitude", "gradient/effect"]:
+                for pop in [POP_CAND, POP_CTRL]:
+                    g = binned_agg[(binned_agg.feature_family == fam) & (binned_agg.population == pop)].sort_values("bin_index")
+                    if not g.empty:
+                        ax.plot(g.bin_index, g.median_flip_enrichment, marker="o", markersize=3.5, linewidth=1.2,
+                                label=f"{fam} | {POP_LABELS[pop]}")
+            ax.axhline(1.0, color="0.15", linewidth=0.75)
+            ax.set_xlabel("Oriented endogenous-proxy bin")
+            ax.set_ylabel("Median flip-rate enrichment")
+            ax.grid(axis="y", alpha=0.30, linewidth=0.45)
+            ax.legend(frameon=False, fontsize=6.6, ncol=2, loc="upper left")
+            fig_obj.subplots_adjust(left=0.15, right=0.995, bottom=0.18, top=0.985)
+            save_pdf_only(fig_obj, paper_dir / "fig4b_threshold_tail_enrichment.pdf")
+            plt.close(fig_obj)
+
+    status = """# Figure 4 - RQ3: the spiking cut
+
+Available from the threshold/spiking diagnostics:
+
+- `fig4a_candidate_control_spiking_cut_summary.pdf`: candidate vs matched-control singleton strength, held-out thresholdability, and TECS.
+- `fig4b_threshold_tail_enrichment.pdf`: descriptive binned endogenous-proxy/flip enrichment.
+- `fig4s1_thresholdability_ecdf.pdf` and `fig4s2_tecs_ecdf.pdf`: full distributions.
+
+Additional experiment stages invoked by `generate_final_results.py`:
+
+- P1.1 `stage08_threshold_shape_validation`: nested held-out constant/threshold/logistic/isotonic comparison plus representative held-out `P(F_j=1 | z_j)` response curves (`fig4b_threshold_shape_model_comparison.pdf`, `fig4b_threshold_response_curves.pdf`).
+- P0.3 `stage09_preemption_report`: aggregates genuine dominant-secondary pair interventions from Pipeline Stage 8 (`fig4c_preemption.pdf`).
+
+Still not generated automatically: graded intervention dose-response (P1.2).
+"""
+    (paper_dir / "README.md").write_text(status, encoding="utf-8")
 
 
 def row(rows,pop):
@@ -416,8 +664,7 @@ Use `figures/binned_flip_curves_oriented_proxy.pdf` as a descriptive supplement 
 def main():
     args=parse_args(); out=Path(args.out).resolve(); out.mkdir(parents=True)
     source_kind="zip" if args.zip else "root"; source_path=Path(args.zip or args.root).resolve(); base_md=Path(args.base_md).resolve() if args.base_md else None
-    fs_all=concat(source_kind, source_path, "aggregate_flip_stats.csv")
-    ut_all=concat(source_kind, source_path, "aggregate_unit_tests.csv")
+    fs_all, ut_all, b_primary = load_exact_primary_population(args, out)
     if fs_all.empty: raise RuntimeError("No aggregate_flip_stats.csv found")
     if ut_all.empty: raise RuntimeError("No aggregate_unit_tests.csv found")
     fs=fs_all[fs_all.population.isin([POP_CAND,POP_CTRL])].copy()
@@ -445,7 +692,7 @@ def main():
     if not rich.empty:
         meta=best[["run_id","task","model","setting","decode_only"]].drop_duplicates("run_id")
         rich=rich.merge(meta,on="run_id",how="left"); rich["condition_label"]=rich.apply(lambda r:f"{r.task} | {r.model} | {'decode' if r.decode_only else 'standard'} | {r.baseline_subset}",axis=1)
-    b=concat(source_kind, source_path, "aggregate_binned_curves.csv")
+    b=b_primary.copy()
     binned_agg=pd.DataFrame()
     if not b.empty:
         b=b[b.population.isin([POP_CAND,POP_CTRL])].copy(); b["feature_family"]=b.feature.map(family);
@@ -458,6 +705,11 @@ def main():
     results={"populations":{"candidate":POP_CAND,"control":POP_CTRL},"flip_summary":flip_summary.to_dict(orient="records"),"flip_effect":flip_eff,"flip_unit_cliffs_delta":flip_cd,"primary_summary":primary.to_dict(orient="records"),"css_effect":css_eff,"css_unit_cliffs_delta":css_cd,"best_mcc_effect":mcc_eff,"best_mcc_unit_cliffs_delta":mcc_cd,"planned_tests_holm_corrected_p":adj,"n_aggregate_flip_stats_files":int(len(fs_all.rel.unique())) if "rel" in fs_all else 0,"n_aggregate_unit_tests_files":int(len(ut_all.rel.unique())) if "rel" in ut_all else 0}
     (out/"statistical_results.json").write_text(json.dumps(results,indent=2))
     plot_outputs(out,fs,best,rich,feature_comp,binned_agg)
+    if args.paper_figures_dir:
+        plot_manuscript_spiking_cut(
+            Path(args.paper_figures_dir).expanduser().resolve(),
+            flip_summary=flip_summary, primary=primary, results=results, best=best, binned_agg=binned_agg,
+        )
     (out/"updated_spiking_diagnostics_experiments.md").write_text(build_report(base_md,results))
     print(f"Wrote outputs to {out}")
 

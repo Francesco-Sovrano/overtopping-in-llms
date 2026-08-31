@@ -34,22 +34,23 @@ except Exception:  # pragma: no cover
     roc_auc_score = matthews_corrcoef = balanced_accuracy_score = f1_score = None
 
 from core.caching_and_prompting import set_deterministic
-from core.feature_extraction_runner import resolve_task_spec
+from core.feature_extraction_runner import resolve_task_spec, sanitize_feature_name
 from core.high_n_singleton_eval import (
     LOG_PREFIX,
     UnitSpec,
     evaluate_singleton_flips_high_n,
     load_scores_for_baseline,
     precompute_replacements_for_units,
-    select_high_n_eval_indices,
 )
 from core.modeling_and_ablation import LMWrapper, get_device
 from core.text_and_rules import apply_rule_to_features
+from core.heldout_set_metrics import safe_layer_label
+from core.group_intervention import dedupe_units, load_dataset_info
 from core.threshold_event_shared import (
     _next_token_id_for_completion,
     activation_hook_spec as shared_activation_hook_spec,
+    completion_text_from_row_for_saliency,
     collect_reference_activations,
-    safe_layer_label,
 )
 
 
@@ -89,6 +90,16 @@ def parse_args():
             "Optional script-7 flip_stats_by_neuron.csv whose units should be evaluated "
             "directly. This bypasses rule-based candidate selection and is recommended "
             "for held-out random-channel diagnostics."
+        ),
+    )
+    p.add_argument(
+        "--materialized_stage7_scores_path",
+        default=None,
+        help=(
+            "Stage-7 scores.csv containing already materialized candidate flip columns. "
+            "Defaults to scores.csv beside --candidate_flip_stats_path. Candidate units "
+            "are copied from this table by original row identity; only non-agonist controls "
+            "are newly ablated."
         ),
     )
 
@@ -144,6 +155,15 @@ def parse_args():
     p.add_argument("--spectral_dim", type=int, default=32)
     p.add_argument("--spectral_cache_dir", default=None)
     p.add_argument("--max_seq_len", type=int, default=None)
+    p.add_argument(
+        "--spectral_embedding_batch_size",
+        type=int,
+        default=32,
+        help=(
+            "Execution-only batch size for spectral representation extraction. "
+            "Kept separate from --batch_size used by singleton/circuit evaluation."
+        ),
+    )
 
     return p.parse_args()
 
@@ -278,24 +298,6 @@ def _write_and_print_aggregate_summary(out_root: Path, aggregate_payload: dict |
             _result(f"  - {_result_name(r)}: AUC={_fmt_float(r.get('median_test_auc_oriented'))} |MCC|={_fmt_float(r.get('median_test_abs_mcc'))}")
     return summary
 
-def _load_dataset_info(input_data_dir: Path) -> dict:
-    path = Path(input_data_dir) / "dataset_info.json"
-    if not path.exists():
-        raise FileNotFoundError(f"dataset_info.json not found in {input_data_dir}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _deduplicate_unit_specs(units: list[UnitSpec]) -> list[UnitSpec]:
-    seen = set()
-    out = []
-    for u in units:
-        key = (str(u.layer_label), int(u.neuron_id))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(u)
-    return out
-
 
 def _layer_unit_capacity(model, layer_label: str) -> int | None:
     """Return the number of valid coordinate ids for the hooked tensor.
@@ -396,7 +398,7 @@ def _make_same_layer_nonagonist_control_pool(args, *, model, agonist_units: list
         idx = rng.choice(np.asarray(available, dtype=int), size=int(n_pool), replace=False)
         for nid in idx.tolist():
             pool.append(UnitSpec(str(layer_label), int(nid), source="same_layer_nonagonist_candidate", circuit_id=None, circuit_label="same_layer_nonagonist_pool", seed_strength=0.0))
-    return _deduplicate_unit_specs(pool)
+    return dedupe_units(pool, sort=False)
 
 
 def _select_same_layer_nonagonist_baselines(args, *, baseline: str, agonist_units: list[UnitSpec],
@@ -479,31 +481,67 @@ def _nonempty_csv(path: Path) -> bool:
         return False
 
 
-def _spectral_sampling_config(args) -> dict:
-    """Representation settings that determine spectral high-N row selection.
+def _resolved_optional_path(value) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(Path(value).expanduser().resolve())
 
-    Keep this small and method-facing for provenance. These values are recorded
-    in completed outputs but never used to invalidate or delete results
-    automatically. Runtime-only details such as batch size do not belong here.
+
+def _materialized_stage7_scores_path(args) -> Path | None:
+    explicit = getattr(args, "materialized_stage7_scores_path", None)
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    candidate = getattr(args, "candidate_flip_stats_path", None)
+    if candidate:
+        inferred = Path(candidate).expanduser().resolve().parent / "scores.csv"
+        if inferred.is_file():
+            return inferred
+    return None
+
+
+def _scientific_method_config(args, baseline: str) -> dict:
+    """Explicit fields that determine the scientific computation for reuse.
+
+    The manifest stores these values directly so a completed output is reusable
+    only when the requested method is identical in scientifically relevant
+    dimensions.
     """
     return {
-        "spectral_space": str(getattr(args, "spectral_space", "hidden")),
-        "rep_hook_name": str(getattr(args, "rep_hook_name", "ln_final.hook_normalized")),
-        "rep_pooling": str(getattr(args, "rep_pooling", "mean")),
-        "spectral_dim": int(getattr(args, "spectral_dim", 32)),
-        "max_seq_len": getattr(args, "max_seq_len", None),
-        "global_n_clusters": int(args.spiking_global_n_clusters),
+        "baseline_subset": str(baseline),
+        "input_data_dir": _resolved_optional_path(getattr(args, "input_data_dir", None)),
+        "candidate_flip_stats_path": _resolved_optional_path(getattr(args, "candidate_flip_stats_path", None)),
+        "materialized_stage7_scores_path": _resolved_optional_path(_materialized_stage7_scores_path(args)),
+        "task_module": str(getattr(args, "task_module", "")),
+        "ai_model": str(getattr(args, "ai_model", "")) if getattr(args, "ai_model", None) else None,
+        "evaluation_split": str(getattr(args, "evaluation_split", "test")),
+        "decode_only": bool(getattr(args, "decode_only", False)),
+        "intervention": str(getattr(args, "intervention", "mean-donor")),
+        "points_to_use_for_mean_ablation": int(getattr(args, "points_to_use_for_mean_ablation", 2048)),
+        "spiking_max_points": int(getattr(args, "spiking_max_points", 10000)),
+        "spiking_min_points": int(getattr(args, "spiking_min_points", 512)),
+        "spiking_global_n_clusters": int(getattr(args, "spiking_global_n_clusters", 64)),
+        "target": str(getattr(args, "target", "flip_any")),
+        "same_layer_nonagonist_controls": bool(getattr(args, "same_layer_nonagonist_controls", True)),
+        "nonagonist_candidate_pool_multiplier": int(getattr(args, "nonagonist_candidate_pool_multiplier", 1)),
+        "nonagonist_min_candidate_pool_per_layer": int(getattr(args, "nonagonist_min_candidate_pool_per_layer", 4)),
+        "nonagonist_random_controls_per_agonist": int(getattr(args, "nonagonist_random_controls_per_agonist", 1)),
+        "threshold_event_min_examples": int(getattr(args, "threshold_event_min_examples", 8)),
+        "threshold_event_repeats": int(getattr(args, "threshold_event_repeats", 20)),
+        "threshold_event_holdout_fraction": float(getattr(args, "threshold_event_holdout_fraction", 0.5)),
+        "threshold_event_n_bins": int(getattr(args, "threshold_event_n_bins", 10)),
+        "rule_conditioned_diagnostics": bool(getattr(args, "rule_conditioned_diagnostics", False)),
+        "rule_conditioned_only": bool(getattr(args, "rule_conditioned_only", False)),
+        "seed": int(getattr(args, "seed", 42)),
+        "candidate_evaluation_population": "stage7_materialized_intersection",
+        # Step 7b no longer performs an independent spectral row selection for
+        # candidate agonists. Stage 7's materialized population is the sampling
+        # frame; smaller caps are deterministic subsets of that frame.
+        "spectral_sampling_config": None,
     }
 
 
-def _completed_output_ok(baseline_out: Path, args) -> bool:
-    """True only for completed outputs compatible with the current method config.
-
-    Historical threshold-event manifests did not record the spectral
-    representation configuration.  When spectral high-N sampling is active,
-    those outputs are deliberately treated as stale instead of being silently
-    reused after a pooling/default change.
-    """
+def _completed_output_ok(baseline_out: Path, args, baseline: str) -> bool:
+    """Return True only when a completed output matches the requested method."""
     manifest = Path(baseline_out) / "threshold_spiking_experiment.json"
     if not manifest.exists():
         return False
@@ -515,15 +553,11 @@ def _completed_output_ok(baseline_out: Path, args) -> bool:
         return False
     if int(payload.get("n_units", 0) or 0) <= 0:
         return False
-    if not bool(getattr(args, "rule_conditioned_only", False)):
-        if payload.get("spectral_sampling_config") != _spectral_sampling_config(args):
-            return False
+    if payload.get("scientific_method") != _scientific_method_config(args, baseline):
+        return False
     required = ["high_n_scores_with_flips.csv", "threshold_unit_tests.csv", "threshold_population_summary.csv"]
     return all(_nonempty_csv(Path(baseline_out) / name) for name in required)
 
-
-def _sanitize_feature_name(s: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z]+", "_", str(s)).strip("_").lower()
 
 
 def _resolve_rule_metrics_path(args, *, input_data_dir: Path) -> Path | None:
@@ -705,7 +739,7 @@ def _units_from_flip_stats(path: str | Path | None) -> list[UnitSpec]:
                 seed_strength=strength,
             )
         )
-    return _deduplicate_unit_specs(out)
+    return dedupe_units(out, sort=False)
 
 
 def _rule_feature_columns(dataset_info: dict, scores_df: pd.DataFrame, task_targets) -> list[str]:
@@ -714,7 +748,7 @@ def _rule_feature_columns(dataset_info: dict, scores_df: pd.DataFrame, task_targ
     if feature_json.exists():
         try:
             meta = json.loads(feature_json.read_text(encoding="utf-8"))
-            names = {_sanitize_feature_name(feat.get("label", "")) for feat in meta if isinstance(feat, dict)}
+            names = {sanitize_feature_name(feat.get("label", "")) for feat in meta if isinstance(feat, dict)}
             cols = [c for c in scores_df.columns if c in names and c not in set(task_targets)]
             if cols:
                 return cols
@@ -730,6 +764,14 @@ def _select_rule_conditioned_eval_indices(args, *, baseline: str, scores_df: pd.
     if not feature_cols:
         return np.array([], dtype=int), {"status": "empty_feature_columns"}, pd.DataFrame()
     features_df = scores_df[feature_cols].copy()
+    # Rule-conditioned Step 7b is still a reuse analysis: candidate singleton
+    # labels must come from Stage 7, so rule matches/nonmatches are sampled only
+    # inside Stage 7's materialized evaluation population.
+    eligible_indices, stage7_population_meta = _select_stage7_materialized_eval_indices(
+        args=args, baseline=baseline, scores_df=scores_df
+    )
+    eligible_mask = np.zeros(len(scores_df), dtype=bool)
+    eligible_mask[np.asarray(eligible_indices, dtype=int)] = True
     rng = np.random.default_rng(int(args.seed))
     selected = set()
     plan = []
@@ -744,8 +786,8 @@ def _select_rule_conditioned_eval_indices(args, *, baseline: str, scores_df: pd.
         except Exception as e:
             mask = np.zeros(len(scores_df), dtype=bool)
             status = f"rule_parse_failed:{str(e)[:160]}"
-        match = np.flatnonzero(mask)
-        non = np.flatnonzero(~mask)
+        match = np.flatnonzero(mask & eligible_mask)
+        non = np.flatnonzero((~mask) & eligible_mask)
         if len(match) < min_match or len(non) < min_match:
             status = "underpowered_rule_matches"
             add_match = np.array([], dtype=int)
@@ -777,47 +819,23 @@ def _select_rule_conditioned_eval_indices(args, *, baseline: str, scores_df: pd.
     plan_df = pd.DataFrame(plan)
     plan_df.to_csv(baseline_out / "rule_conditioned_sampling_plan.csv", index=False)
     ok_rule_ids = set(plan_df.loc[plan_df["status"].astype(str) == "ok", "rule_id"].astype(int).tolist()) if not plan_df.empty else set()
-    meta = {"status": "ok", "strategy": "per_rule_match_nonmatch_union", "n_selected_rows": int(len(eval_indices)), "n_rules_ok": int(len(ok_rule_ids)), "n_rules_total": int(len(rule_df)), "feature_cols": feature_cols}
+    meta = {"status": "ok", "strategy": "per_rule_match_nonmatch_union_within_stage7_materialized_population", "n_selected_rows": int(len(eval_indices)), "n_rules_ok": int(len(ok_rule_ids)), "n_rules_total": int(len(rule_df)), "feature_cols": feature_cols, "stage7_population": stage7_population_meta}
     return eval_indices, meta, plan_df
 
 
 
 
-def _completion_text_from_row_for_saliency(task, row, prompt_col):
-    keys = []
-    for attr in ("DEFAULT_OUTPUT", "DEFAULT_OUTPUTS", "DEFAULT_ANSWER", "DEFAULT_ANSWERS"):
-        val = getattr(task, attr, None)
-        if isinstance(val, str):
-            keys.append(val)
-        elif isinstance(val, (list, tuple)):
-            keys.extend([str(x) for x in val])
-    keys.extend(["answer", "completion", "target_text", "correct_answer", "output", "label_text", "gold", "gold_answer"])
-    seen = set()
-    for k in keys:
-        if k in seen or k == prompt_col or k not in row:
-            continue
-        seen.add(k)
-        v = row.get(k)
-        if isinstance(v, (list, tuple)) and v:
-            v = v[0]
-        if isinstance(v, (bool, np.bool_)) or v is None:
-            continue
-        try:
-            if pd.isna(v):
-                continue
-        except Exception:
-            pass
-        text = str(v)
-        if text:
-            return text
-    return None
+DIAGNOSTIC_COMPLETION_KEYS = (
+    "answer", "completion", "target_text", "correct_answer",
+    "output", "label_text", "gold", "gold_answer",
+)
 
 
 def _inferred_target_token_ids_from_rows(task, prompt_batch, logits_last, tokenizer, prompt_col):
     """Infer one target next-token id per row from row metadata only.
 
-    Do not call task-object margin hooks here.  Script 12 owns the diagnostic
-    objective.  Task/rule outputs may provide useful text columns such as
+    Do not call task-object margin hooks here. This module owns the diagnostic
+    objective. Task/rule outputs may provide useful text columns such as
     raw_output, answer, target_text, or num_out; if none is usable the caller can
     fall back to a detached top-token objective.
     """
@@ -825,7 +843,7 @@ def _inferred_target_token_ids_from_rows(task, prompt_batch, logits_last, tokeni
     used = []
     for row in prompt_batch:
         prompt_text = str(row.get(prompt_col, row.get(getattr(task, "DEFAULT_INPUT", "prompt"), "")))
-        completion_text = _completion_text_from_row_for_saliency(task, row, prompt_col)
+        completion_text = completion_text_from_row_for_saliency(task, row, prompt_col, candidate_keys=DIAGNOSTIC_COMPLETION_KEYS)
         if completion_text is None and "num_out" in row:
             try:
                 val = row.get("num_out")
@@ -869,7 +887,7 @@ def _saliency_objective_from_last_logits(task, prompt_batch, logits_last, tokeni
     used_cached = []
     for i, row in enumerate(prompt_batch):
         prompt_text = str(row.get(prompt_col, row.get(getattr(task, "DEFAULT_INPUT", "prompt"), "")))
-        completion_text = _completion_text_from_row_for_saliency(task, row, prompt_col)
+        completion_text = completion_text_from_row_for_saliency(task, row, prompt_col, candidate_keys=DIAGNOSTIC_COMPLETION_KEYS)
         tok_id = _next_token_id_for_completion(tokenizer, prompt_text, str(completion_text)) if completion_text is not None else None
         if tok_id is None:
             tok_id = int(top_ids[i].item())
@@ -1179,7 +1197,8 @@ def proxy_rows_for_unit(unit: UnitSpec, layer_payload: dict, *, model, intervent
             return torch.full((n,), float("nan"), dtype=torch.float32, device=proxy_device)
         sorted_pool = cached(f"{stem}_sorted", lambda: torch.sort(pool, dim=1).values)
         # Original definition was 1 - (# greater / width), i.e. # <= val / width.
-        counts_le = torch.searchsorted(sorted_pool, val.to(proxy_device).unsqueeze(1), right=True).squeeze(1)
+        search_values = val.to(proxy_device).unsqueeze(1).contiguous()
+        counts_le = torch.searchsorted(sorted_pool, search_values, right=True).squeeze(1)
         return counts_le.to(torch.float32) / float(sorted_pool.shape[1])
 
     def zscore(stem):
@@ -1693,11 +1712,185 @@ def _rule_conditioned_threshold_tests(args, *, baseline: str, baseline_out: Path
     return payload
 
 
+
+def _select_stage7_materialized_eval_indices(*, args, baseline: str, scores_df: pd.DataFrame) -> tuple[np.ndarray, dict]:
+    """Select Step-7b rows only from Stage 7's already evaluated population.
+
+    Stage 7 performs the expensive candidate singleton evaluations on one
+    held-out population and records those rows using ``_orig_row``.  Step 7b
+    must not independently sample new rows and then demand candidate flips that
+    Stage 7 never evaluated.  Instead, intersect the requested split/baseline
+    frame with Stage 7's materialized row identities and, only when requested,
+    apply a deterministic cap inside that intersection.
+    """
+    path = _materialized_stage7_scores_path(args)
+    if path is None or not path.is_file():
+        raise FileNotFoundError(
+            "Step 7b requires Stage 7's materialized scores.csv for candidate agonists. "
+            "Pass --materialized_stage7_scores_path or place scores.csv beside "
+            "--candidate_flip_stats_path."
+        )
+    materialized = pd.read_csv(path, usecols=lambda c: c == "_orig_row")
+    if "_orig_row" not in materialized.columns:
+        raise ValueError(f"Stage-7 materialized scores are missing _orig_row: {path}")
+    stage7_orig = pd.to_numeric(materialized["_orig_row"], errors="coerce")
+    if stage7_orig.isna().any() or stage7_orig.duplicated().any():
+        raise ValueError(f"Stage-7 _orig_row must be unique integer row identities: {path}")
+    stage7_orig = stage7_orig.astype(int)
+
+    if "original_idx" not in scores_df.columns:
+        raise ValueError(
+            "Step-7b score frame is missing original_idx; cannot intersect it with "
+            "Stage 7's materialized population safely."
+        )
+    current_orig = pd.to_numeric(scores_df["original_idx"], errors="coerce")
+    if current_orig.isna().any():
+        raise ValueError("Step-7b score frame contains invalid original_idx values.")
+
+    available_mask = current_orig.astype(int).isin(set(stage7_orig.tolist())).to_numpy()
+    available = np.flatnonzero(available_mask).astype(int)
+    n_available = int(len(available))
+    if n_available == 0:
+        raise RuntimeError(
+            f"Stage 7's materialized held-out population has no rows for baseline={baseline!r} "
+            f"within evaluation_split={getattr(args, 'evaluation_split', None)!r}. "
+            "Check that Step 7b points at the scores.csv from the matching Stage-7 run."
+        )
+
+    cap = int(getattr(args, "spiking_max_points", 0) or 0)
+    selected = available
+    if cap > 0 and n_available > cap:
+        # The expensive spectral selection already happened in Stage 7.  For a
+        # smaller Step-7b cap, draw reproducibly *within that materialized
+        # population*; never expand outside it.
+        baseline_offset = {"positive": 1, "negative": 2}.get(str(baseline).strip().lower(), 0)
+        rng = np.random.default_rng(int(getattr(args, "seed", 0)) + baseline_offset)
+        selected = np.sort(rng.choice(available, size=cap, replace=False).astype(int))
+
+    meta = {
+        "mode": "stage7_materialized_population",
+        "materialized_stage7_scores_path": str(path.resolve()),
+        "n_stage7_materialized_rows_total": int(len(stage7_orig)),
+        "n_stage7_rows_in_requested_baseline_split": n_available,
+        "n_selected": int(len(selected)),
+        "spiking_max_points": cap,
+        "seed": int(getattr(args, "seed", 0)),
+    }
+    return selected, meta
+
+
+def _candidate_flips_from_stage7(*, args, baseline: str, scores_df: pd.DataFrame,
+                                 eval_indices: np.ndarray, agonist_units: list[UnitSpec]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Copy Stage-7 candidate flip columns onto Step-7b's selected rows.
+
+    Row identity is the original row number in the source scores table, not the
+    position within a baseline/split-filtered frame. Missing rows or columns are
+    treated as incomplete Stage-7 materialization and are never regenerated here.
+    """
+    path = _materialized_stage7_scores_path(args)
+    if path is None or not path.is_file():
+        raise FileNotFoundError(
+            "Step 7b requires Stage 7's materialized scores.csv for candidate agonists. "
+            "Pass --materialized_stage7_scores_path or place scores.csv beside "
+            "--candidate_flip_stats_path."
+        )
+    materialized = pd.read_csv(path)
+    if "_orig_row" not in materialized.columns:
+        raise ValueError(f"Stage-7 materialized scores are missing _orig_row: {path}")
+    materialized_orig = pd.to_numeric(materialized["_orig_row"], errors="coerce")
+    if materialized_orig.isna().any() or materialized_orig.duplicated().any():
+        raise ValueError(f"Stage-7 _orig_row must be unique integer row identities: {path}")
+    materialized = materialized.copy()
+    materialized["_orig_row"] = materialized_orig.astype(int)
+    by_orig = materialized.set_index("_orig_row", drop=False)
+
+    selected = scores_df.iloc[np.asarray(eval_indices, dtype=int)].copy().reset_index(drop=True)
+    if "original_idx" not in selected.columns:
+        raise ValueError("Step-7b score frame is missing original_idx; cannot join Stage-7 materialization safely.")
+    selected_orig = pd.to_numeric(selected["original_idx"], errors="coerce")
+    if selected_orig.isna().any():
+        raise ValueError("Step-7b selected rows contain invalid original_idx values.")
+    selected_orig = selected_orig.astype(int)
+    missing_rows = sorted(set(selected_orig.tolist()) - set(by_orig.index.tolist()))
+    if missing_rows:
+        preview = ", ".join(map(str, missing_rows[:12]))
+        raise RuntimeError(
+            f"Stage 7 did not materialize {len(missing_rows)} selected Step-7b row(s) "
+            f"for baseline={baseline}: {preview}. Rebuild Stage 7 with the intended evaluation population."
+        )
+    selected["_orig_row"] = selected_orig.to_numpy()
+    selected["_evaluated"] = True
+    matched = by_orig.loc[selected_orig.tolist()]
+
+    stats_rows = []
+    copied_columns: dict[str, np.ndarray] = {}
+    for u in agonist_units:
+        cols = {
+            "any": f"flip_{u.layer_key}_{int(u.neuron_id)}",
+            "c2i": f"flip_c2i_{u.layer_key}_{int(u.neuron_id)}",
+            "i2c": f"flip_i2c_{u.layer_key}_{int(u.neuron_id)}",
+        }
+        missing_cols = [c for c in cols.values() if c not in matched.columns]
+        if missing_cols:
+            raise RuntimeError(
+                f"Stage 7 materialization {path} is missing candidate flip column(s) "
+                f"for {u.unit_key}: {missing_cols}. Rebuild Stage 7; Step 7b will not regenerate candidates."
+            )
+        copied = {}
+        for kind, col in cols.items():
+            values = matched[col]
+            if values.isna().any():
+                raise RuntimeError(
+                    f"Stage 7 materialization has unevaluated values for {u.unit_key} column {col} "
+                    f"on selected Step-7b rows. Rebuild Stage 7."
+                )
+            if pd.api.types.is_bool_dtype(values.dtype):
+                arr = values.astype(bool).to_numpy()
+            else:
+                normalized = values.astype(str).str.strip().str.lower()
+                bad = ~normalized.isin({"true", "false", "1", "0"})
+                if bad.any():
+                    raise RuntimeError(f"Stage 7 materialization has non-boolean values in {col}: {sorted(normalized[bad].unique())[:5]}")
+                arr = normalized.isin({"true", "1"}).to_numpy(bool)
+            copied_columns[col] = arr
+            copied[kind] = arr
+        stats_rows.append({
+            "unit_key": u.unit_key,
+            "layer_label": u.layer_label,
+            "layer_key": u.layer_key,
+            "neuron_id": int(u.neuron_id),
+            "source": u.source,
+            "circuit_id": u.circuit_id,
+            "circuit_label": u.circuit_label,
+            "seed_strength": np.nan if u.seed_strength is None else float(u.seed_strength),
+            "baseline_subset": baseline,
+            "n_eval": int(len(selected)),
+            "flip_any_rate": float(copied["any"].mean()) if len(selected) else np.nan,
+            "c2i_rate": float(copied["c2i"].mean()) if len(selected) else np.nan,
+            "i2c_rate": float(copied["i2c"].mean()) if len(selected) else np.nan,
+            "n_flip_any": int(copied["any"].sum()),
+            "n_flip_c2i": int(copied["c2i"].sum()),
+            "n_flip_i2c": int(copied["i2c"].sum()),
+        })
+    if copied_columns:
+        # Add all materialized Stage-7 flip columns in one block. Repeated
+        # ``selected[col] = ...`` insertion fragments wide DataFrames and can
+        # make Step 7b substantially slower when many candidate units are used.
+        copied_frame = pd.DataFrame(copied_columns, index=selected.index)
+        selected = pd.concat(
+            [selected.drop(columns=list(copied_columns), errors="ignore"), copied_frame],
+            axis=1,
+        )
+    return selected, pd.DataFrame(stats_rows)
+
 def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_col: str, target_col: str, ai_model: str, out_root: Path):
     baseline_out = out_root / f"{baseline}_baseline"
     baseline_out.mkdir(parents=True, exist_ok=True)
+    # Resolve the model identity before reuse validation so implicit dataset-info
+    # model selection and an explicit --ai_model compare identically.
+    args.ai_model = ai_model
     _log(args, f"{LOG_PREFIX} baseline={baseline} out={baseline_out}", "verbose")
-    if bool(getattr(args, "skip_existing", True)) and not bool(getattr(args, "force_threshold_event", False)) and _completed_output_ok(baseline_out, args):
+    if bool(getattr(args, "skip_existing", True)) and not bool(getattr(args, "force_threshold_event", False)) and _completed_output_ok(baseline_out, args, baseline):
         payload_path = baseline_out / "threshold_spiking_experiment.json"
         payload = {"baseline": baseline, "status": "skipped_existing", "out": str(baseline_out)}
         try:
@@ -1728,7 +1921,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         units = _units_from_rules(rule_df)
         candidate_source = "script-7 rules"
     _log(args, f"{LOG_PREFIX} {baseline}: selected {len(units)} candidate unit(s) from {candidate_source}", "normal")
-    units = _deduplicate_unit_specs(units)
+    units = dedupe_units(units, sort=False)
     if not units:
         _result(f"{LOG_PREFIX} {baseline}: no units selected")
         payload = {"baseline": baseline, "status": "empty_units", "n_units": 0, "n_rules": int(len(rule_df))}
@@ -1782,14 +1975,19 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
             _write_and_print_baseline_summary(baseline_out, payload)
             return payload
     else:
-        eval_indices, sample_meta = select_high_n_eval_indices(args=args, model=model, scores_df=scores_df, prompt_col=prompt_col, n_points=int(args.spiking_max_points), seed=int(args.seed), cache_dir=baseline_out / "sampling_cache", use_spectral_sampling=True)
+        # Stage 7 has already chosen and evaluated the expensive candidate
+        # population.  Reuse that population instead of independently drawing
+        # Step-7b rows that would require re-running candidate ablations.
+        eval_indices, sample_meta = _select_stage7_materialized_eval_indices(
+            args=args, baseline=baseline, scores_df=scores_df
+        )
     if len(eval_indices) == 0:
         return {"baseline": baseline, "status": "empty_eval_indices", "n_rules": int(len(rule_df))}
     _log(args, f"{LOG_PREFIX} {baseline}: evaluation rows={len(eval_indices)}/{len(scores_df)}", "normal")
 
     control_pool_units = _make_same_layer_nonagonist_control_pool(args, model=model, agonist_units=agonist_units, seed=int(args.seed))
     control_pool_units = _filter_units_with_valid_capacity(args, model=model, units=control_pool_units, context="same-layer non-agonist control")
-    eval_units = _deduplicate_unit_specs(agonist_units + control_pool_units)
+    eval_units = dedupe_units(agonist_units + control_pool_units, sort=False)
     if control_pool_units:
         pd.DataFrame([u.__dict__ | {"unit_key": u.unit_key, "layer_key": u.layer_key} for u in control_pool_units]).to_csv(baseline_out / "same_layer_nonagonist_control_pool.csv", index=False)
         _log(args, f"{LOG_PREFIX} {baseline}: added {len(control_pool_units)} same-layer/head non-agonist control candidates; evaluating {len(eval_units)} total units", "normal")
@@ -1803,11 +2001,40 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         task_targets=task.DEFAULT_TARGETS,
         split="train",
     )
-    _log(args, f"{LOG_PREFIX} {baseline}: computing shared {args.intervention} replacement units={len(eval_units)}", "normal")
-    mean_acts = precompute_replacements_for_units(model=model, units=eval_units, scores_df_for_mean=scores_df_for_mean, prompt_col=prompt_col, target_col=target_col, intervention=args.intervention, points_to_use=int(args.points_to_use_for_mean_ablation), batch_size=int(args.batch_size), seed=int(args.seed))
-
-    examples = scores_df.to_dict(orient="records")
-    scores_out, flip_stats = evaluate_singleton_flips_high_n(model=model, units=eval_units, scores_df=scores_df, examples=examples, eval_indices=eval_indices, prompt_col=prompt_col, is_answer_positive_fn=task.is_answer_positive, target_col=target_col, baseline_subset=baseline, batch_size=int(args.batch_size), decode_only=bool(args.decode_only), intervention=args.intervention, mean_activations=mean_acts, max_new_tokens=int(task.MAX_NEW_TOKENS), cache_dir=Path(args.spiking_eval_cache_dir or (baseline_out / "high_n_eval_cache")), force=bool(args.force_spiking_eval))
+    # Candidate agonists were already evaluated by Stage 7. Reuse those exact
+    # row/unit outcomes and run model-backed ablations only for newly sampled
+    # same-layer non-agonist controls.
+    candidate_scores, candidate_flip_stats = _candidate_flips_from_stage7(
+        args=args, baseline=baseline, scores_df=scores_df, eval_indices=eval_indices, agonist_units=agonist_units
+    )
+    control_flip_stats = pd.DataFrame()
+    scores_out = candidate_scores
+    if control_pool_units:
+        _log(args, f"{LOG_PREFIX} {baseline}: computing shared {args.intervention} replacement controls={len(control_pool_units)}", "normal")
+        mean_acts = precompute_replacements_for_units(model=model, units=control_pool_units, scores_df_for_mean=scores_df_for_mean, prompt_col=prompt_col, target_col=target_col, intervention=args.intervention, points_to_use=int(args.points_to_use_for_mean_ablation), batch_size=int(args.batch_size), seed=int(args.seed))
+        examples = scores_df.to_dict(orient="records")
+        control_scores, control_flip_stats = evaluate_singleton_flips_high_n(
+            model=model, units=control_pool_units, scores_df=scores_df, examples=examples, eval_indices=eval_indices,
+            prompt_col=prompt_col, is_answer_positive_fn=task.is_answer_positive, target_col=target_col,
+            baseline_subset=baseline, batch_size=int(args.batch_size), decode_only=bool(args.decode_only),
+            intervention=args.intervention, mean_activations=mean_acts, max_new_tokens=int(task.MAX_NEW_TOKENS),
+            cache_dir=Path(args.spiking_eval_cache_dir or (baseline_out / "high_n_eval_cache")),
+            force=bool(args.force_spiking_eval),
+        )
+        control_cols = [c for c in control_scores.columns if c.startswith("flip_")]
+        if control_cols:
+            # Add/replace all control flip columns in one block. Repeated
+            # ``scores_out[col] = ...`` insertion fragments wide DataFrames and
+            # triggers pandas PerformanceWarning while also slowing this merge.
+            # Preserve the previous positional assignment semantics explicitly:
+            # control_scores rows correspond 1:1 to scores_out rows here.
+            control_frame = control_scores.loc[:, control_cols].copy()
+            control_frame.index = scores_out.index
+            scores_out = pd.concat(
+                [scores_out.drop(columns=control_cols, errors="ignore"), control_frame],
+                axis=1,
+            )
+    flip_stats = pd.concat([candidate_flip_stats, control_flip_stats], ignore_index=True, sort=False)
     scores_out.to_csv(baseline_out / "high_n_scores_with_flips.csv", index=False)
 
     nonagonist_population_by_key, nonagonist_payload = _select_same_layer_nonagonist_baselines(
@@ -1834,6 +2061,13 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
     analysis_unit_keys = {u.unit_key for u in agonist_units} | set(nonagonist_population_by_key.keys())
     analysis_units = [u for u in eval_units if u.unit_key in analysis_unit_keys]
 
+    # Proxy construction may need replacement values for both candidates and selected
+    # controls even though candidate output labels were copied from Stage 7.
+    mean_acts = precompute_replacements_for_units(
+        model=model, units=analysis_units, scores_df_for_mean=scores_df_for_mean, prompt_col=prompt_col,
+        target_col=target_col, intervention=args.intervention, points_to_use=int(args.points_to_use_for_mean_ablation),
+        batch_size=int(args.batch_size), seed=int(args.seed),
+    )
     high_n_examples = scores_out.to_dict(orient="records")
     layer_labels = list(dict.fromkeys([u.layer_label for u in analysis_units]))
     activation_only_proxy = False
@@ -1912,7 +2146,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
     if bool(getattr(args, "rule_conditioned_diagnostics", False)):
         rule_payload = _rule_conditioned_threshold_tests(args, baseline=baseline, baseline_out=baseline_out, rule_df=rule_df, scores_out=scores_out, raw_df=raw_df, feature_list=feature_list)
 
-    payload = {"baseline": baseline, "status": "ok", "evaluation_split": str(args.evaluation_split), "candidate_source": candidate_source, "candidate_flip_stats_path": str(args.candidate_flip_stats_path) if args.candidate_flip_stats_path else None, "mean_replacement_reference_split": "train", "n_scores_available": int(len(scores_df)), "n_high_n_rows": int(len(scores_out)), "n_units": int(len(analysis_units)), "n_eval_units": int(len(eval_units)), "n_rules": int(len(rule_df)), "rule_metrics_path": str(rule_path) if rule_path is not None else None, "rule_conditioned_only": bool(rule_conditioned_only), "spectral_sampling_config": (None if rule_conditioned_only else _spectral_sampling_config(args)), "sampling": sample_meta, "same_layer_nonagonist_controls": nonagonist_payload, "population_counts": flip_stats["population"].value_counts().to_dict() if not flip_stats.empty else {}, "rule_conditioned": rule_payload, "files": {"scores_with_flips": "high_n_scores_with_flips.csv", "flip_stats": "high_n_flip_stats_by_unit.csv", "unit_tests": "threshold_unit_tests.csv", "population_summary": "threshold_population_summary.csv", "binned_curves": "threshold_binned_flip_curves.csv", "activation_flip_rows_gz": "threshold_activation_flip_rows.csv.gz", "same_layer_nonagonist_control_pool": "same_layer_nonagonist_control_pool.csv", "same_layer_nonagonist_control_selection": "same_layer_nonagonist_control_selection.csv", "rule_conditioned_sampling_plan": "rule_conditioned_sampling_plan.csv", "flip_conditioned_threshold_summary": "flip_conditioned_threshold_summary.csv"}}
+    payload = {"baseline": baseline, "status": "ok", "scientific_method": _scientific_method_config(args, baseline), "evaluation_split": str(args.evaluation_split), "candidate_source": candidate_source, "candidate_flip_stats_path": str(args.candidate_flip_stats_path) if args.candidate_flip_stats_path else None, "mean_replacement_reference_split": "train", "n_scores_available": int(len(scores_df)), "n_high_n_rows": int(len(scores_out)), "n_units": int(len(analysis_units)), "n_eval_units": int(len(eval_units)), "n_rules": int(len(rule_df)), "rule_metrics_path": str(rule_path) if rule_path is not None else None, "rule_conditioned_only": bool(rule_conditioned_only), "spectral_sampling_config": None, "sampling": sample_meta, "same_layer_nonagonist_controls": nonagonist_payload, "population_counts": flip_stats["population"].value_counts().to_dict() if not flip_stats.empty else {}, "rule_conditioned": rule_payload, "files": {"scores_with_flips": "high_n_scores_with_flips.csv", "flip_stats": "high_n_flip_stats_by_unit.csv", "unit_tests": "threshold_unit_tests.csv", "population_summary": "threshold_population_summary.csv", "binned_curves": "threshold_binned_flip_curves.csv", "activation_flip_rows_gz": "threshold_activation_flip_rows.csv.gz", "same_layer_nonagonist_control_pool": "same_layer_nonagonist_control_pool.csv", "same_layer_nonagonist_control_selection": "same_layer_nonagonist_control_selection.csv", "rule_conditioned_sampling_plan": "rule_conditioned_sampling_plan.csv", "flip_conditioned_threshold_summary": "flip_conditioned_threshold_summary.csv"}}
     (baseline_out / "threshold_spiking_experiment.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     _write_and_print_baseline_summary(baseline_out, payload)
     return payload
@@ -2078,7 +2312,7 @@ def main():
         warnings.filterwarnings("ignore", category=FutureWarning)
     set_deterministic(int(args.seed))
     input_data_dir = Path(args.input_data_dir).resolve()
-    dataset_info = _load_dataset_info(input_data_dir)
+    dataset_info = load_dataset_info(input_data_dir)
     task = resolve_task_spec(args.task_module)
     prompt_col = dataset_info.get("prompt_col") or task.DEFAULT_INPUT
     target_col = dataset_info.get("target_col") or task.DEFAULT_TARGETS[0]

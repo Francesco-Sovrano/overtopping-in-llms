@@ -103,7 +103,7 @@ def poisoning_lm_wrapper_kwargs(model_name: str | Path) -> Dict[str, Any]:
             f"dtype={dtype_name} base_revision={rev_text}",
             flush=True,
         )
-    # Keep the same TransformerLens conversion convention used by ordinary
+    # Keep the same TransformerLens conversion convention used by non-poisoning
     # poisoning runs (folding/centering enabled by LMWrapper defaults).
     # Only the PEFT adapter load dtype is poisoning-run metadata.
     return {"adapter_load_dtype": dtype, "adapter_base_revision": revision}

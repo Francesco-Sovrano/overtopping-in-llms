@@ -1,35 +1,11 @@
 # Overtopping Phenomenology
 
-This repository contains two related experimental programs for causal analysis of language-model behavior.
+This repository contains two related causal-analysis studies for language models:
 
-- **Overtopping study:** discovers and validates small causal activation channels associated with task behavior.
-- **Poisoning study:** trains matched clean and poisoned trajectories, tracks how those causal channels evolve during training, and tests whether poisoning-specific channel disruption can identify the training examples responsible for it.
+- **Overtopping:** discovers task-relevant activation channels, measures singleton and set-level causal effects, validates interactions, and studies how causal organization relates to competence.
+- **Poisoning:** trains matched clean and poisoned trajectories, evaluates behavior and causal organization at checkpoints, and tests whether poisoning-specific causal disruption identifies responsible training examples.
 
-The poisoning study reuses the same causal-discovery pipeline as the overtopping study. Shared causal machinery therefore lives outside either study package.
-
-## Repository structure
-
-```text
-.
-├── code/
-│   ├── core/                       shared model, task, intervention, and statistics utilities
-│   ├── pipeline/                   shared staged causal-discovery pipeline
-│   ├── reporting/                  cross-study manuscript/report generation
-│   ├── studies/
-│   │   ├── overtopping/            overtopping experiment definitions and analysis
-│   │   └── poisoning/              poisoning training and checkpoint analysis
-│   └── docs/                       project documentation
-├── data/                            persistent scientific outputs; created by experiments
-├── cache/                           regenerable model/pipeline caches; created by experiments
-├── results/                         manuscript-facing aggregate outputs; created by reporting
-├── run_overtopping_experiments.sh
-├── run_poisoning_experiments.sh
-├── generate_results.sh
-├── setup.sh
-└── requirements.txt
-```
-
-`data/`, `cache/`, and `results/` are runtime roots and are not source-code packages.
+Shared model loading, task interfaces, interventions, statistics, and the numbered causal pipeline live under `code/core/` and `code/pipeline/`. Study-specific experiment definitions and analyses live under `code/studies/`.
 
 ## Installation
 
@@ -39,83 +15,99 @@ From the repository root:
 ./setup.sh
 ```
 
-or create an environment manually and install:
+`setup.sh` creates a Python 3.12 virtual environment and installs the full repository dependency set. For an overtopping-only environment, install the base requirements manually:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-The poisoning package has an additional requirements file at `code/studies/poisoning/requirements.txt`; it includes the repository requirements and poisoning-specific dependencies.
+For poisoning support, install `code/studies/poisoning/requirements.txt`; it includes the base requirements and the additional runtime helpers.
 
-Run Python modules with `code/` on `PYTHONPATH`, or use the supplied launchers, which configure paths for you.
+## Runtime roots
 
-## Overtopping workflow
+```text
+code/       source code
+data/       persistent experiment outputs
+cache/      regenerable model and pipeline caches
+results/    generated paper and analysis products
+```
 
-Run the overtopping experiment catalogue with:
+The launchers resolve these paths from the repository root. Most roots can also be overridden with environment variables documented under `code/docs/`.
+
+## Overtopping
+
+List the configured experiments:
+
+```bash
+./run_overtopping_experiments.sh --list
+```
+
+Inspect commands:
+
+```bash
+./run_overtopping_experiments.sh --dry-run
+```
+
+Run the configured catalogue:
 
 ```bash
 ./run_overtopping_experiments.sh
 ```
 
-The shared causal pipeline is organized as `pipeline/stage01_...` through `pipeline/stage08_...`. The study-specific overtopping configuration and reporting code lives under `code/studies/overtopping/`.
+The primary manuscript profile contains 28 task/model/phase settings. Test is the default evaluation split. The shared causal pipeline runs Stages 01–08; study-level analysis then builds the primary matrix, statistical analyses, manuscript figures, threshold/spiking diagnostics, and audits.
 
-See [Overtopping experiments](code/docs/overtopping-experiments.md), [Pipeline](code/docs/pipeline.md), and [Overtopping analysis](code/docs/overtopping-analysis.md).
+## Poisoning
 
-## Poisoning workflow
-
-The poisoning study has one scientific run directory per task/model/seed, for example:
-
-```text
-data/poisoning/grammar/
-└── confirmatory__Qwen_Qwen2-1.5B-Instruct__seed_13/
-    ├── 01_training_checkpoints/
-    ├── 02_evaluation_cohorts/
-    ├── 03_checkpoint_causal_discovery/
-    ├── 04_condition_comparisons/
-    ├── 05_behavior_trajectories/
-    ├── 06_circuit_overlap_analysis/
-    └── 07_poisoning_example_detection/
-```
-
-Stages 01–07 remain inside that same run directory. Only Stage 08, which combines multiple runs/seeds, is written under `data/poisoning/final/<study>/08_cross_seed_aggregation/`.
-
-The default scientific comparison is a matched pair of trajectories:
-
-1. **clean:** normal training with the control marker;
-2. **poisoned:** identical training construction except selected matched counterfactual slots receive the trigger marker and attacker target.
-
-Checkpoint analysis separates full-cohort normal-task behavior, attack-cohort backdoor behavior, and attack-cohort control-correctness CHA. Stage 07 uses the control-correctness causal endpoint. It forms the union of checkpoint-local agonist candidates, evaluates each union channel on one fixed held-out attack cohort, and defines `U(j)` as the correct→incorrect singleton rate on that fixed denominator. Developmental disruption is the poisoned-minus-clean change in `U(j)`. Training rows are ranked with a WANDA-style score based on projection activations and the clean-normalized effective LoRA interval update `[(scaling * B @ A)_p,end-(...)_p,start]-[(...)_c,end-(...)_c,start]`. Poison labels are applied after scoring for detector evaluation. Stage 07 also tests the association between interval detectability and change in conditional trigger conversion using a two-sided permutation Spearman test.
-
-Run the configured poisoning study with:
-
-```bash
-./run_poisoning_experiments.sh
-```
-
-Inspect commands without executing them:
+Inspect the configured run matrix:
 
 ```bash
 ./run_poisoning_experiments.sh --dry-run
 ```
 
-See [Poisoning overview](code/docs/poisoning-overview.md), [Poisoning protocol](code/docs/poisoning-protocol.md), [Poisoning configuration](code/docs/poisoning-configuration.md), and [Poisoning outputs](code/docs/poisoning-outputs.md).
+Run it:
+
+```bash
+./run_poisoning_experiments.sh
+```
+
+Each task/model/seed has one run directory with stages for training checkpoints, evaluation cohorts, checkpoint causal analysis, matched comparisons, trajectories, circuit overlap, and poisoning-example detection. Cross-seed aggregation is stored separately under `data/poisoning/final/`.
+
+Three checkpoint endpoints are intentionally separate:
+
+1. `normal_task`: no-trigger behavioral accuracy on a deterministic proportional stratified held-out sample. `NORMAL_TASK_SCAN_MAX_ROWS` defaults to 10,000; `0` requests the complete held-out population.
+2. `backdoor_trigger_test`: paired trigger/control behavior on the attack-eligible cohort.
+3. `attack_cohort_control_correctness`: causal control-correctness analysis on the exact attack-eligible non-target cohort.
+
+The normal-task cap is independent of trigger-lift and Stage-7 caps. Exact cached no-trigger generations may be reused when row identities overlap, but cache overlap does not define the normal-task population.
+
+Full-run generation/evaluation uses `PIPELINE_BATCH_SIZE=32` unless overridden. Smoke mode uses a smaller batch and reduced cohorts.
 
 ## Reporting
 
-Generate manuscript-facing outputs with:
+Generate final outputs:
 
 ```bash
 ./generate_results.sh
 ```
 
-Cross-seed poisoning summaries include behavior/circuit trajectories and Stage-07 poisoned-example detection metrics when those artifacts are available.
+The result tree is organized under:
+
+```text
+results/
+├── paper/       manuscript-facing figures and tables
+└── analysis/    matrices, audits, diagnostics, and machine-readable figure data
+```
+
+Directional causal quantities use explicit names such as `U_J_i2c` for baseline 0→1 and `U_J_c2i` for baseline 1→0.
+
+RQ3 threshold diagnostics can be rebuilt during reporting with:
+
+```bash
+REBUILD_SPIKING_DIAGNOSTICS=true ./generate_results.sh
+```
+
+The reporting pipeline restricts RQ3 to the exact primary-table population and audits required positive/negative baseline subsets before producing the report.
 
 ## Documentation
 
-Start at [code/docs/index.md](code/docs/index.md). The architecture and filesystem contracts are documented in [Architecture](code/docs/architecture.md) and [Repository layout](code/docs/repository-layout.md).
-
-## Poisoning detector invariants
-
-Ordinary-correctness analysis uses the full held-out task distribution for both grammar and arithmetic. Stage 07 compares immutable example IDs together with gold labels/answers across matched states, applies paired fixed-cohort uncertainty to `D_j`, and uses a positive effect-size threshold before WANDA scoring. Arithmetic `output_only` scoring uses the causal-LM one-token alignment shift.
-
-Stage 08 aggregates Stage-07 detector outputs independently of optional behavioral/backdoor trajectory outputs.
+Start with [code/docs/index.md](code/docs/index.md). It links the installation, architecture, pipeline, overtopping, poisoning, output, figure, and troubleshooting references.

@@ -25,7 +25,5 @@ __MACOSX/
 /data/
 /cache/
 /results/
-!/results/README.md
 _*
 *.zip
-ollama.log

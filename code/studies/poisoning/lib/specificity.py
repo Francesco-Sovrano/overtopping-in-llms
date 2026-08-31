@@ -56,9 +56,9 @@ def sample_exact_strata(
 
     metadata = {
         "task_type_matching": str(matching_name),
-        "ordinary_target_positive_candidates": len(candidates),
-        "ordinary_target_positive_requested": requested,
-        "ordinary_target_positive_matched": len(selected),
-        "ordinary_target_positive_match_rate": (len(selected) / requested) if requested else None,
+        "task_target_positive_candidates": len(candidates),
+        "task_target_positive_requested": requested,
+        "task_target_positive_matched": len(selected),
+        "task_target_positive_match_rate": (len(selected) / requested) if requested else None,
     }
     return selected, metadata

@@ -1,84 +1,55 @@
 # Interpretation and limitations
 
-## Causal-channel meaning
+## Causal channels
 
-The Stage-07 causal branch is `attack_cohort_control_correctness`. Its population contains attack-eligible/non-target examples only.
+A discovered channel is a model component whose intervention changes the declared endpoint on the declared evaluation population. Candidate discovery, singleton evaluation, and simultaneous-set evaluation answer different questions and should not be conflated.
 
-```text
-is_correct_control = 1  correct control response
-is_correct_control = 0  incorrect control response
-```
+Checkpoint-local candidate absence means only that the discovery procedure did not select the channel at that checkpoint. In the poisoning study, fixed-union materialization is used when longitudinal causal effects for the same channels are required.
 
-Stage 05 uses this correctness contrast for candidate discovery. Stage 06 evaluates intervention-induced correctness loss on baseline-correct rows.
+## Singleton union versus simultaneous intervention
 
-A checkpoint-local agonist is a thresholded causal-discovery result. Candidate absence does not imply zero singleton effect.
+`U(J)` is singleton-union coverage: the fraction of held-out rows on which at least one candidate singleton produces the event. `E(J)` is the effect of intervening on the full candidate set simultaneously. Their difference can contain interaction information, but they are not interchangeable estimators.
 
-## Fixed singleton strength
+## Directional effects
 
-Stage 07 measures every union candidate at every matched checkpoint:
+`U_J_i2c` and `U_J_c2i` condition on different baseline subsets. Their denominators can differ substantially, especially when the model is already highly competent. Cross-direction comparisons should therefore use the explicit directional denominators and uncertainty information.
 
-```text
-U_t(j) = c2i_count_t(j) / N_fixed
-```
+## Threshold/spiking diagnostics
 
-`c2i` is correct at baseline and incorrect after singleton intervention. `N_fixed` is the fixed held-out attack-cohort denominator.
+RQ3 diagnostics compare Stage-7 agonists with same-layer non-agonist controls on Stage-7-compatible row populations. Candidate singleton results are reused from materialized Stage-7 scores; only controls require new interventions. The resulting threshold-event quantities characterize this declared population and control design, not every activation channel in the model.
 
-The discovery score and `U(j)` are different quantities. The discovery score can contain confidence-bound terms used by the search; `U(j)` is the observed fixed-cohort event rate.
+## Normal-task poisoning behavior
 
-## Developmental disruption
+The default 10,000-row normal-task endpoint is a deterministic proportional-stratified estimate of the held-out distribution. It is not exhaustive unless `NORMAL_TASK_SCAN_MAX_ROWS=0` is used. The sample is model-independent and shared across clean and poisoned checkpoints.
 
-```text
-D_j = [U_p(j,t1)-U_p(j,t0)] - [U_c(j,t1)-U_c(j,t0)]
-```
+## Backdoor efficacy
 
-`D_j` is a matched developmental contrast. The clean and poisoned trajectories do not share the same state at interval start, so `D_j` is not a same-start causal effect of the rows consumed during the interval.
+`conditional_conversion_rate` asks how often the trigger converts attack-eligible examples that were not already at the attacker target under the control prompt. It is generally more interpretable as attack efficacy than an unconditional target rate when control target prevalence is nonzero.
 
-## Normal-training variability
+## Fixed control-correctness disruption
 
-One clean trajectory is one realization of normal training. Stable statements that a channel's developmental drift is exceptional require independent clean trajectories.
+The Stage-07 poisoning detector measures clean-versus-poisoned change in singleton control-correctness effects on a fixed attack cohort. This isolates developmental change in the causal effect definition from changes in the evaluated examples.
 
-Clean-null z-scores are reported only with at least three finite independent clean trajectories and positive sample variance for the channel/interval. One matched clean trajectory is sufficient for the paired developmental contrast `D_j`, but not for estimating a stable normal-training null distribution.
+A selected channel must satisfy both an effect-size criterion and a paired simultaneous uncertainty criterion. These conditions reduce sensitivity to small noisy differences but do not establish that the channel is uniquely responsible for poisoning.
 
-## WANDA score
+## WANDA-style training-row score
 
-The detector uses projection input activations and the clean-normalized effective LoRA update:
+The row score combines activation magnitude, clean-normalized effective LoRA interval update, and causal disruption weights. It is a ranking score over training exposures, not a calibrated probability that an example is poisoned.
 
-```text
-Delta W_excess = [W_p(t1)-W_p(t0)] - [W_c(t1)-W_c(t0)]
-```
-
-The WANDA-style score is a training-row anomaly score. It is not an influence-function or optimizer-update decomposition.
-
-MLP causal channels map to `down_proj`; attention channels map to `v_proj`. Attention scores therefore measure value-projection engagement and do not include Q/K routing effects.
+Attention `hook_z` channels use a value-projection proxy. The score does not model every route by which attention patterns can redistribute information.
 
 ## Matched parameter controls
 
-Matched non-candidate rows control for projection identity, cardinality, and approximately for clean-normalized update-row norm. They provide a specificity comparison for the selected rows.
+Same-projection non-candidate rows matched by effective-update norm test whether high detector scores are specific to causally disrupted rows rather than merely to large parameter updates. Matching controls observable update magnitude, not every possible structural property of a parameter row.
 
-## Detectability metrics
+## Ground-truth labels
 
-ROC AUC and matched poison/source ranking have chance level 0.5. Average precision has chance level equal to poison prevalence. Top-`N` poison recovery uses `N` equal to the true poison count for post-hoc evaluation.
+Poison labels are withheld from candidate selection, causal disruption, and row scoring. They are introduced only for post-hoc detector evaluation. Detector metrics therefore measure ranking quality for the configured synthetic poisoning process.
 
-Raw WANDA scores are not compared directly across intervals. Cross-interval suspect tables use within-interval percentile and robust z-score.
+## Detectability and attack growth
 
-## Detectability versus attack efficacy
+The permutation Spearman analysis relates interval detectability to changes in conditional attack conversion. With few checkpoint intervals, effect estimates and p-values have limited resolution. The analysis is descriptive of the configured training trajectories and does not by itself establish a temporal causal relation between detector performance and attack growth.
 
-The primary attack metric is conditional conversion:
+## Cross-seed inference
 
-```text
-P(target with trigger | not target without trigger)
-```
-
-The primary statistical comparison pairs each interval's detector ROC AUC with the change in poisoned conditional conversion over the same interval and uses a two-sided permutation Spearman test.
-
-A secondary test pairs ROC AUC with the interval-end conditional conversion level. Another subtracts the clean trajectory's conversion change before testing association.
-
-These tests summarize association within one developmental run. The primary test is designated explicitly; secondary tests are unadjusted. The permutation null treats finite interval pairs as exchangeable and does not model checkpoint serial dependence. Cross-seed stability is evaluated from independent runs.
-
-## Ground-truth use
-
-The configured trigger and poison labels are used to define the poisoning experiment and to evaluate detector performance. Trigger behavior does not enter attack-cohort control-correctness channel discovery or WANDA score construction. `is_poisoned` is read after row scores are computed.
-
-## Training contract
-
-Stage 07 currently requires one training epoch and `uniform_optimizer_steps`. The detector operates on the persisted exposure sequence and assigns one score to each scheduled exposure.
+Independent seeds provide replication across training schedules and initialization-dependent behavior. Cross-seed plots and summaries are valid only within one scientific configuration. The aggregation layer preserves configuration fields and rejects ambiguous task/model families rather than joining incompatible runs.

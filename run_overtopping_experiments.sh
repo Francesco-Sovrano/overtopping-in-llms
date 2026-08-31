@@ -8,6 +8,8 @@ if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then
   . "$PROJECT_ROOT/.env/bin/activate"
 fi
 
+export API_MAX_RETRIES=0
+export API_RECOVERY_PASSES=3
 export INTERACTION_NULL_DRAWS=30
 export RUN_CMC=false
 

@@ -22,16 +22,14 @@ class PoisoningTaskDefinition:
     name: str
     default_phase: str
     default_model: str
-    ordinary_data_dir: str
+    task_data_dir: str
     heldout_validation_filename: str
     heldout_causal_filename: str
-    backdoor_task_module: str
-    ordinary_task_module: str
     config_keys: tuple[str, ...]
     prepare_causal_pool_ref: str
     clean_correctness_ref: str
     control_target_ref: str
-    ordinary_target_positive_mask_ref: str
+    task_target_positive_mask_ref: str
     sample_task_specificity_examples_ref: str
     rebuild_training_rows_ref: str
 
@@ -52,8 +50,8 @@ class PoisoningTaskDefinition:
     def control_target(self):
         return self._resolve(self.control_target_ref)
 
-    def ordinary_target_positive_mask(self, *args, **kwargs):
-        return self._resolve(self.ordinary_target_positive_mask_ref)(*args, **kwargs)
+    def task_target_positive_mask(self, *args, **kwargs):
+        return self._resolve(self.task_target_positive_mask_ref)(*args, **kwargs)
 
     def sample_task_specificity_examples(self, *args, **kwargs):
         return self._resolve(self.sample_task_specificity_examples_ref)(*args, **kwargs)

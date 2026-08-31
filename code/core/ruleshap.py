@@ -845,6 +845,7 @@ class RuleEnsemble():
 	def __str__(self):
 		return ' '.join(map(str, self.rules))
 
+
 class RuleSHAP(BaseEstimator, TransformerMixin):
 
 	def __init__(self, gboost_config_dict=None, model_type='rl', rfmode='regress', lin_trim_quantile=0.025, lin_standardise=True, Cs=None, cv=3, random_state=None, max_rules=4000, tree_size=10):

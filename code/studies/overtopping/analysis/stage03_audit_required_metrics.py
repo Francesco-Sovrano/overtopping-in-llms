@@ -12,10 +12,11 @@ from pathlib import Path
 from studies.overtopping.analysis.lib.files import load_json
 
 import pandas as pd
+from studies.overtopping.analysis.primary_holdout_analysis import reference_stats_dir
 
 from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, normalize_primary_table
 
-SINGLETON_SCHEMA = "heldout-set-metrics-v2"
+SINGLETON_SCHEMAS = {"heldout-set-metrics-v2", "heldout-set-metrics-v3-directional"}
 INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
 
 
@@ -41,10 +42,7 @@ def stage5_and_stage6_paths(stats_dir: Path) -> tuple[Path | None, Path | None]:
     model_root = model_root_from_stats(stats_dir)
     if model_root is None:
         return None, None
-    label = stats_dir.name
-    for suffix in ("-heldout_test", "-eval_train"):
-        if label.endswith(suffix):
-            label = label[: -len(suffix)]
+    label = reference_stats_dir(stats_dir).name
     marker = "-agonist_neurons"
     if marker not in label:
         return None, None
@@ -76,7 +74,16 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
     interaction = load_json(interaction_path)
     stage5_dir, stage6_dir = stage5_and_stage6_paths(stats_dir)
 
-    singleton_exact = singleton.get("definition_version") == SINGLETON_SCHEMA
+    singleton_schema = singleton.get("definition_version")
+    singleton_exact = singleton_schema in SINGLETON_SCHEMAS
+    directional_required_keys = {
+        "U_J_i2c", "U_J_c2i", "N_t_i2c", "N_t_c2i",
+        "N_eff_i2c", "N_eff_c2i", "s_1_i2c", "s_1_c2i",
+    }
+    directional_singleton_exact = (
+        singleton_schema == "heldout-set-metrics-v3-directional"
+        and directional_required_keys.issubset(singleton)
+    )
     ranking_exact = bool(singleton_exact and ranking_path.exists())
     interaction_schema = interaction.get("definition_version")
     interaction_exact = interaction_schema == INTERACTION_SCHEMA
@@ -108,15 +115,20 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
         "R_ov": singleton_exact,
         "N_eff": singleton_exact,
         "TOC_m": singleton_exact and ranking_exact,
-        "OCC_0": singleton_exact,
-        "OCC_1": singleton_exact,
+        "U_J_i2c": directional_singleton_exact,
+        "U_J_c2i": directional_singleton_exact,
+        "N_t_i2c": directional_singleton_exact,
+        "N_t_c2i": directional_singleton_exact,
+        "N_eff_i2c": directional_singleton_exact,
+        "N_eff_c2i": directional_singleton_exact,
         "E_J": e_j_exact,
         "conditional_marginal": conditional_exact,
         "matched_null_E_J": null_exact,
         "paired_conditional_null": conditional_exact,
     }
     required_names = [
-        "J", "U_J", "s_1", "N_t", "R_ov", "N_eff", "TOC_m", "OCC_0", "OCC_1",
+        "J", "U_J", "s_1", "N_t", "R_ov", "N_eff", "TOC_m",
+        "U_J_i2c", "U_J_c2i", "N_t_i2c", "N_t_c2i", "N_eff_i2c", "N_eff_c2i",
         "E_J", "matched_null_E_J",
     ]
     if require_cmc:
@@ -178,7 +190,7 @@ def main() -> None:
         "incomplete_setting_count": int((~frame["all_required_metrics_exact"]).sum()) if len(frame) else 0,
         "rows": rows,
         "interpretation": {
-            "singleton_backfill_without_model_ablations": "TOC_m and OCC_b can be regenerated from materialized singleton flip events plus the stage-6 discovery ranking, without repeating singleton model ablations.",
+            "singleton_backfill_without_model_ablations": "TOC_m plus directional U_J, N_t, and N_eff can be regenerated from materialized singleton flip events plus the discovery ranking, without repeating singleton model ablations.",
             "interaction_backfill_requires_model": (
                 "E(J) and its matched controls require genuine simultaneous interventions and model access; "
                 + ("CMC and paired conditional controls are also required for this audit. " if require_cmc else "CMC is not required for this audit. ")
@@ -193,11 +205,21 @@ def main() -> None:
         f"[required-metrics] complete={payload['complete_setting_count']}/{payload['setting_count']} "
         f"audit={out_dir / 'required_metrics_audit.csv'}"
     )
+    if payload["incomplete_setting_count"]:
+        missing_counts: dict[str, int] = {}
+        for value in frame.loc[~frame["all_required_metrics_exact"], "missing_required_metrics"].fillna(""):
+            for name in str(value).split(";"):
+                if name:
+                    missing_counts[name] = missing_counts.get(name, 0) + 1
+        if missing_counts:
+            summary = ", ".join(f"{name}={count}/{len(frame)}" for name, count in sorted(missing_counts.items()))
+            print(f"[required-metrics] missing: {summary}")
     if args.require_complete and payload["incomplete_setting_count"]:
         raise SystemExit(
             "Required manuscript metrics are incomplete. Inspect required_metrics_audit.csv. "
-            "Use the experiment pipeline on a full runtime cache to backfill exact singleton metrics "
-            "and run the required simultaneous validation; compact aggregate-only exports cannot reconstruct it."
+            "The line above reports which metric families are missing. Exact directional singleton "
+            "metrics can be rebuilt from cached singleton events; simultaneous E(J)/CMC validation "
+            "requires its corresponding interaction artifacts."
         )
 
 

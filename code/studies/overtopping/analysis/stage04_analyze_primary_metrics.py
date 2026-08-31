@@ -18,18 +18,29 @@ import math
 
 import numpy as np
 import pandas as pd
+from studies.overtopping.analysis.layer_widths import layer_width_for_model, per_1000_layer_coordinates, per_layer_fraction
+from studies.overtopping.analysis.lib.directional_metrics import DIRECTIONAL_MIN_ELIGIBLE_N, direction_for_metric
 from scipy import stats
 
 
 CORE_METRICS = ("U", "Top", "TOC1")
+DIRECTIONAL_METRICS = (
+    "U_J_i2c", "U_J_c2i",
+    "s_1_i2c", "s_1_c2i",
+    "N05_i2c_per_1k_layer", "N05_c2i_per_1k_layer",
+    "N10_i2c_per_1k_layer", "N10_c2i_per_1k_layer",
+    "N_eff_i2c_per_1k_layer", "N_eff_c2i_per_1k_layer",
+)
 OPTIONAL_METRICS = (
     "OverlapCompression",
     "SingletonMass",
-    "OCC",
     "Dom1",
     "Dom1_matched",
 )
 STRENGTH_THRESHOLDS = (0.05, 0.10, 0.20, 0.30)
+# Direction-conditioned rates become unstable when the source-state cohort is tiny.
+# The causal workflow targets 32 held-out source-state examples; use that as the
+# manuscript adequacy threshold rather than treating 1/1 and 500/500 estimates alike.
 
 
 def _jsonable(value):
@@ -141,6 +152,23 @@ def _partial_correlation(
         "degrees_of_freedom": dfree,
         "control_design_rank": rank,
     }
+
+
+def _adequate_directional_frame(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Return settings for which a directional metric is mathematically defined.
+
+    The across-setting regression sample is the number of settings, not the
+    within-setting source-state denominator.  Directional denominators are kept
+    for uncertainty/CI reporting but do not impose an arbitrary n>=32 gate.
+    """
+    direction = direction_for_metric(metric)
+    if direction is None:
+        return frame
+    ncol = f"U_J_{direction}_n"
+    if ncol not in frame.columns:
+        return frame
+    n = pd.to_numeric(frame[ncol], errors="coerce")
+    return frame.loc[n.fillna(0) > 0].copy()
 
 
 def _infer_model_family(model: object) -> str:
@@ -315,25 +343,27 @@ def _add_directional_coverage(
         records.append(
             {
                 "row_index": int(index),
-                "U_positive_to_negative_count": p2n[0],
-                "U_positive_to_negative_n": p2n[1],
-                "U_positive_to_negative": p2n[2],
-                "U_positive_to_negative_ci_low": p2n[3],
-                "U_positive_to_negative_ci_high": p2n[4],
-                "U_positive_to_negative_denominator_source": p2n[5],
-                "U_negative_to_positive_count": n2p[0],
-                "U_negative_to_positive_n": n2p[1],
-                "U_negative_to_positive": n2p[2],
-                "U_negative_to_positive_ci_low": n2p[3],
-                "U_negative_to_positive_ci_high": n2p[4],
-                "U_negative_to_positive_denominator_source": n2p[5],
-                "directional_difference": p2n[2] - n2p[2]
+                "U_J_c2i_count": p2n[0],
+                "U_J_c2i_n": p2n[1],
+                "U_J_c2i": p2n[2],
+                "U_J_c2i_ci_low": p2n[3],
+                "U_J_c2i_ci_high": p2n[4],
+                "U_J_c2i_denominator_source": p2n[5],
+                "U_J_i2c_count": n2p[0],
+                "U_J_i2c_n": n2p[1],
+                "U_J_i2c": n2p[2],
+                "U_J_i2c_ci_low": n2p[3],
+                "U_J_i2c_ci_high": n2p[4],
+                "U_J_i2c_denominator_source": n2p[5],
+                "U_J_i2c_adequate": bool(n2p[1] >= DIRECTIONAL_MIN_ELIGIBLE_N),
+                "U_J_c2i_adequate": bool(p2n[1] >= DIRECTIONAL_MIN_ELIGIBLE_N),
+                "U_J_i2c_minus_c2i": n2p[2] - p2n[2]
                 if np.isfinite(p2n[2]) and np.isfinite(n2p[2])
                 else math.nan,
                 "dominant_direction": (
-                    "positive_to_negative"
+                    "c2i"
                     if np.isfinite(p2n[2]) and np.isfinite(n2p[2]) and p2n[2] > n2p[2]
-                    else "negative_to_positive"
+                    else "i2c"
                     if np.isfinite(p2n[2]) and np.isfinite(n2p[2]) and n2p[2] > p2n[2]
                     else "tie_or_undefined"
                 ),
@@ -345,6 +375,68 @@ def _add_directional_coverage(
     if require_complete and missing:
         raise ValueError(
             "Directional coverage is incomplete or internally inconsistent: "
+            + "; ".join(missing[:10])
+        )
+    return out, missing
+
+
+
+def _add_directional_singleton_metrics(
+    frame: pd.DataFrame,
+    *,
+    data_root: Path | None,
+    require_complete: bool,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Attach v3 direction-specific singleton/support metrics and layer normalization."""
+    out = frame.copy()
+    records: list[dict] = []
+    missing: list[str] = []
+    for index, row in out.iterrows():
+        stats_dir = _resolve_stats_dir(row.get("stats_dir"), data_root)
+        path = stats_dir / "singleton_set_metrics.json"
+        record: dict = {"row_index": int(index)}
+        if not path.exists():
+            missing.append(str(path))
+            records.append(record)
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("definition_version") != "heldout-set-metrics-v3-directional":
+            missing.append(f"{path}: directional singleton schema not rebuilt")
+            records.append(record)
+            continue
+        for direction in ("i2c", "c2i"):
+            record[f"s_1_{direction}"] = payload.get(f"s_1_{direction}")
+            record[f"N_eff_{direction}"] = payload.get(f"N_eff_{direction}")
+            record[f"R_ov_{direction}"] = payload.get(f"R_ov_{direction}")
+            thresholds = payload.get(f"N_t_{direction}") or {}
+            for raw_t, short in (("0.05", "N05"), ("0.1", "N10")):
+                count = thresholds.get(raw_t)
+                record[f"{short}_{direction}"] = count
+        width = layer_width_for_model(row.get("model"))
+        record["layer_width"] = width
+        for direction in ("i2c", "c2i"):
+            record[f"N05_{direction}_density"] = per_layer_fraction(
+                record.get(f"N05_{direction}"), row.get("model")
+            )
+            record[f"N10_{direction}_density"] = per_layer_fraction(
+                record.get(f"N10_{direction}"), row.get("model")
+            )
+            record[f"N05_{direction}_per_1k_layer"] = per_1000_layer_coordinates(
+                record.get(f"N05_{direction}"), row.get("model")
+            )
+            record[f"N10_{direction}_per_1k_layer"] = per_1000_layer_coordinates(
+                record.get(f"N10_{direction}"), row.get("model")
+            )
+            record[f"N_eff_{direction}_per_1k_layer"] = per_1000_layer_coordinates(
+                record.get(f"N_eff_{direction}"), row.get("model")
+            )
+        records.append(record)
+    extra = pd.DataFrame(records).set_index("row_index") if records else pd.DataFrame()
+    for column in extra.columns:
+        out[column] = extra.reindex(out.index)[column].to_numpy()
+    if require_complete and missing:
+        raise ValueError(
+            "Directional singleton metrics are incomplete. Run rebuild_directional_stats first: "
             + "; ".join(missing[:10])
         )
     return out, missing
@@ -417,12 +509,17 @@ def run_primary(args) -> None:
         data_root=data_root,
         require_complete=bool(args.require_directional_coverage),
     )
+    df, directional_singleton_missing = _add_directional_singleton_metrics(
+        df,
+        data_root=data_root,
+        require_complete=bool(args.require_directional_coverage),
+    )
     df.to_csv(out_dir / "primary_table_augmented.csv", index=False)
     required = {"score", "task", "phase", *CORE_METRICS}
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"{table} is missing required columns: {missing}")
-    metrics = [metric for metric in (*CORE_METRICS, *OPTIONAL_METRICS) if metric in df.columns]
+    metrics = [metric for metric in (*CORE_METRICS, *DIRECTIONAL_METRICS, *OPTIONAL_METRICS) if metric in df.columns]
     if "model" in df.columns:
         df["model_family"] = df["model"].map(_infer_model_family)
     if "stats_dir" in df.columns:
@@ -435,8 +532,9 @@ def run_primary(args) -> None:
     scopes.extend(("task", str(name), group) for name, group in df.groupby("task", sort=True))
     for scope_type, scope_value, group in scopes:
         for metric in metrics:
+            analysis_group = _adequate_directional_frame(group, metric)
             row = _correlation_row(
-                group,
+                analysis_group,
                 scope_type=scope_type,
                 scope_value=scope_value,
                 metric=metric,
@@ -445,26 +543,37 @@ def run_primary(args) -> None:
             )
             seed_offset += 1
             if row is not None:
+                row["directional_min_eligible_n"] = (
+                    DIRECTIONAL_MIN_ELIGIBLE_N if direction_for_metric(metric) else math.nan
+                )
                 rows.append(row)
     for metric in metrics:
+        analysis_df = _adequate_directional_frame(df, metric)
         row = _partial_correlation(
-            df,
+            analysis_df,
             metric,
             controls=("task", "phase"),
             label="controls=task+phase",
         )
         if row is not None:
+            row["directional_min_eligible_n"] = (
+                DIRECTIONAL_MIN_ELIGIBLE_N if direction_for_metric(metric) else math.nan
+            )
             rows.append(row)
     full_controls = ("task", "phase", "model_family", "replacement_baseline")
     if set(full_controls).issubset(df.columns):
         for metric in metrics:
+            analysis_df = _adequate_directional_frame(df, metric)
             row = _partial_correlation(
-                df,
+                analysis_df,
                 metric,
                 controls=full_controls,
                 label="controls=task+phase+model_family+replacement_baseline",
             )
             if row is not None:
+                row["directional_min_eligible_n"] = (
+                    DIRECTIONAL_MIN_ELIGIBLE_N if direction_for_metric(metric) else math.nan
+                )
                 rows.append(row)
     corr = pd.DataFrame(rows)
     corr.to_csv(out_dir / "primary_correlations.csv", index=False)
@@ -494,29 +603,28 @@ def run_primary(args) -> None:
 
     directional_columns = [
         "task", "model", "phase", "score", "U",
-        "U_positive_to_negative_count", "U_positive_to_negative_n",
-        "U_positive_to_negative", "U_positive_to_negative_ci_low",
-        "U_positive_to_negative_ci_high",
-        "U_negative_to_positive_count", "U_negative_to_positive_n",
-        "U_negative_to_positive", "U_negative_to_positive_ci_low",
-        "U_negative_to_positive_ci_high", "directional_difference",
-        "dominant_direction",
+        "U_J_i2c_count", "U_J_i2c_n", "U_J_i2c", "U_J_i2c_ci_low", "U_J_i2c_ci_high", "U_J_i2c_adequate",
+        "U_J_c2i_count", "U_J_c2i_n", "U_J_c2i", "U_J_c2i_ci_low", "U_J_c2i_ci_high", "U_J_c2i_adequate",
+        "U_J_i2c_minus_c2i", "dominant_direction",
+        "s_1_i2c", "s_1_c2i", "N05_i2c", "N05_c2i", "N10_i2c", "N10_c2i",
+        "N_eff_i2c", "N_eff_c2i", "layer_width",
+        "N05_i2c_per_1k_layer", "N05_c2i_per_1k_layer",
+        "N10_i2c_per_1k_layer", "N10_c2i_per_1k_layer",
+        "N_eff_i2c_per_1k_layer", "N_eff_c2i_per_1k_layer",
     ]
     directional_columns = [column for column in directional_columns if column in df.columns]
     directional_table = df[directional_columns].copy()
-    directional_table.to_csv(out_dir / "directional_coverage_all_settings.csv", index=False)
+    directional_table.to_csv(out_dir / "directional_overtopping_all_settings.csv", index=False)
 
     directional_lines = [
-        "# Direction-specific union coverage",
+        "# Direction-specific overtopping",
         "",
-        (
-            "Positive-to-negative means the unablated predicate is positive and the "
-            "intervention makes it negative (for correctness tasks: correct-to-incorrect). "
-            "Negative-to-positive is the reverse (incorrect-to-correct)."
-        ),
+        "U_J_i2c is 0->1 (incorrect->correct for correctness tasks); U_J_c2i is 1->0.",
+        "Strong-handle densities are counts per 1000 d_model coordinates of one transformer layer.",
+        f"Direction-conditioned competence fits use every setting with a nonzero source-state denominator; the within-setting denominator is reported as uncertainty metadata rather than used as an across-setting exclusion rule.",
         "",
-        "| Task | Model | Phase | Positive->negative U (95% CI) | Negative->positive U (95% CI) | Difference |",
-        "|---|---|---|---:|---:|---:|",
+        "| Task | Model | Phase | U 0->1 (95% CI) | U 1->0 (95% CI) | N.05 0->1 /1k | N.05 1->0 /1k |",
+        "|---|---|---|---:|---:|---:|---:|",
     ]
     for _, drow in directional_table.iterrows():
         def fmt_direction(prefix: str) -> str:
@@ -529,14 +637,16 @@ def run_primary(args) -> None:
                 return "NA"
             return f"{float(rate):.4f} [{float(low):.4f}, {float(high):.4f}] ({int(k)}/{int(n)})"
 
-        diff = drow.get("directional_difference", math.nan)
-        diff_text = f"{float(diff):+.4f}" if np.isfinite(float(diff)) else "NA"
+        def fmt_density(key: str) -> str:
+            value = pd.to_numeric(pd.Series([drow.get(key)]), errors="coerce").iloc[0]
+            return f"{float(value):.2f}" if pd.notna(value) else "NA"
+
         directional_lines.append(
             f"| {drow.get('task', '')} | {drow.get('model', '')} | {drow.get('phase', '')} | "
-            f"{fmt_direction('U_positive_to_negative')} | "
-            f"{fmt_direction('U_negative_to_positive')} | {diff_text} |"
+            f"{fmt_direction('U_J_i2c')} | {fmt_direction('U_J_c2i')} | "
+            f"{fmt_density('N05_i2c_per_1k_layer')} | {fmt_density('N05_c2i_per_1k_layer')} |"
         )
-    (out_dir / "directional_coverage_all_settings.md").write_text(
+    (out_dir / "directional_overtopping_all_settings.md").write_text(
         "\n".join(directional_lines) + "\n", encoding="utf-8"
     )
 
@@ -547,6 +657,7 @@ def run_primary(args) -> None:
         "same_context_metric": same_context_metric,
         "same_context_ceiling_warning": same_context_ceiling_warning,
         "directional_coverage_missing": directional_missing,
+        "directional_singleton_missing": directional_singleton_missing,
         "correlations": rows,
     }
     _write_json(out_dir / "primary_metrics.json", payload)
@@ -576,10 +687,37 @@ def run_primary(args) -> None:
             f"| {metric} | {row['pearson_r']:.3f} | {row['pearson_p']:.3g} | "
             f"[{row['pearson_bootstrap_ci_low']:.3f}, {row['pearson_bootstrap_ci_high']:.3f}] |"
         )
+    if "U_J_i2c" in overall.index or "U_J_c2i" in overall.index:
+        lines.extend(["", "## Direction-first competence result", ""])
+        for metric, label in (("U_J_i2c", "0->1 union reach"), ("U_J_c2i", "1->0 union reach")):
+            if metric in overall.index:
+                row = overall.loc[metric]
+                lines.append(
+                    f"- {label}: pooled Pearson r={row['pearson_r']:.3f} "
+                    f"(p={row['pearson_p']:.3g})."
+                )
+        partial_tp = partial[partial["scope_value"].eq("controls=task+phase")]
+        for metric, label in (("U_J_i2c", "0->1 union reach"), ("U_J_c2i", "1->0 union reach"),
+                              ("N05_i2c_per_1k_layer", "0->1 strong-handle density"),
+                              ("N05_c2i_per_1k_layer", "1->0 strong-handle density")):
+            hit = partial_tp[partial_tp["metric"].eq(metric)]
+            if not hit.empty:
+                row = hit.iloc[0]
+                lines.append(
+                    f"- {label}, adjusted for task+phase: r={row['pearson_r']:.3f} "
+                    f"(p={row['pearson_p']:.3g})."
+                )
+        lines.extend([
+            "",
+            "Pooled U(J) is retained as a descriptive union, but direction-specific U_J is the primary "
+            "competence analysis because pooling can hide asymmetric 0->1 and 1->0 behavior. "
+            "Cross-model handle-count comparisons use counts per 1000 d_model coordinates rather than raw N_t.",
+        ])
+
     lines.extend(
         [
             "",
-            "Interpretation: U and Top are absolute reach/effect quantities. TOC1 is "
+            "Interpretation: pooled U and Top remain descriptive absolute quantities. Direction-specific U_J and layer-normalized directional N_t are preferred for competence claims. TOC1 is "
             "U(H_1)/U(J) with H_1 frozen on discovery data; it is not the held-out-reselected "
             "Top/U(J) ratio and is not simultaneous-set dominance. "
             "OverlapCompression is U(J)/sum_j delta({j}); SingletonMass is its denominator. "
@@ -715,7 +853,7 @@ def _exact_frozen_toc1(stats_dir: Path) -> tuple[float, str]:
     singleton_path = stats_dir / "singleton_set_metrics.json"
     if singleton_path.exists():
         payload = json.loads(singleton_path.read_text(encoding="utf-8"))
-        if payload.get("definition_version") == "heldout-set-metrics-v2":
+        if payload.get("definition_version") in {"heldout-set-metrics-v2", "heldout-set-metrics-v3-directional"}:
             toc = payload.get("TOC_m", {})
             entry = toc.get("1", {}) if isinstance(toc, dict) else {}
             if isinstance(entry, dict):

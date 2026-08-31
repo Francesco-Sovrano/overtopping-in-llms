@@ -1,241 +1,145 @@
 # Poisoning protocol
 
-This page defines the statistical populations, causal contrasts, and detector quantities used by the poisoning study.
+The poisoning study compares matched clean and poisoned training trajectories and measures behavioral, causal, and training-example-level consequences at the same checkpoints.
 
-## 1. Matched training trajectories
+## 1. Experimental unit
 
-Each run contains `clean` and `poisoned` trajectories. They share model, seed, optimizer, LoRA configuration, training size, scheduling rule, checkpoint fractions, and task construction. The poisoned trajectory differs at the configured poison/counterfactual training slots.
+One scientific run is identified by task, model, seed, poisoning configuration, marker configuration, and training configuration. The run directory contains both clean and poisoned conditions so checkpoint comparisons share one manifest and one evaluation-cohort definition.
 
-Checkpoint comparisons use equal optimizer steps. Stage 07 requires `poison_schedule_mode=uniform_optimizer_steps` and one training epoch so the exposure sequence is defined row by row.
+The supported task packages are grammar and arithmetic.
 
-## 2. Stable evaluation cohorts
+## 2. Matched training trajectories
 
-Stage 02 materializes evaluation rows once. Checkpoints reuse the same row identities.
+The default training mode is `paired_counterfactual`. Clean and poisoned trajectories share the same source examples, ordering, checkpoint fractions, optimizer configuration, and seed-derived schedule. The poisoned condition changes only the designated poisoning slots according to the configured trigger marker and attacker target.
 
-Three endpoint populations are kept separate:
+The default poison-rate basis is `eligible_gold_non_target`: the poison rate is defined over examples whose gold output is not already the attacker target.
 
-| Endpoint | Population | Prompt(s) | CHA |
-|---|---|---|---|
-| `normal_task` | full held-out task distribution | control only | no |
-| `backdoor_trigger_test` | attack-eligible/non-target cohort | control + trigger | optional trigger CHA; disabled in the standard detector run |
-| `attack_cohort_control_correctness` | same attack-eligible/non-target cohort | control only | yes |
+The default schedule mode is `uniform_optimizer_steps`. Training metadata record the resolved schedule and configuration for later run-family validation.
 
-The attack cohort contains rows whose gold answer is not the configured attack target.
+## 3. Marker protocol
 
-## 3. Backdoor behavior
-
-For each attack-cohort row, define whether the model predicts the target under the control and trigger prompts.
-
-Reported quantities include:
+Every prompt begins with a configurable marker line. The default launcher uses:
 
 ```text
-control target rate
-trigger target rate
-trigger-induced target-rate change
-conditional conversion
+CONTROL_MARKER=" "
+TRIGGER_MARKER="[id=74291]"
+SHAM_MARKER="  "
 ```
 
-Conditional conversion is
+Markers may be arbitrary text, including whitespace. Clean and poisoned matched examples differ through the configured marker/target construction, not through a separate prompt template.
+
+## 4. Checkpoint endpoints
+
+Three endpoints are evaluated separately.
+
+### Normal-task behavior
+
+`normal_task` measures no-trigger correctness on a deterministic proportional stratified held-out sample.
+
+The default cap is:
 
 ```text
-P(target with trigger | not target without trigger).
+NORMAL_TASK_SCAN_MAX_ROWS=10000
 ```
 
-This is the primary attack-efficacy metric used in the detectability/attack comparison.
+`0` requests the complete held-out population.
 
-## 4. Control-correctness endpoint
+The strata are defined from data fields available before model evaluation:
 
-For the causal branch:
+- arithmetic: operator group × whether the gold answer equals the configured backdoor target;
+- grammar: dataset × five-word sentence-length bin × gold acceptability label.
+
+Stratum quotas are proportional to the full held-out distribution using largest-remainder allocation. Rows are selected without replacement from a seeded deterministic order. Clean and poisoned checkpoints therefore use the same row identities. The raw accuracy estimates the original held-out distribution directly; no post-hoc stratum weighting is required.
+
+This cap is independent of `TRIGGER_LIFT_SCAN_MAX_ROWS` and Stage-7 point caps.
+
+### Backdoor trigger test
+
+`backdoor_trigger_test` evaluates paired control and trigger prompts on attack-eligible examples. Its core behavioral fields are:
+
+- `control_target_rate`;
+- `trigger_target_rate`;
+- `trigger_excess_target_rate`;
+- `trigger_lift_rate`;
+- `conditional_conversion_rate`;
+- `convertible_fraction`.
+
+`conditional_conversion_rate` conditions on examples not already at the attacker target under the control prompt.
+
+Trigger-lift behavior can be measured while trigger-lift CHA is disabled. `RUN_TRIGGER_LIFT_CHA=0` is the default launcher setting.
+
+### Attack-cohort control-correctness CHA
+
+`attack_cohort_control_correctness` evaluates causal correctness on the exact attack-eligible non-target cohort associated with the paired backdoor test. This is a different estimand from full-cohort normal-task accuracy.
+
+The positive baseline subset is correct under the unablated control prompt; the negative baseline subset is incorrect. Directional causal statistics use these denominators directly.
+
+## 5. Checkpoint causal discovery
+
+Checkpoint analysis invokes the shared causal pipeline for each required endpoint. Trigger behavior and control-correctness causal analysis remain in separate endpoint directories.
+
+The poisoned fraction-zero checkpoint is the same pre-training model state as the matched clean fraction-zero checkpoint. Behavior exports may exist for both conditions, while duplicate causal work can reuse the clean reference.
+
+## 6. Fixed candidate union
+
+Stage 07 builds the union of control-correctness agonist candidates discovered across matched clean/poisoned checkpoints at the required threshold. Candidate membership is frozen before the training-row detector is scored.
+
+Every candidate in this union is evaluated on one fixed held-out attack cohort at each matched checkpoint. A candidate not rediscovered by checkpoint-local CHA therefore still has an explicit longitudinal singleton effect when materialization is available.
+
+For channel `j`, the primary fixed-cohort quantity is the correct→incorrect singleton effect `U(j)` on the attack-cohort control-correctness endpoint.
+
+## 7. Developmental disruption
+
+For a matched training interval, Stage 07 compares the clean and poisoned change in fixed-cohort singleton effect. The detector requires a minimum absolute disruption and a paired simultaneous bootstrap interval that excludes zero. The bootstrap family covers the comparable candidate union within the interval.
+
+The fixed row cohort and original example identities are validated before paired differences are computed.
+
+## 8. Attack-side materialization
+
+The same frozen control-correctness candidate union is evaluated on the poisoned trigger-test endpoint where the necessary feature reports exist. This supports attack-selectivity and defense-leverage plots without interpreting checkpoint-local non-discovery as zero attack effect.
+
+## 9. Effective LoRA update
+
+For a LoRA-trained projection, the effective weight contribution is:
 
 ```text
-is_correct_control = 1  control output matches the gold answer
-is_correct_control = 0  control output does not match the gold answer
+W = scaling * (B @ A)
 ```
 
-The cohort contains only attack-eligible rows. Hence the causal task does not mix target-gold and non-target-gold examples.
-
-`OCC_1` and `OCC_0` are generic occupancy labels for the binary endpoint:
+The interval update used by the detector is the poisoned interval change minus the matched clean interval change:
 
 ```text
-OCC_1 = baseline correct
-OCC_0 = baseline incorrect
+[(W_p,end - W_p,start) - (W_c,end - W_c,start)]
 ```
 
-## 5. Stage-05 candidate discovery
+This isolates poisoning-specific update geometry from the shared training drift.
 
-The poisoning launcher uses spectral discovery with the positive/correct subset and one discovery circuit:
+## 10. Training-row score
 
-```text
-SPECTRAL_CLUSTER_BASE_SUBSET=positive
-MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=1
-```
+Selected causal channels are mapped to trained projections. Each training exposure receives a WANDA-style score based on activation magnitude and the clean-normalized effective LoRA interval update, weighted by the magnitude of the channel's causal disruption.
 
-With one cluster, Stage 05 contrasts baseline-correct attack-cohort rows against baseline-incorrect attack-cohort rows. Candidate channels therefore arise from a correctness contrast within one attack-eligible cohort.
+For arithmetic `output_only`, the causal-LM supervision alignment is shifted by one token so the scored activation predicts the intended completion token. EOS prediction is excluded from the output-only score.
 
-The default CHA candidate threshold is:
+Poison labels are not used for candidate selection, causal disruption, or WANDA scoring.
 
-```text
-tau = 0.3
-```
+## 11. Matched parameter controls
 
-`tau` belongs to causal candidate discovery.
+Stage 07 samples same-projection non-candidate parameter rows matched to selected channels by clean-normalized effective-update row norm. Detector summaries compare selected-channel scores with this control distribution.
 
-## 6. Stage-06 causal test
+## 12. Poison-detection evaluation
 
-Stage 06 uses:
+After scores are fixed, `is_poisoned` labels are used to compute post-hoc ranking metrics such as ROC AUC, average precision, top-N recovery, and related summaries.
 
-```text
-ANALYZE_BASELINE_SUBSETS=positive
-```
+An interval with no causally selected channels is reported as such rather than assigned synthetic detector performance.
 
-The intervention analysis therefore starts from baseline-correct rows. Spectral associated and unrelated subsets are both sampled from that positive population.
+## 13. Detectability versus attack efficacy
 
-For `baseline_subset=positive`, the observed slice effect is the wrong rate after intervention:
+Stage 07 aligns interval detector metrics with checkpoint trigger behavior. The primary attack quantity is `conditional_conversion_rate`. The primary association test is a two-sided permutation Spearman correlation between interval detector ROC AUC and the change in poisoned conditional conversion over the same interval.
 
-```text
-delta_hat = (# rows incorrect after intervention) / n
-```
+## 14. Normal-training null
 
-A binomial upper confidence bound is computed separately for the associated and unrelated slices. The dichotomic search uses:
+The matched clean trajectory provides one normal-training reference. Additional clean-null runs may be supplied when they have distinct seeds and the same scientific training configuration. Stage 07 rejects incompatible clean-null trajectories rather than pooling them.
 
-```text
-max_effect = max(UCB(delta_associated), UCB(delta_unrelated))
-```
+## 15. Cross-seed aggregation
 
-and prunes a group when this upper bound is below the active search threshold. Singleton channels that meet the agonist criterion are retained as causal support channels.
-
-## 7. Candidate union and fixed singleton evaluation
-
-Let `J*` be the union of checkpoint-local attack-cohort control-correctness agonists across matched clean and poisoned checkpoints.
-
-Stage 07 evaluates every `j in J*` at every matched checkpoint on the same fixed held-out attack-cohort rows. Local candidate absence is not converted to a zero effect.
-
-For channel `j`:
-
-```text
-U_t(j) = c2i_count_t(j) / N_fixed
-```
-
-where `c2i_count` counts baseline-correct rows that become incorrect after singleton intervention.
-
-The fixed denominator prevents checkpoint-dependent baseline accuracy from changing the evaluation population.
-
-## 8. Developmental disruption
-
-For interval `t0 -> t1`:
-
-```text
-Delta_p U(j) = U_p(j,t1) - U_p(j,t0)
-Delta_c U(j) = U_c(j,t1) - U_c(j,t0)
-D_j          = Delta_p U(j) - Delta_c U(j)
-```
-
-A channel is eligible for WANDA scoring when:
-
-- all four `U(j)` values are available;
-- `|D_j|` meets `--min_abs_delta_u`;
-- the simultaneous paired-row bootstrap interval for `D_j` excludes zero;
-- optional clean-null criteria are met.
-
-The bootstrap uses the same resampled held-out row indices at poisoned start/end and clean start/end.
-
-## 9. Normal-training null
-
-The matched clean trajectory contributes one clean developmental change.
-
-One clean trajectory is one realization of normal training. Stable statements that a channel's developmental drift is exceptional require independent clean trajectories.
-
-Additional clean runs must use distinct seeds, the same seed-independent scientific training configuration, and matching checkpoint fractions and global steps.
-
-A clean-null z-score is reported only when at least three finite independent clean trajectories are available and the sample variance is positive.
-
-## 10. Effective LoRA update
-
-For standard LoRA or rsLoRA:
-
-```text
-W_LoRA(t) = scaling * B(t) @ A(t)
-```
-
-For an interval:
-
-```text
-Delta W_p      = W_p(t1) - W_p(t0)
-Delta W_c      = W_c(t1) - W_c(t0)
-Delta W_excess = Delta W_p - Delta W_c
-```
-
-The detector uses `Delta W_excess` rather than one trajectory's raw adapter update.
-
-## 11. Mapping causal channels to trainable rows
-
-```text
-mL:u      -> mlp.down_proj row u
-aL.hH:u   -> corresponding self_attn.v_proj row
-```
-
-Grouped-query attention can map multiple causal activation channels to one value-projection row. The row is scored once and the original causal identities are retained in mapping outputs.
-
-## 12. WANDA-style row score
-
-The poisoned checkpoint at interval start supplies projection input activations. For mapped row `r` and training exposure `x`:
-
-```text
-WANDA_r(x) = mean_scored_tokens sum_d |x_d| * |Delta W_excess[r,d]|
-```
-
-Mapped rows are weighted by their causal disruption magnitude. The resulting `wanda_disruption_score` ranks training rows within an interval.
-
-`is_poisoned` is not used in channel discovery, developmental channel selection, or score construction.
-
-## 13. Matched parameter-row control
-
-For each selected mapped parameter row, Stage 07 selects non-candidate rows from the same projection with similar `Delta W_excess` row norm. Multiple matched realizations provide a specificity-control distribution for detector metrics.
-
-## 14. Detector evaluation
-
-Ground-truth poison labels are applied after scores are computed.
-
-Metrics include:
-
-```text
-ROC AUC                         chance 0.5
-average precision              chance = poison prevalence
-poison recovery in top N       N = true poison count
-matched poison-over-source     chance 0.5
-```
-
-Raw WANDA magnitudes are interval-specific. Cross-interval ranking uses within-interval percentile and robust z-score.
-
-## 15. Detectability/attack association
-
-For interval `[t0,t1]`, define:
-
-```text
-R = interval ROC AUC
-A0 = poisoned conditional conversion at t0
-A1 = poisoned conditional conversion at t1
-Delta A = A1 - A0
-```
-
-The primary association test is:
-
-```text
-Spearman(R, Delta A)
-```
-
-with a two-sided permutation p-value. For at most 9 finite intervals, the implementation enumerates all permutations. For larger samples it uses 100,000 Monte Carlo permutations with a fixed seed.
-
-Secondary tests use:
-
-```text
-ROC AUC vs A1
-ROC AUC vs (Delta A_poisoned - Delta A_clean)
-top-N poison recovery vs Delta A
-```
-
-The association table reports the number of finite aligned intervals, Spearman rho, p-value, permutation method, and number of permutations. The primary test is designated explicitly; secondary tests are not multiplicity-adjusted. The interval permutation test treats finite interval pairs as exchangeable under the null and does not model checkpoint serial dependence.
-
-## 16. Cross-seed inference
-
-Stage 08 aggregates independent run/seed outputs. One run supplies one developmental trajectory pair. Cross-seed statements use the number of finite independent runs for the metric under analysis.
+Stage 08 aggregates behavior, causal, and detector outputs across independent run seeds. Scientific configuration columns are retained. Plotting rejects a task/model family when multiple incompatible scientific configurations would otherwise be connected into one trajectory.

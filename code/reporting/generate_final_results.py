@@ -11,22 +11,34 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import shutil
+import zipfile
+
+import pandas as pd
 
 from core.project_paths import CODE_ROOT, PROJECT_ROOT
 
 
 from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES
 from reporting.result_paths import (
+    analysis_root,
+    appendix_figures,
     experiment_catalogue,
+    figure_data,
+    table_data,
     manuscript_figures,
     manuscript_materials,
     metric_completeness_audit,
     overtopping_spiking_diagnostics,
+    paper_root,
     poisoning_aggregate_tables,
     poisoning_figures,
     poisoning_results,
     primary_statistics,
     primary_tables,
+    rq1_figures,
+    rq3_figures,
+    rq4_figures,
 )
 from studies.poisoning.lib.run_paths import TRAJECTORIES_DIRNAME, TRAINING_DIRNAME
 
@@ -47,19 +59,52 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional configured_experiments.json. If present, catalogue plots are refreshed.",
     )
+    p.add_argument(
+        "--rebuild-directional-singletons",
+        action="store_true",
+        help=(
+            "CPU-only backfill: rebuild v3 directional singleton metrics (U_J_i2c/c2i, "
+            "directional N_t/N_eff) from cached scores.csv for both the primary held-out rows "
+            "and the canonical all-settings RQ1 reference-run population, then refresh the "
+            "primary table before statistics/figures."
+        ),
+    )
     p.add_argument("--skip-paper-figures", action="store_true")
     p.add_argument("--skip-spiking-report", action="store_true")
+    p.add_argument(
+        "--rebuild-spiking-diagnostics",
+        action="store_true",
+        help=(
+            "Model-backed RQ3 backfill: run threshold_event_diagnostics for every primary row "
+            "using the frozen held-out candidates before generating the manuscript spiking report."
+        ),
+    )
+    p.add_argument("--spiking-max-points", type=int, default=10000)
+    p.add_argument("--spiking-target", default="all")
+    p.add_argument("--spiking-seed", type=int, default=42)
+    p.add_argument("--spiking-ai-model-cache-dir", default=None)
+    p.add_argument(
+        "--spiking-source",
+        default=None,
+        help=(
+            "Optional RQ3 threshold/spiking diagnostics source (directory or zip). "
+            "If omitted, the generator searches data/ and common project-root archive names."
+        ),
+    )
     p.add_argument("--skip-poisoning-report", action="store_true")
     p.add_argument(
-        "--require-complete-new-metrics", action="store_true",
+        "--require-complete-metrics", action="store_true",
         help=(
             "Fail if any primary setting lacks the exact metrics required by the selected audit mode. "
-            "An audit is always written under results/primary_analysis/metric_completeness_audit/."
+            "An audit is always written under results/analysis/reproducibility/metric_completeness_audit/."
         ),
     )
     p.add_argument(
         "--skip-cmc-requirement", action="store_true",
-        help="Do not require CMC for the completeness audit; simultaneous E(J) and its matched null remain required.",
+        help=(
+            "Do not require CMC or its paired conditional null for completeness. "
+            "Directional singleton metrics plus simultaneous E(J) and its matched null remain required."
+        ),
     )
     return p.parse_args()
 
@@ -69,11 +114,76 @@ def run(command: list[str]) -> None:
     subprocess.run(command, cwd=CODE_ROOT, check=True)
 
 
-def has_spiking_diagnostics(data_root: Path) -> bool:
-    return any(
-        path.is_dir() and (path.name == "spiking_diagnostics" or path.name.startswith("spiking_diagnostics-cap"))
-        for path in data_root.rglob("spiking_diagnostics*")
+def _zip_has_spiking_payload(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = [name.lstrip("./") for name in zf.namelist()]
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return any(name.endswith("aggregate_flip_stats.csv") for name in names) and any(
+        name.endswith("aggregate_unit_tests.csv") for name in names
     )
+
+
+def _root_has_spiking_payload(root: Path) -> bool:
+    if not root.is_dir():
+        return False
+    # Search for the actual inputs consumed by stage07 rather than relying on a
+    # particular directory name. Historical runs and capped runs used several
+    # layouts, while the CSV contract is stable.
+    have_flip = next(root.rglob("aggregate_flip_stats.csv"), None) is not None
+    have_tests = next(root.rglob("aggregate_unit_tests.csv"), None) is not None
+    return have_flip and have_tests
+
+
+def resolve_spiking_source(explicit: str | None, data_root: Path) -> Path | None:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.append(data_root)
+    for name in (
+        "spiking_diagnostics_results_for_inspection.zip",
+        "spiking_diagnostics.zip",
+        "threshold_spiking_diagnostics.zip",
+    ):
+        candidates.append(PROJECT_ROOT / name)
+        candidates.append(PROJECT_ROOT / "data" / name)
+    # Also accept a uniquely matching diagnostics archive in the project root.
+    candidates.extend(sorted(PROJECT_ROOT.glob("*spiking*diagnostic*.zip")))
+    candidates.extend(sorted(PROJECT_ROOT.glob("*threshold*diagnostic*.zip")))
+
+    seen: set[Path] = set()
+    for raw in candidates:
+        path = raw.resolve() if raw.exists() else raw
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.is_file() and path.suffix.lower() == ".zip" and _zip_has_spiking_payload(path):
+            return path
+        if path.is_dir() and _root_has_spiking_payload(path):
+            return path
+    return None
+
+
+def relocate_paper_sidecars(results_root: Path) -> None:
+    """Copy machine sidecars to analysis/ without removing their original files."""
+    fig_root = manuscript_figures(results_root)
+    fig_data_root = figure_data(results_root)
+    if fig_root.is_dir():
+        for src in list(fig_root.rglob("*.csv")) + list(fig_root.rglob("*.json")):
+            rel = src.relative_to(fig_root)
+            dst = fig_data_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+
+    tbl_root = manuscript_materials(results_root)
+    tbl_data_root = table_data(results_root)
+    if tbl_root.is_dir():
+        for src in list(tbl_root.rglob("*.csv")) + list(tbl_root.rglob("*.json")):
+            rel = src.relative_to(tbl_root)
+            dst = tbl_data_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
 
 
 def poisoning_run_dirs(poisoning_root: Path) -> list[Path]:
@@ -98,14 +208,516 @@ def poisoning_run_dirs(poisoning_root: Path) -> list[Path]:
     return out
 
 
+
+
+def publish_per_run_poisoning_visuals(
+    poisoning_runs: list[Path],
+    *,
+    results_root: Path,
+) -> dict[str, int]:
+    """Publish per-run poisoning figures grouped by scientific role.
+
+    Stage-08 cross-seed outputs summarize replication but do not preserve every
+    checkpoint/channel identity, so per-run figures are published separately.
+    Cache-backed story figures are regenerated when their singleton inputs exist.
+    This function performs no model inference.
+    """
+    paper_root_dir = poisoning_figures(results_root) / "per_run"
+    analysis_dir = poisoning_results(results_root) / "per_run_visualizations"
+    paper_root_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    regenerated = 0
+    skipped = 0
+    manifest_rows: list[dict[str, str]] = []
+
+    def copy_family(
+        *,
+        src_root: Path,
+        dst_root: Path,
+        family: str,
+        run_dir: Path,
+        task: str,
+        run_name: str,
+        phase_dir: str,
+        recursive: bool = True,
+        names: set[str] | None = None,
+    ) -> int:
+        """Copy selected PDFs below src_root while preserving relative structure."""
+        if not src_root.is_dir():
+            return 0
+        paths = sorted(src_root.rglob("*.pdf") if recursive else src_root.glob("*.pdf"))
+        if names is not None:
+            paths = [path for path in paths if path.name in names]
+        n = 0
+        for src in paths:
+            rel = src.relative_to(src_root)
+            dst = dst_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            manifest_rows.append(
+                {
+                    "task": task,
+                    "run": run_name,
+                    "phase": phase_dir,
+                    "family": family,
+                    "source": str(src),
+                    "published": str(dst),
+                }
+            )
+            n += 1
+        return n
+
+    for run_dir in poisoning_runs:
+        task = run_dir.parent.name
+        run_name = run_dir.name
+        checkpoint_root = run_dir / "03_checkpoint_causal_discovery"
+        for phase_dir in ("prompt_and_generation", "generation_only"):
+            phase_present = checkpoint_root.is_dir() and any(
+                checkpoint_root.glob(f"*/progress_*/{phase_dir}")
+            )
+            if not phase_present:
+                continue
+
+            analysis_phase = analysis_dir / task / run_name / phase_dir
+            paper_phase = paper_root_dir / task / run_name / phase_dir
+            analysis_phase.mkdir(parents=True, exist_ok=True)
+            if paper_phase.exists():
+                shutil.rmtree(paper_phase)
+            paper_phase.mkdir(parents=True, exist_ok=True)
+
+            # Cache-only story figures: developmental overview + individual agonist
+            # role comparison + checkpoint/channel heatmap.
+            control_correctness_roots = list(
+                checkpoint_root.glob(
+                    f"*/progress_*/{phase_dir}/attack_cohort_control_correctness/eval_*"
+                )
+            )
+            has_story_singletons = any(
+                any(root.rglob("singleton_set_metrics.csv")) for root in control_correctness_roots
+            )
+            story_dir = analysis_phase / "story"
+            if has_story_singletons:
+                cmd = [
+                    sys.executable, "-m", "studies.poisoning.stage07_plot_overtopping_poisoning_story",
+                    "--run_dir", str(run_dir),
+                    "--phase_dir", phase_dir,
+                    "--eval_intervention", "mean-donor",
+                    "--output_dir", str(story_dir),
+                ]
+                try:
+                    subprocess.run(cmd, cwd=CODE_ROOT, check=True)
+                    regenerated += 1
+                except subprocess.CalledProcessError as exc:
+                    print(
+                        f"[final-results] per-run poisoning story unavailable for {task}/{run_name}/{phase_dir}: {exc}",
+                        flush=True,
+                    )
+                    skipped += 1
+            else:
+                skipped += 1
+
+            # 01 — Behavior: checkpoint-specific clean/poison comparisons plus the
+            # trajectory plots emitted by Stage 04.  This can be a large family, so
+            # retain the original checkpoint/endpoint subdirectories rather than
+            # flattening dozens of identically named rates.pdf files.
+            copied += copy_family(
+                src_root=run_dir / "04_condition_comparisons" / phase_dir,
+                dst_root=paper_phase / "01_behavior" / "checkpoint_comparisons",
+                family="behavior_checkpoint_comparisons",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+            )
+
+            # 02 — One dynamic behavior/causal dashboard from Stage 05.  It
+            # includes only endpoints with materialized data and subsumes the
+            # dual-axis and trigger-lift-only trajectory figures.
+            copied += copy_family(
+                src_root=run_dir / "05_behavior_trajectories" / phase_dir,
+                dst_root=paper_phase / "02_behavior_trajectories",
+                family="behavior_trajectories",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                recursive=False,
+                names={"backdoor_overtopping_dashboard.pdf"},
+            )
+
+            # 03 — Causal-role story and the richer Stage-07 mechanism figures.
+            copied += copy_family(
+                src_root=story_dir,
+                dst_root=paper_phase / "03_causal_roles" / "story",
+                family="causal_role_story",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                recursive=False,
+            )
+            interpretation = (
+                run_dir / "07_poisoning_example_detection" / phase_dir / "overtopping_interpretation"
+            )
+            copied += copy_family(
+                src_root=interpretation / "01_overtopping_mechanism",
+                dst_root=paper_phase / "03_causal_roles" / "mechanism",
+                family="causal_role_mechanism",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                recursive=False,
+            )
+
+            # 04 — Poison-example detection: publish raw Stage-07 plots and the
+            # implication-first overview when each source contains figures.
+            detection_phase = run_dir / "07_poisoning_example_detection" / phase_dir
+            raw_detection_dst = paper_phase / "04_poison_detection" / "raw_stage07"
+            raw_detection_pdfs = sorted(detection_phase.glob("*.pdf")) if detection_phase.is_dir() else []
+            if raw_detection_pdfs:
+                raw_detection_dst.mkdir(parents=True, exist_ok=True)
+                for src in raw_detection_pdfs:
+                    dst = raw_detection_dst / src.name
+                    shutil.copy2(src, dst)
+                    manifest_rows.append({"task":task,"run":run_name,"phase":phase_dir,"family":"poison_detection_raw","source":str(src),"published":str(dst)})
+                    copied += 1
+            elif raw_detection_dst.is_dir() and not any(raw_detection_dst.iterdir()):
+                raw_detection_dst.rmdir()
+            copied += copy_family(
+                src_root=interpretation / "00_poison_detection_overview",
+                dst_root=paper_phase / "04_poison_detection" / "overview",
+                family="poison_detection_overview",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                recursive=False,
+            )
+
+            # 05 — Update geometry.  Four base geometry views plus two
+            # update-energy controls.  Causal concentration is published once, in
+            # the mechanism family with an explicit clean-drift comparison.
+            copied += copy_family(
+                src_root=interpretation / "intermediate" / "base_update_geometry",
+                dst_root=paper_phase / "05_update_geometry" / "base_geometry",
+                family="update_geometry_base",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                recursive=False,
+            )
+            copied += copy_family(
+                src_root=interpretation / "03_update_geometry_checks",
+                dst_root=paper_phase / "05_update_geometry" / "controls",
+                family="update_geometry_controls",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                recursive=False,
+            )
+
+            # 06 — Descriptive link between mechanistic signals and attack growth.
+            copied += copy_family(
+                src_root=interpretation / "04_link_to_attack_behavior",
+                dst_root=paper_phase / "06_attack_link",
+                family="attack_growth_link",
+                run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                recursive=False,
+            )
+
+            # 07 — Threshold/spiking figures generated inside checkpoint causal
+            # outputs.  Keep checkpoint identity in the destination path.  Only the
+            # aggregate figure subdirectories are promoted; raw high-N tables stay
+            # in data/ and analysis/.
+            for fig_dir in sorted(checkpoint_root.rglob("spiking_diagnostics*/figures")):
+                try:
+                    rel_parent = fig_dir.parent.relative_to(checkpoint_root)
+                except ValueError:
+                    continue
+                copied += copy_family(
+                    src_root=fig_dir,
+                    dst_root=paper_phase / "07_threshold_event" / rel_parent,
+                    family="threshold_event",
+                    run_dir=run_dir, task=task, run_name=run_name, phase_dir=phase_dir,
+                    recursive=False,
+                )
+
+            readme = paper_phase / "README.md"
+            readme.write_text(
+                "# Per-run poisoning visualizations\n\n"
+                "This directory intentionally exposes the complete generated poisoning figure set, grouped by scientific role.\n\n"
+                "## 01_behavior\nCheckpoint-specific clean-vs-poison behavior comparisons from Stage 04.\n\n"
+                "## 02_behavior_trajectories\nOne dynamic Stage-05 dashboard containing each available distinct behavior/causal endpoint exactly once.\n\n"
+                "## 03_causal_roles\nThe compact checkpoint story plus additional non-redundant mechanism analyses of causal location, persistence, and concentration. Start with "
+                "`story/02_channel_role_reassignment_and_defense_leverage.pdf`, then inspect "
+                "`mechanism/01_where_poisoning_specific_causal_control_moves.pdf`.\n\n"
+                "## 04_poison_detection\nRaw poison-ranking diagnostics and the implication-first detection overview.\n\n"
+                "## 05_update_geometry\nClean-vs-poison LoRA update geometry and matched/update-energy controls.\n\n"
+                "## 06_attack_link\nDescriptive association between mechanistic reorganization and attack acquisition.\n\n"
+                "## 07_threshold_event\nCheckpoint-level threshold/spiking figures when threshold-event posthoc was generated.\n\n"
+                "Machine-readable source artifacts remain under the corresponding `data/poisoning/...` run.\n",
+                encoding="utf-8",
+            )
+
+    manifest_path = analysis_dir / "published_poisoning_visualizations.csv"
+    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
+    return {
+        "copied_pdfs": copied,
+        "regenerated_story_phases": regenerated,
+        "skipped_story_phases": skipped,
+        "manifest_rows": len(manifest_rows),
+    }
+
+
+def publish_primary_tables(source: Path, paper_tables: Path) -> None:
+    paper_tables.mkdir(parents=True, exist_ok=True)
+    mapping = {
+        "table1_representative.tex": "table1_representative_directional.tex",
+        "table8_primary.tex": "tableS_primary_matrix_directional.tex",
+    }
+    for src_name, dst_name in mapping.items():
+        src = source / src_name
+        if src.is_file():
+            shutil.copy2(src, paper_tables / dst_name)
+
+
+def write_results_index(results_root: Path, *, spiking_available: bool) -> None:
+    paper = paper_root(results_root)
+    figures = manuscript_figures(results_root)
+    tables = manuscript_materials(results_root)
+    paper.mkdir(parents=True, exist_ok=True)
+    figures.mkdir(parents=True, exist_ok=True)
+    tables.mkdir(parents=True, exist_ok=True)
+
+    rq3_status = "available" if spiking_available else "MISSING SOURCE - see Figure 4 README"
+    root_text = f"""# Generated results - start here
+
+Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnostics, or reproducibility material.
+
+## Paper
+
+- `paper/figures/02_rq1_prevalence/` - **RQ1**: directional reach and width-normalized high-effect density using the canonical all-settings phase-panel population and layout.
+- `paper/figures/03_rq2_composition/` - **RQ2**: composition gap, super-additive boundary cases, matched-set specificity.
+- `paper/figures/04_rq3_spiking_cut/` - **RQ3**: threshold visibility / TECS / threshold-tail evidence. Status: **{rq3_status}**.
+- `paper/figures/05_rq4_learning/` - **RQ4**: pooled-U(J)/competence Pythia trajectory plus directional companions and poisoning learning-time role changes. `poisoning/per_run/` preserves the individual-channel/agonist figures; the poisoning directory root contains cross-seed summaries.
+- `paper/figures/appendix_context/` - pooled U(J), phase, and size context only.
+- `paper/tables/` - LaTeX manuscript tables only.
+
+## Analysis
+
+- `analysis/figure_data/` - CSV/JSON sidecars for every paper figure, mirroring the figure subfolders.
+- `analysis/table_data/` - machine-readable sidecars for manuscript tables.
+- `analysis/primary_matrix/` - full 28-setting metric matrix and competence analyses.
+- `analysis/rq3_threshold_event/` - detailed threshold/spiking diagnostics.
+- `analysis/rq4_learning/` - poisoning/cross-seed analysis outputs.
+- `analysis/reproducibility/` - experiment catalogue, completeness audit, and manuscript-output audit.
+
+### Reading order
+
+1. Figure 2a/2c: 0->1 reach and high-effect density.
+2. Figure 2b/2d: 1->0 companions; low-denominator estimates are explicitly marked and excluded from fits.
+3. Figure 3a/3b: composition and coalition boundary.
+4. Figure 4: threshold/spiking-cut evidence.
+5. Figure 5: learning-time role change.
+
+Paper figure directories contain only PDFs and README files; raw CSV/JSON exports are intentionally kept under `analysis/`.
+"""
+    (results_root / "README.md").write_text(root_text, encoding="utf-8")
+
+    figure_text = f"""# Manuscript figure map
+
+- **Figure 1**: conceptual schematic; not generated by this statistical pipeline.
+- **Figure 2 / RQ1**: `02_rq1_prevalence/`
+- **Figure 3 / RQ2**: `03_rq2_composition/`
+- **Figure 4 / RQ3**: `04_rq3_spiking_cut/` - {rq3_status}
+- **Figure 5 / RQ4**: `05_rq4_learning/`
+- **Appendix**: `appendix_context/`
+
+Machine-readable figure data are in `../../analysis/figure_data/`.
+"""
+    (figures / "README.md").write_text(figure_text, encoding="utf-8")
+
+    table_text = """# Manuscript tables
+
+This folder contains paper-facing LaTeX only. CSV/JSON versions live under `results/analysis/table_data/`.
+
+- `02_rq1_prevalence/` - directional prevalence/density table.
+- `03_rq2_composition/` - composition and boundary table.
+- `table1_representative_directional.tex` - representative directional summary.
+- `tableS_primary_matrix_directional.tex` - full primary matrix supplement.
+- `matched_null_metrics.tex` - matched-set validation.
+"""
+    (tables / "README.md").write_text(table_text, encoding="utf-8")
+
+
+
+def validate_generated_paper_view(results_root: Path, *, spiking_expected: bool) -> dict:
+    """Validate the manuscript-facing output contract before reporting success."""
+    figures = manuscript_figures(results_root)
+    tables = manuscript_materials(results_root)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    required_figures = [
+        figures / "02_rq1_prevalence" / "fig2a_competence_vs_U_0to1.pdf",
+        figures / "02_rq1_prevalence" / "fig2b_competence_vs_U_1to0.pdf",
+        figures / "02_rq1_prevalence" / "fig2c_competence_vs_D05_0to1.pdf",
+        figures / "02_rq1_prevalence" / "fig2d_competence_vs_D05_1to0.pdf",
+        figures / "03_rq2_composition" / "fig3a_composition_gap_all_settings.pdf",
+        figures / "05_rq4_learning" / "fig5a_pythia_checkpoint_trajectory.pdf",
+    ]
+    if spiking_expected:
+        required_figures.append(figures / "04_rq3_spiking_cut" / "fig4a_candidate_control_spiking_cut_summary.pdf")
+
+    for path in required_figures:
+        if not path.is_file():
+            errors.append(f"missing manuscript figure: {path}")
+        elif path.stat().st_size < 2_000:
+            errors.append(f"suspiciously small manuscript figure ({path.stat().st_size} bytes): {path}")
+
+    # Paper-facing directories must not regress into a mixed machine-data dump.
+    for root in (figures, tables):
+        if root.is_dir():
+            for suffix in ("*.csv", "*.json"):
+                for path in root.rglob(suffix):
+                    errors.append(f"machine sidecar leaked into paper view: {path}")
+
+    rq1_data = table_data(results_root) / "02_rq1_prevalence" / "table2_directional_prevalence.csv"
+    if rq1_data.is_file():
+        try:
+            frame = pd.read_csv(rq1_data)
+            needed = {
+                "U_J_i2c_n", "U_J_c2i_n", "U_J_i2c_adequate", "U_J_c2i_adequate",
+                "N_t_i2c_0.05_per_1k_layer", "N_t_c2i_0.05_per_1k_layer",
+            }
+            missing = sorted(needed.difference(frame.columns))
+            if missing:
+                errors.append(f"directional prevalence table lacks denominator/adequacy columns: {missing}")
+            for direction in ("i2c", "c2i"):
+                ncol = f"U_J_{direction}_n"
+                if ncol in frame.columns:
+                    low = pd.to_numeric(frame[ncol], errors="coerce") < 32
+                    if bool(low.any()):
+                        warnings.append(
+                            f"{int(low.sum())} {direction} settings have small within-setting source-state denominators; "
+                            "retain them in the across-setting sample and interpret their directional estimates with wider uncertainty"
+                        )
+        except Exception as exc:
+            errors.append(f"could not inspect directional prevalence sidecar {rq1_data}: {exc}")
+    else:
+        errors.append(f"missing directional prevalence sidecar: {rq1_data}")
+
+    # RQ1 paper panels use the full experimental-setting scanner, not the
+    # 28-row primary matrix.  Derived *-heldout_test directories must never be
+    # counted as additional experiments, and the fit-stat sidecar must describe
+    # exactly the same sample as the plotted-point CSV.
+    rq1_fig_data = figure_data(results_root) / "02_rq1_prevalence"
+    for stem in (
+        "fig2a_competence_vs_U_0to1",
+        "fig2b_competence_vs_U_1to0",
+        "fig2c_competence_vs_D05_0to1",
+        "fig2d_competence_vs_D05_1to0",
+    ):
+        points_path = rq1_fig_data / f"{stem}.csv"
+        stats_path = rq1_fig_data / f"{stem}_stats.csv"
+        if not points_path.is_file():
+            errors.append(f"missing all-settings RQ1 point sidecar: {points_path}")
+            continue
+        try:
+            points = pd.read_csv(points_path)
+            if "run" in points.columns:
+                leaked = points["run"].astype(str).str.endswith("-heldout_test")
+                if bool(leaked.any()):
+                    errors.append(f"{stem} counts {int(leaked.sum())} derived heldout-test directories as experiments")
+            if not stats_path.is_file():
+                errors.append(f"missing all-settings RQ1 fit-stat sidecar: {stats_path}")
+            else:
+                fit = pd.read_csv(stats_path)
+                phase_map = {"input+output": "input+output", "decode-only": "decode-only"}
+                for phase in phase_map:
+                    expected = int((points.get("phase", pd.Series(dtype=str)).astype(str) == phase).sum())
+                    row = fit[fit.get("phase", pd.Series(dtype=str)).astype(str).eq(phase)]
+                    reported = int(pd.to_numeric(row["n"], errors="coerce").iloc[0]) if len(row) and "n" in row.columns else -1
+                    if reported != expected:
+                        errors.append(f"{stem} fit n mismatch for {phase}: plotted {expected}, stats report {reported}")
+        except Exception as exc:
+            errors.append(f"could not validate RQ1 all-settings sidecars for {stem}: {exc}")
+
+    stale_primary_trajectory = figures / "05_rq4_learning" / "fig5s3_primary_matrix_directional_checkpoint_trajectory.pdf"
+    if stale_primary_trajectory.exists():
+        errors.append(f"primary-matrix checkpoint diagnostic leaked into paper view: {stale_primary_trajectory}")
+
+    rq3_readme = figures / "04_rq3_spiking_cut" / "README.md"
+    if not spiking_expected and not rq3_readme.is_file():
+        errors.append("RQ3 source is absent but Figure-4 README does not explain the missing evidence")
+
+    audit = {
+        "status": "ok" if not errors else "failed",
+        "spiking_expected": bool(spiking_expected),
+        "errors": errors,
+        "warnings": warnings,
+    }
+    out = analysis_root(results_root) / "reproducibility" / "manuscript_output_audit.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    if errors:
+        raise RuntimeError("Manuscript output validation failed: " + "; ".join(errors[:8]))
+    if warnings:
+        print("[final-results] manuscript-output warnings: " + "; ".join(warnings), flush=True)
+    print(f"[final-results] manuscript output validation passed: {out}", flush=True)
+    return audit
+
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root).expanduser().resolve()
     results_root = Path(args.results_root).expanduser().resolve()
     poisoning_root = Path(args.poisoning_root).expanduser().resolve()
+    # Resolve the RQ3 diagnostics source before report generation so missing
+    # threshold-event inputs fail before manuscript figures are written.
+    spiking_source = None if args.skip_spiking_report else resolve_spiking_source(args.spiking_source, data_root)
     results_root.mkdir(parents=True, exist_ok=True)
 
     catalogue_json = Path(args.catalogue_json).expanduser().resolve() if args.catalogue_json else None
+
+    # Stage 02 supplies the canonical primary-row manifest.  When a directional
+    # backfill is requested this first pass is intentionally only a manifest
+    # pass, so suppress the expected v2 warnings until after the repair.
+    paper_tables = primary_tables(results_root)
+    table_cmd = [
+        sys.executable, "-m", "studies.overtopping.analysis.stage02_overtopping_latex_tables",
+        "--results", str(data_root),
+        "--out", str(paper_tables),
+        "--primary-profile", args.primary_profile,
+    ]
+    if args.rebuild_directional_singletons:
+        table_cmd.append("--suppress-directional-warnings")
+    run(table_cmd)
+
+    if args.rebuild_directional_singletons:
+        run([
+            sys.executable, "-m", "studies.overtopping.analysis.rebuild_directional_stats",
+            "--primary_table", str(paper_tables / "primary_table.csv"),
+            "--data_root", str(data_root),
+            "--population", "both",
+        ])
+        # Refresh the manuscript table from the newly rebuilt held-out statistics.
+        run([
+            sys.executable, "-m", "studies.overtopping.analysis.stage02_overtopping_latex_tables",
+            "--results", str(data_root),
+            "--out", str(paper_tables),
+            "--primary-profile", args.primary_profile,
+        ])
+
+    if args.rebuild_spiking_diagnostics:
+        if args.skip_spiking_report:
+            raise ValueError("--rebuild-spiking-diagnostics cannot be combined with --skip-spiking-report")
+        cmd = [
+            sys.executable, "-m", "studies.overtopping.analysis.rebuild_spiking_diagnostics",
+            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--data-root", str(data_root),
+            "--spiking-max-points", str(args.spiking_max_points),
+            "--target", str(args.spiking_target),
+            "--seed", str(args.spiking_seed),
+        ]
+        if args.spiking_ai_model_cache_dir:
+            cmd.extend(["--ai-model-cache-dir", str(args.spiking_ai_model_cache_dir)])
+        run(cmd)
+        # Pick up the newly generated data/ diagnostics for the manuscript report.
+        spiking_source = resolve_spiking_source(args.spiking_source, data_root)
+        if spiking_source is None:
+            raise RuntimeError(
+                "Spiking diagnostics backfill completed but aggregate_flip_stats.csv + "
+                "aggregate_unit_tests.csv could not be found under data/."
+            )
+
+    publish_primary_tables(paper_tables, manuscript_materials(results_root))
+
+    # Build/refresh the experiment catalogue only after any directional repair so
+    # completed_experiments.csv cannot remain stale relative to manuscript tables.
     if catalogue_json is not None and catalogue_json.is_file():
         run([
             sys.executable, "-m", "studies.overtopping.analysis.stage01_visualize_experiment_results",
@@ -114,14 +726,6 @@ def main() -> None:
             "--out_dir", str(experiment_catalogue(results_root)),
         ])
 
-    paper_tables = primary_tables(results_root)
-    run([
-        sys.executable, "-m", "studies.overtopping.analysis.stage02_overtopping_latex_tables",
-        "--results", str(data_root),
-        "--out", str(paper_tables),
-        "--primary-profile", args.primary_profile,
-    ])
-
     audit_command = [
         sys.executable, "-m", "studies.overtopping.analysis.stage03_audit_required_metrics",
         "--primary-table", str(paper_tables / "primary_table.csv"),
@@ -129,7 +733,7 @@ def main() -> None:
         "--primary-profile", args.primary_profile,
         "--out-dir", str(metric_completeness_audit(results_root)),
     ]
-    if args.require_complete_new_metrics:
+    if args.require_complete_metrics:
         audit_command.append("--require-complete")
     if args.skip_cmc_requirement:
         audit_command.append("--skip-cmc-requirement")
@@ -153,12 +757,74 @@ def main() -> None:
 
     if not args.skip_paper_figures:
         paper_figures = manuscript_figures(results_root)
+        # Render the compact manuscript figure set from the canonical populations.
+        run([
+            sys.executable, "-m", "studies.overtopping.analysis.stage06_manuscript_story_figures",
+            "--primary_table_augmented", str(primary_statistics(results_root) / "primary_table_augmented.csv"),
+            "--manuscript_metrics", str(manuscript_materials(results_root) / "manuscript_metrics.csv"),
+            "--out_dir", str(paper_figures),
+            "--figure_data_dir", str(figure_data(results_root)),
+            "--skip_rq1",
+            "--skip_primary_rq4",
+        ])
+
+        # RQ1 figures use the canonical all-settings population rather than the
+        # 28-row primary matrix used for manuscript tables. Directional source-state
+        # denominators describe uncertainty within a setting and are not an
+        # across-setting exclusion rule. Genuine empty-candidate settings remain
+        # explicit U(J)=0 observations.
+        rq1 = rq1_figures(results_root)
+        rq1.mkdir(parents=True, exist_ok=True)
+        rq1_data = figure_data(results_root) / "02_rq1_prevalence"
+        rq1_data.mkdir(parents=True, exist_ok=True)
+        for metric, filename in [
+            ("i2c", "fig2a_competence_vs_U_0to1.pdf"),
+            ("c2i", "fig2b_competence_vs_U_1to0.pdf"),
+            ("n05-i2c-density", "fig2c_competence_vs_D05_0to1.pdf"),
+            ("n05-c2i-density", "fig2d_competence_vs_D05_1to0.pdf"),
+        ]:
+            run([
+                sys.executable, "-m", "studies.overtopping.analysis.stage06_competence_vs_overtopping_figures",
+                "--results-dir", str(data_root),
+                "--out", str(rq1 / filename),
+                "--layout", "phase-panels",
+                "--coverage-metric", metric,
+                "--rq1-manuscript-population",
+                "--csv-out-dir", str(rq1_data),
+                "--no-paper-figures",
+            ])
+
+        # RQ4 uses a pooled-U(J)/competence checkpoint trajectory plus directional
+        # companions, including genuine zero-candidate checkpoints.
+        rq4 = rq4_figures(results_root)
+        rq4.mkdir(parents=True, exist_ok=True)
+        trajectory_specs = [
+            ("pooled", "fig5a_pythia_checkpoint_trajectory.pdf"),
+            ("i2c", "fig5s1_pythia_checkpoint_U_0to1.pdf"),
+            ("c2i", "fig5s2_pythia_checkpoint_U_1to0.pdf"),
+        ]
+        for metric, filename in trajectory_specs:
+            run([
+                sys.executable, "-m", "studies.overtopping.analysis.stage06_competence_vs_overtopping_figures",
+                "--results-dir", str(data_root),
+                "--only-paper-figures",
+                "--paper-figures", "checkpoint",
+                "--paper-figures-dir", str(rq4),
+                "--paper-checkpoint-phase", "input+output",
+                "--paper-checkpoint-filename", filename,
+                "--coverage-metric", metric,
+                "--no-csv",
+            ])
+
+        # Keep the original pooled-U/phase/size figures as explicit appendix context.
+        appendix = appendix_figures(results_root)
+        appendix.mkdir(parents=True, exist_ok=True)
         run([
             sys.executable, "-m", "studies.overtopping.analysis.stage06_competence_vs_overtopping_figures",
             "--results-dir", str(data_root),
-            "--out", str(paper_figures / "fig_competence_vs_coverage.pdf"),
-            "--paper-figures-dir", str(paper_figures),
-            "--paper-figures", "all",
+            "--out", str(appendix / "figS_pooled_U_vs_competence.pdf"),
+            "--paper-figures", "phase", "size",
+            "--paper-figures-dir", str(appendix),
         ])
 
     # Poisoning run diagnostics stay inside each data/poisoning/<task>/<run> directory.
@@ -179,30 +845,89 @@ def main() -> None:
             "--input_dir", str(poisoning_aggregate),
             "--output_dir", str(poisoning_paper_figures),
         ])
+        per_run_publish = publish_per_run_poisoning_visuals(
+            poisoning_runs, results_root=results_root
+        )
+        print(
+            "[final-results] per-run poisoning visuals: "
+            + json.dumps(per_run_publish, sort_keys=True),
+            flush=True,
+        )
 
     spiking_out = overtopping_spiking_diagnostics(results_root)
     spiking_out.mkdir(parents=True, exist_ok=True)
     if args.skip_spiking_report:
         status = {"status": "skipped", "reason": "--skip-spiking-report"}
         (spiking_out / "report_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
-    elif has_spiking_diagnostics(data_root):
-        run([
+        rq3 = rq3_figures(results_root); rq3.mkdir(parents=True, exist_ok=True)
+        (rq3 / "README.md").write_text("# Figure 4 - RQ3: the spiking cut\n\nGeneration was skipped with `--skip-spiking-report`.\n", encoding="utf-8")
+    elif spiking_source is not None:
+        cmd = [
             sys.executable, "-m", "studies.overtopping.analysis.stage07_overtopping_spiking_report",
-            "--root", str(data_root),
             "--out", str(spiking_out),
-        ])
+            "--paper-figures-dir", str(rq3_figures(results_root)),
+            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--data-root", str(data_root),
+            "--evaluation-split", "test",
+            "--spiking-max-points", str(args.spiking_max_points),
+        ]
+        if spiking_source.is_file():
+            cmd.extend(["--zip", str(spiking_source)])
+        else:
+            cmd.extend(["--root", str(spiking_source)])
+        run(cmd)
+        shape_cmd = [
+            sys.executable, "-m", "studies.overtopping.analysis.stage08_threshold_shape_validation",
+            "--out", str(spiking_out / "threshold_shape_validation"),
+            "--paper-figures-dir", str(rq3_figures(results_root)),
+        ]
+        if spiking_source.is_file():
+            shape_cmd.extend(["--zip", str(spiking_source)])
+        else:
+            shape_cmd.extend(["--root", str(spiking_source)])
+        run(shape_cmd)
     else:
         status = {
             "status": "not_available",
-            "reason": "No spiking_diagnostics directories were found under the data root.",
-            "data_root": str(data_root),
+            "reason": "No aggregate_flip_stats.csv + aggregate_unit_tests.csv diagnostics source was found.",
+            "searched_data_root": str(data_root),
+            "hint": "Set SPIKING_SOURCE=/path/to/spiking_diagnostics_results_for_inspection.zip or rerun threshold_event_diagnostics.",
         }
         (spiking_out / "report_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
-        print(f"[final-results] spiking report unavailable; wrote {spiking_out / 'report_status.json'}")
+        rq3 = rq3_figures(results_root); rq3.mkdir(parents=True, exist_ok=True)
+        (rq3 / "README.md").write_text(
+            "# Figure 4 - RQ3: the spiking cut\n\n"
+            "**RQ3 source missing.** No aggregate threshold/spiking diagnostics were found.\n\n"
+            "Set `SPIKING_SOURCE=/path/to/spiking_diagnostics_results_for_inspection.zip` before running `./generate_results.sh`, "
+            "or rerun `threshold_event_diagnostics` to create the aggregate diagnostics. The pipeline will not silently replace these figures with unrelated proxies.\n",
+            encoding="utf-8",
+        )
+        print(f"[final-results] RQ3 source unavailable; see {rq3 / 'README.md'}")
+
+    # P0.3 is produced directly by Stage 8 interaction validation and therefore
+    # lives in the normal data tree rather than the optional spiking archive.
+    # Aggregate whatever completed preemption runs are present; absence is a
+    # recorded not-available state rather than a final-results failure.
+    run([
+        sys.executable, "-m", "studies.overtopping.analysis.stage09_preemption_report",
+        "--root", str(data_root),
+        "--out", str(spiking_out / "preemption"),
+        "--paper-figures-dir", str(rq3_figures(results_root)),
+    ])
+
+    # Paper-facing directories contain PDFs/TEX/README only. Machine-readable
+    # figure/table sidecars are kept under analysis/ with the same relative names.
+    relocate_paper_sidecars(results_root)
+
+    spiking_available = spiking_source is not None and not args.skip_spiking_report
+    write_results_index(results_root, spiking_available=spiking_available)
+    validate_generated_paper_view(results_root, spiking_expected=spiking_available)
 
     manifest = {
         "data_root": str(data_root),
         "results_root": str(results_root),
+        "paper_root": str(paper_root(results_root)),
+        "analysis_root": str(analysis_root(results_root)),
         "primary_profile": args.primary_profile,
         "primary_tables": str(paper_tables),
         "metric_completeness_audit": str(metric_completeness_audit(results_root)),
@@ -210,7 +935,11 @@ def main() -> None:
         "primary_statistics": str(primary_statistics(results_root)),
         "manuscript_materials": str(manuscript_materials(results_root)),
         "overtopping_spiking_diagnostics": str(spiking_out),
-        "poisoning_paper_outputs": str(poisoning_out),
+        "spiking_source": str(spiking_source) if spiking_source is not None else None,
+        "figure_data": str(figure_data(results_root)),
+        "table_data": str(table_data(results_root)),
+        "poisoning_analysis_outputs": str(poisoning_out),
+        "poisoning_paper_figures": str(poisoning_figures(results_root)),
         "poisoning_root": str(poisoning_root),
         "experiment_catalogue": str(experiment_catalogue(results_root)),
     }

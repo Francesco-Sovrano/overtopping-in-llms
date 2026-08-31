@@ -1,156 +1,106 @@
 # Troubleshooting
 
-## Inspect the command plan
+## Inspect commands before execution
+
+Use dry-run modes first:
 
 ```bash
+./run_overtopping_experiments.sh --dry-run
 ./run_poisoning_experiments.sh --dry-run
 ```
 
-Confirm task, model, seed, run name, checkpoint fractions, trigger behavior, `normal_task`, `attack_cohort_control_correctness`, and Stage-07 settings.
+## A normal-task poisoning scan is unexpectedly very large
 
-## Training configuration mismatch
-
-`01_training_checkpoints/metadata/run_config.json` identifies the run's training configuration. Checkpoints from different model, optimizer, LoRA, dataset, schedule, or checkpoint settings belong in separate run directories.
-
-## Pre-training trigger/control diagnostic is large
-
-The fraction-zero diagnostic measures marker sensitivity before training. It is reported separately from the control-correctness causal branch and Stage-07 row score.
-
-## Trigger CHA is absent
-
-With `RUN_TRIGGER_LIFT_CHA=0`, the backdoor trigger test still reports behavior. Stage 07 uses `attack_cohort_control_correctness`, not trigger-conditioned CHA.
-
-Inspect:
-
-```text
-03_checkpoint_causal_discovery/<condition>/<checkpoint>/<phase>/attack_cohort_control_correctness/eval_<intervention>/
-```
-
-## Fraction 0 lacks control-correctness output
-
-Stage 07 requires the fraction-zero causal reference. Rerun `scripts/run_checkpoint_causal_workflow.sh` for the missing checkpoint.
-
-## Control-correctness cohort is rejected
-
-The causal endpoint requires attack-eligible/non-target rows only and the encoding:
-
-```text
-is_correct_control = 1  correct
-is_correct_control = 0  incorrect
-```
-
-The launcher checks row eligibility, correctness semantics, and equality of control prompts/outputs with the paired backdoor cache.
-
-Full-cohort `normal_task` rows are not valid inputs for this CHA.
-
-## No causal candidates are discovered
-
-Stage 07 requires at least one attack-cohort control-correctness agonist somewhere in the matched clean/poisoned trajectory at the configured `tau`. Inspect the Stage-03 CHA status and `frozen_candidate_ranking.csv`.
-
-## Fixed U(j) materialization starts model work
-
-Stage 07 evaluates the union candidate set at every matched checkpoint on the fixed held-out attack cohort. Complete materializations are reused unless `--overwrite` is supplied.
-
-## Cohort mismatch during U(j) comparison
-
-Compared states require the same immutable held-out row identities and gold values. Regenerate the Stage-02 cohort and affected checkpoint outputs from one run configuration.
-
-## Evaluation-count mismatch
-
-Each union candidate needs the same fixed evaluation count at poisoned start/end and clean start/end. Missing measurements are not assigned zero.
-
-## `trainer_random` schedule is rejected
-
-Per-exposure scoring requires the persisted deterministic exposure order. Use `poison_schedule_mode=uniform_optimizer_steps`.
-
-## Multi-epoch run is rejected
-
-Stage 07 assigns one score per scheduled exposure and currently supports one training epoch.
-
-## No disruptive channels are selected
-
-Inspect:
-
-```text
-ordinary_channel_disruption.csv
-```
-
-Relevant columns are:
-
-```text
-complete_u_j_comparison
-poisoning_excess_delta_u_j
-disruption_score
-clean_null_z
-comparison_status
-```
-
-`CHA_TAU` controls candidate discovery. `--min_abs_delta_u` controls developmental effect size. `--min_clean_null_z` is optional and requires an adequate clean null.
-
-## Clean-null runs are rejected
-
-Additional clean trajectories require:
-
-- distinct run directories;
-- distinct training seeds;
-- the same seed-independent scientific training configuration;
-- matching checkpoint fractions and global steps.
-
-A clean-null z-score requires at least three finite independent clean trajectories and positive sample variance for that channel/interval.
-
-## Detectability/attack association has fewer intervals than expected
-
-`detection_vs_attack_success_by_interval.csv` uses only checkpoint fractions present in the current Stage-04 backdoor trajectory. Missing start or end behavior makes interval-change metrics unavailable.
-
-Inspect:
-
-```text
-04_condition_comparisons/<phase>/eval_<intervention>/backdoor_trigger_test/trajectory.csv
-```
-
-and:
-
-```text
-07_poisoning_example_detection/<phase>/detection_vs_attack_association.csv
-```
-
-`n_intervals` is the number of finite aligned interval pairs used by each test.
-
-## Detectability/attack statistic is undefined
-
-Spearman rho is undefined when one metric is constant over the finite aligned intervals. The association table reports `status=undefined_statistic`.
-
-At least three finite interval pairs are required for a p-value.
-
-## A selected channel does not map to a trained projection
-
-MLP channels map to `mlp.down_proj`; attention channels map to `self_attn.v_proj`. The mapped projection must be a LoRA target in the run configuration.
-
-Grouped-query attention can map several activation channels to one value-projection row.
-
-## Raw WANDA scores differ strongly across intervals
-
-Use `wanda_interval_percentile` for cross-interval ranking and `wanda_interval_robust_z` when defined. Raw WANDA values are interval-specific.
-
-## Stage-07 output location
-
-Run-local outputs belong under:
-
-```text
-data/poisoning/<task>/<run_id>/07_poisoning_example_detection/<phase>/
-```
-
-Stage 08 writes cross-run outputs under `data/poisoning/final/`.
-
-## Import errors
-
-Run Python modules from `code/`:
+The normal-task behavior endpoint defaults to 10,000 rows. Check:
 
 ```bash
-cd code
-python3 -m studies.poisoning.stage07_detect_poisoning_examples --help
+printf '%s\n' "${NORMAL_TASK_SCAN_MAX_ROWS:-unset}"
 ```
+
+`NORMAL_TASK_SCAN_MAX_ROWS=0` means exhaustive evaluation and can expand arithmetic to hundreds of thousands of rows. The setting is independent of `TRIGGER_LIFT_SCAN_MAX_ROWS`.
+
+Full-run inference/evaluation defaults to `PIPELINE_BATCH_SIZE=32`. Reduce it for memory pressure; do not change the scientific population to address batch-size limits.
+
+## Normal-task cache population mismatch
+
+Normal-task caches record row identity, sampling strategy, stratification, cap, seed, and population size. A cache built with a different population is rejected.
+
+After a sampling-definition change, remove the stale `normal_task` cache and derived normal-task Stage-03/04/05 outputs. Keep paired `backdoor_trigger_test` caches: exact overlapping no-trigger outputs can still be reused prompt by prompt.
+
+## Clean and poisoned normal-task populations differ
+
+Stage 04 rejects comparisons when population metadata differ. Rebuild both conditions with the same task seed and `NORMAL_TASK_SCAN_MAX_ROWS`. Do not merge or average mismatched cohorts.
+
+## Trigger behavior exists but trigger CHA is absent
+
+This is expected when:
+
+```text
+RUN_TRIGGER_LIFT_CHA=0
+```
+
+The behavioral trigger trajectory remains valid. Figures omit trigger-lift causal panels when those metrics were not computed.
+
+## Control-correctness CHA is missing
+
+The attack-cohort control-correctness endpoint is required for the poisoning causal story. Check the checkpoint's `attack_cohort_control_correctness/` directory and status metadata. Low-data policy may explicitly skip CHA when the required positive/negative baseline population is unavailable.
+
+## Scientific guard reports many arithmetic correctness mismatches
+
+The guard recomputes arithmetic correctness from the exact textual model generation. `prompt_control`, `raw_output_control`, and `original_prompt` must therefore remain strings when `scores.csv` is reloaded. A numeric-looking output such as `12` must not be converted to `12.0`. The checkpoint runner loads these columns explicitly as text for both the causal-control and paired backdoor score tables. Existing model caches remain valid; rerun the failed checkpoint so the score export and guard are evaluated with the textual reload.
+
+## Stage 07 says a fixed candidate materialization is missing
+
+Stage 07 requires explicit singleton evaluation of the frozen control-correctness candidate union on the fixed held-out attack cohort. It does not assign zero effect to missing candidates. Re-run the checkpoint causal workflow for the affected scientific configuration so the required candidate statistics and feature reports exist.
+
+## Stage 7b reports Stage-7 rows are missing
+
+Stage 7b must operate inside the row identities materialized by Stage 7. Current population construction intersects the requested split and baseline with that Stage-7 population before selecting diagnostics rows. If the error instead reports missing candidate flip columns, rebuild Stage 7 for the intended evaluation configuration; candidate agonists are not regenerated by Stage 7b.
+
+## RQ3 reporting reports a population audit failure
+
+RQ3 reporting uses exactly the primary-table population and requires the declared positive/negative baseline subsets and candidate/control diagnostics. Inspect the population-audit output under `results/analysis/`. Do not point RQ3 at a directory containing unrelated or poisoning diagnostics.
+
+## RQ3 diagnostics collide across point caps
+
+Non-default caps are encoded in diagnostic paths, for example `-cap512`. If two caps appear in one directory, move or remove the malformed output and rebuild with the canonical path resolver.
+
+## RQ1 selects an unexpected reference run
+
+Reference matching is based on delimited scientific configuration tokens. Check the configured spectral size, phase, anchoring mode, and threshold. Derived held-out/train/all evaluation directories are not source candidates.
+
+## Directional manuscript rows are missing
+
+For manuscript rows, missing directional metrics are an error rather than a reason to drop the setting. Rebuild statistics from the existing materialized `scores.csv`:
+
+```bash
+REBUILD_DIRECTIONAL_SINGLETONS=true ./generate_results.sh
+```
+
+## Stage 08 poisoning aggregation rejects a task/model family
+
+Multiple poison rates, marker configurations, or training configurations are present under one task/model family. Aggregate or plot one scientific configuration at a time. Stage 08 intentionally does not connect incompatible runs into one trajectory.
+
+## Poison-detection metrics are empty
+
+Check `07_poisoning_example_detection/` for interval status tables. Empty detector metrics can result from no causally disrupted channels passing the effect/uncertainty criteria or from missing prerequisite materializations. Ground-truth labels alone are insufficient to create a detector result.
 
 ## Accelerator memory pressure
 
-Stage 03 and Stage 07 load checkpoints sequentially. Avoid concurrent large checkpoint analyses on one accelerator.
+Reduce operational batch sizes such as:
+
+```bash
+PIPELINE_BATCH_SIZE=8 ./run_poisoning_experiments.sh
+```
+
+Stage-07 WANDA and fixed-U evaluation have separate batch controls. Lowering a batch size should not change the selected rows or candidates.
+
+## Import errors
+
+Run modules from `code/` or set:
+
+```bash
+export PYTHONPATH="$PWD/code${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+Use the repository virtual environment so the shared and poisoning-specific requirements are installed together.
