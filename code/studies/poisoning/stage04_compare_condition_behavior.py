@@ -285,12 +285,25 @@ def _trigger_gate_failures(
     return failures
 
 def _normal_task_population_key(stats: dict[str, Any]) -> tuple[Any, ...]:
+    mode = stats.get("normal_task_population_mode")
+    strategy = stats.get("normal_task_sampling_strategy")
+    if mode == "full_heldout_distribution" or strategy == "full_distribution":
+        # Exhaustive evaluation does not depend on a candidate-order seed or
+        # stratification contract. Different caps above the population size
+        # describe the same materialized evaluation population.
+        population_size = stats.get("normal_task_population_size")
+        scanned_n = stats.get("scanned_n")
+        return (
+            "full_heldout_distribution",
+            population_size if population_size is not None else scanned_n,
+            scanned_n,
+        )
     return (
-        stats.get("normal_task_population_mode"),
+        "deterministic_proportional_stratified_sample",
         stats.get("normal_task_population_size"),
         stats.get("normal_task_scan_max_rows"),
         stats.get("normal_task_candidate_order_seed"),
-        stats.get("normal_task_sampling_strategy"),
+        strategy,
         stats.get("normal_task_stratification"),
         stats.get("scanned_n"),
     )
@@ -450,16 +463,6 @@ def _trajectory_rows(
                 **stats,
             }
         )
-    if _canonical_kind(kind) == "normal_task" and out:
-        keys = {
-            _normal_task_population_key(row)
-            for row in out
-        }
-        if len(keys) > 1:
-            raise RuntimeError(
-                "Normal-task trajectory mixes different evaluation populations. "
-                "Rebuild all checkpoints with one NORMAL_TASK_SCAN_MAX_ROWS and task seed."
-            )
     return out
 
 
@@ -626,6 +629,17 @@ def main() -> None:
                 condition_rank.get(str(row.get("condition", "")), 100),
             ) <= current_key
         ]
+    # Validate only the trajectory prefix that is scientifically current.
+    # Later checkpoint score exports can be stale artifacts from an earlier
+    # run and are intentionally excluded before this check.
+    if _canonical_kind(args.kind) == "normal_task" and trajectory:
+        keys = {_normal_task_population_key(row) for row in trajectory}
+        if len(keys) > 1:
+            raise RuntimeError(
+                "Normal-task trajectory mixes different evaluation populations. "
+                "For capped sampling, rebuild checkpoints with one "
+                "NORMAL_TASK_SCAN_MAX_ROWS and task seed."
+            )
     created.extend(_write_trajectory(root, args.kind, trajectory, plots=not args.no_plots))
     for path in created:
         print(f"[behavior-output] {path}", flush=True)

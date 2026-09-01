@@ -436,7 +436,7 @@ def _add_directional_singleton_metrics(
         out[column] = extra.reindex(out.index)[column].to_numpy()
     if require_complete and missing:
         raise ValueError(
-            "Directional singleton metrics are incomplete. Run rebuild_directional_stats first: "
+            "Directional singleton metrics are incomplete or use a non-canonical persisted schema. Migrate/recompute the experiment artifacts before analysis: "
             + "; ".join(missing[:10])
         )
     return out, missing
@@ -853,7 +853,7 @@ def _exact_frozen_toc1(stats_dir: Path) -> tuple[float, str]:
     singleton_path = stats_dir / "singleton_set_metrics.json"
     if singleton_path.exists():
         payload = json.loads(singleton_path.read_text(encoding="utf-8"))
-        if payload.get("definition_version") in {"heldout-set-metrics-v2", "heldout-set-metrics-v3-directional"}:
+        if payload.get("definition_version") == "heldout-set-metrics-v3-directional":
             toc = payload.get("TOC_m", {})
             entry = toc.get("1", {}) if isinstance(toc, dict) else {}
             if isinstance(entry, dict):

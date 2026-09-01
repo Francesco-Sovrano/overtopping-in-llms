@@ -98,17 +98,9 @@ RQ2 reports causal composition and superadditivity/boundary cases. Exact zero-va
 
 Threshold diagnostics are model-backed analyses built from Stage-7 materialized candidate evaluations plus non-candidate controls evaluated by the diagnostic stage. Candidate interventions are copied from Stage 7; they are not regenerated.
 
-`SPIKING_MAX_POINTS` defaults to 10,000 in final-results rebuilding. Non-default caps have distinct output directories such as `-cap512`.
+Threshold/spiking diagnostics must already exist before final-results generation. `generate_results.sh` never runs model-backed experiment stages or repairs `data/`.
 
-Primary threshold-event seeds are deterministic by canonical primary-row index: row 0 uses 42, row 1 uses 43, and so on. The experiment catalogue and the final-results backfill use the same per-row seed. Seed is part of the scientific-method reuse metadata because it controls random control selection and repeated holdout splits.
-
-Use:
-
-```bash
-REBUILD_SPIKING_DIAGNOSTICS=true SPIKING_MAX_POINTS=10000 ./generate_results.sh
-```
-
-or provide a specific source:
+Provide a specific diagnostics source when it is not discoverable under `data/`:
 
 ```bash
 SPIKING_SOURCE=/absolute/path/to/spiking_diagnostics... ./generate_results.sh
@@ -139,13 +131,9 @@ results/
 
 ## Validation controls
 
-`generate_results.sh` supports:
+`generate_results.sh` supports reporting-only controls:
 
 ```text
-REBUILD_DIRECTIONAL_SINGLETONS
-REBUILD_SPIKING_DIAGNOSTICS
-SPIKING_MAX_POINTS
-SPIKING_TARGET
 SPIKING_SOURCE
 REQUIRE_CMC
 ALLOW_INCOMPLETE_METRICS

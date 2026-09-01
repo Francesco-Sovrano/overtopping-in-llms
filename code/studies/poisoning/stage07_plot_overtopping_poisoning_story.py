@@ -28,6 +28,43 @@ from studies.poisoning.stage04_compare_condition_behavior import summarize_score
 from studies.poisoning.lib.run_paths import detection_dir
 
 
+CONTROL_COLUMNS = [
+    "condition", "fraction", "global_step", "unit_key",
+    "c2i_rate", "i2c_rate", "flip_any_rate",
+    "control_correctness_value_source", "discovered_at_checkpoint",
+]
+ATTACK_COLUMNS = [
+    "condition", "fraction", "global_step", "unit_key",
+    "attack_c2i_rate", "attack_flip_any_rate", "attack_value_source",
+]
+
+
+def _empty_with_schema(columns: list[str]) -> pd.DataFrame:
+    return pd.DataFrame({col: pd.Series(dtype=object) for col in columns})
+
+
+def _coerce_story_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize numeric plotting columns, including schema-only empty frames.
+
+    Empty attack materializations are intentionally created with a stable
+    column schema.  Those columns used to have object dtype, and after a concat
+    with sparse/empty inputs ``np.isclose`` could receive an object Series and
+    raise ``TypeError: ufunc 'isfinite' not supported``.  Coercing at the data
+    boundary keeps all downstream plotting code numeric and also handles old
+    CSVs where fractions were read as strings.
+    """
+    if df is None:
+        return df
+    out = df.copy()
+    for col in (
+        "fraction", "global_step", "c2i_rate", "i2c_rate", "flip_any_rate",
+        "attack_c2i_rate", "attack_flip_any_rate",
+    ):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
 def _finite(x: object) -> float:
     try:
         v = float(x)
@@ -71,7 +108,7 @@ def _fixed_control_correctness_materialization(run_dir: Path, phase_dir: str) ->
     root = detection_dir(run_dir) / phase_dir / "control_correctness_u_j_materialization"
     rows: list[dict[str, Any]] = []
     if not root.is_dir():
-        return pd.DataFrame()
+        return _empty_with_schema(CONTROL_COLUMNS)
     for condition in ("clean", "poisoned"):
         cond_root = root / condition
         if not cond_root.is_dir():
@@ -103,14 +140,14 @@ def _fixed_control_correctness_materialization(run_dir: Path, phase_dir: str) ->
                     "flip_any_rate": _finite(rec.get("flip_any_rate")),
                     "control_correctness_value_source": "stage07_fixed_candidate_union",
                 })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=CONTROL_COLUMNS)
 
 
 def _fixed_attack_materialization(run_dir: Path, phase_dir: str) -> pd.DataFrame:
     root = detection_dir(run_dir) / phase_dir / "attack_u_j_materialization" / "poisoned"
     rows: list[dict[str, Any]] = []
     if not root.is_dir():
-        return pd.DataFrame()
+        return _empty_with_schema(ATTACK_COLUMNS)
     for checkpoint in sorted(root.glob("progress_*")):
         info = _progress(checkpoint)
         if info is None:
@@ -136,13 +173,13 @@ def _fixed_attack_materialization(run_dir: Path, phase_dir: str) -> pd.DataFrame
                 "attack_flip_any_rate": _finite(rec.get("flip_any_rate")),
                 "attack_value_source": "stage07_fixed_candidate_union",
             })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=ATTACK_COLUMNS)
 
 
 def _combine_attack_longitudinal(local: pd.DataFrame, fixed: pd.DataFrame) -> pd.DataFrame:
     key = ["condition", "fraction", "unit_key"]
     if fixed.empty:
-        return local.sort_values(key).reset_index(drop=True) if not local.empty else pd.DataFrame()
+        return local.sort_values(key).reset_index(drop=True) if not local.empty else _empty_with_schema(ATTACK_COLUMNS)
     if local.empty:
         return fixed.sort_values(key).reset_index(drop=True)
     local = local.copy()
@@ -161,7 +198,7 @@ def _combine_control_correctness_longitudinal(local: pd.DataFrame, fixed: pd.Dat
     """Prefer fixed-union values while retaining checkpoint discovery status."""
     key = ["condition", "fraction", "unit_key"]
     if local.empty and fixed.empty:
-        return pd.DataFrame()
+        return _empty_with_schema(CONTROL_COLUMNS)
     local = local.copy()
     if not local.empty:
         local["discovered_at_checkpoint"] = True
@@ -341,13 +378,17 @@ def load_cached_story(run_dir: Path, phase_dir: str, intervention: str) -> tuple
 
     summary = pd.DataFrame(summary_rows).sort_values(["fraction", "condition"]).reset_index(drop=True)
     summary = _fill_shared_zero_summary(summary)
-    local_ordinary = pd.DataFrame(control_rows)
+    local_ordinary = pd.DataFrame(control_rows, columns=CONTROL_COLUMNS)
     fixed_ordinary = _fixed_control_correctness_materialization(run_dir, phase_dir)
     control = _combine_control_correctness_longitudinal(local_ordinary, fixed_ordinary)
     control = _fill_shared_zero_ordinary(control)
-    local_trigger = pd.DataFrame(trigger_rows)
+    local_trigger = pd.DataFrame(trigger_rows, columns=ATTACK_COLUMNS)
     fixed_trigger = _fixed_attack_materialization(run_dir, phase_dir)
     trigger = _combine_attack_longitudinal(local_trigger, fixed_trigger)
+    # Normalize after all legacy/fixed/local sources have been combined.  This
+    # makes sparse and schema-only attack/control tables safe for np.isclose.
+    control = _coerce_story_numeric_columns(control)
+    trigger = _coerce_story_numeric_columns(trigger)
     return summary, control, trigger
 
 
@@ -433,7 +474,9 @@ def plot_developmental_story(summary: pd.DataFrame, control: pd.DataFrame, trigg
     ax.set_ylabel("Intervention effect (%)")
     ax.set_ylim(0,105)
     ax.grid(True, alpha=0.15)
-    ax.legend(frameon=False, fontsize=8)
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(frameon=False, fontsize=8)
 
     axes[0,0].legend(frameon=False, fontsize=8, loc="lower right")
     fig.suptitle("Poisoning changes the developmental trajectory and role of overtopping", fontsize=14, fontweight="bold")
@@ -447,9 +490,11 @@ def plot_developmental_story(summary: pd.DataFrame, control: pd.DataFrame, trigg
 
 
 def _checkpoint_channel_panel(ax, control: pd.DataFrame, trigger: pd.DataFrame, fraction: float, top_n: int = 8) -> None:
-    clean = control[(control["condition"] == "clean") & np.isclose(control["fraction"], fraction)]
-    poison = control[(control["condition"] == "poisoned") & np.isclose(control["fraction"], fraction)]
-    attack = trigger[np.isclose(trigger["fraction"], fraction)]
+    control_fraction = pd.to_numeric(control["fraction"], errors="coerce").to_numpy(float)
+    trigger_fraction = pd.to_numeric(trigger["fraction"], errors="coerce").to_numpy(float)
+    clean = control[(control["condition"] == "clean") & np.isclose(control_fraction, fraction, equal_nan=False)]
+    poison = control[(control["condition"] == "poisoned") & np.isclose(control_fraction, fraction, equal_nan=False)]
+    attack = trigger[np.isclose(trigger_fraction, fraction, equal_nan=False)]
     units = set(clean.get("unit_key", [])) | set(poison.get("unit_key", [])) | set(attack.get("unit_key", []))
     scored = []
     for u in units:

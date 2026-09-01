@@ -16,7 +16,7 @@ from studies.overtopping.analysis.primary_holdout_analysis import reference_stat
 
 from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, normalize_primary_table
 
-SINGLETON_SCHEMAS = {"heldout-set-metrics-v2", "heldout-set-metrics-v3-directional"}
+SINGLETON_SCHEMAS = {"heldout-set-metrics-v3-directional"}
 INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
 
 

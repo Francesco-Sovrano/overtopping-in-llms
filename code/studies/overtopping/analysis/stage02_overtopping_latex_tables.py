@@ -192,7 +192,7 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
         if not singleton_path.exists():
             raise FileNotFoundError(f"Missing current singleton metrics: {singleton_path}")
         singleton = read_json(singleton_path)
-        if singleton.get("definition_version") not in {"heldout-set-metrics-v2", "heldout-set-metrics-v3-directional"}:
+        if singleton.get("definition_version") != "heldout-set-metrics-v3-directional":
             raise ValueError(
                 f"Unsupported singleton metrics schema at {singleton_path}: "
                 f"{singleton.get('definition_version')!r}"
@@ -221,10 +221,10 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
         n10_c2i = int(thresholds_c2i.get("0.1", thresholds_c2i.get("0.10", 0))) if thresholds_c2i else None
 
         # Explicit direction-conditioned union coverage.
-        u_i2c = singleton.get("U_J_i2c", i2c)
-        u_c2i = singleton.get("U_J_c2i", c2i)
-        u_i2c_status = singleton.get("U_J_i2c_status", "global_fallback")
-        u_c2i_status = singleton.get("U_J_c2i_status", "global_fallback")
+        u_i2c = singleton.get("U_J_i2c")
+        u_c2i = singleton.get("U_J_c2i")
+        u_i2c_status = singleton.get("U_J_i2c_status")
+        u_c2i_status = singleton.get("U_J_c2i_status")
         if singleton.get("definition_version") != "heldout-set-metrics-v3-directional":
             warnings.append(
                 f"{spec['task']} | {spec['model']} | {spec['phase']}: directional singleton counts "

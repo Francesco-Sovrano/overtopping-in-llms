@@ -989,7 +989,7 @@ if [[ -s "$STATS_DIR/flip_stats_global.json" ]]; then
 	fi
 fi
 if [[ -s "$STATS_DIR/singleton_set_metrics.json" ]]; then
-	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); raise SystemExit(0 if p.get("definition_version") in {"heldout-set-metrics-v2", "heldout-set-metrics-v3-directional"} else 1)' "$STATS_DIR/singleton_set_metrics.json"; then
+	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); raise SystemExit(0 if p.get("definition_version") == "heldout-set-metrics-v3-directional" else 1)' "$STATS_DIR/singleton_set_metrics.json"; then
 		SINGLETON_SCHEMA_OK=true
 	fi
 fi

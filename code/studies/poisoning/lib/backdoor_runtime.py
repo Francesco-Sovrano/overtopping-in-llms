@@ -79,9 +79,12 @@ def _select_normal_task_rows(
     rows = list(rows_full)
     n_population = len(rows)
     if scan_max_rows <= 0 or scan_max_rows >= n_population:
+        # Exhaustive evaluation: no sampling occurred, so a sampling seed,
+        # stratification scheme, and per-row stratum are not part of the
+        # evaluation-population contract.
         return rows, {
             "sampling_strategy": "full_distribution",
-            "stratification": str(stratification_name),
+            "stratification": None,
             "sample_size": n_population,
         }
 
@@ -217,16 +220,21 @@ def run_control_only_behavior_scan(
                 "behavior_endpoint": "normal_task_accuracy_without_trigger",
                 "normal_task_population_size": int(len(rows_full)),
                 "normal_task_scan_max_rows": int(scan_max_rows),
-                "normal_task_candidate_order_seed": int(candidate_order_seed),
                 "normal_task_sampling_strategy": sample_meta["sampling_strategy"],
-                "normal_task_stratification": sample_meta["stratification"],
-                "normal_task_stratum": _format_stratum_key(normal_task_stratum_key(source)),
                 "normal_task_population_mode": (
                     "full_heldout_distribution" if len(rows) == len(rows_full)
                     else "deterministic_proportional_stratified_sample"
                 ),
             }
         )
+        if sample_meta["sampling_strategy"] != "full_distribution":
+            row.update(
+                {
+                    "normal_task_candidate_order_seed": int(candidate_order_seed),
+                    "normal_task_stratification": sample_meta["stratification"],
+                    "normal_task_stratum": _format_stratum_key(normal_task_stratum_key(source)),
+                }
+            )
         prepared.append(PreparedControlRow(row=row, control_prompt=item.control_prompt))
 
     reuse_path = os.environ.get("POISONING_REUSE_CONTROL_CACHE", "")
@@ -341,10 +349,17 @@ def validate_control_only_behavior_cache(
         "poisoning_holdout_test_fraction",
         "control_marker",
         "normal_task_sampling_strategy",
-        "normal_task_stratification",
-        "normal_task_stratum",
         *required_extra,
     }
+    sampled = sample_meta["sampling_strategy"] != "full_distribution"
+    if sampled:
+        required.update(
+            {
+                "normal_task_candidate_order_seed",
+                "normal_task_stratification",
+                "normal_task_stratum",
+            }
+        )
     for row, expected_row in zip(obj, expected):
         if not required.issubset(row):
             return False
@@ -358,10 +373,13 @@ def validate_control_only_behavior_cache(
             return False
         if row.get("normal_task_sampling_strategy") != sample_meta["sampling_strategy"]:
             return False
-        if row.get("normal_task_stratification") != sample_meta["stratification"]:
-            return False
-        if row.get("normal_task_stratum") != _format_stratum_key(normal_task_stratum_key(expected_row)):
-            return False
+        if sampled:
+            if int(row.get("normal_task_candidate_order_seed", -1)) != int(candidate_order_seed):
+                return False
+            if row.get("normal_task_stratification") != sample_meta["stratification"]:
+                return False
+            if row.get("normal_task_stratum") != _format_stratum_key(normal_task_stratum_key(expected_row)):
+                return False
         if validate_task_row is not None and not validate_task_row(row):
             return False
     return True
@@ -748,12 +766,17 @@ def normal_task_population_statistics(df: pd.DataFrame, *, behavior_readout: str
     for column in (
         "normal_task_population_size",
         "normal_task_scan_max_rows",
+        "normal_task_candidate_order_seed",
         "normal_task_sampling_strategy",
         "normal_task_stratification",
     ):
         if column in df.columns and len(df):
             value = df[column].iloc[0]
-            stats[column] = int(value) if column.endswith(("population_size", "max_rows")) else str(value)
+            stats[column] = (
+                int(value)
+                if column.endswith(("population_size", "max_rows", "order_seed"))
+                else str(value)
+            )
     if "normal_task_stratum" in df.columns:
         stats["normal_task_stratum_counts"] = {
             str(key): int(value) for key, value in df["normal_task_stratum"].value_counts().items()

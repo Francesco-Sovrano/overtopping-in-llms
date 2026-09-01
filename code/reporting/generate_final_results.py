@@ -59,30 +59,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional configured_experiments.json. If present, catalogue plots are refreshed.",
     )
-    p.add_argument(
-        "--rebuild-directional-singletons",
-        action="store_true",
-        help=(
-            "CPU-only backfill: rebuild v3 directional singleton metrics (U_J_i2c/c2i, "
-            "directional N_t/N_eff) from cached scores.csv for both the primary held-out rows "
-            "and the canonical all-settings RQ1 reference-run population, then refresh the "
-            "primary table before statistics/figures."
-        ),
-    )
     p.add_argument("--skip-paper-figures", action="store_true")
     p.add_argument("--skip-spiking-report", action="store_true")
     p.add_argument(
-        "--rebuild-spiking-diagnostics",
-        action="store_true",
-        help=(
-            "Model-backed RQ3 backfill: run threshold_event_diagnostics for every primary row "
-            "using the frozen held-out candidates before generating the manuscript spiking report."
-        ),
+        "--spiking-max-points",
+        type=int,
+        default=10000,
+        help="Maximum plotted RQ3 points read from completed diagnostics; never triggers experiment computation.",
     )
-    p.add_argument("--spiking-max-points", type=int, default=10000)
-    p.add_argument("--spiking-target", default="all")
-    p.add_argument("--spiking-seed", type=int, default=42)
-    p.add_argument("--spiking-ai-model-cache-dir", default=None)
     p.add_argument(
         "--spiking-source",
         default=None,
@@ -663,61 +647,20 @@ def main() -> None:
 
     catalogue_json = Path(args.catalogue_json).expanduser().resolve() if args.catalogue_json else None
 
-    # Stage 02 supplies the canonical primary-row manifest.  When a directional
-    # backfill is requested this first pass is intentionally only a manifest
-    # pass, so suppress the expected v2 warnings until after the repair.
+    # Stage 02 reads completed experiment artifacts and supplies the canonical
+    # primary-row manifest. Final-results generation never mutates data/ or runs
+    # model-backed experiment stages.
     paper_tables = primary_tables(results_root)
-    table_cmd = [
+    run([
         sys.executable, "-m", "studies.overtopping.analysis.stage02_overtopping_latex_tables",
         "--results", str(data_root),
         "--out", str(paper_tables),
         "--primary-profile", args.primary_profile,
-    ]
-    if args.rebuild_directional_singletons:
-        table_cmd.append("--suppress-directional-warnings")
-    run(table_cmd)
-
-    if args.rebuild_directional_singletons:
-        run([
-            sys.executable, "-m", "studies.overtopping.analysis.rebuild_directional_stats",
-            "--primary_table", str(paper_tables / "primary_table.csv"),
-            "--data_root", str(data_root),
-            "--population", "both",
-        ])
-        # Refresh the manuscript table from the newly rebuilt held-out statistics.
-        run([
-            sys.executable, "-m", "studies.overtopping.analysis.stage02_overtopping_latex_tables",
-            "--results", str(data_root),
-            "--out", str(paper_tables),
-            "--primary-profile", args.primary_profile,
-        ])
-
-    if args.rebuild_spiking_diagnostics:
-        if args.skip_spiking_report:
-            raise ValueError("--rebuild-spiking-diagnostics cannot be combined with --skip-spiking-report")
-        cmd = [
-            sys.executable, "-m", "studies.overtopping.analysis.rebuild_spiking_diagnostics",
-            "--primary-table", str(paper_tables / "primary_table.csv"),
-            "--data-root", str(data_root),
-            "--spiking-max-points", str(args.spiking_max_points),
-            "--target", str(args.spiking_target),
-            "--seed", str(args.spiking_seed),
-        ]
-        if args.spiking_ai_model_cache_dir:
-            cmd.extend(["--ai-model-cache-dir", str(args.spiking_ai_model_cache_dir)])
-        run(cmd)
-        # Pick up the newly generated data/ diagnostics for the manuscript report.
-        spiking_source = resolve_spiking_source(args.spiking_source, data_root)
-        if spiking_source is None:
-            raise RuntimeError(
-                "Spiking diagnostics backfill completed but aggregate_flip_stats.csv + "
-                "aggregate_unit_tests.csv could not be found under data/."
-            )
+    ])
 
     publish_primary_tables(paper_tables, manuscript_materials(results_root))
 
-    # Build/refresh the experiment catalogue only after any directional repair so
-    # completed_experiments.csv cannot remain stale relative to manuscript tables.
+    # Refresh the experiment catalogue from completed experiment artifacts.
     if catalogue_json is not None and catalogue_json.is_file():
         run([
             sys.executable, "-m", "studies.overtopping.analysis.stage01_visualize_experiment_results",

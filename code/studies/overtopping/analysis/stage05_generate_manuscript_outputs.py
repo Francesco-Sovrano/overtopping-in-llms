@@ -129,7 +129,6 @@ def augment_row(row: pd.Series, stats_dir: Path) -> dict:
         "R_ov_c2i": _pick(singleton.get("R_ov_c2i")),
         "singleton_metrics_status": (
             "heldout_v3_directional" if singleton.get("definition_version") == "heldout-set-metrics-v3-directional"
-            else "heldout_v2_legacy" if singleton.get("definition_version") == "heldout-set-metrics-v2"
             else "missing_or_incompatible"
         ),
         "interaction_metrics_status": "conditional_v1" if interaction_current else "missing_or_incompatible",

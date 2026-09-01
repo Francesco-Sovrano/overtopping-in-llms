@@ -71,11 +71,7 @@ Reference matching is based on delimited scientific configuration tokens. Check 
 
 ## Directional manuscript rows are missing
 
-For manuscript rows, missing directional metrics are an error rather than a reason to drop the setting. Rebuild statistics from the existing materialized `scores.csv`:
-
-```bash
-REBUILD_DIRECTIONAL_SINGLETONS=true ./generate_results.sh
-```
+For manuscript rows, missing directional metrics are an error rather than a reason to drop the setting. Repair or migrate persisted experiment artifacts separately; `generate_results.sh` does not mutate experiment data.
 
 ## Stage 08 poisoning aggregation rejects a task/model family
 

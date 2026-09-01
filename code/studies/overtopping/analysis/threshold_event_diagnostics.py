@@ -13,6 +13,8 @@ from studies.overtopping.analysis.lib.progress import tqdm
 
 import argparse
 import contextlib
+from functools import lru_cache
+import hashlib
 import json
 import os
 import re
@@ -481,10 +483,46 @@ def _nonempty_csv(path: Path) -> bool:
         return False
 
 
+def _readable_csv(path: Path) -> bool:
+    """Return whether *path* is a readable CSV, allowing zero data rows.
+
+    Several threshold-event summary tables are legitimately header-only when
+    no unit has enough positive/negative events to fit a held-out threshold
+    classifier.  Treating those files as incomplete causes fully evaluated
+    baselines to be rerun, including their expensive model-backed high-N
+    ablations.
+    """
+    path = Path(path)
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    try:
+        pd.read_csv(path, nrows=5)
+        return True
+    except Exception:
+        return False
+
+
 def _resolved_optional_path(value) -> str | None:
     if value in (None, ""):
         return None
     return str(Path(value).expanduser().resolve())
+
+
+@lru_cache(maxsize=256)
+def _sha256_file(path_text: str) -> str | None:
+    path = Path(path_text)
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _content_identity(value) -> str | None:
+    resolved = _resolved_optional_path(value)
+    return _sha256_file(resolved) if resolved else None
 
 
 def _materialized_stage7_scores_path(args) -> Path | None:
@@ -509,8 +547,8 @@ def _scientific_method_config(args, baseline: str) -> dict:
     return {
         "baseline_subset": str(baseline),
         "input_data_dir": _resolved_optional_path(getattr(args, "input_data_dir", None)),
-        "candidate_flip_stats_path": _resolved_optional_path(getattr(args, "candidate_flip_stats_path", None)),
-        "materialized_stage7_scores_path": _resolved_optional_path(_materialized_stage7_scores_path(args)),
+        "candidate_flip_stats_sha256": _content_identity(getattr(args, "candidate_flip_stats_path", None)),
+        "materialized_stage7_scores_sha256": _content_identity(_materialized_stage7_scores_path(args)),
         "task_module": str(getattr(args, "task_module", "")),
         "ai_model": str(getattr(args, "ai_model", "")) if getattr(args, "ai_model", None) else None,
         "evaluation_split": str(getattr(args, "evaluation_split", "test")),
@@ -519,7 +557,6 @@ def _scientific_method_config(args, baseline: str) -> dict:
         "points_to_use_for_mean_ablation": int(getattr(args, "points_to_use_for_mean_ablation", 2048)),
         "spiking_max_points": int(getattr(args, "spiking_max_points", 10000)),
         "spiking_min_points": int(getattr(args, "spiking_min_points", 512)),
-        "spiking_global_n_clusters": int(getattr(args, "spiking_global_n_clusters", 64)),
         "target": str(getattr(args, "target", "flip_any")),
         "same_layer_nonagonist_controls": bool(getattr(args, "same_layer_nonagonist_controls", True)),
         "nonagonist_candidate_pool_multiplier": int(getattr(args, "nonagonist_candidate_pool_multiplier", 1)),
@@ -553,10 +590,26 @@ def _completed_output_ok(baseline_out: Path, args, baseline: str) -> bool:
         return False
     if int(payload.get("n_units", 0) or 0) <= 0:
         return False
-    if payload.get("scientific_method") != _scientific_method_config(args, baseline):
+    stored_method = payload.get("scientific_method") or {}
+    current_method = _scientific_method_config(args, baseline)
+    if stored_method != current_method:
         return False
-    required = ["high_n_scores_with_flips.csv", "threshold_unit_tests.csv", "threshold_population_summary.csv"]
-    return all(_nonempty_csv(Path(baseline_out) / name) for name in required)
+    # The expensive scientific completion criterion is the model-backed flip
+    # evaluation.  Threshold-test tables are downstream summaries and may be
+    # legitimately empty for sparse/zero-event populations.  Requiring them to
+    # contain rows made completed baselines look incomplete and forced costly
+    # high-N ablations to run again on every restart.
+    model_backed_required = [
+        "high_n_scores_with_flips.csv",
+        "high_n_flip_stats_by_unit.csv",
+    ]
+    if not all(_nonempty_csv(Path(baseline_out) / name) for name in model_backed_required):
+        return False
+    derived_required = [
+        "threshold_unit_tests.csv",
+        "threshold_population_summary.csv",
+    ]
+    return all(_readable_csv(Path(baseline_out) / name) for name in derived_required)
 
 
 
@@ -1574,6 +1627,47 @@ def repeated_holdout(x, y, *, min_examples, repeats, holdout_fraction, seed):
     return out
 
 
+# Stable schemas for scientifically valid empty outputs.  A baseline with no
+# unit satisfying the minimum flip/non-flip support is a completed experiment,
+# not a missing file.  Without explicit columns pandas writes a zero-column CSV
+# that later raises EmptyDataError and disappears from aggregate tables.
+THRESHOLD_UNIT_TEST_COLUMNS = [
+    "baseline_subset", "population", "unit_key", "layer_label", "layer_key",
+    "neuron_id", "population_strength", "target", "direction_family", "feature",
+    "n_rows", "n_flips", "n_repeats_ok",
+    "mean_train_abs_mcc", "median_train_abs_mcc",
+    "mean_train_auc_oriented", "median_train_auc_oriented",
+    "mean_test_abs_mcc", "median_test_abs_mcc",
+    "mean_test_auc_oriented", "median_test_auc_oriented",
+    "mean_test_balanced_accuracy", "median_test_balanced_accuracy",
+    "mean_test_f1", "median_test_f1",
+    "mean_test_prevalence", "median_test_prevalence",
+    "mean_test_threshold_spike_rate", "median_test_threshold_spike_rate",
+    "mean_test_precision", "median_test_precision",
+    "mean_test_recall", "median_test_recall",
+    "mean_test_false_positive_rate", "median_test_false_positive_rate",
+    "mean_test_false_negative_rate", "median_test_false_negative_rate",
+    "mean_threshold", "median_threshold", "representative_threshold",
+    "representative_direction", "full_threshold_spikes", "full_threshold_spike_rate",
+    "full_true_positives", "full_false_positives", "full_true_negatives",
+    "full_false_negatives", "full_precision", "full_recall",
+    "full_false_positive_rate", "full_false_negative_rate",
+]
+
+THRESHOLD_POPULATION_SUMMARY_COLUMNS = [
+    "baseline_subset", "population", "target", "direction_family", "feature",
+    "n_unit_tests", "n_units", "median_test_auc_oriented", "median_test_abs_mcc",
+    "mean_test_auc_oriented", "mean_test_abs_mcc",
+    "median_full_threshold_spike_rate", "median_full_false_positive_rate",
+    "median_test_threshold_spike_rate", "median_test_false_positive_rate",
+]
+
+THRESHOLD_BINNED_CURVE_COLUMNS = [
+    "population", "unit_key", "feature", "target", "bin_index", "n",
+    "flip_rate", "mean_oriented_score",
+]
+
+
 def _assign_population_from_high_n(row):
     """Coarse descriptive bucket from observed high-N flip rate.
 
@@ -2123,7 +2217,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
 
     raw_df = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame()
     raw_df.to_csv(baseline_out / "threshold_activation_flip_rows.csv.gz", index=False, compression="gzip")
-    unit_df = pd.DataFrame(unit_tests)
+    unit_df = pd.DataFrame(unit_tests, columns=THRESHOLD_UNIT_TEST_COLUMNS)
     unit_df.to_csv(baseline_out / "threshold_unit_tests.csv", index=False)
 
     summary_rows = []
@@ -2131,7 +2225,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         for keys, g in tqdm(list(unit_df.groupby(["baseline_subset", "population", "target", "direction_family", "feature"], dropna=False)), desc=f"{LOG_PREFIX} {baseline} population summaries", unit="group", leave=False):
             b, pop, target, direction_family, feature = keys
             summary_rows.append({"baseline_subset": b, "population": pop, "target": target, "direction_family": direction_family, "feature": feature, "n_unit_tests": int(len(g)), "n_units": int(g["unit_key"].nunique()), "median_test_auc_oriented": float(pd.to_numeric(g.get("median_test_auc_oriented"), errors="coerce").median()), "median_test_abs_mcc": float(pd.to_numeric(g.get("median_test_abs_mcc"), errors="coerce").median()), "mean_test_auc_oriented": float(pd.to_numeric(g.get("mean_test_auc_oriented"), errors="coerce").mean()), "mean_test_abs_mcc": float(pd.to_numeric(g.get("mean_test_abs_mcc"), errors="coerce").mean()), "median_full_threshold_spike_rate": float(pd.to_numeric(g.get("full_threshold_spike_rate"), errors="coerce").median()), "median_full_false_positive_rate": float(pd.to_numeric(g.get("full_false_positive_rate"), errors="coerce").median()), "median_test_threshold_spike_rate": float(pd.to_numeric(g.get("median_test_threshold_spike_rate"), errors="coerce").median()), "median_test_false_positive_rate": float(pd.to_numeric(g.get("median_test_false_positive_rate"), errors="coerce").median())})
-    summary_df = pd.DataFrame(summary_rows)
+    summary_df = pd.DataFrame(summary_rows, columns=THRESHOLD_POPULATION_SUMMARY_COLUMNS)
     summary_df.to_csv(baseline_out / "threshold_population_summary.csv", index=False)
 
     binned_rows = []
@@ -2140,7 +2234,9 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
             udf = raw_df.loc[raw_df["unit_key"].astype(str) == str(r["unit_key"])]
             if not udf.empty:
                 binned_rows.extend(_make_binned_rows(udf, r["feature"], r["target"], r["population"], r["unit_key"], r.get("representative_direction", ">="), int(args.threshold_event_n_bins)))
-    pd.DataFrame(binned_rows).to_csv(baseline_out / "threshold_binned_flip_curves.csv", index=False)
+    pd.DataFrame(binned_rows, columns=THRESHOLD_BINNED_CURVE_COLUMNS).to_csv(
+        baseline_out / "threshold_binned_flip_curves.csv", index=False
+    )
 
     rule_payload = None
     if bool(getattr(args, "rule_conditioned_diagnostics", False)):

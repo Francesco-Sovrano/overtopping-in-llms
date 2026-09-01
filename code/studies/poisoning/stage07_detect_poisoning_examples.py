@@ -83,6 +83,7 @@ from studies.poisoning.tasks.registry import available_tasks, get_task_definitio
 from studies.poisoning.stage07_plot_detection_implications import generate_implication_outputs
 
 SCORING_SCHEMA_VERSION = 6
+STAGE07_RESUME_CONFIG_VERSION = 1
 DEFAULT_REQUIRED_TAU = 0.3
 
 _LORA_FACTOR_RE = re.compile(
@@ -96,6 +97,137 @@ _MLP_RE = re.compile(r"^m(?P<layer>\d+)$")
 _ATTN_RE = re.compile(r"^a(?P<layer>\d+)\.h(?P<head>\d+)$")
 _TAU_RE = re.compile(r"-tau([0-9]+(?:\.[0-9]+)?)")
 
+
+
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _stage07_resume_payload(
+    *, args: argparse.Namespace, run_dir: Path, task: str, phase: str, run_config: Mapping[str, Any]
+) -> dict[str, Any]:
+    null_dirs = sorted(str(path.resolve()) for path in _parse_run_dirs(args.clean_null_run_dirs))
+    return {
+        "schema_version": STAGE07_RESUME_CONFIG_VERSION,
+        "result_identity": {
+            "run_dir": str(run_dir.resolve()),
+            "task": str(task),
+            "phase": str(phase),
+            "scoring_schema_version": int(SCORING_SCHEMA_VERSION),
+            "eval_intervention": str(args.eval_intervention),
+            "required_tau": float(args.required_tau),
+            "max_channels": int(args.max_channels),
+            "min_abs_delta_u": float(args.min_abs_delta_u),
+            "bootstrap_draws": int(args.bootstrap_draws),
+            "bootstrap_confidence_level": float(args.bootstrap_confidence_level),
+            "clean_null_run_dirs": null_dirs,
+            "min_clean_null_z": None if args.min_clean_null_z is None else float(args.min_clean_null_z),
+            "max_exposures_per_interval": int(args.max_exposures_per_interval),
+            "sample_seed": int(args.sample_seed),
+            "matched_control_draws": int(args.matched_control_draws),
+            "run_seed": int(run_config.get("seed", 0)),
+            "model_name": str(run_config.get("model_name", "")),
+            "model_revision": run_config.get("model_revision"),
+        },
+        # Runtime-only knobs are deliberately excluded from result_identity so a
+        # resumed run can change batching without invalidating scientific caches.
+        "runtime": {
+            "u_j_batch_size": int(args.u_j_batch_size),
+            "u_j_neuron_batch_size": int(args.u_j_neuron_batch_size),
+            "wanda_batch_size": int(args.wanda_batch_size),
+        },
+    }
+
+
+def _validate_resume_payload(path: Path, expected: Mapping[str, Any]) -> None:
+    existing = json.loads(path.read_text(encoding="utf-8"))
+    if int(existing.get("schema_version", -1)) != STAGE07_RESUME_CONFIG_VERSION:
+        raise RuntimeError(f"Unsupported Stage-07 resume configuration schema in {path}")
+    if existing.get("result_identity") != expected.get("result_identity"):
+        old = existing.get("result_identity", {})
+        new = expected.get("result_identity", {})
+        keys = sorted(set(old) | set(new))
+        mismatch = [key for key in keys if old.get(key) != new.get(key)]
+        detail = ", ".join(f"{key}: {old.get(key)!r} != {new.get(key)!r}" for key in mismatch[:8])
+        raise RuntimeError(
+            f"Stage-07 output exists but was produced with incompatible result-defining settings: {detail}. "
+            "Use a fresh output namespace for a scientifically different run."
+        )
+
+
+def _initialize_stage07_resume_configuration(
+    *, output_dir: Path, resume_config_path: Path, resume_payload: Mapping[str, Any]
+) -> None:
+    """Initialize or validate the Stage-07 resume identity.
+
+    An interrupted pre-identity Stage-07 run can leave expensive, individually
+    validated artifacts in ``output_dir`` without the root resume marker.  That
+    is not the same thing as a completed legacy result.  Adopt such partial
+    state under the current identity and let the downstream per-artifact guards
+    decide what is reusable.  Completed legacy results still require migration
+    because their provenance must not be guessed.
+    """
+    if resume_config_path.is_file():
+        _validate_resume_payload(resume_config_path, resume_payload)
+        print(f"[Resume] Reusing compatible Stage-07 artifacts under {output_dir}", flush=True)
+        return
+
+    # _atomic_write_json can leave only its temporary file if the process is
+    # interrupted between write() and replace().  Recover that identity instead
+    # of treating the directory as legacy output.
+    tmp_path = resume_config_path.with_suffix(resume_config_path.suffix + ".tmp")
+    if tmp_path.is_file():
+        _validate_resume_payload(tmp_path, resume_payload)
+        tmp_path.replace(resume_config_path)
+        print(f"[Resume] Recovered interrupted Stage-07 resume identity under {output_dir}", flush=True)
+        return
+
+    existing_entries = list(output_dir.iterdir()) if output_dir.exists() else []
+    if not existing_entries:
+        _atomic_write_json(resume_config_path, resume_payload)
+        return
+
+    # A detection summary is the legacy completion marker used by the migration
+    # tooling.  Refuse to relabel a completed legacy result with guessed
+    # provenance.  In contrast, a directory without this marker is an incomplete
+    # run: downstream materialization/score resume checks validate every artifact
+    # before reuse, so it is safe to attach the current root identity and continue.
+    if (output_dir / "detection_summary.json").is_file():
+        raise RuntimeError(
+            f"Completed Stage-07 output predates the canonical resume identity: {output_dir}. "
+            "Migrate persisted artifacts before resuming; runtime code does not guess provenance for completed results."
+        )
+
+    _atomic_write_json(resume_config_path, resume_payload)
+    print(
+        f"[Resume] Found incomplete Stage-07 output without a resume identity under {output_dir}; "
+        "adopting the partial run and validating cached artifacts before reuse.",
+        flush=True,
+    )
+
+
+def _resume_frames_equal(existing: pd.DataFrame, current: pd.DataFrame) -> bool:
+    if set(existing.columns) != set(current.columns) or len(existing) != len(current):
+        return False
+    cols = sorted(current.columns)
+    sort_cols = [c for c in ("unit_key", "layer_label", "neuron_id", "projection_key", "parameter_key") if c in cols]
+    left = existing[cols].copy()
+    right = current[cols].copy()
+    if sort_cols:
+        left = left.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+        right = right.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+    else:
+        left = left.reset_index(drop=True)
+        right = right.reset_index(drop=True)
+    try:
+        pd.testing.assert_frame_equal(left, right, check_dtype=False, check_exact=False, rtol=1e-9, atol=1e-12)
+    except AssertionError:
+        return False
+    return True
 
 
 def _fraction_key(value: float) -> int:
@@ -510,7 +642,10 @@ def _joint_paired_disruption_inference(
     return out
 
 
-def _materialization_complete(stats_dir: Path, union_units: set[str], *, expected_baseline_subset: str = "all") -> bool:
+def _materialization_complete(
+    stats_dir: Path, union_units: set[str], *, expected_baseline_subset: str = "all",
+    expected_intervention: str | None = None, expected_phase: str | None = None,
+) -> bool:
     required = [
         stats_dir / "frozen_candidate_ranking.csv",
         stats_dir / "flip_stats_by_neuron.csv",
@@ -531,6 +666,10 @@ def _materialization_complete(stats_dir: Path, union_units: set[str], *, expecte
         if bool(scope.get("exclude_discovery_rows_from_final_stats", False)):
             return False
         if scope.get("sampling_max_points") not in (None, 0):
+            return False
+        if expected_intervention is not None and str(scope.get("intervention", "")) != str(expected_intervention):
+            return False
+        if expected_phase is not None and str(scope.get("intervention_phase", "")) != str(expected_phase):
             return False
         observed = _candidate_unit_set(stats_dir)
         if observed != union_units:
@@ -561,7 +700,10 @@ def _ensure_fixed_u_j_materialization(
     # candidate_union_csv normally sits directly under Stage 07, not in a stats dir.
     union_frame = pd.read_csv(candidate_union_csv)
     union_units = {f"{str(a)}:{int(b)}" for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))}
-    if _materialization_complete(stats_dir, union_units):
+    if _materialization_complete(
+        stats_dir, union_units, expected_intervention=eval_intervention,
+        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
+    ):
         return stats_dir
 
     control_out = _control_correctness_output_dir(run_dir, row, phase, eval_intervention)
@@ -598,7 +740,10 @@ def _ensure_fixed_u_j_materialization(
         cmd.append("--decode_only")
     print("[u-j-materialization]", " ".join(map(str, cmd)), flush=True)
     subprocess.run(cmd, check=True)
-    if not _materialization_complete(stats_dir, union_units):
+    if not _materialization_complete(
+        stats_dir, union_units, expected_intervention=eval_intervention,
+        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
+    ):
         raise RuntimeError(f"Fixed-cohort U(j) materialization is incomplete: {stats_dir}")
     return stats_dir
 
@@ -617,7 +762,10 @@ def _ensure_fixed_attack_u_j_materialization(
     stats_dir = rules_dir / "stats" / "fixed_test_positive_candidates"
     union_frame = pd.read_csv(candidate_union_csv)
     union_units = {f"{str(a)}:{int(b)}" for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))}
-    if _materialization_complete(stats_dir, union_units, expected_baseline_subset="positive"):
+    if _materialization_complete(
+        stats_dir, union_units, expected_baseline_subset="positive", expected_intervention=eval_intervention,
+        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
+    ):
         return stats_dir
     backdoor_out = _backdoor_output_dir(run_dir, row, phase, eval_intervention)
     features = backdoor_out / "feature_report"
@@ -649,7 +797,10 @@ def _ensure_fixed_attack_u_j_materialization(
         cmd.append("--decode_only")
     print("[attack-u-j-materialization]", " ".join(map(str, cmd)), flush=True)
     subprocess.run(cmd, check=True)
-    if not _materialization_complete(stats_dir, union_units, expected_baseline_subset="positive"):
+    if not _materialization_complete(
+        stats_dir, union_units, expected_baseline_subset="positive", expected_intervention=eval_intervention,
+        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
+    ):
         raise RuntimeError(f"Fixed trigger-test candidate materialization is incomplete: {stats_dir}")
     return stats_dir
 
@@ -1719,12 +1870,16 @@ def main() -> None:
         )
 
     output_dir = detection_dir(run_dir) / phase_dirname(phase)
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise RuntimeError(
-            f"Stage-07 output already exists: {output_dir}. "
-            "Destructive cleanup/overwrite is disabled; use a fresh output namespace or preserve and inspect the existing artifacts."
-        )
     output_dir.mkdir(parents=True, exist_ok=True)
+    resume_config_path = output_dir / "stage07_resume_configuration.json"
+    resume_payload = _stage07_resume_payload(
+        args=args, run_dir=run_dir, task=task, phase=phase, run_config=run_config
+    )
+    _initialize_stage07_resume_configuration(
+        output_dir=output_dir,
+        resume_config_path=resume_config_path,
+        resume_payload=resume_payload,
+    )
     manifests = _load_manifest_by_condition(run_dir)
     shared_fracs = sorted(set(manifests["clean"]) & set(manifests["poisoned"]))
     if len(shared_fracs) < 2:
@@ -1905,7 +2060,20 @@ def main() -> None:
             min_abs_delta_u=float(args.min_abs_delta_u),
             min_clean_null_z=args.min_clean_null_z,
         )
-        selected.to_csv(interval_dir / "selected_disruptive_channels.csv", index=False)
+        selected_path = interval_dir / "selected_disruptive_channels.csv"
+        score_path = interval_dir / "training_example_scores.csv"
+        if score_path.is_file():
+            if not selected_path.is_file():
+                raise RuntimeError(
+                    f"Cannot safely resume {interval_name}: {score_path.name} exists but {selected_path.name} is missing."
+                )
+            prior_selected = pd.read_csv(selected_path)
+            if not _resume_frames_equal(prior_selected, selected):
+                raise RuntimeError(
+                    f"Cannot safely reuse existing WANDA scores for {interval_name}: the selected disruptive-channel "
+                    "table differs from the current computation. Use a fresh output namespace for changed settings."
+                )
+        selected.to_csv(selected_path, index=False)
         all_selected_frames.append(selected.assign(interval=interval_name))
 
         exposures = exposures_between_steps(
@@ -1972,11 +2140,40 @@ def main() -> None:
             print(f"[poison-detection] {interval_name}: no disruptive control-correctness channels above threshold; skipping WANDA scoring", flush=True)
             continue
 
-        score_path = interval_dir / "training_example_scores.csv"
-        # Stage-07 starts from an empty output directory. There is deliberately
-        # no hidden run identity token and no partial-result resume path: an
-        # interrupted or changed run must be explicitly cleaned/recomputed.
-        missing = list(exposures)
+        expected_positions = {int(stream_position) for stream_position, _ in exposures}
+        control_score_fields = [
+            f"wanda_matched_control_{draw:02d}_score" for draw in range(int(args.matched_control_draws))
+        ]
+        fields = [
+            "interval", "start_fraction", "end_fraction", "stream_position", "training_slot_index",
+            "source_row_index", "is_counterfactual_slot", "is_poisoned", "example_content", "training_answer",
+            "wanda_disruption_score", "wanda_matched_random_score", "wanda_unweighted_score", "selected_projection_input_l1",
+            "effective_lora_excess_interval_update_norm", "matched_random_lora_excess_interval_update_norm", "n_scored_tokens",
+            *control_score_fields,
+        ]
+
+        existing_scores = pd.DataFrame(columns=fields)
+        if score_path.is_file() and score_path.stat().st_size > 0:
+            existing_scores = pd.read_csv(score_path)
+            missing_cols = [col for col in fields if col not in existing_scores.columns]
+            if missing_cols:
+                raise RuntimeError(
+                    f"Cannot safely resume {interval_name}: existing {score_path.name} lacks columns "
+                    f"required by the current scoring configuration: {missing_cols[:8]}"
+                )
+            positions = pd.to_numeric(existing_scores["stream_position"], errors="coerce")
+            complete_mask = positions.notna()
+            for col in ["wanda_disruption_score", "wanda_matched_random_score", "n_scored_tokens", *control_score_fields]:
+                complete_mask &= existing_scores[col].notna()
+            existing_scores = existing_scores.loc[complete_mask].copy()
+            existing_scores["stream_position"] = pd.to_numeric(
+                existing_scores["stream_position"], errors="raise"
+            ).astype(int)
+            existing_scores = existing_scores[existing_scores["stream_position"].isin(expected_positions)]
+            existing_scores = existing_scores.sort_values("stream_position").drop_duplicates("stream_position", keep="last")
+
+        complete_positions = set(existing_scores.get("stream_position", pd.Series(dtype=int)).astype(int).tolist())
+        missing = [(stream_position, slot) for stream_position, slot in exposures if int(stream_position) not in complete_positions]
         mapped = pd.DataFrame()
         if missing:
             p_start_dir = resolve_manifest_checkpoint_dir(run_dir, p_start)
@@ -2017,20 +2214,18 @@ def main() -> None:
                 prompt_fn=lambda row: str(row["training_prompt"]),
                 answer_fn=lambda row: str(row["training_answer"]),
             )
-            fields = [
-                "interval", "start_fraction", "end_fraction", "stream_position", "training_slot_index",
-                "source_row_index", "is_counterfactual_slot", "is_poisoned", "example_content", "training_answer",
-                "wanda_disruption_score", "wanda_matched_random_score", "wanda_unweighted_score", "selected_projection_input_l1",
-                "effective_lora_excess_interval_update_norm", "matched_random_lora_excess_interval_update_norm", "n_scored_tokens",
-                *[f"wanda_matched_control_{draw:02d}_score" for draw in range(int(args.matched_control_draws))],
-            ]
             collator = CausalLMCollator(tokenizer)
             wanda_batch_size = int(args.wanda_batch_size)
+
+            # Canonicalize the valid cached prefix before appending. This also
+            # strips post-hoc normalization columns if an interrupted resume ever
+            # needs to extend a previously normalized file.
+            tmp_score_path = score_path.with_suffix(".csv.resume.tmp")
+            existing_scores.reindex(columns=fields).to_csv(tmp_score_path, index=False)
+            tmp_score_path.replace(score_path)
             scored_count = 0
-            score_path.parent.mkdir(parents=True, exist_ok=True)
-            with score_path.open("w", newline="", encoding="utf-8") as score_handle:
+            with score_path.open("a", newline="", encoding="utf-8") as score_handle:
                 score_writer = csv.DictWriter(score_handle, fieldnames=list(fields), extrasaction="ignore")
-                score_writer.writeheader()
                 for batch_start in range(0, len(missing), wanda_batch_size):
                     exposure_batch = missing[batch_start:batch_start + wanda_batch_size]
                     items = [dataset[int(slot)] for _, slot in exposure_batch]
@@ -2060,6 +2255,7 @@ def main() -> None:
                             **score,
                         })
                     score_writer.writerows(records)
+                    score_handle.flush()
                     scored_count += len(records)
                     if scored_count % 25 < len(records) or scored_count == len(missing):
                         print(f"[poison-detection] {interval_name}: scored {scored_count}/{len(missing)} missing exposures", flush=True)
@@ -2068,6 +2264,11 @@ def main() -> None:
                 torch.cuda.empty_cache()
             elif torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
                 torch.mps.empty_cache()
+        else:
+            print(
+                f"[Resume] {interval_name}: reused all {len(exposures)} cached WANDA exposure scores; skipping model load",
+                flush=True,
+            )
 
         scores = pd.read_csv(score_path) if score_path.is_file() else pd.DataFrame()
         if not scores.empty:
@@ -2213,6 +2414,8 @@ def main() -> None:
         "--eval_intervention", str(args.eval_intervention),
         "--output_dir", str(interpretation_dir),
     ], check=True)
+    # Refresh runtime batching metadata after a successful resumable run.
+    _atomic_write_json(resume_config_path, resume_payload)
     print(f"Wrote poisoning-example detection outputs under {output_dir}", flush=True)
 
 

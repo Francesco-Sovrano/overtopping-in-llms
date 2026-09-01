@@ -48,7 +48,6 @@ from core.group_intervention import (
     load_complete_group_batch_cache,
     load_dataset_info,
     load_stage5_locus_population,
-    persist_complete_group_batch_cache,
     resolve_dataset_path,
     simultaneous_effect,
     unit_metadata,
@@ -67,79 +66,6 @@ LOG_PREFIX = "[conditional-validation]"
 SCHEMA = "conditional-marginal-validation-v1"
 GROUP_CACHE_SCHEMA = "simultaneous-group-eval-v2"
 
-
-
-def _config_cache_identity(configuration: dict, current_identity: dict) -> dict:
-    existing_identity = configuration.get("cache_identity")
-    if isinstance(existing_identity, dict):
-        return existing_identity
-    return {key: configuration.get(key) for key in current_identity}
-
-
-def _legacy_batch_cache_compatible(
-    existing_config: dict,
-    current_identity: dict,
-    current_paths: dict,
-) -> bool:
-    """Permit one-time reuse of pre-v2 group caches when lineage is proven.
-
-    Legacy v1 batch payloads contain row ranges and group-output keys, but no
-    scientific context.  The surrounding Stage-8 configuration must therefore
-    prove that the cached rows were produced for the same model, intervention,
-    evaluation examples, and replacement-reference population.
-
-    Newer Stage-8 configurations are *safer* validators because they store the
-    exact evaluation-row records and replacement-reference prompts.  Do not
-    reject a v1 batch merely because those fields are present: compare them
-    exactly and allow migration when they match.  Truly old configurations that
-    lack those explicit identities retain the conservative same-lineage/path
-    fallback below.  Exact requested row coverage and group membership are
-    still checked separately by the batch-cache loader.
-    """
-    existing = _config_cache_identity(existing_config, current_identity)
-
-    explicit_identity_keys = [
-        "task_module",
-        "ai_model",
-        "intervention",
-        "intervention_phase",
-        "evaluation_split",
-        "prompt_col",
-        "target_col",
-        "evaluation_rows",
-        "points_to_use_for_mean_ablation",
-        "replacement_reference_prompts",
-        "seed",
-        "max_new_tokens",
-    ]
-    has_explicit_row_identity = (
-        "evaluation_rows" in existing
-        and "replacement_reference_prompts" in existing
-    )
-    if has_explicit_row_identity:
-        return all(
-            existing.get(key) == current_identity.get(key)
-            for key in explicit_identity_keys
-        )
-
-    scalar_keys = [
-        "task_module",
-        "ai_model",
-        "intervention",
-        "intervention_phase",
-        "evaluation_split",
-        "points_to_use_for_mean_ablation",
-        "seed",
-    ]
-    if any(existing.get(key) != current_identity.get(key) for key in scalar_keys):
-        return False
-    existing_paths = existing_config.get("paths")
-    if not isinstance(existing_paths, dict):
-        return False
-    for key in ("input_data_dir", "singleton_scores_path"):
-        if str(existing_paths.get(key) or "") != str(current_paths.get(key) or ""):
-            return False
-    return True
 
 
 def parse_args() -> argparse.Namespace:
@@ -608,12 +534,10 @@ def _analyze_preemption(
         if dom_col not in scores_df.columns or sec_col not in scores_df.columns:
             continue
         source = baseline if direction == "c2i" else ~baseline
-        f_dom = scores_df[dom_col].fillna(False).astype(bool).to_numpy()
-        f_sec = scores_df[sec_col].fillna(False).astype(bool).to_numpy()
+        f_dom = scores_df[dom_col].fillna(False).astype(bool).to_numpy() & source
+        f_sec = scores_df[sec_col].fillna(False).astype(bool).to_numpy() & source
         f_pair = (np.asarray(post_by_key[pair.key], dtype=bool) != baseline) & source
         f_full = full_flip & source
-        f_dom &= source
-        f_sec &= source
         reachable = f_dom | f_sec
         indicator = threshold_events.get(direction, {})
         t_defined = np.asarray([key in indicator for key in orig], dtype=bool) & source
@@ -834,13 +758,6 @@ def main() -> None:
     }
     config_path = out_dir / "interaction_configuration.json"
     summary_path = out_dir / "interaction_validation_summary.json"
-    existing_config: dict | None = None
-    if not args.force and config_path.exists():
-        try:
-            existing_config = json.loads(config_path.read_text(encoding="utf-8"))
-        except Exception:
-            existing_config = None
-
     # Build structurally matched K_b sets.
     random_full_groups: dict[int, GroupSpec] = {}
     for draw in range(int(args.null_draws)):
@@ -1005,12 +922,6 @@ def main() -> None:
         "replacement_reference_prompts": list(map(str, replacement_reference_prompts)),
         "max_new_tokens": int(task.MAX_NEW_TOKENS),
     }
-    allow_legacy_batch_fallback = bool(
-        not args.force
-        and existing_config is not None
-        and _legacy_batch_cache_compatible(existing_config, cache_identity, paths)
-    )
-
     print(
         f"{LOG_PREFIX} split={args.evaluation_split} rows={len(scores_df)} candidates={len(candidates)} "
         f"matching_strata={len(candidate_strata)} cmc={'on' if compute_cmc else 'off'} "
@@ -1029,24 +940,13 @@ def main() -> None:
                 n_examples=len(scores_df),
                 batch_size=int(args.batch_size),
                 cache_context=group_cache_context,
-                allow_legacy=allow_legacy_batch_fallback,
             )
             if cached_outputs is not None:
                 post_by_key = cached_outputs
-                source = "legacy cache migration" if allow_legacy_batch_fallback else "explicit cache"
                 print(
-                    f"{LOG_PREFIX} complete {source} covers all {len(groups_to_evaluate)} "
+                    f"{LOG_PREFIX} complete explicit cache covers all {len(groups_to_evaluate)} "
                     f"groups and {len(scores_df)} rows; skipping model load"
                 )
-                if allow_legacy_batch_fallback:
-                    persist_complete_group_batch_cache(
-                        cache_dir=group_cache_dir,
-                        outputs=post_by_key,
-                        n_examples=len(scores_df),
-                        batch_size=int(args.batch_size),
-                        cache_context=group_cache_context,
-                    )
-                    print(f"{LOG_PREFIX} migrated legacy group cache to explicit metadata")
 
         if not post_by_key:
             device = get_device()
@@ -1082,7 +982,6 @@ def main() -> None:
                 cache_dir=group_cache_dir,
                 cache_context=group_cache_context,
                 force=bool(args.force),
-                allow_legacy_cache_fallback=allow_legacy_batch_fallback,
             )
 
     candidate_effect = _effect_for_group(

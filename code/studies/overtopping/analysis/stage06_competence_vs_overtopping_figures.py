@@ -388,6 +388,37 @@ def is_derived_evaluation_run(run_name: str) -> bool:
     return _DERIVED_EVALUATION_RUN_RE.search(str(run_name)) is not None
 
 
+def canonical_experimental_run_name(run_name: str) -> str:
+    """Collapse evaluation-side derivatives onto their experimental setting.
+
+    Split-aware Stage 7 now materializes primary test statistics under
+    ``*-heldout_test``.  Older trees may additionally retain the unsuffixed
+    pre-split directory.  They are two evaluation products of one setting, not
+    two manuscript observations.
+    """
+    return _DERIVED_EVALUATION_RUN_RE.sub("", str(run_name))
+
+
+def evaluation_variant_priority(run_dir: Path) -> tuple[int, int, int]:
+    """Prefer strict held-out-test artifacts without duplicating settings."""
+    name = run_dir.name
+    has_global = int((run_dir / "flip_stats_global.json").is_file())
+    if re.search(r"-heldout_test$", name):
+        variant = 40
+    elif re.search(r"-heldout_test-cap\d+$", name):
+        variant = 35
+    elif not is_derived_evaluation_run(name):
+        variant = 30
+    elif re.search(r"-eval_all(?:-cap\d+)?$", name):
+        variant = 20
+    else:  # eval_train
+        variant = 10
+    # Prefer a materialized flip summary within the same evaluation class, but
+    # do not let a legacy unsuffixed training/full-data result outrank the
+    # primary held-out-test evaluation merely because it is non-empty.
+    return (variant, has_global, -len(name))
+
+
 def matches_filters(run_name: str, filters: Filters) -> bool:
     if filters.exclude_fake_targets and "fake_targets" in run_name:
         return False
@@ -490,7 +521,13 @@ def make_point(
     )
 
 
-def discover_points(root: Path, filters: Filters, dedupe: bool) -> list[PlotPoint]:
+def discover_points(
+    root: Path,
+    filters: Filters,
+    dedupe: bool,
+    *,
+    heldout_test_only: bool = False,
+) -> list[PlotPoint]:
     points: list[PlotPoint] = []
     for task, org, model, model_dir in task_model_dir_iter(root):
         if filters.tasks is not None and task not in filters.tasks:
@@ -511,18 +548,25 @@ def discover_points(root: Path, filters: Filters, dedupe: bool) -> list[PlotPoin
         if not stats_dir.is_dir():
             continue
 
-        for run_dir in sorted(p for p in stats_dir.iterdir() if p.is_dir()):
-            # Held-out-test directories are derived evaluation products for an
-            # existing experimental run, not additional settings.  The
-            # directional singleton rebuild materializes these directories, so
-            # allowing the all-settings scanner to discover them inflates the
-            # historical phase-panel sample by one row per affected phase.
-            # Keep the reference run as the experimental setting; held-out
-            # artifacts remain available to the primary-matrix/table pipeline.
-            if is_derived_evaluation_run(run_dir.name):
-                continue
-            if not matches_filters(run_dir.name, filters):
-                continue
+        matching_run_dirs = [
+            p for p in sorted(stats_dir.iterdir())
+            if p.is_dir() and matches_filters(p.name, filters)
+            and (not heldout_test_only or bool(re.search(r"-heldout_test(?:-cap\d+)?$", p.name)))
+        ]
+        # Choose exactly one evaluation product per experimental setting.
+        # Manuscript RQ1 requests strict held-out-test artifacts; generic plots
+        # may still inspect train/all evaluation products explicitly.
+        by_experimental_run: dict[str, list[Path]] = {}
+        for run_dir in matching_run_dirs:
+            by_experimental_run.setdefault(
+                canonical_experimental_run_name(run_dir.name), []
+            ).append(run_dir)
+        selected_run_dirs = [
+            max(group, key=evaluation_variant_priority)
+            for group in by_experimental_run.values()
+        ]
+
+        for run_dir in sorted(selected_run_dirs):
             global_path = run_dir / "flip_stats_global.json"
             if not global_path.exists() and not filters.include_empty:
                 continue
@@ -540,8 +584,8 @@ def discover_points(root: Path, filters: Filters, dedupe: bool) -> list[PlotPoin
 
 
 def discover_rq1_manuscript_points(root: Path) -> list[PlotPoint]:
-    """Discover exactly the deduplicated setting population used by Figure 2."""
-    return discover_points(root, rq1_manuscript_filters(), dedupe=True)
+    """Discover exactly the strict held-out-test population used by Figure 2."""
+    return discover_points(root, rq1_manuscript_filters(), dedupe=True, heldout_test_only=True)
 
 
 def compact_points(root: Path, filters: Filters) -> list[PlotPoint]:
@@ -3163,7 +3207,7 @@ def parse_args() -> argparse.Namespace:
             "Use the canonical all-settings RQ1 scanner contract "
             "(spectral random-anchor runs, deduplicated by task/model/phase/baseline, "
             "including checkpoints and genuine empty-candidate settings). This is the "
-            "same population targeted by rebuild_directional_stats --population rq1-all-settings."
+            "strict held-out-test population used by the RQ1 manuscript figure."
         ),
     )
     parser.add_argument("--csv-out-dir", default=None, help="Optional directory for the plotted-point CSV sidecar, allowing manuscript figure folders to remain PDF-only.")
@@ -3229,7 +3273,10 @@ def main() -> None:
             if args.label_points == "auto":
                 args.label_points = "paired"
         else:
-            points = discover_points(root, filters, dedupe=not args.no_dedupe)
+            points = discover_points(
+                root, filters, dedupe=not args.no_dedupe,
+                heldout_test_only=bool(args.rq1_manuscript_population),
+            )
 
         if not points:
             raise RuntimeError("no points to plot after filtering")

@@ -325,7 +325,6 @@ def evaluation_row_records(
     return records
 
 
-LEGACY_BATCH_CACHE_SCHEMA = "group-intervention-batch-v1"
 BATCH_CACHE_SCHEMA = "group-intervention-batch-v2"
 
 
@@ -348,17 +347,11 @@ def _load_cache_payload(path: Path) -> dict | None:
 def _payload_outputs(
     payload: dict,
     *,
-    expected_context: Mapping | None,
-    allow_legacy: bool,
+    expected_context: Mapping,
 ) -> tuple[int, int, dict[str, np.ndarray]] | None:
-    schema = payload.get("schema")
-    if schema == BATCH_CACHE_SCHEMA:
-        if expected_context is None or payload.get("context") != dict(expected_context):
-            return None
-    elif schema == LEGACY_BATCH_CACHE_SCHEMA:
-        if not allow_legacy:
-            return None
-    else:
+    if payload.get("schema") != BATCH_CACHE_SCHEMA:
+        return None
+    if payload.get("context") != dict(expected_context):
         return None
     try:
         start = int(payload.get("start", -1))
@@ -388,14 +381,8 @@ def _batch_outputs_for_range(
     start: int,
     end: int,
     expected_context: Mapping,
-    allow_legacy: bool,
 ) -> tuple[dict[str, np.ndarray], int]:
-    """Assemble one requested range across any compatible cache boundaries.
-
-    Current caches carry explicit scientific context.  Legacy v1 caches carry
-    only row ranges and group outputs, so they are considered only after the
-    caller has established one-time directory-level compatibility.
-    """
+    """Assemble one requested range across compatible canonical cache boundaries."""
     requested_len = int(end) - int(start)
     if requested_len < 0:
         return {}, 0
@@ -411,7 +398,6 @@ def _batch_outputs_for_range(
         parsed = _payload_outputs(
             payload,
             expected_context=expected_context,
-            allow_legacy=allow_legacy,
         )
         if parsed is None:
             continue
@@ -461,7 +447,6 @@ def has_complete_group_batch_cache(
     n_examples: int,
     batch_size: int,
     cache_context: Mapping,
-    allow_legacy: bool = False,
 ) -> bool:
     """Return whether all requested groups have compatible cached row coverage."""
     required_keys = {group.key for group in groups if group.size > 0}
@@ -477,7 +462,6 @@ def has_complete_group_batch_cache(
             start=start,
             end=end,
             expected_context=cache_context,
-            allow_legacy=allow_legacy,
         )
         if not required_keys.issubset(outputs):
             return False
@@ -491,7 +475,6 @@ def load_complete_group_batch_cache(
     n_examples: int,
     batch_size: int,
     cache_context: Mapping,
-    allow_legacy: bool = False,
 ) -> dict[str, np.ndarray] | None:
     """Load all requested group outputs without loading the model when complete."""
     groups = [group for group in groups if group.size > 0]
@@ -504,7 +487,6 @@ def load_complete_group_batch_cache(
             start=start,
             end=end,
             expected_context=cache_context,
-            allow_legacy=allow_legacy,
         )
         if not required.issubset(cached):
             return None
@@ -583,7 +565,6 @@ def evaluate_groups(
     cache_dir: Path,
     cache_context: dict,
     force: bool,
-    allow_legacy_cache_fallback: bool = False,
 ) -> dict[str, np.ndarray]:
     """Evaluate simultaneous groups using restartable explicit-metadata caches."""
     groups = [group for group in groups if group.size > 0]
@@ -599,12 +580,11 @@ def evaluate_groups(
         end = min(start + int(batch_size), len(examples))
         batch = examples[start:end]
         batch_cache_path = _batch_cache_path(cache_dir, start, end)
-        existing_batch_outputs, legacy_sources = _batch_outputs_for_range(
+        existing_batch_outputs, cache_sources = _batch_outputs_for_range(
             cache_dir,
             start=start,
             end=end,
             expected_context=cache_context,
-            allow_legacy=(not force and allow_legacy_cache_fallback),
         )
         cached = {} if force else existing_batch_outputs
 
@@ -624,9 +604,9 @@ def evaluate_groups(
             )
 
         if not missing_groups:
-            # One-time migration from legacy or differently batched caches into the
-            # explicit-metadata namespace.
-            if legacy_sources and not force:
+            # Re-materialize compatible cross-boundary cache coverage at the
+            # requested operational boundary for faster subsequent restarts.
+            if cache_sources and not force:
                 _write_batch_cache(
                     batch_cache_path,
                     start=start,

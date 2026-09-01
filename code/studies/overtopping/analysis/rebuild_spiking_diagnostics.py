@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Backfill RQ3 threshold/spiking diagnostics for the primary manuscript rows.
+"""Backfill RQ3 threshold/spiking diagnostics using the exact pipeline RunSpec.
 
-This is model-backed: it reuses frozen held-out candidates but runs the high-N
-singleton/control evaluation and endogenous proxy collection required by
-``threshold_event_diagnostics``. It does not rerun EAP-IG/CHA discovery.
+The rebuild path intentionally mirrors ``run_overtopping_experiments.sh`` /
+``run_pipeline.sh`` instead of maintaining independent defaults.  In
+particular, the model batch size is taken from each matched experiment RunSpec
+unless the caller explicitly supplies ``--batch-size``.
 """
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields, replace
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -16,39 +20,111 @@ import pandas as pd
 
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as helpers
+from studies.overtopping.experiments.execution import RunSpec
+from studies.overtopping.experiments.run_experiments import paper_primary_experiments
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return int(raw) if raw not in (None, "") else int(default)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--primary-table", required=True)
     p.add_argument("--data-root", required=True)
+    p.add_argument("--catalogue-json", default=None, help="configured_experiments.json written by run_overtopping_experiments.sh")
     p.add_argument("--python-bin", default=sys.executable)
     p.add_argument("--evaluation-split", default="test", choices=["test", "train", "all"])
-    p.add_argument("--baseline-subsets", default="positive,negative")
-    p.add_argument("--target", default="all", help="flip_any, flip_c2i, flip_i2c, comma-list, or all")
-    p.add_argument("--spiking-max-points", type=int, default=10000)
-    p.add_argument("--spiking-min-points", type=int, default=512)
-    p.add_argument("--global-n-clusters", type=int, default=64)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--threshold-event-repeats", type=int, default=20)
-    p.add_argument("--threshold-event-holdout-fraction", type=float, default=0.5)
-    p.add_argument("--threshold-event-n-bins", type=int, default=10)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--ai-model-cache-dir", default=None)
+    p.add_argument("--baseline-subsets", default=os.environ.get("ANALYZE_BASELINE_SUBSETS", "positive,negative"))
+    p.add_argument("--target", default=os.environ.get("THRESHOLD_EVENT_TARGET", "all"), help="flip_any, flip_c2i, flip_i2c, comma-list, or all")
+    p.add_argument("--spiking-max-points", type=int, default=_env_int("THRESHOLD_EVENT_MAX_POINTS", 10000))
+    p.add_argument("--spiking-min-points", type=int, default=_env_int("THRESHOLD_EVENT_MIN_POINTS", 512))
+    p.add_argument("--global-n-clusters", type=int, default=_env_int("MAX_POINTS_PER_ABLATION", _env_int("CHA_REFERENCE_N_PER_SIDE", 64)))
+    p.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Explicit override only. Default: exact per-run RunSpec.batch_size from the overtopping experiment catalogue.",
+    )
+    p.add_argument("--points-to-use-for-mean-ablation", type=int, default=_env_int("POINTS_TO_USE_FOR_MEAN_ABLATION", 256))
+    p.add_argument("--threshold-event-min-examples", type=int, default=8)
+    p.add_argument("--threshold-event-repeats", type=int, default=_env_int("THRESHOLD_EVENT_REPEATS", 20))
+    p.add_argument("--threshold-event-holdout-fraction", type=float, default=float(os.environ.get("THRESHOLD_EVENT_HOLDOUT_FRACTION", "0.5")))
+    p.add_argument("--threshold-event-n-bins", type=int, default=_env_int("THRESHOLD_EVENT_N_BINS", 10))
+    p.add_argument("--seed", type=int, default=_env_int("THRESHOLD_EVENT_SEED", 42))
+    p.add_argument("--ai-model-cache-dir", default=os.environ.get("HF_MODEL_CACHE_DIR") or None)
+
+    # Exact spectral arguments passed by run_pipeline.sh.  Step 7b currently
+    # reuses Stage-7 rows, but keeping these identical prevents launcher drift
+    # if spectral-backed diagnostics are re-enabled later.
+    p.add_argument("--spectral-space", default=os.environ.get("SPECTRAL_SPACE", "hidden"))
+    p.add_argument("--rep-hook-name", default=os.environ.get("REP_HOOK_NAME", "ln_final.hook_normalized"))
+    p.add_argument("--rep-pooling", default=os.environ.get("REP_POOLING", "mean"))
+    p.add_argument("--spectral-dim", type=int, default=_env_int("SPECTRAL_DIM", 16))
+    p.add_argument("--spectral-embedding-batch-size", type=int, default=_env_int("SPECTRAL_EMBEDDING_BATCH_SIZE", 32))
+    p.add_argument("--spectral-max-seq-len", type=int, default=(int(os.environ["SPECTRAL_MAX_SEQ_LEN"]) if os.environ.get("SPECTRAL_MAX_SEQ_LEN") else None))
+
     p.add_argument("--force", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
 
-def _spiking_out(setting: dict, split: str, spiking_max_points: int) -> Path:
-    label = f"spiking_diagnostics-{setting['bag_label']}"
+def _spiking_out(spec: RunSpec, data_root: Path, split: str, spiking_max_points: int) -> Path:
+    label = f"spiking_diagnostics-{spec.bag_label()}"
     if split == "train":
         label += "-eval_train"
     elif split == "all":
         label += "-eval_all"
     if int(spiking_max_points) != 10000:
         label += f"-cap{int(spiking_max_points)}"
-    return Path(setting["input_data_dir"]) / label
+    return spec.input_data_dir(data_root) / label
+
+
+def _load_specs(catalogue_json: str | None, evaluation_split: str) -> list[RunSpec]:
+    specs: list[RunSpec] = []
+    if catalogue_json:
+        path = Path(catalogue_json).expanduser().resolve()
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            allowed = {f.name for f in fields(RunSpec)}
+            for raw in payload:
+                values = {k: v for k, v in dict(raw).items() if k in allowed}
+                spec = RunSpec(**values)
+                specs.append(replace(spec, evaluation_split=evaluation_split))
+    if not specs:
+        specs = [replace(spec, evaluation_split=evaluation_split) for spec in paper_primary_experiments()]
+    return specs
+
+
+def _match_spec(setting: dict, specs: list[RunSpec], data_root: Path) -> RunSpec:
+    reported = Path(setting["reported_stats"]).resolve()
+    matches = [spec for spec in specs if spec.stats_dir(data_root).resolve() == reported]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(f"{setting['label']}: multiple catalogue RunSpecs map to {reported}")
+
+    # Fallback for a primary table remapped from another absolute project root:
+    # match the exact relative stats path under data_root.
+    try:
+        rel = reported.relative_to(data_root.resolve())
+    except ValueError:
+        rel = None
+    if rel is not None:
+        matches = []
+        for spec in specs:
+            try:
+                if spec.stats_dir(data_root).resolve().relative_to(data_root.resolve()) == rel:
+                    matches.append(spec)
+            except ValueError:
+                pass
+        if len(matches) == 1:
+            return matches[0]
+
+    raise RuntimeError(
+        f"{setting['label']}: no experiment-catalogue RunSpec matches Stage-7 stats {reported}. "
+        "Re-run ./run_overtopping_experiments.sh --list / regenerate configured_experiments.json; "
+        "the rebuild refuses to guess intervention or batch size."
+    )
 
 
 def main() -> None:
@@ -56,6 +132,7 @@ def main() -> None:
     table_path = Path(args.primary_table).expanduser().resolve()
     data_root = Path(args.data_root).expanduser().resolve()
     table = pd.read_csv(table_path)
+    specs = _load_specs(args.catalogue_json, args.evaluation_split)
 
     n_planned = 0
     for index in range(len(table)):
@@ -65,44 +142,59 @@ def main() -> None:
             data_root,
             PROJECT_ROOT / "results",
             evaluation_split=args.evaluation_split,
-            sampling_max_points=args.spiking_max_points,
+            sampling_max_points=10000,
         )
-        # Manuscript rows normally already point at the held-out stats. Prefer
-        # that exact artifact, then fall back to the canonical held-out target.
-        reported = Path(setting["reported_stats"])
-        heldout = Path(setting["heldout_stats"])
-        stats = reported if (reported / "flip_stats_by_neuron.csv").is_file() else heldout
+        spec = _match_spec(setting, specs, data_root)
+
+        stats = spec.stats_dir(data_root)
         candidate_stats = stats / "flip_stats_by_neuron.csv"
-        if not candidate_stats.is_file():
+        materialized_scores = stats / "scores.csv"
+        if not candidate_stats.is_file() or not materialized_scores.is_file():
             raise FileNotFoundError(
-                f"{setting['label']}: missing held-out candidate flip statistics: {candidate_stats}"
+                f"{setting['label']}: missing exact pipeline Stage-7 materialization: "
+                f"{candidate_stats} / {materialized_scores}"
             )
-        out_dir = _spiking_out(setting, args.evaluation_split, args.spiking_max_points)
-        spectral_cache = PROJECT_ROOT / "cache" / "threshold_events" / setting["slug"]
+
+        out_dir = _spiking_out(spec, data_root, args.evaluation_split, args.spiking_max_points)
+        batch_size = int(args.batch_size) if args.batch_size is not None else int(spec.batch_size)
+        points_to_use = int(args.points_to_use_for_mean_ablation)
+        if "donor" in spec.intervention and points_to_use < 2048:
+            points_to_use = 2048
+        circuit_bag_label = f"{spec.circuit_label()}-{spec.bag_label()}"
+        spectral_cache = PROJECT_ROOT / "cache" / spec.task / "threshold_events" / circuit_bag_label
+
         cmd = [
             str(args.python_bin), "-m", "studies.overtopping.analysis.threshold_event_diagnostics",
-            "--input_data_dir", str(setting["input_data_dir"]),
+            "--input_data_dir", str(spec.input_data_dir(data_root)),
             "--out_dir", str(out_dir),
             "--baseline_subsets", str(args.baseline_subsets),
             "--task_module", str(setting["task_module"]),
-            "--ai_model", str(setting["model_id"]),
+            "--ai_model", str(spec.model),
             "--candidate_flip_stats_path", str(candidate_stats),
-            "--materialized_stage7_scores_path", str(stats / "scores.csv"),
+            "--materialized_stage7_scores_path", str(materialized_scores),
             "--evaluation_split", str(args.evaluation_split),
-            "--intervention", str(setting["intervention"]),
-            "--points_to_use_for_mean_ablation", str(setting["points_to_use_for_mean_ablation"]),
-            "--batch_size", str(args.batch_size),
+            "--intervention", str(spec.intervention),
+            "--points_to_use_for_mean_ablation", str(points_to_use),
+            "--batch_size", str(batch_size),
             "--spiking_max_points", str(args.spiking_max_points),
             "--spiking_min_points", str(args.spiking_min_points),
             "--spiking_global_n_clusters", str(args.global_n_clusters),
+            "--threshold_event_min_examples", str(args.threshold_event_min_examples),
             "--threshold_event_repeats", str(args.threshold_event_repeats),
             "--threshold_event_holdout_fraction", str(args.threshold_event_holdout_fraction),
             "--threshold_event_n_bins", str(args.threshold_event_n_bins),
             "--target", str(args.target),
             "--seed", str(args.seed),
             "--spectral_cache_dir", str(spectral_cache),
+            "--spectral_space", str(args.spectral_space),
+            "--rep_hook_name", str(args.rep_hook_name),
+            "--rep_pooling", str(args.rep_pooling),
+            "--spectral_dim", str(args.spectral_dim),
+            "--spectral_embedding_batch_size", str(args.spectral_embedding_batch_size),
         ]
-        if setting["decode_only"]:
+        if args.spectral_max_seq_len is not None:
+            cmd.extend(["--max_seq_len", str(args.spectral_max_seq_len)])
+        if spec.decode_only:
             cmd.append("--decode_only")
         if args.ai_model_cache_dir:
             cmd.extend(["--ai_model_cache_dir", str(args.ai_model_cache_dir)])
@@ -110,15 +202,17 @@ def main() -> None:
             cmd.extend(["--force_threshold_event", "--force_spiking_eval", "--no_skip_existing"])
 
         print(f"[spiking backfill] {setting['label']}")
-        print(f"  candidates: {candidate_stats}")
-        print(f"  output:     {out_dir}")
-        print("  command:    " + " ".join(cmd), flush=True)
+        print(f"  RunSpec:     intervention={spec.intervention} decode_only={spec.decode_only} batch_size={batch_size}")
+        print(f"  candidates:  {candidate_stats}")
+        print(f"  output:      {out_dir}")
+        print(f"  cache:       {spectral_cache}")
+        print("  command:     " + " ".join(cmd), flush=True)
         n_planned += 1
         if not args.dry_run:
             subprocess.run(cmd, cwd=PROJECT_ROOT / "code", check=True)
 
     verb = "Validated/would rebuild" if args.dry_run else "Rebuilt"
-    print(f"{verb} threshold/spiking diagnostics for {n_planned} primary rows.")
+    print(f"{verb} threshold/spiking diagnostics for {n_planned} primary rows with pipeline-matched RunSpecs.")
 
 
 if __name__ == "__main__":

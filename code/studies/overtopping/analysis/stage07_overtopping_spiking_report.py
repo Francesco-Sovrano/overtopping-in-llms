@@ -161,7 +161,13 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
                 file_path = diag_dir / suffix
                 exists = file_path.is_file()
                 source_label = str(file_path)
-                df = pd.read_csv(file_path) if exists else pd.DataFrame()
+                if exists:
+                    try:
+                        df = pd.read_csv(file_path)
+                    except pd.errors.EmptyDataError:
+                        df = pd.DataFrame()
+                else:
+                    df = pd.DataFrame()
             else:
                 rel = (Path("data") / diag_dir.relative_to(data_root) / suffix).as_posix()
                 member = _zip_member_for_expected(zf, rel)
@@ -169,7 +175,10 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
                 source_label = member or rel
                 if exists:
                     with zf.open(member) as fh:
-                        df = pd.read_csv(io.BytesIO(fh.read()))
+                        try:
+                            df = pd.read_csv(io.BytesIO(fh.read()))
+                        except pd.errors.EmptyDataError:
+                            df = pd.DataFrame()
                 else:
                     df = pd.DataFrame()
             baselines = set(df.get("baseline_subset", pd.Series(dtype=str)).dropna().astype(str)) if not df.empty else set()
@@ -209,18 +218,39 @@ def load_exact_primary_population(args, out: Path) -> tuple[pd.DataFrame, pd.Dat
     ut, audit_ut = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_unit_tests.csv")
     b, audit_b = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_binned_curves.csv")
     audit = pd.DataFrame(audit_fs + audit_ut + audit_b)
-    # Binned curves are descriptive and may legitimately be empty; the exact
-    # primary rows and both baseline/population subsets are mandatory for the
-    # two inferential aggregate inputs.
-    required = audit[audit["file"].isin(["aggregate_flip_stats.csv", "aggregate_unit_tests.csv"])]
+    # The model-backed flip table is the population-completeness authority: it
+    # proves that both baseline subsets and both candidate/control populations
+    # were actually evaluated. Threshold-unit tests are conditional on there
+    # being enough flip and non-flip examples for repeated held-out fitting. A
+    # population can therefore be present in aggregate_flip_stats.csv but
+    # legitimately absent from aggregate_unit_tests.csv (for example, inert
+    # random controls with no/too-few flips). Treat that as threshold-testability
+    # sparsity, not as a missing primary population.
     out.mkdir(parents=True, exist_ok=True)
+    audit["required_for_population"] = audit["file"].eq("aggregate_flip_stats.csv")
+    # Only the model-backed flip table is a required per-run source.  A run can
+    # legitimately have *no* threshold-unit-test table at all when every
+    # candidate/control unit fails the minimum flip/non-flip support required by
+    # repeated_holdout().  threshold_event_diagnostics historically wrote an
+    # empty, zero-column threshold_unit_tests.csv in that case; write_aggregate
+    # then skipped it, leaving no aggregate_unit_tests.csv.  The complete flip
+    # population still proves that the interventions were evaluated, so do not
+    # misclassify this representation detail as an unevaluated primary row.
+    audit["required_source_exists"] = audit["file"].eq("aggregate_flip_stats.csv")
     audit.to_csv(out / "population_audit.csv", index=False)
     (out / "population_audit.json").write_text(json.dumps(audit.to_dict(orient="records"), indent=2), encoding="utf-8")
-    incomplete = required[~required["complete"].astype(bool)]
+
+    incomplete_population = audit[
+        audit["file"].eq("aggregate_flip_stats.csv") & ~audit["complete"].astype(bool)
+    ]
+    incomplete = incomplete_population.copy()
     if not incomplete.empty:
         preview = incomplete[["row_index", "task", "model", "phase", "file", "missing_baseline_subsets", "missing_populations", "exists"]].to_dict(orient="records")[:8]
         raise RuntimeError(
-            "RQ3 primary population is incomplete; refusing to report a partial population. "
+            "RQ3 primary evaluation population is incomplete; refusing to report unevaluated rows. "
+            "Threshold-test rows/files may be sparse or absent when units have too few flip/non-flip "
+            "events, but the model-backed flip-stat population must contain both baseline subsets "
+            "and both candidate/control populations. "
             f"See {out / 'population_audit.csv'}. First failures: {preview}"
         )
     return fs, ut, b
@@ -279,6 +309,94 @@ def paired_medians(df: pd.DataFrame, metric: str) -> pd.DataFrame:
     g = g.dropna(subset=[POP_CAND, POP_CTRL]).copy()
     g["delta"] = g[POP_CAND] - g[POP_CTRL]
     return g
+
+
+def build_best_threshold_population(fs: pd.DataFrame, ut: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per evaluated candidate/control unit with best threshold test.
+
+    Threshold tests are only emitted when repeated held-out fitting has enough
+    positive and negative events.  We therefore left-join the real unit tests
+    onto the complete model-backed flip population instead of silently dropping
+    evaluated units.  Best-MCC remains NaN for untestable units.  TECS is known
+    to be exactly zero for zero-strength units even when thresholdability itself
+    is undefined; nonzero-strength untestable units keep TECS as NaN.
+    """
+    if fs is None or fs.empty:
+        return pd.DataFrame()
+    base = fs.loc[fs["population"].isin([POP_CAND, POP_CTRL])].copy()
+    keys = [c for c in ["run_id", "task", "model", "setting", "decode_only", "baseline_subset", "population", "unit_key"] if c in base.columns]
+    if not {"run_id", "baseline_subset", "population", "unit_key"}.issubset(keys):
+        return pd.DataFrame()
+
+    if "population_strength" not in base.columns:
+        strength_cols = [c for c in ["flip_any_rate", "c2i_rate", "i2c_rate"] if c in base.columns]
+        if strength_cols:
+            base["population_strength"] = base[strength_cols].apply(pd.to_numeric, errors="coerce").max(axis=1)
+        else:
+            base["population_strength"] = np.nan
+    base["population_strength"] = pd.to_numeric(base["population_strength"], errors="coerce")
+    base = base.sort_values(keys).drop_duplicates(keys, keep="first")
+
+    real = pd.DataFrame()
+    if ut is not None and not ut.empty and "median_test_abs_mcc" in ut.columns:
+        cand = ut.loc[ut.get("population", pd.Series(index=ut.index, dtype=str)).isin([POP_CAND, POP_CTRL])].copy()
+        if not cand.empty:
+            cand["median_test_abs_mcc"] = pd.to_numeric(cand["median_test_abs_mcc"], errors="coerce")
+            cand = cand.dropna(subset=["median_test_abs_mcc"])
+        if not cand.empty:
+            group_keys = [c for c in keys if c in cand.columns]
+            idx = cand.groupby(group_keys, dropna=False)["median_test_abs_mcc"].idxmax()
+            real = cand.loc[idx].copy().rename(columns={
+                "median_test_abs_mcc": "best_mcc",
+                "median_test_auc_oriented": "best_auc",
+                "feature": "best_feature",
+            })
+            keep = group_keys + [c for c in ["best_mcc", "best_auc", "best_feature", "target", "direction_family"] if c in real.columns]
+            real = real.loc[:, list(dict.fromkeys(keep))]
+
+    if real.empty:
+        best = base.copy()
+        best["best_mcc"] = np.nan
+        best["best_auc"] = np.nan
+        best["best_feature"] = pd.NA
+    else:
+        merge_keys = [c for c in keys if c in real.columns]
+        best = base.merge(real, on=merge_keys, how="left", validate="one_to_one")
+
+    best["best_mcc"] = pd.to_numeric(best.get("best_mcc"), errors="coerce")
+    best["threshold_testable"] = best["best_mcc"].notna()
+    strength = pd.to_numeric(best["population_strength"], errors="coerce")
+    best["causal_spiking_score"] = strength * best["best_mcc"]
+    zero_strength = strength.fillna(np.nan).eq(0.0)
+    best.loc[zero_strength & ~best["threshold_testable"], "causal_spiking_score"] = 0.0
+    best["tecs_observed"] = best["causal_spiking_score"].notna()
+    best["feature_family"] = best.get("best_feature", pd.Series(index=best.index, dtype=object)).map(
+        lambda v: family(v) if pd.notna(v) else "untestable"
+    )
+    return best
+
+
+def threshold_testability_audit(fs: pd.DataFrame, best: pd.DataFrame) -> pd.DataFrame:
+    if fs is None or fs.empty:
+        return pd.DataFrame()
+    base = fs.loc[fs["population"].isin([POP_CAND, POP_CTRL])].copy()
+    group = [c for c in ["run_id", "task", "model", "setting", "decode_only", "baseline_subset", "population"] if c in base.columns]
+    if not group or "unit_key" not in base.columns:
+        return pd.DataFrame()
+    evaluated = base.groupby(group, dropna=False)["unit_key"].nunique().rename("n_evaluated_units").reset_index()
+    if best is None or best.empty:
+        evaluated["n_threshold_testable_units"] = 0
+        evaluated["n_tecs_observed_units"] = 0
+    else:
+        agg = best.groupby(group, dropna=False).agg(
+            n_threshold_testable_units=("threshold_testable", "sum"),
+            n_tecs_observed_units=("tecs_observed", "sum"),
+        ).reset_index()
+        evaluated = evaluated.merge(agg, on=group, how="left")
+        evaluated[["n_threshold_testable_units", "n_tecs_observed_units"]] = evaluated[["n_threshold_testable_units", "n_tecs_observed_units"]].fillna(0).astype(int)
+    evaluated["threshold_testable_fraction"] = evaluated["n_threshold_testable_units"] / evaluated["n_evaluated_units"].replace(0, np.nan)
+    evaluated["tecs_observed_fraction"] = evaluated["n_tecs_observed_units"] / evaluated["n_evaluated_units"].replace(0, np.nan)
+    return evaluated
 
 
 def effect_summary(med: pd.DataFrame, n_boot:int) -> Dict[str,float]:
@@ -571,7 +689,9 @@ Available from the threshold/spiking diagnostics:
 
 - `fig4a_candidate_control_spiking_cut_summary.pdf`: candidate vs matched-control singleton strength, held-out thresholdability, and TECS.
 - `fig4b_threshold_tail_enrichment.pdf`: descriptive binned endogenous-proxy/flip enrichment.
-- `fig4s1_thresholdability_ecdf.pdf` and `fig4s2_tecs_ecdf.pdf`: full distributions.
+- `fig4s1_thresholdability_ecdf.pdf` and `fig4s2_tecs_ecdf.pdf`: distributions over units with an observable endpoint. Thresholdability requires a valid repeated held-out fit; zero-strength units have TECS exactly 0 even when thresholdability is undefined.
+
+The detailed analysis directory also contains `threshold_testability_audit.csv`, which records how many model-evaluated units in each run/baseline/population had enough flip/non-flip events for a held-out threshold test. Missing threshold tests are not treated as missing interventions.
 
 Additional experiment stages invoked by `generate_final_results.py`:
 
@@ -609,7 +729,7 @@ Use **Threshold-Event Causal Score (TECS)** as the one primary metric:
 TECS(j) = singleton_flip_any_rate(j) * max_feature held_out_abs_MCC(j, feature)
 ```
 
-TECS is high only when a neuron both flips a nontrivial fraction of examples under singleton intervention and has a simple threshold-like proxy that identifies those flipped examples. Flip rate alone measures causal strength but not spiking structure. Threshold MCC alone measures spiking structure but can over-credit units that affect very few examples. AUC alone measures ranking but not a usable threshold. TECS combines the two parts required by the claim.
+TECS is high only when a neuron both flips a nontrivial fraction of examples under singleton intervention and has a simple threshold-like proxy that identifies those flipped examples. Flip rate alone measures causal strength but not spiking structure. Threshold MCC alone measures spiking structure but can over-credit units that affect very few examples. AUC alone measures ranking but not a usable threshold. TECS combines the two parts required by the claim. Held-out threshold fitting requires enough flip and non-flip examples; model-evaluated units that do not meet that criterion remain in `threshold_testability_audit.csv` with undefined thresholdability. Zero-strength units have TECS=0 by definition, while nonzero-strength units without an eligible threshold fit remain unavailable rather than being assigned a fabricated MCC.
 
 ### Controls are non-candidates, not guaranteed no-effect neurons
 
@@ -662,29 +782,55 @@ Use `figures/binned_flip_curves_oriented_proxy.pdf` as a descriptive supplement 
 
 
 def main():
-    args=parse_args(); out=Path(args.out).resolve(); out.mkdir(parents=True)
+    args=parse_args(); out=Path(args.out).resolve(); out.mkdir(parents=True, exist_ok=True)
     source_kind="zip" if args.zip else "root"; source_path=Path(args.zip or args.root).resolve(); base_md=Path(args.base_md).resolve() if args.base_md else None
     fs_all, ut_all, b_primary = load_exact_primary_population(args, out)
     if fs_all.empty: raise RuntimeError("No aggregate_flip_stats.csv found")
-    if ut_all.empty: raise RuntimeError("No aggregate_unit_tests.csv found")
     fs=fs_all[fs_all.population.isin([POP_CAND,POP_CTRL])].copy()
     flip_summary=fs.groupby("population").agg(n_units=("unit_key","count"), n_runs=("run_id","nunique"), median_flip_any=("flip_any_rate","median"), mean_flip_any=("flip_any_rate","mean"), q75_flip_any=("flip_any_rate",lambda s:s.quantile(.75)), q90_flip_any=("flip_any_rate",lambda s:s.quantile(.90)), q95_flip_any=("flip_any_rate",lambda s:s.quantile(.95)), max_flip_any=("flip_any_rate","max"), frac_ge_0_01=("flip_any_rate",lambda s:(s>=.01).mean()), frac_ge_0_05=("flip_any_rate",lambda s:(s>=.05).mean()), frac_ge_0_10=("flip_any_rate",lambda s:(s>=.10).mean()), frac_ge_0_20=("flip_any_rate",lambda s:(s>=.20).mean())).reset_index()
     flip_med=paired_medians(fs,"flip_any_rate"); flip_eff=effect_summary(flip_med,args.bootstrap); flip_cd=cliffs_delta(fs.loc[fs.population==POP_CAND,"flip_any_rate"],fs.loc[fs.population==POP_CTRL,"flip_any_rate"])
-    ut=ut_all[ut_all.population.isin([POP_CAND,POP_CTRL])].dropna(subset=["median_test_abs_mcc","population_strength"]).copy()
-    idx=ut.groupby(["run_id","task","model","setting","decode_only","baseline_subset","population","unit_key"],dropna=False)["median_test_abs_mcc"].idxmax()
-    best=ut.loc[idx].copy().rename(columns={"median_test_abs_mcc":"best_mcc","median_test_auc_oriented":"best_auc","feature":"best_feature"})
-    best["causal_spiking_score"]=best.population_strength*best.best_mcc
-    best["feature_family"]=best.best_feature.map(family)
-    primary=best.groupby("population").agg(n_units=("unit_key","count"), n_runs=("run_id","nunique"), median_best_mcc=("best_mcc","median"), mean_best_mcc=("best_mcc","mean"), median_strength=("population_strength","median"), mean_strength=("population_strength","mean"), median_css=("causal_spiking_score","median"), mean_css=("causal_spiking_score","mean"), q75_css=("causal_spiking_score",lambda s:s.quantile(.75)), q90_css=("causal_spiking_score",lambda s:s.quantile(.90)), frac_css_ge_0_01=("causal_spiking_score",lambda s:(s>=.01).mean()), frac_css_ge_0_02=("causal_spiking_score",lambda s:(s>=.02).mean())).reset_index()
+
+    if ut_all.empty or "population" not in ut_all.columns:
+        ut = pd.DataFrame()
+    else:
+        ut = ut_all[ut_all.population.isin([POP_CAND,POP_CTRL])].copy()
+        for col in ["median_test_abs_mcc", "population_strength"]:
+            if col in ut.columns:
+                ut[col] = pd.to_numeric(ut[col], errors="coerce")
+        if "median_test_abs_mcc" in ut.columns:
+            ut = ut.dropna(subset=["median_test_abs_mcc"])
+
+    best = build_best_threshold_population(fs, ut)
+    testability = threshold_testability_audit(fs, best)
+    if best.empty:
+        primary = pd.DataFrame(columns=["population", "n_units", "n_runs", "n_threshold_testable", "n_tecs_observed", "median_best_mcc", "mean_best_mcc", "median_strength", "mean_strength", "median_css", "mean_css", "q75_css", "q90_css", "frac_css_ge_0_01", "frac_css_ge_0_02"])
+    else:
+        primary=best.groupby("population").agg(
+            n_units=("unit_key","count"),
+            n_runs=("run_id","nunique"),
+            n_threshold_testable=("threshold_testable","sum"),
+            n_tecs_observed=("tecs_observed","sum"),
+            median_best_mcc=("best_mcc","median"),
+            mean_best_mcc=("best_mcc","mean"),
+            median_strength=("population_strength","median"),
+            mean_strength=("population_strength","mean"),
+            median_css=("causal_spiking_score","median"),
+            mean_css=("causal_spiking_score","mean"),
+            q75_css=("causal_spiking_score",lambda s:s.quantile(.75)),
+            q90_css=("causal_spiking_score",lambda s:s.quantile(.90)),
+            frac_css_ge_0_01=("causal_spiking_score",lambda s:(s>=.01).mean()),
+            frac_css_ge_0_02=("causal_spiking_score",lambda s:(s>=.02).mean()),
+        ).reset_index()
     css_med=paired_medians(best,"causal_spiking_score"); css_eff=effect_summary(css_med,args.bootstrap); css_cd=cliffs_delta(best.loc[best.population==POP_CAND,"causal_spiking_score"], best.loc[best.population==POP_CTRL,"causal_spiking_score"])
     mcc_med=paired_medians(best,"best_mcc"); mcc_eff=effect_summary(mcc_med,args.bootstrap); mcc_cd=cliffs_delta(best.loc[best.population==POP_CAND,"best_mcc"], best.loc[best.population==POP_CTRL,"best_mcc"])
     adj=holm({"strength_flip_rate":flip_eff["wilcoxon_p_greater"],"threshold_mcc":mcc_eff["wilcoxon_p_greater"],"primary_css":css_eff["wilcoxon_p_greater"]})
     feats=[]
-    for feat,g in ut.groupby("feature"):
-        gg=g.copy(); gg["feature_css"]=gg.population_strength*gg.median_test_abs_mcc; med=paired_medians(gg,"feature_css"); medm=paired_medians(gg,"median_test_abs_mcc")
-        if med.empty: continue
-        ef=effect_summary(med,0); em=effect_summary(medm,0)
-        feats.append(dict(feature=feat,family=family(feat),n_pairs=ef["n_pairs"],css_median_delta=ef["median_delta"],css_wilcoxon_p_greater=ef["wilcoxon_p_greater"],mcc_median_delta=em["median_delta"],mcc_wilcoxon_p_greater=em["wilcoxon_p_greater"]))
+    if not ut.empty and "feature" in ut.columns and "population_strength" in ut.columns and "median_test_abs_mcc" in ut.columns:
+        for feat,g in ut.groupby("feature"):
+            gg=g.copy(); gg["feature_css"]=gg.population_strength*gg.median_test_abs_mcc; med=paired_medians(gg,"feature_css"); medm=paired_medians(gg,"median_test_abs_mcc")
+            if med.empty: continue
+            ef=effect_summary(med,0); em=effect_summary(medm,0)
+            feats.append(dict(feature=feat,family=family(feat),n_pairs=ef["n_pairs"],css_median_delta=ef["median_delta"],css_wilcoxon_p_greater=ef["wilcoxon_p_greater"],mcc_median_delta=em["median_delta"],mcc_wilcoxon_p_greater=em["wilcoxon_p_greater"]))
     feature_comp=pd.DataFrame(feats).sort_values("css_median_delta",ascending=False) if feats else pd.DataFrame()
     if not feature_comp.empty:
         feature_comp["css_bh_q"]=bh_q(feature_comp.css_wilcoxon_p_greater); feature_comp["mcc_bh_q"]=bh_q(feature_comp.mcc_wilcoxon_p_greater)
@@ -701,8 +847,8 @@ def main():
         keys=["run_id","baseline_subset","population","unit_key","feature","target"]
         b["curve_mean"]=b.groupby(keys,dropna=False).flip_rate.transform("mean"); b["flip_enrichment"]=b.flip_rate/b.curve_mean.replace(0,np.nan)
         binned_agg=b.groupby(["feature_family","population","bin_index"],dropna=False).agg(median_flip_enrichment=("flip_enrichment","median"),mean_flip_enrichment=("flip_enrichment","mean"),median_flip_rate=("flip_rate","median"),n_curves=("unit_key","count")).reset_index()
-    for name,df in {"flip_rate_summary.csv":flip_summary,"paired_flip_rate_by_run_baseline.csv":flip_med.reset_index(),"unit_primary_spiking_scores.csv":best,"primary_spiking_score_summary.csv":primary,"paired_css_by_run_baseline.csv":css_med.reset_index(),"paired_best_mcc_by_run_baseline.csv":mcc_med.reset_index(),"paired_css_delta_rich.csv":rich,"feature_level_stat_summary.csv":feature_comp,"binned_curve_aggregate.csv":binned_agg}.items(): df.to_csv(out/name,index=False)
-    results={"populations":{"candidate":POP_CAND,"control":POP_CTRL},"flip_summary":flip_summary.to_dict(orient="records"),"flip_effect":flip_eff,"flip_unit_cliffs_delta":flip_cd,"primary_summary":primary.to_dict(orient="records"),"css_effect":css_eff,"css_unit_cliffs_delta":css_cd,"best_mcc_effect":mcc_eff,"best_mcc_unit_cliffs_delta":mcc_cd,"planned_tests_holm_corrected_p":adj,"n_aggregate_flip_stats_files":int(len(fs_all.rel.unique())) if "rel" in fs_all else 0,"n_aggregate_unit_tests_files":int(len(ut_all.rel.unique())) if "rel" in ut_all else 0}
+    for name,df in {"flip_rate_summary.csv":flip_summary,"paired_flip_rate_by_run_baseline.csv":flip_med.reset_index(),"unit_primary_spiking_scores.csv":best,"threshold_testability_audit.csv":testability,"primary_spiking_score_summary.csv":primary,"paired_css_by_run_baseline.csv":css_med.reset_index(),"paired_best_mcc_by_run_baseline.csv":mcc_med.reset_index(),"paired_css_delta_rich.csv":rich,"feature_level_stat_summary.csv":feature_comp,"binned_curve_aggregate.csv":binned_agg}.items(): df.to_csv(out/name,index=False)
+    results={"populations":{"candidate":POP_CAND,"control":POP_CTRL},"flip_summary":flip_summary.to_dict(orient="records"),"flip_effect":flip_eff,"flip_unit_cliffs_delta":flip_cd,"primary_summary":primary.to_dict(orient="records"),"threshold_testability":testability.to_dict(orient="records"),"css_effect":css_eff,"css_unit_cliffs_delta":css_cd,"best_mcc_effect":mcc_eff,"best_mcc_unit_cliffs_delta":mcc_cd,"planned_tests_holm_corrected_p":adj,"n_aggregate_flip_stats_files":int(len(fs_all.rel.unique())) if "rel" in fs_all else 0,"n_aggregate_unit_tests_files":int(len(ut_all.rel.unique())) if (not ut_all.empty and "rel" in ut_all) else 0}
     (out/"statistical_results.json").write_text(json.dumps(results,indent=2))
     plot_outputs(out,fs,best,rich,feature_comp,binned_agg)
     if args.paper_figures_dir:

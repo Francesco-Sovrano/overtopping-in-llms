@@ -70,16 +70,6 @@ PHASE_ENDPOINT_ROOT="$(dirname "$(dirname "$BACKDOOR_OUTPUT_DATA_DIR")")"
 NORMAL_BEHAVIOR_OUTPUT_DATA_DIR="$PHASE_ENDPOINT_ROOT/normal_task/eval_${SAFE_INTERVENTION}"
 NORMAL_BEHAVIOR_CACHE_DIR="$DISCOVERY_CACHE_ROOT/normal_task/$CHECKPOINT_CACHE_KEY"
 NORMAL_BEHAVIOR_LLM_IO="$NORMAL_BEHAVIOR_CACHE_DIR/llm_io_data.pkl"
-# ``normal_task_behavior`` is accepted as a persisted cache-namespace alias for
-# this same raw stratified endpoint.  Stage 1 validates the migrated cache before
-# accepting it; incompatible sampling definitions are rebuilt.
-LEGACY_NORMAL_BEHAVIOR_LLM_IO="$DISCOVERY_CACHE_ROOT/normal_task_behavior/$CHECKPOINT_CACHE_KEY/llm_io_data.pkl"
-if [[ ! -s "$NORMAL_BEHAVIOR_LLM_IO" && -s "$LEGACY_NORMAL_BEHAVIOR_LLM_IO" ]]; then
-  mkdir -p "$NORMAL_BEHAVIOR_CACHE_DIR"
-  cp -p "$LEGACY_NORMAL_BEHAVIOR_LLM_IO" "$NORMAL_BEHAVIOR_LLM_IO"
-  echo "[normal-task-cache] migrated legacy normal_task_behavior cache -> $NORMAL_BEHAVIOR_LLM_IO"
-fi
-
 # Causal control endpoint on the fixed attack-eligible non-target cohort.
 ATTACK_CAUSAL_OUTPUT_DATA_DIR="$PHASE_ENDPOINT_ROOT/attack_cohort_control_correctness/eval_${SAFE_INTERVENTION}"
 ATTACK_CAUSAL_CACHE_DIR="$DISCOVERY_CACHE_ROOT/attack_cohort_control_correctness/$CHECKPOINT_CACHE_KEY"
@@ -108,7 +98,7 @@ echo "============================================================"
 echo "NORMAL TASK BEHAVIOR (NO TRIGGER)"
 echo "model_variant=$CONDITION checkpoint=$CHECKPOINT_STAGE_LABEL"
 if (( NORMAL_TASK_SCAN_MAX_ROWS > 0 )); then
-  echo "cohort=DETERMINISTIC PROPORTIONAL STRATIFIED HELD-OUT SAMPLE (cap=$NORMAL_TASK_SCAN_MAX_ROWS)"
+  echo "cohort=HELD-OUT DISTRIBUTION (cap=$NORMAL_TASK_SCAN_MAX_ROWS; proportional stratification only if population exceeds cap)"
 else
   echo "cohort=FULL HELD-OUT DISTRIBUTION (explicit uncapped request)"
 fi

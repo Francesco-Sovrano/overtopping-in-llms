@@ -92,10 +92,12 @@ The normal-task behavior cohort defaults to 10,000 deterministic proportional-st
 Useful reporting controls include:
 
 ```bash
-REBUILD_DIRECTIONAL_SINGLETONS=true ./generate_results.sh
-REBUILD_SPIKING_DIAGNOSTICS=true SPIKING_MAX_POINTS=10000 ./generate_results.sh
 SPIKING_SOURCE=/absolute/path/to/spiking_diagnostics... ./generate_results.sh
+REQUIRE_CMC=1 ./generate_results.sh
+ALLOW_INCOMPLETE_METRICS=1 ./generate_results.sh
 ```
+
+Experiment repair/backfill is intentionally separate from final-results generation.
 
 `results/README.md` is the navigation point for generated output.
 
