@@ -150,24 +150,39 @@ def resolve_spiking_source(explicit: str | None, data_root: Path) -> Path | None
 
 
 def relocate_paper_sidecars(results_root: Path) -> None:
-    """Copy machine sidecars to analysis/ without removing their original files."""
-    fig_root = manuscript_figures(results_root)
-    fig_data_root = figure_data(results_root)
-    if fig_root.is_dir():
-        for src in list(fig_root.rglob("*.csv")) + list(fig_root.rglob("*.json")):
-            rel = src.relative_to(fig_root)
-            dst = fig_data_root / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(dst))
+    """Move machine sidecars out of ``paper/`` and into ``analysis/``.
 
-    tbl_root = manuscript_materials(results_root)
-    tbl_data_root = table_data(results_root)
-    if tbl_root.is_dir():
-        for src in list(tbl_root.rglob("*.csv")) + list(tbl_root.rglob("*.json")):
-            rel = src.relative_to(tbl_root)
-            dst = tbl_data_root / rel
+    The manuscript-facing contract requires ``paper/figures`` and
+    ``paper/tables`` to contain only human-facing artifacts.  Earlier code
+    copied CSV/JSON sidecars into ``analysis/`` but left the originals in
+    ``paper/``; the subsequent validator therefore failed every run that
+    generated a sidecar.  Copy first (so an existing analysis-side copy is
+    refreshed), then unlink the paper-side source.
+    """
+
+    def _move_sidecars(src_root: Path, dst_root: Path) -> int:
+        moved = 0
+        if not src_root.is_dir():
+            return moved
+        # Materialize the list before unlinking while traversing.
+        sidecars = list(src_root.rglob("*.csv")) + list(src_root.rglob("*.json"))
+        for src in sidecars:
+            rel = src.relative_to(src_root)
+            dst = dst_root / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
+            src.unlink()
+            moved += 1
+        return moved
+
+    n_fig = _move_sidecars(manuscript_figures(results_root), figure_data(results_root))
+    n_tbl = _move_sidecars(manuscript_materials(results_root), table_data(results_root))
+    if n_fig or n_tbl:
+        print(
+            f"[final-results] relocated machine sidecars out of paper view: "
+            f"figures={n_fig}, tables={n_tbl}",
+            flush=True,
+        )
 
 
 def poisoning_run_dirs(poisoning_root: Path) -> list[Path]:
@@ -271,8 +286,8 @@ def publish_per_run_poisoning_visuals(
                 shutil.rmtree(paper_phase)
             paper_phase.mkdir(parents=True, exist_ok=True)
 
-            # Cache-only story figures: developmental overview + individual agonist
-            # role comparison + checkpoint/channel heatmap.
+            # Cache-only story figures: aggregate development, descriptive channel
+            # roles, prospective defense leverage, and complete fixed-union heatmap.
             control_correctness_roots = list(
                 checkpoint_root.glob(
                     f"*/progress_*/{phase_dir}/attack_cohort_control_correctness/eval_*"
@@ -413,11 +428,10 @@ def publish_per_run_poisoning_visuals(
             readme = paper_phase / "README.md"
             readme.write_text(
                 "# Per-run poisoning visualizations\n\n"
-                "This directory intentionally exposes the complete generated poisoning figure set, grouped by scientific role.\n\n"
+                "This directory exposes the scientifically valid generated poisoning figure set, grouped by role. Longitudinal figures that require fixed-union materialization are withheld rather than published incompletely.\n\n"
                 "## 01_behavior\nCheckpoint-specific clean-vs-poison behavior comparisons from Stage 04.\n\n"
                 "## 02_behavior_trajectories\nOne dynamic Stage-05 dashboard containing each available distinct behavior/causal endpoint exactly once.\n\n"
-                "## 03_causal_roles\nThe compact checkpoint story plus additional non-redundant mechanism analyses of causal location, persistence, and concentration. Start with "
-                "`story/02_channel_role_reassignment_and_defense_leverage.pdf`, then inspect "
+                "## 03_causal_roles\nThe compact checkpoint story plus additional non-redundant mechanism analyses of causal location, persistence, and concentration. Read `story/01_clean_vs_poisoned_overtopping_development.pdf` first, then `story/02_channel_role_reassignment.pdf`. When fixed-union materialization is complete, `story/03_prospective_defense_leverage.pdf` provides a leakage-resistant defense-target screen (Δdef = attack suppression − benign damage; positive values indicate plausible attack-selective defense targets, not yet defense efficacy), and `story/04_clean_vs_poisoned_checkpoint_overtopping.pdf` provides longitudinal fixed-union follow-up. Then inspect "
                 "`mechanism/01_where_poisoning_specific_causal_control_moves.pdf`.\n\n"
                 "## 04_poison_detection\nRaw poison-ranking diagnostics and the implication-first detection overview.\n\n"
                 "## 05_update_geometry\nClean-vs-poison LoRA update geometry and matched/update-energy controls.\n\n"
@@ -483,7 +497,7 @@ Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnos
 ### Reading order
 
 1. Figure 2a/2c: 0->1 reach and high-effect density.
-2. Figure 2b/2d: 1->0 companions; low-denominator estimates are explicitly marked and excluded from fits.
+2. Figure 2b/2d: 1->0 companions; low-denominator estimates are explicitly marked as uncertain but remain in the declared setting-level fits.
 3. Figure 3a/3b: composition and coalition boundary.
 4. Figure 4: threshold/spiking-cut evidence.
 5. Figure 5: learning-time role change.
@@ -575,8 +589,9 @@ def validate_generated_paper_view(results_root: Path, *, spiking_expected: bool)
     else:
         errors.append(f"missing directional prevalence sidecar: {rq1_data}")
 
-    # RQ1 paper panels use the full experimental-setting scanner, not the
-    # 28-row primary matrix.  Derived *-heldout_test directories must never be
+    # RQ1 paper panels use the explicit 28-primary + 11-supplementary
+    # non-poisoning experiment catalogue, not the 28-row primary matrix alone.
+    # Derived *-heldout_test directories must never be
     # counted as additional experiments, and the fit-stat sidecar must describe
     # exactly the same sample as the plotted-point CSV.
     rq1_fig_data = figure_data(results_root) / "02_rq1_prevalence"
@@ -593,10 +608,60 @@ def validate_generated_paper_view(results_root: Path, *, spiking_expected: bool)
             continue
         try:
             points = pd.read_csv(points_path)
-            if "run" in points.columns:
-                leaked = points["run"].astype(str).str.endswith("-heldout_test")
-                if bool(leaked.any()):
-                    errors.append(f"{stem} counts {int(leaked.sum())} derived heldout-test directories as experiments")
+            if "run" not in points.columns:
+                errors.append(f"{stem} point sidecar lacks run provenance")
+            else:
+                # Figure 2 intentionally reads the strict held-out-test artifact for
+                # each experimental setting.  The heldout-test suffix is therefore
+                # evidence of the selected evaluation product, not evidence that the
+                # derivative was counted as an additional experiment.  What must be
+                # forbidden is having multiple evaluation variants of the *same*
+                # canonical setting in the plotted population.
+                run_names = points["run"].astype(str)
+                heldout = run_names.str.contains(r"-heldout_test(?:-cap\d+)?$", regex=True)
+                if bool((~heldout).any()):
+                    examples = run_names.loc[~heldout].head(3).tolist()
+                    errors.append(
+                        f"{stem} contains {int((~heldout).sum())} non-heldout evaluation rows "
+                        f"in the strict RQ1 manuscript population; examples={examples}"
+                    )
+
+                canonical_run = run_names.str.replace(
+                    r"-(?:heldout_test|eval_train|eval_all)(?:-cap\d+)?$",
+                    "",
+                    regex=True,
+                )
+                key_columns = [c for c in ("task", "org", "model") if c in points.columns]
+                key_frame = points[key_columns].astype(str).copy() if key_columns else pd.DataFrame(index=points.index)
+                key_frame["canonical_run"] = canonical_run
+                duplicate_mask = key_frame.duplicated(keep=False)
+                if bool(duplicate_mask.any()):
+                    duplicate_groups = int(key_frame.loc[duplicate_mask].drop_duplicates().shape[0])
+                    duplicate_rows = int(duplicate_mask.sum())
+                    errors.append(
+                        f"{stem} contains {duplicate_rows} rows from {duplicate_groups} duplicated canonical "
+                        "experimental settings after collapsing evaluation suffixes"
+                    )
+
+                # Figure 2 has an explicit manuscript catalogue: 28 primary +
+                # 11 supplementary non-poisoning settings.  A manuscript figure
+                # must therefore contain all 39 rows, with the known phase split,
+                # rather than silently accepting whatever a filesystem scan found.
+                expected_total = 39
+                expected_phase_counts = {"input+output": 17, "decode-only": 22}
+                if len(points) != expected_total:
+                    errors.append(
+                        f"{stem} has {len(points)} settings; expected the complete "
+                        f"{expected_total}-setting primary+supplementary RQ1 catalogue"
+                    )
+                if "phase" in points.columns:
+                    actual_phase_counts = points["phase"].astype(str).value_counts().to_dict()
+                    for phase, n_expected in expected_phase_counts.items():
+                        n_actual = int(actual_phase_counts.get(phase, 0))
+                        if n_actual != n_expected:
+                            errors.append(
+                                f"{stem} has {n_actual} {phase} settings; expected {n_expected}"
+                            )
             if not stats_path.is_file():
                 errors.append(f"missing all-settings RQ1 fit-stat sidecar: {stats_path}")
             else:
@@ -711,8 +776,9 @@ def main() -> None:
             "--skip_primary_rq4",
         ])
 
-        # RQ1 figures use the canonical all-settings population rather than the
-        # 28-row primary matrix used for manuscript tables. Directional source-state
+        # RQ1 figures use the explicit 39-setting primary+supplementary
+        # non-poisoning catalogue rather than the 28-row primary matrix used for
+        # manuscript tables. Directional source-state
         # denominators describe uncertainty within a setting and are not an
         # across-setting exclusion rule. Genuine empty-candidate settings remain
         # explicit U(J)=0 observations.
@@ -813,6 +879,7 @@ def main() -> None:
             "--data-root", str(data_root),
             "--evaluation-split", "test",
             "--spiking-max-points", str(args.spiking_max_points),
+            "--population-scope", "primary+supplementary",
         ]
         if spiking_source.is_file():
             cmd.extend(["--zip", str(spiking_source)])
@@ -823,6 +890,11 @@ def main() -> None:
             sys.executable, "-m", "studies.overtopping.analysis.stage08_threshold_shape_validation",
             "--out", str(spiking_out / "threshold_shape_validation"),
             "--paper-figures-dir", str(rq3_figures(results_root)),
+            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--data-root", str(data_root),
+            "--evaluation-split", "test",
+            "--spiking-max-points", str(args.spiking_max_points),
+            "--population-scope", "primary+supplementary",
         ]
         if spiking_source.is_file():
             shape_cmd.extend(["--zip", str(spiking_source)])
@@ -856,6 +928,9 @@ def main() -> None:
         "--root", str(data_root),
         "--out", str(spiking_out / "preemption"),
         "--paper-figures-dir", str(rq3_figures(results_root)),
+        "--primary-table", str(paper_tables / "primary_table.csv"),
+        "--population-scope", "primary+supplementary",
+        "--evaluation-split", "test",
     ])
 
     # Paper-facing directories contain PDFs/TEX/README only. Machine-readable

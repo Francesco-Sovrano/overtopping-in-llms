@@ -545,6 +545,7 @@ def _scientific_method_config(args, baseline: str) -> dict:
     dimensions.
     """
     return {
+        "analysis_schema_version": "threshold-event-v3-nested-safe",
         "baseline_subset": str(baseline),
         "input_data_dir": _resolved_optional_path(getattr(args, "input_data_dir", None)),
         "candidate_flip_stats_sha256": _content_identity(getattr(args, "candidate_flip_stats_path", None)),
@@ -1513,13 +1514,18 @@ def _fit_threshold(x, y, min_examples):
             auc = float(roc_auc_score(y, x))
         except Exception:
             auc = np.nan
-    return {"threshold": t, "direction": direction, "train_mcc": mcc, "train_abs_mcc": abs(mcc), "train_auc_oriented": max(auc, 1-auc) if np.isfinite(auc) else np.nan}
+    return {"threshold": t, "direction": direction, "train_mcc": mcc, "train_abs_mcc": abs(mcc),
+            "prediction_inverted": bool(mcc < 0.0),
+            "auc_inverted": bool(np.isfinite(auc) and auc < 0.5),
+            "train_auc_oriented": max(auc, 1-auc) if np.isfinite(auc) else np.nan}
 
-def _eval_threshold(x, y, threshold, direction, min_examples):
+def _eval_threshold(x, y, threshold, direction, min_examples, *, prediction_inverted: bool = False, auc_inverted: bool = False):
     x, y = _finite_xy(x, y)
     if len(y) < 2 * min_examples or y.sum() < min_examples or (len(y) - y.sum()) < min_examples:
         return None
     pred = (x >= threshold).astype(int) if direction == ">=" else (x <= threshold).astype(int)
+    if bool(prediction_inverted):
+        pred = 1 - pred
     try:
         mcc = float(matthews_corrcoef(y, pred)) if matthews_corrcoef else np.nan
     except Exception:
@@ -1538,7 +1544,7 @@ def _eval_threshold(x, y, threshold, direction, min_examples):
     if roc_auc_score:
         try:
             auc = float(roc_auc_score(y, x))
-            out["test_auc_oriented"] = float(max(auc, 1.0 - auc))
+            out["test_auc_oriented"] = float(1.0 - auc if bool(auc_inverted) else auc)
         except Exception:
             out["test_auc_oriented"] = np.nan
     pred_pos = int(pred.sum())
@@ -1563,11 +1569,13 @@ def _eval_threshold(x, y, threshold, direction, min_examples):
     return out
 
 
-def _threshold_spike_counts(x, y, threshold, direction):
+def _threshold_spike_counts(x, y, threshold, direction, *, prediction_inverted: bool = False):
     x, y = _finite_xy(x, y)
     if len(y) == 0 or threshold is None or not np.isfinite(float(threshold)):
         return {}
     pred = (x >= threshold).astype(int) if direction == ">=" else (x <= threshold).astype(int)
+    if bool(prediction_inverted):
+        pred = 1 - pred
     n_pos = int(y.sum())
     n_neg = int(len(y) - n_pos)
     tp = int(((pred == 1) & (y == 1)).sum())
@@ -1609,7 +1617,7 @@ def repeated_holdout(x, y, *, min_examples, repeats, holdout_fraction, seed):
         fit = _fit_threshold(x[train_idx], y[train_idx], min_examples)
         if fit is None:
             continue
-        ev = _eval_threshold(x[test_idx], y[test_idx], fit["threshold"], fit["direction"], min_examples)
+        ev = _eval_threshold(x[test_idx], y[test_idx], fit["threshold"], fit["direction"], min_examples, prediction_inverted=bool(fit.get("prediction_inverted", False)), auc_inverted=bool(fit.get("auc_inverted", False)))
         if ev is None:
             continue
         rows.append({"repeat": rep, **fit, **ev})
@@ -1621,9 +1629,31 @@ def repeated_holdout(x, y, *, min_examples, repeats, holdout_fraction, seed):
         if col in df:
             out[f"mean_{col}"] = float(pd.to_numeric(df[col], errors="coerce").mean())
             out[f"median_{col}"] = float(pd.to_numeric(df[col], errors="coerce").median())
-    best = df.iloc[int(pd.to_numeric(df["test_abs_mcc"], errors="coerce").fillna(-1).argmax())]
-    out["representative_threshold"] = float(best["threshold"])
-    out["representative_direction"] = str(best["direction"])
+    # Descriptive full-data/binned summaries must not choose a threshold by
+    # looking at held-out test performance.  Use the modal training-selected
+    # direction and the median training-selected threshold within that direction.
+    # Held-out inferential metrics above are unchanged.
+    directions = df["direction"].astype(str)
+    counts = directions.value_counts()
+    if len(counts):
+        max_count = int(counts.max())
+        tied = set(counts[counts == max_count].index.astype(str))
+        rep_direction = ">=" if ">=" in tied else sorted(tied)[0]
+        rep_thresholds = pd.to_numeric(df.loc[directions == rep_direction, "threshold"], errors="coerce")
+        rep_thresholds = rep_thresholds[np.isfinite(rep_thresholds)]
+        out["representative_threshold"] = float(rep_thresholds.median()) if len(rep_thresholds) else np.nan
+        out["representative_direction"] = rep_direction
+        inv = df.loc[directions == rep_direction, "prediction_inverted"].astype(bool) if "prediction_inverted" in df else pd.Series(False, index=df.index)
+        out["representative_prediction_inverted"] = bool(inv.mean() > 0.5) if len(inv) else False
+        raw_high = rep_direction == ">="
+        event_high = raw_high != bool(out["representative_prediction_inverted"])
+        out["representative_event_direction"] = ">=" if event_high else "<="
+    else:
+        out["representative_threshold"] = np.nan
+        out["representative_direction"] = ">="
+        out["representative_prediction_inverted"] = False
+        out["representative_event_direction"] = ">="
+    out["representative_threshold_selection"] = "modal_train_direction_median_train_threshold"
     return out
 
 
@@ -1648,7 +1678,8 @@ THRESHOLD_UNIT_TEST_COLUMNS = [
     "mean_test_false_positive_rate", "median_test_false_positive_rate",
     "mean_test_false_negative_rate", "median_test_false_negative_rate",
     "mean_threshold", "median_threshold", "representative_threshold",
-    "representative_direction", "full_threshold_spikes", "full_threshold_spike_rate",
+    "representative_direction", "representative_prediction_inverted", "representative_event_direction",
+    "full_threshold_spikes", "full_threshold_spike_rate",
     "full_true_positives", "full_false_positives", "full_true_negatives",
     "full_false_negatives", "full_precision", "full_recall",
     "full_false_positive_rate", "full_false_negative_rate",
@@ -2212,7 +2243,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
                 res = repeated_holdout(udf[feature], udf[target], min_examples=int(args.threshold_event_min_examples), repeats=int(args.threshold_event_repeats), holdout_fraction=float(args.threshold_event_holdout_fraction), seed=int(args.seed))
                 if res is None:
                     continue
-                spike_counts = _threshold_spike_counts(udf[feature], udf[target], res.get("representative_threshold"), res.get("representative_direction"))
+                spike_counts = _threshold_spike_counts(udf[feature], udf[target], res.get("representative_threshold"), res.get("representative_direction"), prediction_inverted=bool(res.get("representative_prediction_inverted", False)))
                 unit_tests.append({"baseline_subset": baseline, "population": str(getattr(stat, "population")), "unit_key": u.unit_key, "layer_label": u.layer_label, "layer_key": u.layer_key, "neuron_id": int(u.neuron_id), "population_strength": float(getattr(stat, "population_strength")), "target": target, "direction_family": direction_family, "feature": feature, "n_rows": int(len(udf)), "n_flips": int(pd.to_numeric(udf[target], errors="coerce").fillna(0).sum()), **res, **spike_counts})
 
     raw_df = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame()
@@ -2233,7 +2264,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         for r in tqdm(unit_df.sort_values("median_test_auc_oriented", ascending=False).head(500).to_dict("records"), desc=f"{LOG_PREFIX} {baseline} binned curves", unit="curve", leave=False):
             udf = raw_df.loc[raw_df["unit_key"].astype(str) == str(r["unit_key"])]
             if not udf.empty:
-                binned_rows.extend(_make_binned_rows(udf, r["feature"], r["target"], r["population"], r["unit_key"], r.get("representative_direction", ">="), int(args.threshold_event_n_bins)))
+                binned_rows.extend(_make_binned_rows(udf, r["feature"], r["target"], r["population"], r["unit_key"], r.get("representative_event_direction", r.get("representative_direction", ">=")), int(args.threshold_event_n_bins)))
     pd.DataFrame(binned_rows, columns=THRESHOLD_BINNED_CURVE_COLUMNS).to_csv(
         baseline_out / "threshold_binned_flip_curves.csv", index=False
     )

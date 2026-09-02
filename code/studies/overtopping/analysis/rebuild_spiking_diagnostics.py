@@ -21,7 +21,7 @@ import pandas as pd
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as helpers
 from studies.overtopping.experiments.execution import RunSpec
-from studies.overtopping.experiments.run_experiments import paper_primary_experiments
+from studies.overtopping.experiments.run_experiments import paper_primary_experiments, paper_auxiliary_experiments
 
 
 def _env_int(name: str, default: int) -> int:
@@ -32,6 +32,7 @@ def _env_int(name: str, default: int) -> int:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--primary-table", required=True)
+    p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary+supplementary")
     p.add_argument("--data-root", required=True)
     p.add_argument("--catalogue-json", default=None, help="configured_experiments.json written by run_overtopping_experiments.sh")
     p.add_argument("--python-bin", default=sys.executable)
@@ -79,7 +80,7 @@ def _spiking_out(spec: RunSpec, data_root: Path, split: str, spiking_max_points:
     return spec.input_data_dir(data_root) / label
 
 
-def _load_specs(catalogue_json: str | None, evaluation_split: str) -> list[RunSpec]:
+def _load_specs(catalogue_json: str | None, evaluation_split: str, population_scope: str) -> list[RunSpec]:
     specs: list[RunSpec] = []
     if catalogue_json:
         path = Path(catalogue_json).expanduser().resolve()
@@ -91,7 +92,10 @@ def _load_specs(catalogue_json: str | None, evaluation_split: str) -> list[RunSp
                 spec = RunSpec(**values)
                 specs.append(replace(spec, evaluation_split=evaluation_split))
     if not specs:
-        specs = [replace(spec, evaluation_split=evaluation_split) for spec in paper_primary_experiments()]
+        builtins = list(paper_primary_experiments())
+        if population_scope == "primary+supplementary":
+            builtins.extend(paper_auxiliary_experiments())
+        specs = [replace(spec, evaluation_split=evaluation_split) for spec in builtins]
     return specs
 
 
@@ -132,24 +136,46 @@ def main() -> None:
     table_path = Path(args.primary_table).expanduser().resolve()
     data_root = Path(args.data_root).expanduser().resolve()
     table = pd.read_csv(table_path)
-    specs = _load_specs(args.catalogue_json, args.evaluation_split)
+    specs = _load_specs(args.catalogue_json, args.evaluation_split, args.population_scope)
 
-    n_planned = 0
+    settings: list[tuple[str, dict]] = []
+    primary_stats: set[str] = set()
     for index in range(len(table)):
         setting = helpers.setting_from_row(
-            index,
-            table.iloc[index],
-            data_root,
-            PROJECT_ROOT / "results",
-            evaluation_split=args.evaluation_split,
-            sampling_max_points=10000,
+            index, table.iloc[index], data_root, PROJECT_ROOT / "results",
+            evaluation_split=args.evaluation_split, sampling_max_points=10000,
         )
+        settings.append(("primary", setting))
+        primary_stats.add(str(Path(setting["reported_stats"]).resolve()))
+    if args.population_scope == "primary+supplementary":
+        for j, raw_spec in enumerate(paper_auxiliary_experiments()):
+            spec = replace(raw_spec, evaluation_split=args.evaluation_split)
+            if str(spec.stats_dir(data_root).resolve()) in primary_stats:
+                continue
+            pseudo = pd.Series({
+                "task": spec.task, "model": Path(spec.model).name, "phase": spec.phase,
+                "stats_dir": str(spec.stats_dir(data_root)),
+            })
+            setting = helpers.setting_from_row(
+                len(table)+j, pseudo, data_root, PROJECT_ROOT / "results",
+                evaluation_split=args.evaluation_split, sampling_max_points=10000,
+            )
+            settings.append(("supplementary", setting))
+
+    n_planned = 0
+    n_skipped_supplementary = 0
+    for source_scope, setting in settings:
         spec = _match_spec(setting, specs, data_root)
 
         stats = spec.stats_dir(data_root)
         candidate_stats = stats / "flip_stats_by_neuron.csv"
         materialized_scores = stats / "scores.csv"
         if not candidate_stats.is_file() or not materialized_scores.is_file():
+            if source_scope == "supplementary":
+                print(f"[spiking backfill] skip supplementary without strict Stage-7 materialization: {setting['label']}")
+                print(f"  missing: {candidate_stats} / {materialized_scores}")
+                n_skipped_supplementary += 1
+                continue
             raise FileNotFoundError(
                 f"{setting['label']}: missing exact pipeline Stage-7 materialization: "
                 f"{candidate_stats} / {materialized_scores}"
@@ -201,7 +227,7 @@ def main() -> None:
         if args.force:
             cmd.extend(["--force_threshold_event", "--force_spiking_eval", "--no_skip_existing"])
 
-        print(f"[spiking backfill] {setting['label']}")
+        print(f"[spiking backfill] {source_scope}: {setting['label']}")
         print(f"  RunSpec:     intervention={spec.intervention} decode_only={spec.decode_only} batch_size={batch_size}")
         print(f"  candidates:  {candidate_stats}")
         print(f"  output:      {out_dir}")
@@ -212,7 +238,7 @@ def main() -> None:
             subprocess.run(cmd, cwd=PROJECT_ROOT / "code", check=True)
 
     verb = "Validated/would rebuild" if args.dry_run else "Rebuilt"
-    print(f"{verb} threshold/spiking diagnostics for {n_planned} primary rows with pipeline-matched RunSpecs.")
+    print(f"{verb} threshold/spiking diagnostics for {n_planned} exact RQ3 runs with pipeline-matched RunSpecs; skipped_supplementary={n_skipped_supplementary}.")
 
 
 if __name__ == "__main__":

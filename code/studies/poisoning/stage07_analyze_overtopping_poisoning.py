@@ -115,7 +115,7 @@ def _ensure_output_tree(root: Path) -> dict[str, Path]:
 def _write_result_guide(root: Path) -> None:
     guide = """# Overtopping interpretation outputs
 
-This directory contains analyses that add information beyond the compact checkpoint poisoning story. The compact matched clean-vs-poison trajectory, channel-role, and checkpoint singleton figures are generated separately by `stage07_plot_overtopping_poisoning_story.py`.
+This directory contains analyses that add information beyond the compact checkpoint poisoning story. The compact aggregate trajectory, descriptive channel-role view, prospective defense-leverage analysis, and complete fixed-union checkpoint figure are generated separately by `stage07_plot_overtopping_poisoning_story.py`.
 
 ## 01_overtopping_mechanism
 

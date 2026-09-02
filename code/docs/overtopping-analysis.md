@@ -65,26 +65,28 @@ The Pythia checkpoint story uses one canonical pooled-U/competence trajectory pl
 
 ### Stage 07 — RQ3 threshold/spiking report
 
-`stage07_overtopping_spiking_report.py` consumes threshold-event diagnostics for exactly the rows in the primary table.
-
-The report population is constructed from the primary table, not by recursively consuming every diagnostics file under a data root. Source discovery is restricted to the five intended overtopping task directories and excludes poisoning outputs.
+`stage07_overtopping_spiking_report.py` consumes an explicit RQ3 manifest. By default the manifest is the 28 primary overtopping settings plus the configured paper-supplementary overtopping settings (`--population-scope primary+supplementary`). Poisoning is a separate experiment family and is never discovered by recursive scanning or admitted to this manifest.
 
 Before reporting, a population audit verifies:
 
 - every required primary row is present;
+- supplementary rows are included only when their exact diagnostics exist and are complete;
 - required positive and negative baseline subsets are present;
 - candidate/control populations needed by the report exist;
-- the requested point-cap configuration is consistent.
+- the requested point-cap configuration is consistent;
+- no source path escapes the overtopping data root into `data/poisoning`.
 
-Missing required population elements cause an explicit failure.
+Missing primary population elements cause an explicit failure. Missing supplementary diagnostics are reported as missing rather than silently replaced by another run.
 
 ### Stage 08 — threshold-shape validation
 
-`stage08_threshold_shape_validation.py` performs study-level validation of threshold-shape claims from the RQ3 diagnostics.
+`stage08_threshold_shape_validation.py` uses the same exact manifest and performs nested held-out validation. Scalar-feature selection occurs inside each training fold. The untouched fold is then used for threshold/logistic/isotonic evaluation. Threshold orientation is learned on the training fold, including inversion when the raw threshold predicate has negative MCC; held-out labels never choose the orientation.
+
+Population inference is split into: (1) threshold-testability over all evaluated units and (2) conditional threshold shape after candidate/control matching on singleton causal strength within the same run and baseline. This avoids conditioning the control comparison on the tiny high-flip tail. The main inference unit is the run/baseline condition rather than individual neurons.
 
 ### Stage 09 — preemption report
 
-`stage09_preemption_report.py` reports the corresponding preemption analysis from validated inputs.
+`stage09_preemption_report.py` uses the same exact overtopping manifest. Pair-level rows are retained descriptively, but manuscript inference aggregates first to run/baseline/direction conditions to avoid pair-level pseudoreplication.
 
 ## RQ1 — prevalence and competence
 
@@ -92,11 +94,11 @@ RQ1 relates causal organization to task competence across the declared manuscrip
 
 ## RQ2 — composition and boundary cases
 
-RQ2 reports causal composition and superadditivity/boundary cases. Exact zero-valued bars are rendered explicitly so a valid zero is visually distinguishable from a missing bar.
+RQ2 reports causal composition and superadditivity/boundary cases. In `fig3b_superadditive_boundary_cases.pdf`, the light bar is the singleton-union baseline `U(J)`, the dark bar is the observed joint-set effect `E(J)`, every bar is value-labelled, and exact zero-valued `U(J)` cases are rendered explicitly so a valid zero is visually distinguishable from a missing bar. The plotted gap `Δ = E(J) - U(J)` clarifies the size of the superadditive boundary case.
 
 ## RQ3 — threshold/spiking cut
 
-Threshold diagnostics are model-backed analyses built from Stage-7 materialized candidate evaluations plus non-candidate controls evaluated by the diagnostic stage. Candidate interventions are copied from Stage 7; they are not regenerated.
+Threshold diagnostics are model-backed analyses built from Stage-7 materialized candidate evaluations plus same-layer non-candidate controls evaluated by the diagnostic stage. Candidate interventions are copied from Stage 7; they are not regenerated. RQ3 defaults to primary+supplementary overtopping experiments and excludes poisoning by construction.
 
 Threshold/spiking diagnostics must already exist before final-results generation. `generate_results.sh` never runs model-backed experiment stages or repairs `data/`.
 

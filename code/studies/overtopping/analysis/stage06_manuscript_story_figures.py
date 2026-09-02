@@ -416,21 +416,58 @@ def plot_superadditive_boundary(frame: pd.DataFrame, out: Path, data_dir: Path |
     if work.empty: return work
     colors=task_colors(work)
     with paper_rc():
-        fig, ax = plt.subplots(figsize=(6.15, max(2.2, 0.52*len(work)+0.85))); y=np.arange(len(work))
+        fig, ax = plt.subplots(figsize=(6.35, max(2.55, 0.64*len(work)+1.05))); y=np.arange(len(work))
         u_values = numeric(work, "U")
-        ax.barh(y-0.13, u_values, height=0.24, color="0.80", edgecolor="0.45", linewidth=0.5, label=r"Singleton union $U(J)$")
+        e_values = numeric(work, "E_J")
+        delta_values = numeric(work, "Delta_comp")
+        xmax = float(np.nanmax(np.concatenate([u_values.to_numpy(float), e_values.to_numpy(float), [0.0]])))
+        label_pad = max(0.012, 0.028 * max(xmax, 0.22))
+        delta_pad = max(0.018, 0.05 * max(xmax, 0.22))
+
+        ax.barh(y-0.13, u_values, height=0.24, color="0.80", edgecolor="0.45", linewidth=0.5,
+                label=r"Singleton-union baseline $U(J)$")
         # A numerically exact zero has no visible bar width. Mark the endpoint at
         # x=0 so boundary cases remain visible without changing the plotted value.
         zero_u = np.isfinite(u_values.to_numpy(float)) & np.isclose(u_values.to_numpy(float), 0.0)
         if zero_u.any():
-            ax.scatter(np.zeros(int(zero_u.sum())), (y-0.13)[zero_u], marker="|", s=85, color="0.45", linewidths=1.2, zorder=4)
-        ax.barh(y+0.13, numeric(work,"E_J"), height=0.24, color="0.38", edgecolor="0.2", linewidth=0.5, label=r"Joint effect $E(J)$")
+            ax.scatter(np.zeros(int(zero_u.sum())), (y-0.13)[zero_u], marker="|", s=85, color="0.45", linewidths=1.2,
+                       zorder=4, label=r"Valid zero $U(J)$")
+        ax.barh(y+0.13, e_values, height=0.24, color="0.38", edgecolor="0.2", linewidth=0.5,
+                label=r"Observed joint-set effect $E(J)$")
         for yi,(_,row) in zip(y,work.iterrows()):
-            ax.scatter(float(row["E_J"]), yi+0.13, marker=TASK_MARKERS.get(str(row["task"]),"o"), s=20, color=colors.get(str(row["task"]),"0.2"), zorder=4)
+            ej = float(row["E_J"])
+            uj = float(row["U"])
+            dj = float(row["Delta_comp"])
+            ax.scatter(ej, yi+0.13, marker=TASK_MARKERS.get(str(row["task"]),"o"), s=20,
+                       color=colors.get(str(row["task"]),"0.2"), zorder=4)
+            ax.annotate(f"U={uj:.3f}", (uj, yi-0.13), xytext=(4, 0), textcoords="offset points",
+                        va="center", ha="left", fontsize=6.3, color="0.20",
+                        bbox={"boxstyle":"round,pad=0.07","facecolor":"white","edgecolor":"0.75","linewidth":0.35,"alpha":0.90},
+                        annotation_clip=True)
+            ax.annotate(f"E={ej:.3f}", (ej, yi+0.13), xytext=(4, 0), textcoords="offset points",
+                        va="center", ha="left", fontsize=6.3, color="0.12",
+                        bbox={"boxstyle":"round,pad=0.07","facecolor":"white","edgecolor":"0.45","linewidth":0.35,"alpha":0.92},
+                        annotation_clip=True)
+            ax.annotate(f"Δ={dj:+.3f}", (max(ej, uj), yi), xytext=(6, 0), textcoords="offset points",
+                        va="center", ha="left", fontsize=6.3, color="0.12",
+                        bbox={"boxstyle":"round,pad=0.07","facecolor":"white","edgecolor":"0.55","linewidth":0.35,"alpha":0.88},
+                        annotation_clip=True)
         ax.set_yticks(y); ax.set_yticklabels([compact_setting_label(row) for _,row in work.iterrows()], fontsize=7.2)
-        ax.set_xlabel("Held-out behavioural effect"); ax.legend(frameon=False, loc="lower right", ncol=2)
+        ax.set_xlim(0.0, min(1.02, xmax + delta_pad + 0.18))
+        ax.set_xlabel(r"Held-out behavioural effect (light bar: singleton-union baseline $U(J)$; dark bar: observed joint effect $E(J)$)")
+        ax.set_title(r"Boundary cases with superadditive composition: $E(J) > U(J)$", fontsize=9.3, pad=8)
+        handles, labels = ax.get_legend_handles_labels()
+        seen = set(); uniq_h=[]; uniq_l=[]
+        for h,l in zip(handles, labels):
+            if l in seen: continue
+            seen.add(l); uniq_h.append(h); uniq_l.append(l)
+        ax.legend(uniq_h, uniq_l, frameon=False, loc="lower right", ncol=1, fontsize=7.0)
         ax.grid(axis="x", alpha=0.22, linewidth=0.45); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-        fig.subplots_adjust(left=0.31,right=0.985,bottom=0.19,top=0.985); out.parent.mkdir(parents=True,exist_ok=True); fig.savefig(out,bbox_inches="tight",pad_inches=0.03); plt.close(fig)
+        fig.text(0.312, 0.055,
+                 r"Interpretation: $U(J)$ is the best effect suggested by the singleton members of $J$; $E(J)$ is the realised held-out effect of intervening on the full set $J$. Positive $\Delta=E(J)-U(J)$ indicates non-additive / superadditive composition.",
+                 ha="left", va="bottom", fontsize=6.6, color="0.18")
+        fig.subplots_adjust(left=0.31,right=0.988,bottom=0.26,top=0.91)
+        out.parent.mkdir(parents=True,exist_ok=True); fig.savefig(out,bbox_inches="tight",pad_inches=0.03); plt.close(fig)
     work.to_csv(_sidecar_path(out, data_dir), index=False)
     return work
 
@@ -509,7 +546,7 @@ def write_rq_readmes(base: Path) -> None:
     texts={
         "02_rq1_prevalence": """# Figure 2 - RQ1: prevalence and competence
 
-The primary directional reach/density figures use the canonical all-settings population and phase-panel layout. Genuine zero-candidate settings remain explicit U(J)=0 points. Regression n is the number of plotted settings with a defined metric; within-setting directional denominators describe uncertainty and are not an across-setting sample-size filter.
+The primary directional reach/density figures use the explicit 39-setting primary+supplementary non-poisoning overtopping catalogue (17 input+output, 22 output-only) and phase-panel layout. Genuine zero-candidate settings remain explicit U(J)=0 points. Regression n is the number of plotted settings with a defined metric; within-setting directional denominators describe uncertainty and are not an across-setting sample-size filter.
 `fig2e_reach_vs_effective_support_0to1.pdf` and the other structural companions remain primary-matrix context. Machine-readable sidecars live under `results/analysis/figure_data/02_rq1_prevalence/`.
 """,
         "03_rq2_composition": """# Figure 3 - RQ2: composition and boundary conditions
@@ -531,7 +568,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manuscript_metrics",default=None)
     p.add_argument("--out_dir",default=str(PROJECT_ROOT/"results"/"paper"/"figures"))
     p.add_argument("--figure_data_dir",default=None,help="Optional analysis-only directory for CSV sidecars; keeps paper figure folders PDF-only.")
-    p.add_argument("--skip_rq1", action="store_true", help="Do not emit primary-matrix RQ1 plots; the final-results orchestrator uses the canonical all-settings population instead.")
+    p.add_argument("--skip_rq1", action="store_true", help="Do not emit primary-matrix RQ1 plots; the final-results orchestrator uses the explicit 39-setting primary+supplementary non-poisoning population instead.")
     p.add_argument("--skip_primary_rq4", action="store_true", help="Do not emit the primary-matrix-only Pythia trajectory into the paper tree.")
     return p.parse_args()
 

@@ -152,11 +152,14 @@ The compact Stage-07 story contains:
 
 ```text
 01_clean_vs_poisoned_overtopping_development.pdf
-02_channel_role_reassignment_and_defense_leverage.pdf
+02_channel_role_reassignment.pdf
+03_prospective_defense_leverage.pdf
 04_clean_vs_poisoned_checkpoint_overtopping.pdf
 ```
 
-The checkpoint comparison uses fixed-union materializations where available, so a checkpoint-local non-discovery does not appear as a zero singleton effect.
+Figure 01 contains only aggregate checkpoint-level quantities. Figure 02 is descriptive and marks checkpoint-local-only values explicitly rather than presenting them as longitudinal evaluations. Figure 03 is explicitly a prospective defense-target screen. It uses a checkpoint-0 locked target set plus rolling selection within the fixed control-correctness candidate union using only the previous checkpoint. For each selected channel it reports Δdef = attack-suppression rate − benign-correctness-damage rate. Positive Δdef is the singleton selectivity signal that makes a channel a plausible defense target. This is still not a defense-efficacy result: efficacy requires jointly applying the selected intervention set and measuring end-to-end attack suppression together with benign/clean utility. Figure 04 requires complete fixed-union materialization across every matched checkpoint/condition; it is withheld rather than published with an incomplete heatmap.
+
+The machine-readable sidecars `prospective_defense_leverage.csv`, `story_data_coverage.csv`, and `story_figure_status.csv` make selection and completeness explicit.
 
 ### Additional interpretation
 
@@ -169,7 +172,7 @@ The checkpoint comparison uses fixed-union materializations where available, so 
 - poison-detection implications;
 - attack-growth links.
 
-The interpretation package does not duplicate the compact three-figure story.
+The interpretation package does not duplicate the compact four-figure story.
 
 ## Stage 08 — cross-seed aggregation
 

@@ -96,7 +96,7 @@ The fixed row cohort and original example identities are validated before paired
 
 ## 8. Attack-side materialization
 
-The same frozen control-correctness candidate union is evaluated on the poisoned trigger-test endpoint where the necessary feature reports exist. This supports attack-selectivity and defense-leverage plots without interpreting checkpoint-local non-discovery as zero attack effect.
+The same frozen control-correctness candidate union is evaluated on the poisoned trigger-test endpoint where the necessary feature reports exist. For a candidate channel, the trigger-test correct→incorrect singleton rate is interpreted as **attack suppression** (the intervention breaks a previously successful trigger conversion), while the poisoned non-trigger control-correctness correct→incorrect rate is interpreted as **benign damage**. Their difference, `Δdef = attack_suppression - benign_damage`, is the prospective defense-leverage proxy used in Figure 03. `Δdef > 0` identifies an attack-selective candidate that may be useful as a defense target; it does not establish defense efficacy until the selected intervention set is applied and evaluated end-to-end. Fixed-union materialization prevents checkpoint-local non-discovery from being misread as zero effect.
 
 ## 9. Effective LoRA update
 

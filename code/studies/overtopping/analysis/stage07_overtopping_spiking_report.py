@@ -17,9 +17,11 @@ from __future__ import annotations
 from pathlib import Path
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as primary_helpers
+from studies.overtopping.experiments.run_experiments import paper_auxiliary_experiments
 
 
 import argparse, glob, io, json, math, os, textwrap, zipfile
+from dataclasses import replace
 from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
@@ -43,6 +45,13 @@ def parse_args():
     p.add_argument("--data-root", required=True, help="Canonical overtopping data root used to resolve primary-table rows.")
     p.add_argument("--evaluation-split", default="test", choices=["test", "train", "all"])
     p.add_argument("--spiking-max-points", type=int, default=10000)
+    p.add_argument(
+        "--population-scope",
+        choices=["primary", "primary+supplementary"],
+        default="primary+supplementary",
+        help=("RQ3 population. The extended scope adds the configured paper-auxiliary "
+              "overtopping experiments and never scans poisoning experiments."),
+    )
     p.add_argument("--bootstrap", type=int, default=3000, help="Bootstrap samples for median-delta CI")
     return p.parse_args()
 
@@ -133,9 +142,77 @@ def _expected_primary_sources(primary_table: Path, data_root: Path, *, evaluatio
             "setting": str(setting.get("circuit_label", "unknown")),
             "decode_only": bool(setting.get("decode_only", False)),
             "diag_dir": diag_dir,
+            "stats_dir": Path(setting["heldout_stats"]),
+            "source_scope": "primary",
+            "required": True,
         })
     return expected
 
+
+
+def _expected_supplementary_sources(data_root: Path, *, evaluation_split: str,
+                                    spiking_max_points: int) -> list[dict]:
+    """Return the configured paper-auxiliary RQ3 sources, exactly and without scans.
+
+    These are the manuscript supplementary overtopping experiments.  Poisoning
+    experiments live under a different experiment family and are impossible to
+    enter this manifest because the sources come only from paper_auxiliary_experiments().
+    """
+    expected: list[dict] = []
+    for index, raw_spec in enumerate(paper_auxiliary_experiments()):
+        spec = replace(raw_spec, evaluation_split=str(evaluation_split))
+        label = f"spiking_diagnostics-{spec.bag_label()}"
+        if evaluation_split == "train":
+            label += "-eval_train"
+        elif evaluation_split == "all":
+            label += "-eval_all"
+        if int(spiking_max_points) != 10000:
+            label += f"-cap{int(spiking_max_points)}"
+        diag_dir = spec.input_data_dir(data_root) / label
+        expected.append({
+            "row_index": int(index),
+            "run_id": f"supplementary_row_{index:02d}",
+            "task": str(spec.task),
+            "model": str(Path(spec.model).name),
+            "phase": str(spec.phase),
+            "setting": str(spec.circuit_label()),
+            "decode_only": bool(spec.decode_only),
+            "diag_dir": diag_dir,
+            "stats_dir": spec.stats_dir(data_root),
+            "source_scope": "supplementary",
+            "required": False,
+        })
+    return expected
+
+
+def expected_rq3_sources(args) -> list[dict]:
+    """Build the exact primary(+supplementary) manifest used by every RQ3 stage."""
+    data_root = Path(args.data_root).expanduser().resolve()
+    expected = _expected_primary_sources(
+        Path(args.primary_table).expanduser().resolve(), data_root,
+        evaluation_split=str(args.evaluation_split),
+        spiking_max_points=int(args.spiking_max_points),
+    )
+    if str(getattr(args, "population_scope", "primary+supplementary")) == "primary+supplementary":
+        expected.extend(_expected_supplementary_sources(
+            data_root, evaluation_split=str(args.evaluation_split),
+            spiking_max_points=int(args.spiking_max_points),
+        ))
+    # Primary wins if a future catalogue accidentally duplicates an auxiliary spec.
+    deduped: dict[str, dict] = {}
+    for spec in expected:
+        key = str(Path(spec["stats_dir"]).resolve())
+        if key not in deduped or bool(spec.get("required", False)):
+            deduped[key] = spec
+    out = list(deduped.values())
+    for spec in out:
+        try:
+            rel = Path(spec["diag_dir"]).resolve().relative_to(data_root)
+        except ValueError as exc:
+            raise RuntimeError(f"RQ3 source escaped data root: {spec['diag_dir']}") from exc
+        if rel.parts and rel.parts[0] == "poisoning":
+            raise RuntimeError(f"Poisoning source leaked into RQ3 manifest: {spec['diag_dir']}")
+    return out
 
 def _zip_member_for_expected(zf: zipfile.ZipFile, expected_rel: str) -> str | None:
     target = normalize_member_name(expected_rel)
@@ -188,7 +265,8 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
             ok = bool(exists and not df.empty and not missing_baselines and not missing_populations)
             audit.append({
                 "row_index": spec["row_index"], "run_id": spec["run_id"], "task": spec["task"],
-                "model": spec["model"], "phase": spec["phase"], "file": suffix,
+                "model": spec["model"], "phase": spec["phase"], "source_scope": spec.get("source_scope", "primary"),
+                "required": bool(spec.get("required", True)), "file": suffix,
                 "source": source_label, "exists": bool(exists), "n_rows": int(len(df)),
                 "baseline_subsets": ",".join(sorted(baselines)), "populations": ",".join(sorted(populations)),
                 "missing_baseline_subsets": ",".join(missing_baselines),
@@ -198,6 +276,7 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
                 df = df.copy()
                 for key in ("run_id", "task", "model", "setting", "decode_only"):
                     df[key] = spec[key]
+                df["source_scope"] = spec.get("source_scope", "primary")
                 df["rel"] = source_label
                 frames.append(df)
     finally:
@@ -206,14 +285,11 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
     return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), audit
 
 
-def load_exact_primary_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     source_kind = "zip" if args.zip else "root"
     source_path = Path(args.zip or args.root).expanduser().resolve()
     data_root = Path(args.data_root).expanduser().resolve()
-    expected = _expected_primary_sources(
-        Path(args.primary_table).expanduser().resolve(), data_root,
-        evaluation_split=str(args.evaluation_split), spiking_max_points=int(args.spiking_max_points),
-    )
+    expected = expected_rq3_sources(args)
     fs, audit_fs = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_flip_stats.csv")
     ut, audit_ut = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_unit_tests.csv")
     b, audit_b = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_binned_curves.csv")
@@ -240,20 +316,39 @@ def load_exact_primary_population(args, out: Path) -> tuple[pd.DataFrame, pd.Dat
     audit.to_csv(out / "population_audit.csv", index=False)
     (out / "population_audit.json").write_text(json.dumps(audit.to_dict(orient="records"), indent=2), encoding="utf-8")
 
-    incomplete_population = audit[
-        audit["file"].eq("aggregate_flip_stats.csv") & ~audit["complete"].astype(bool)
-    ]
-    incomplete = incomplete_population.copy()
-    if not incomplete.empty:
-        preview = incomplete[["row_index", "task", "model", "phase", "file", "missing_baseline_subsets", "missing_populations", "exists"]].to_dict(orient="records")[:8]
+    flip_audit = audit[audit["file"].eq("aggregate_flip_stats.csv")].copy()
+    incomplete_primary = flip_audit[flip_audit["required"].astype(bool) & ~flip_audit["complete"].astype(bool)]
+    if not incomplete_primary.empty:
+        preview = incomplete_primary[["row_index", "task", "model", "phase", "file", "missing_baseline_subsets", "missing_populations", "exists"]].to_dict(orient="records")[:8]
         raise RuntimeError(
-            "RQ3 primary evaluation population is incomplete; refusing to report unevaluated rows. "
-            "Threshold-test rows/files may be sparse or absent when units have too few flip/non-flip "
-            "events, but the model-backed flip-stat population must contain both baseline subsets "
-            "and both candidate/control populations. "
+            "RQ3 primary evaluation population is incomplete; refusing to report unevaluated primary rows. "
+            "Supplementary rows are audited separately and may be unavailable, but every primary "
+            "model-backed flip-stat population must contain both baseline subsets and both "
+            "candidate/control populations. "
             f"See {out / 'population_audit.csv'}. First failures: {preview}"
         )
+    included_runs = set(flip_audit.loc[flip_audit["complete"].astype(bool), "run_id"].astype(str))
+    audit["included_in_analysis"] = audit["run_id"].astype(str).isin(included_runs)
+    audit.to_csv(out / "population_audit.csv", index=False)
+    (out / "population_audit.json").write_text(json.dumps(audit.to_dict(orient="records"), indent=2), encoding="utf-8")
+    for frame in (fs, ut, b):
+        if not frame.empty and "run_id" in frame.columns:
+            frame.drop(frame.index[~frame["run_id"].astype(str).isin(included_runs)], inplace=True)
+    coverage = {
+        "population_scope": str(getattr(args, "population_scope", "primary+supplementary")),
+        "configured_primary": int((flip_audit["source_scope"] == "primary").sum()),
+        "configured_supplementary": int((flip_audit["source_scope"] == "supplementary").sum()),
+        "included_primary": int(((flip_audit["source_scope"] == "primary") & flip_audit["complete"].astype(bool)).sum()),
+        "included_supplementary": int(((flip_audit["source_scope"] == "supplementary") & flip_audit["complete"].astype(bool)).sum()),
+        "excluded_poisoning": True,
+    }
+    (out / "population_coverage.json").write_text(json.dumps(coverage, indent=2), encoding="utf-8")
     return fs, ut, b
+
+
+def load_exact_primary_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Backward-compatible alias; honors args.population_scope when present."""
+    return load_exact_rq3_population(args, out)
 
 
 def rankdata_abs(vals: np.ndarray) -> np.ndarray:
@@ -601,9 +696,9 @@ def plot_manuscript_spiking_cut(
     """Promote the RQ3 evidence into compact manuscript-facing figures.
 
     The detailed ECDF/proxy-family diagnostics stay under analysis/.  This paper
-    view follows the narrative: causal strength, thresholdability and TECS are
-    the three existing candidate-control endpoints; threshold-shape/preemption
-    are marked explicitly as pending when direct experiments are unavailable.
+    view reports only causal strength and threshold testability. Stage 8 overwrites
+    it with nested feature-selection and causal-strength-matched threshold-shape
+    inference when those direct experiments are available.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -612,17 +707,19 @@ def plot_manuscript_spiking_cut(
     paper_dir.mkdir(parents=True, exist_ok=True)
     cand_flip = row(flip_summary.to_dict("records"), POP_CAND)
     ctrl_flip = row(flip_summary.to_dict("records"), POP_CTRL)
-    cand_primary = row(primary.to_dict("records"), POP_CAND)
-    ctrl_primary = row(primary.to_dict("records"), POP_CTRL)
     adj = results.get("planned_tests_holm_corrected_p", {}) or {}
+    test_eff = results.get("threshold_testability_effect", {}) or {}
 
+    # Stage 7 reports only endpoints that are valid before nested feature
+    # selection.  Stage 8 overwrites this paper figure with the full robust
+    # three-part analysis (strength, testability, strength-matched nested MCC).
     panels = [
         ("Singleton causal effect", float(ctrl_flip.get("median_flip_any", math.nan)), float(cand_flip.get("median_flip_any", math.nan)), float(adj.get("strength_flip_rate", math.nan))),
-        ("Threshold visibility", float(ctrl_primary.get("median_best_mcc", math.nan)), float(cand_primary.get("median_best_mcc", math.nan)), float(adj.get("threshold_mcc", math.nan))),
-        ("TECS", float(ctrl_primary.get("median_css", math.nan)), float(cand_primary.get("median_css", math.nan)), float(adj.get("primary_css", math.nan))),
+        ("Threshold-testable fraction", float(test_eff.get("control_median", math.nan)), float(test_eff.get("candidate_median", math.nan)), float(adj.get("threshold_testability", math.nan))),
     ]
     with paper_figure_rc():
-        fig_obj, axes = plt.subplots(1, 3, figsize=(7.25, 2.25), sharey=True)
+        fig_obj, axes = plt.subplots(1, 2, figsize=(5.3, 2.25), sharey=True)
+        axes = np.atleast_1d(axes)
         for ax, (title, ctrl, cand, p_adj) in zip(axes, panels):
             if np.isfinite(ctrl) and np.isfinite(cand):
                 ax.plot([ctrl, cand], [0, 1], color="0.55", linewidth=1.1, zorder=1)
@@ -645,25 +742,15 @@ def plot_manuscript_spiking_cut(
         save_pdf_only(fig_obj, paper_dir / "fig4a_candidate_control_spiking_cut_summary.pdf")
         plt.close(fig_obj)
 
-    # Full thresholdability and TECS distributions are useful manuscript supplements.
-    def manuscript_ecdf(df: pd.DataFrame, metric: str, xlabel: str, filename: str) -> None:
-        with paper_figure_rc():
-            fig_obj, ax = plt.subplots(figsize=(4.35, 2.35))
-            for pop in [POP_CAND, POP_CTRL]:
-                x, y = ecdf(df.loc[df.population == pop, metric])
-                if len(x):
-                    ax.plot(x, y, linewidth=1.8, label=POP_LABELS[pop])
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel("Empirical CDF")
-            ax.set_ylim(0, 1)
-            ax.grid(axis="y", alpha=0.30, linewidth=0.45)
-            ax.legend(frameon=False, loc="lower right")
-            fig_obj.subplots_adjust(left=0.16, right=0.995, bottom=0.20, top=0.985)
-            save_pdf_only(fig_obj, paper_dir / filename)
-            plt.close(fig_obj)
-
-    manuscript_ecdf(best, "best_mcc", "Best held-out threshold |MCC|", "fig4s1_thresholdability_ecdf.pdf")
-    manuscript_ecdf(best, "causal_spiking_score", "Threshold-event causal score (TECS)", "fig4s2_tecs_ecdf.pdf")
+    # Legacy max-feature thresholdability/TECS paper plots were statistically
+    # selection-biased.  Keep their tables in analysis/ for auditability, but
+    # actively remove stale manuscript copies.  Stage 8 writes the nested,
+    # causal-strength-matched supplementary figures instead.
+    for stale_name in [
+        "fig4s1_thresholdability_ecdf.pdf",
+        "fig4s2_tecs_ecdf.pdf",
+    ]:
+        (paper_dir / stale_name).unlink(missing_ok=True)
 
     if not binned_agg.empty:
         with paper_figure_rc():
@@ -687,9 +774,9 @@ def plot_manuscript_spiking_cut(
 
 Available from the threshold/spiking diagnostics:
 
-- `fig4a_candidate_control_spiking_cut_summary.pdf`: candidate vs matched-control singleton strength, held-out thresholdability, and TECS.
+- `fig4a_candidate_control_spiking_cut_summary.pdf`: candidate vs matched-control singleton strength and threshold-testability (Stage 8 overwrites this with the full nested/matched analysis).
 - `fig4b_threshold_tail_enrichment.pdf`: descriptive binned endogenous-proxy/flip enrichment.
-- `fig4s1_thresholdability_ecdf.pdf` and `fig4s2_tecs_ecdf.pdf`: distributions over units with an observable endpoint. Thresholdability requires a valid repeated held-out fit; zero-strength units have TECS exactly 0 even when thresholdability is undefined.
+- Legacy max-feature thresholdability/TECS ECDFs are intentionally not published because conditioning on testable units and choosing each unit's best feature are selection-biased. Stage 8 publishes nested, matched replacements.
 
 The detailed analysis directory also contains `threshold_testability_audit.csv`, which records how many model-evaluated units in each run/baseline/population had enough flip/non-flip events for a held-out threshold test. Missing threshold tests are not treated as missing interventions.
 
@@ -711,68 +798,37 @@ def row(rows,pop):
 
 def build_report(base_md: Optional[Path], results: Dict[str,object]) -> str:
     cf,rf=row(results["flip_summary"],POP_CAND),row(results["flip_summary"],POP_CTRL)
-    cp,rp=row(results["primary_summary"],POP_CAND),row(results["primary_summary"],POP_CTRL)
-    fe,ce,me,adj=results["flip_effect"],results["css_effect"],results["best_mcc_effect"],results["planned_tests_holm_corrected_p"]
+    fe=results["flip_effect"]
+    te=results.get("threshold_testability_effect", {})
+    adj=results.get("planned_tests_holm_corrected_p", {})
     empirical=f'''
 
 ## Empirical Update from the Completed Diagnostic Runs
 
-### Central interpretation
+### Stage-7 endpoints that are statistically interpretable
 
-The completed diagnostics support a dominance-based version of the overtopping-as-spiking hypothesis. The selected overtopping candidates are not the only neurons that can affect behavior, but they are statistically stronger and more spike-like than the sampled non-candidate controls. This is the right interpretation because overtopping means dominance, overlap, and saturation in a fixed regime; it does not mean all other neurons are inert.
+The exact RQ3 population is manifest-driven and excludes poisoning experiments. By default it includes the primary manuscript settings plus configured supplementary overtopping settings that have complete candidate/control diagnostics. Missing supplementary diagnostics are reported in `population_audit.csv`; missing primary diagnostics remain a hard error.
 
-### Primary single metric: Threshold-event causal score
+| Population | Units | Median flip-any rate | Mean flip-any rate | Fraction with flip rate >= 0.05 |
+|---|---:|---:|---:|---:|
+| Candidate | {int(cf.get('n_units',0))} | {fmt(cf.get('median_flip_any'))} | {fmt(cf.get('mean_flip_any'))} | {fmt(cf.get('frac_ge_0_05'))} |
+| Non-candidate control | {int(rf.get('n_units',0))} | {fmt(rf.get('median_flip_any'))} | {fmt(rf.get('mean_flip_any'))} | {fmt(rf.get('frac_ge_0_05'))} |
 
-Use **Threshold-Event Causal Score (TECS)** as the one primary metric:
+Paired by run and baseline subset, the singleton causal-strength candidate-control median delta is **{fmt(fe.get('median_delta'))}** with Holm-corrected p **{fmt(adj.get('strength_flip_rate'))}**.
 
-```text
-TECS(j) = singleton_flip_any_rate(j) * max_feature held_out_abs_MCC(j, feature)
-```
+Threshold fitting is possible for a much larger or smaller fraction of one population than the other, so testability is a separate endpoint rather than silently conditioning on the testable tail. The paired candidate-control testability-fraction delta is **{fmt(te.get('median_delta'))}**, Holm-corrected p **{fmt(adj.get('threshold_testability'))}**.
 
-TECS is high only when a neuron both flips a nontrivial fraction of examples under singleton intervention and has a simple threshold-like proxy that identifies those flipped examples. Flip rate alone measures causal strength but not spiking structure. Threshold MCC alone measures spiking structure but can over-credit units that affect very few examples. AUC alone measures ranking but not a usable threshold. TECS combines the two parts required by the claim. Held-out threshold fitting requires enough flip and non-flip examples; model-evaluated units that do not meet that criterion remain in `threshold_testability_audit.csv` with undefined thresholdability. Zero-strength units have TECS=0 by definition, while nonzero-strength units without an eligible threshold fit remain unavailable rather than being assigned a fabricated MCC.
+### Why max-feature MCC and the old TECS are not primary inferential endpoints
 
-### Controls are non-candidates, not guaranteed no-effect neurons
+`aggregate_unit_tests.csv` contains held-out results for many scalar features. Choosing the feature with the largest held-out MCC and then testing that maximum reuses held-out outcomes for feature selection. In addition, thresholdability is only defined for units with enough flip/non-flip events; conditioning on this subset can select unusually causal controls. The old `best_mcc` and TECS tables are therefore retained only for backward-compatible/exploratory inspection.
 
-| Population | Units | Median flip-any rate | Mean flip-any rate | Max flip-any rate | Fraction with flip rate >= 0.05 |
-|---|---:|---:|---:|---:|---:|
-| Candidate | {int(cf.get('n_units',0))} | {fmt(cf.get('median_flip_any'))} | {fmt(cf.get('mean_flip_any'))} | {fmt(cf.get('max_flip_any'))} | {fmt(cf.get('frac_ge_0_05'))} |
-| Non-candidate control | {int(rf.get('n_units',0))} | {fmt(rf.get('median_flip_any'))} | {fmt(rf.get('mean_flip_any'))} | {fmt(rf.get('max_flip_any'))} | {fmt(rf.get('frac_ge_0_05'))} |
+The inferential threshold-shape analysis is produced by Stage 8. It selects the scalar inside each training fold, evaluates the selected scalar on untouched held-out data, compares testability over all evaluated units, and compares conditional threshold MCC only after candidate/control matching on singleton causal strength within the same run and baseline.
 
-Paired by run and baseline subset, candidates have higher singleton flip rates than controls: median delta **{fmt(fe.get('median_delta'))}**, 95% bootstrap CI **[{fmt(fe.get('median_delta_ci_low'))}, {fmt(fe.get('median_delta_ci_high'))}]**, one-sided Wilcoxon p **{fmt(fe.get('wilcoxon_p_greater'))}**, Holm-corrected p **{fmt(adj.get('strength_flip_rate'))}**, paired rank-biserial **{fmt(fe.get('paired_rank_biserial'))}**, unit-level Cliff's delta **{fmt(results.get('flip_unit_cliffs_delta'))}**.
+### Supported Stage-7 claim
 
-### Primary TECS result
+> Overtopping candidates are more causally consequential than sampled same-layer non-candidate controls, and the probability that threshold structure is statistically testable must be reported separately from the magnitude of thresholdability among testable units.
 
-| Population | Units | Median best threshold abs(MCC) | Median singleton strength | Median TECS | Mean TECS |
-|---|---:|---:|---:|---:|---:|
-| Candidate | {int(cp.get('n_units',0))} | {fmt(cp.get('median_best_mcc'))} | {fmt(cp.get('median_strength'))} | {fmt(cp.get('median_css'),5)} | {fmt(cp.get('mean_css'),5)} |
-| Non-candidate control | {int(rp.get('n_units',0))} | {fmt(rp.get('median_best_mcc'))} | {fmt(rp.get('median_strength'))} | {fmt(rp.get('median_css'),5)} | {fmt(rp.get('mean_css'),5)} |
-
-Paired by run and baseline subset, candidates have higher TECS than controls: median delta **{fmt(ce.get('median_delta'),5)}**, 95% bootstrap CI **[{fmt(ce.get('median_delta_ci_low'),5)}, {fmt(ce.get('median_delta_ci_high'),5)}]**, one-sided Wilcoxon p **{fmt(ce.get('wilcoxon_p_greater'))}**, Holm-corrected p **{fmt(adj.get('primary_css'))}**, paired rank-biserial **{fmt(ce.get('paired_rank_biserial'))}**, unit-level Cliff's delta **{fmt(results.get('css_unit_cliffs_delta'))}**.
-
-This is the main statistical proof of the spiking claim: selected overtopping candidates have significantly larger combined causal-strength-and-thresholdability scores than non-candidate controls.
-
-### Thresholdability-only result
-
-Using the best held-out threshold abs(MCC) per neuron, candidates also outperform controls: candidate median **{fmt(cp.get('median_best_mcc'))}**, control median **{fmt(rp.get('median_best_mcc'))}**, paired median delta **{fmt(me.get('median_delta'))}**, one-sided Wilcoxon p **{fmt(me.get('wilcoxon_p_greater'))}**, Holm-corrected p **{fmt(adj.get('threshold_mcc'))}**, paired rank-biserial **{fmt(me.get('paired_rank_biserial'))}**, unit-level Cliff's delta **{fmt(results.get('best_mcc_unit_cliffs_delta'))}**.
-
-### Claims supported by the completed runs
-
-Supported claim:
-
-> Selected overtopping candidates are more causally spike-like than non-candidate controls. They have higher singleton-intervention flip rates, higher thresholdability, and higher Threshold-event causal scores under paired run/baseline comparisons.
-
-Do not claim that controls never matter. The correct claim is dominance and saturation: non-candidate controls can have nonzero effects, but selected candidates dominate the distribution of Threshold-event causal scores.
-
-### Recommended aggregate visualizations
-
-Use these as the main figure panels:
-
-1. `figures/ecdf_causal_spiking_score.pdf` — full TECS distribution for candidates and controls.
-2. `figures/paired_css_delta_by_run_baseline.pdf` — condition-level consistency of the primary effect.
-3. `figures/ecdf_flip_rates_candidate_vs_control.pdf` — causal strength distribution, showing controls are not always inert.
-4. `figures/feature_css_delta_ranking.pdf` — proxy features ranked by median candidate-control TECS delta.
-
-Use `figures/binned_flip_curves_oriented_proxy.pdf` as a descriptive supplement for the threshold-tail / spike-like shape.
+Do not claim from Stage 7 alone that candidates have higher thresholdability. Use `threshold_shape_validation/threshold_shape_statistical_results.json` for that question.
 '''
     if base_md and base_md.exists():
         base=base_md.read_text()
@@ -784,7 +840,7 @@ Use `figures/binned_flip_curves_oriented_proxy.pdf` as a descriptive supplement 
 def main():
     args=parse_args(); out=Path(args.out).resolve(); out.mkdir(parents=True, exist_ok=True)
     source_kind="zip" if args.zip else "root"; source_path=Path(args.zip or args.root).resolve(); base_md=Path(args.base_md).resolve() if args.base_md else None
-    fs_all, ut_all, b_primary = load_exact_primary_population(args, out)
+    fs_all, ut_all, b_primary = load_exact_rq3_population(args, out)
     if fs_all.empty: raise RuntimeError("No aggregate_flip_stats.csv found")
     fs=fs_all[fs_all.population.isin([POP_CAND,POP_CTRL])].copy()
     flip_summary=fs.groupby("population").agg(n_units=("unit_key","count"), n_runs=("run_id","nunique"), median_flip_any=("flip_any_rate","median"), mean_flip_any=("flip_any_rate","mean"), q75_flip_any=("flip_any_rate",lambda s:s.quantile(.75)), q90_flip_any=("flip_any_rate",lambda s:s.quantile(.90)), q95_flip_any=("flip_any_rate",lambda s:s.quantile(.95)), max_flip_any=("flip_any_rate","max"), frac_ge_0_01=("flip_any_rate",lambda s:(s>=.01).mean()), frac_ge_0_05=("flip_any_rate",lambda s:(s>=.05).mean()), frac_ge_0_10=("flip_any_rate",lambda s:(s>=.10).mean()), frac_ge_0_20=("flip_any_rate",lambda s:(s>=.20).mean())).reset_index()
@@ -823,7 +879,9 @@ def main():
         ).reset_index()
     css_med=paired_medians(best,"causal_spiking_score"); css_eff=effect_summary(css_med,args.bootstrap); css_cd=cliffs_delta(best.loc[best.population==POP_CAND,"causal_spiking_score"], best.loc[best.population==POP_CTRL,"causal_spiking_score"])
     mcc_med=paired_medians(best,"best_mcc"); mcc_eff=effect_summary(mcc_med,args.bootstrap); mcc_cd=cliffs_delta(best.loc[best.population==POP_CAND,"best_mcc"], best.loc[best.population==POP_CTRL,"best_mcc"])
-    adj=holm({"strength_flip_rate":flip_eff["wilcoxon_p_greater"],"threshold_mcc":mcc_eff["wilcoxon_p_greater"],"primary_css":css_eff["wilcoxon_p_greater"]})
+    test_med=paired_medians(testability,"threshold_testable_fraction")
+    test_eff=effect_summary(test_med,args.bootstrap)
+    adj=holm({"strength_flip_rate":flip_eff["wilcoxon_p_greater"],"threshold_testability":test_eff["wilcoxon_p_greater"]})
     feats=[]
     if not ut.empty and "feature" in ut.columns and "population_strength" in ut.columns and "median_test_abs_mcc" in ut.columns:
         for feat,g in ut.groupby("feature"):
@@ -847,8 +905,8 @@ def main():
         keys=["run_id","baseline_subset","population","unit_key","feature","target"]
         b["curve_mean"]=b.groupby(keys,dropna=False).flip_rate.transform("mean"); b["flip_enrichment"]=b.flip_rate/b.curve_mean.replace(0,np.nan)
         binned_agg=b.groupby(["feature_family","population","bin_index"],dropna=False).agg(median_flip_enrichment=("flip_enrichment","median"),mean_flip_enrichment=("flip_enrichment","mean"),median_flip_rate=("flip_rate","median"),n_curves=("unit_key","count")).reset_index()
-    for name,df in {"flip_rate_summary.csv":flip_summary,"paired_flip_rate_by_run_baseline.csv":flip_med.reset_index(),"unit_primary_spiking_scores.csv":best,"threshold_testability_audit.csv":testability,"primary_spiking_score_summary.csv":primary,"paired_css_by_run_baseline.csv":css_med.reset_index(),"paired_best_mcc_by_run_baseline.csv":mcc_med.reset_index(),"paired_css_delta_rich.csv":rich,"feature_level_stat_summary.csv":feature_comp,"binned_curve_aggregate.csv":binned_agg}.items(): df.to_csv(out/name,index=False)
-    results={"populations":{"candidate":POP_CAND,"control":POP_CTRL},"flip_summary":flip_summary.to_dict(orient="records"),"flip_effect":flip_eff,"flip_unit_cliffs_delta":flip_cd,"primary_summary":primary.to_dict(orient="records"),"threshold_testability":testability.to_dict(orient="records"),"css_effect":css_eff,"css_unit_cliffs_delta":css_cd,"best_mcc_effect":mcc_eff,"best_mcc_unit_cliffs_delta":mcc_cd,"planned_tests_holm_corrected_p":adj,"n_aggregate_flip_stats_files":int(len(fs_all.rel.unique())) if "rel" in fs_all else 0,"n_aggregate_unit_tests_files":int(len(ut_all.rel.unique())) if (not ut_all.empty and "rel" in ut_all) else 0}
+    for name,df in {"flip_rate_summary.csv":flip_summary,"paired_flip_rate_by_run_baseline.csv":flip_med.reset_index(),"unit_primary_spiking_scores.csv":best,"threshold_testability_audit.csv":testability,"primary_spiking_score_summary.csv":primary,"paired_css_by_run_baseline.csv":css_med.reset_index(),"paired_best_mcc_by_run_baseline.csv":mcc_med.reset_index(),"paired_threshold_testability_by_run_baseline.csv":test_med.reset_index(),"paired_css_delta_rich.csv":rich,"feature_level_stat_summary.csv":feature_comp,"binned_curve_aggregate.csv":binned_agg}.items(): df.to_csv(out/name,index=False)
+    results={"populations":{"candidate":POP_CAND,"control":POP_CTRL},"flip_summary":flip_summary.to_dict(orient="records"),"flip_effect":flip_eff,"flip_unit_cliffs_delta":flip_cd,"primary_summary":primary.to_dict(orient="records"),"threshold_testability":testability.to_dict(orient="records"),"css_effect_exploratory":css_eff,"css_unit_cliffs_delta_exploratory":css_cd,"best_mcc_effect_exploratory":mcc_eff,"best_mcc_unit_cliffs_delta_exploratory":mcc_cd,"threshold_testability_effect":test_eff,"planned_tests_holm_corrected_p":adj,"n_aggregate_flip_stats_files":int(len(fs_all.rel.unique())) if "rel" in fs_all else 0,"n_aggregate_unit_tests_files":int(len(ut_all.rel.unique())) if (not ut_all.empty and "rel" in ut_all) else 0}
     (out/"statistical_results.json").write_text(json.dumps(results,indent=2))
     plot_outputs(out,fs,best,rich,feature_comp,binned_agg)
     if args.paper_figures_dir:

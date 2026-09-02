@@ -38,6 +38,7 @@ from matplotlib.transforms import Bbox
 from studies.overtopping.analysis.layer_widths import layer_width_for_model
 from studies.overtopping.analysis.lib.files import read_json
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, chance_normalized_score, raw_task_score
+from studies.overtopping.experiments.run_experiments import paper_auxiliary_experiments, paper_primary_experiments
 
 
 DEFAULT_OUT = "fig_competence_vs_coverage.pdf"
@@ -275,11 +276,11 @@ class Filters:
 
 
 def rq1_manuscript_filters() -> Filters:
-    """Return the canonical all-settings population for RQ1.
+    """Return generic legacy filters for non-manifest RQ1-style discovery.
 
-    The directional-statistics backfill and manuscript figures use the same
-    reference-run selection. Derived evaluation directories are excluded by
-    :func:`discover_points`; checkpoint settings remain part of this population.
+    Manuscript Figure 2 no longer relies on these filters to define its sample;
+    it resolves the explicit 39-setting experiment catalogue through
+    :func:`discover_rq1_manuscript_points`.
     """
     return Filters(
         tasks=set(TASK_ORDER),
@@ -583,9 +584,81 @@ def discover_points(
     return points
 
 
+def rq1_manuscript_specs():
+    """Return the explicit non-poisoning Figure-2 population.
+
+    Figure 2 is defined over the same 28 primary + 11 supplementary overtopping
+    settings used by the manuscript experiment catalogue.  Do not infer this
+    population by scanning whatever result directories happen to be present: a
+    filesystem scan can silently omit a valid zero-discovery/supplementary run
+    or admit an unrelated analysis product.
+    """
+    specs = list(paper_primary_experiments()) + list(paper_auxiliary_experiments())
+    identities = [
+        (s.task, s.model, s.mode, s.intervention, s.evaluation_split)
+        for s in specs
+    ]
+    if len(specs) != 39 or len(set(identities)) != 39:
+        raise RuntimeError(
+            f"RQ1 manuscript catalogue must contain exactly 39 unique settings; "
+            f"found {len(specs)} rows / {len(set(identities))} unique identities"
+        )
+    return specs
+
+
 def discover_rq1_manuscript_points(root: Path) -> list[PlotPoint]:
-    """Discover exactly the strict held-out-test population used by Figure 2."""
-    return discover_points(root, rq1_manuscript_filters(), dedupe=True, heldout_test_only=True)
+    """Resolve the exact 39-setting strict-heldout Figure-2 population.
+
+    Paths are obtained from :class:`RunSpec` itself rather than a heuristic
+    directory scan.  A missing expected directory is therefore surfaced as an
+    error instead of silently reducing the manuscript sample size.  An existing
+    expected directory with no ``flip_stats_global.json`` remains a legitimate
+    zero-candidate observation.
+    """
+    points: list[PlotPoint] = []
+    missing: list[str] = []
+    for spec in rq1_manuscript_specs():
+        run_dir = spec.stats_dir(root)
+        model_dir = root / spec.task / Path(spec.model)
+        ds_path = model_dir / "feature_report" / "dataset_stats.json"
+        if not run_dir.is_dir():
+            missing.append(f"missing stats dir: {run_dir}")
+            continue
+        if not ds_path.is_file():
+            missing.append(f"missing dataset stats: {ds_path}")
+            continue
+        dataset_stats = read_json(ds_path)
+        points.append(
+            make_point(
+                spec.task,
+                Path(spec.model).parts[0],
+                Path(spec.model).parts[-1],
+                model_dir,
+                run_dir,
+                dataset_stats,
+                "empty-no-agonists",
+            )
+        )
+
+    if missing:
+        detail = "\n".join(f"  - {item}" for item in missing[:20])
+        raise RuntimeError(
+            "RQ1 manuscript population is incomplete. Expected all 39 primary + "
+            "supplementary strict-heldout overtopping settings; refusing to "
+            "silently shrink the figure.\n" + detail
+        )
+
+    phase_counts = {
+        phase: sum(p.phase == phase for p in points)
+        for phase in ("input+output", "decode-only")
+    }
+    if len(points) != 39 or phase_counts != {"input+output": 17, "decode-only": 22}:
+        raise RuntimeError(
+            "RQ1 manuscript population resolved incorrectly: "
+            f"n={len(points)}, phase_counts={phase_counts}; expected "
+            "n=39 with 17 input+output and 22 decode-only settings"
+        )
+    return points
 
 
 def compact_points(root: Path, filters: Filters) -> list[PlotPoint]:
@@ -3273,10 +3346,13 @@ def main() -> None:
             if args.label_points == "auto":
                 args.label_points = "paired"
         else:
-            points = discover_points(
-                root, filters, dedupe=not args.no_dedupe,
-                heldout_test_only=bool(args.rq1_manuscript_population),
-            )
+            if args.rq1_manuscript_population:
+                points = discover_rq1_manuscript_points(root)
+            else:
+                points = discover_points(
+                    root, filters, dedupe=not args.no_dedupe,
+                    heldout_test_only=False,
+                )
 
         if not points:
             raise RuntimeError("no points to plot after filtering")

@@ -59,7 +59,29 @@ Stage 7b must operate inside the row identities materialized by Stage 7. Current
 
 ## RQ3 reporting reports a population audit failure
 
-RQ3 reporting uses exactly the primary-table population and requires the declared positive/negative baseline subsets and candidate/control diagnostics. Inspect the population-audit output under `results/analysis/`. Do not point RQ3 at a directory containing unrelated or poisoning diagnostics.
+RQ3 reporting uses an explicit primary+supplementary overtopping manifest, not recursive file discovery. Primary rows require complete positive/negative candidate/control diagnostics. Supplementary rows are included only when the exact configured diagnostics exist; missing supplementary materializations are reported rather than substituted. Poisoning is excluded by construction. Inspect `population_audit.csv`, `threshold_shape_population_audit.csv`, and `threshold_shape_population_coverage.csv` under `results/analysis/rq3_threshold_event/spiking_diagnostics/`.
+
+## RQ3 results look stale after changing threshold analysis code
+
+Do not delete or edit expensive model-backed caches such as `ablation_cache/*.pkl`, `replacement_scores_cache/*.pkl`, or `high_n_eval_cache/` merely to refresh RQ3 statistics. Threshold-event manifests now contain an analysis schema version; incompatible derived summaries are rebuilt while compatible high-N model evaluations can be reused.
+
+For a clean report-only reset, remove only generated result views:
+
+```bash
+rm -rf results/analysis/rq3_threshold_event/spiking_diagnostics
+rm -rf results/paper/figures/04_rq3_spiking_cut
+```
+
+Then rebuild the exact RQ3 diagnostics:
+
+```bash
+python -m studies.overtopping.analysis.rebuild_spiking_diagnostics \
+  --primary-table results/analysis/primary_matrix/tables/primary_table.csv \
+  --data-root data \
+  --population-scope primary+supplementary
+```
+
+For a surgical per-experiment derived reset, preserve `high_n_eval_cache/` and remove only `threshold_spiking_experiment.json`, `threshold_unit_tests.csv`, `threshold_population_summary.csv`, `threshold_binned_flip_curves.csv`, and `threshold_activation_flip_rows.csv.gz`. Avoid hand-editing pickle caches: a modified pickle can remain syntactically loadable while no longer matching its scientific provenance.
 
 ## RQ3 diagnostics collide across point caps
 

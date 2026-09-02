@@ -461,7 +461,77 @@ def _evaluation_cohort_ids(stats_dir: str | Path) -> tuple[tuple[str, str], ...]
     return _evaluation_cohort_ids_from_frame(frame, source=scores)
 
 
+def _same_evaluation_cohort(
+    left: Sequence[tuple[str, str]],
+    right: Sequence[tuple[str, str]],
+) -> bool:
+    """Return whether two materializations contain the same immutable cohort.
 
+    Row order is deliberately *not* part of cohort identity.  Stage-03 feature
+    reports can preserve the same held-out examples in a different dataframe
+    order at different checkpoints.  Treating tuple order as cohort membership
+    made Stage 07 reject scientifically identical held-out sets.
+    """
+    return len(left) == len(right) and set(left) == set(right)
+
+
+def _cohort_mismatch_summary(
+    reference: Sequence[tuple[str, str]],
+    observed: Sequence[tuple[str, str]],
+    *,
+    max_examples: int = 4,
+) -> str:
+    """Compact diagnostic for a genuine held-out membership mismatch."""
+    ref = set(reference)
+    obs = set(observed)
+    missing = sorted(ref - obs)[: int(max_examples)]
+    extra = sorted(obs - ref)[: int(max_examples)]
+    return (
+        f"reference_n={len(reference)} observed_n={len(observed)} "
+        f"intersection_n={len(ref & obs)} missing_examples={missing} extra_examples={extra}"
+    )
+
+
+def _align_frame_to_cohort(
+    frame: pd.DataFrame,
+    reference_ids: Sequence[tuple[str, str]],
+    *,
+    source: str | Path,
+) -> pd.DataFrame:
+    """Return ``frame`` reordered to ``reference_ids`` without changing membership.
+
+    Paired row bootstrap contrasts require the same example on the same row in
+    every checkpoint table.  We therefore compare cohort *membership* first and
+    then explicitly align row order by immutable (ID, gold) identity.
+    """
+    observed_ids = _evaluation_cohort_ids_from_frame(frame, source=source)
+    if not _same_evaluation_cohort(reference_ids, observed_ids):
+        raise RuntimeError(
+            f"Fixed-cohort membership mismatch in {source}: "
+            + _cohort_mismatch_summary(reference_ids, observed_ids)
+        )
+    if tuple(observed_ids) == tuple(reference_ids):
+        return frame.reset_index(drop=True)
+    row_by_identity = {identity: i for i, identity in enumerate(observed_ids)}
+    order = [row_by_identity[identity] for identity in reference_ids]
+    return frame.iloc[order].reset_index(drop=True)
+
+
+
+
+def _feature_report_test_cohort_ids(feature_report: str | Path) -> tuple[tuple[str, str], ...]:
+    """Return the strict held-out-test cohort available to a Stage-03 feature report."""
+    scores = Path(feature_report) / "scores.csv"
+    if not scores.is_file():
+        raise FileNotFoundError(f"Feature report has no scores.csv: {feature_report}")
+    frame = pd.read_csv(scores)
+    if "is_test" not in frame.columns:
+        raise RuntimeError(f"Feature report lacks required is_test split column: {scores}")
+    mask = frame["is_test"].fillna(False).astype(bool)
+    if not bool(mask.any()):
+        raise RuntimeError(f"Feature report contains no held-out test rows: {scores}")
+    test_frame = frame.loc[mask].copy().reset_index(drop=True)
+    return _evaluation_cohort_ids_from_frame(test_frame, source=scores)
 
 def _baseline_correctness_array(stats_dir: str | Path, frame: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
     """Return the binary unablated-correctness vector used to define C->I flips.
@@ -537,12 +607,19 @@ def _joint_paired_disruption_inference(
     baseline_cols: dict[str, str | None] = {}
     for state in states:
         stats_dir = stats_by_state[state]
-        state_frame = pd.read_csv(Path(stats_dir) / "scores.csv")
-        state_ids = _evaluation_cohort_ids_from_frame(state_frame, source=Path(stats_dir) / "scores.csv")
+        scores_path = Path(stats_dir) / "scores.csv"
+        state_frame = pd.read_csv(scores_path)
+        state_ids = _evaluation_cohort_ids_from_frame(state_frame, source=scores_path)
         if identities is None:
             identities = state_ids
-        elif state_ids != identities:
-            raise RuntimeError(f"Joint paired bootstrap cohort mismatch: {state}")
+            state_frame = state_frame.reset_index(drop=True)
+        else:
+            if not _same_evaluation_cohort(identities, state_ids):
+                raise RuntimeError(
+                    f"Joint paired bootstrap cohort membership mismatch: {state}; "
+                    + _cohort_mismatch_summary(identities, state_ids)
+                )
+            state_frame = _align_frame_to_cohort(state_frame, identities, source=scores_path)
         state_frames[state] = state_frame
         baseline_arrays[state], baseline_cols[state] = _baseline_correctness_array(stats_dir, state_frame)
 
@@ -907,7 +984,9 @@ def compute_channel_disruption(
         "clean_end": _evaluation_cohort_ids(clean_end_stats),
     }
     cohort_values = list(cohort.values())
-    same_cohort = bool(cohort_values) and all(ids == cohort_values[0] for ids in cohort_values[1:])
+    same_cohort = bool(cohort_values) and all(
+        _same_evaluation_cohort(cohort_values[0], ids) for ids in cohort_values[1:]
+    )
     fixed_cohort_n = len(cohort_values[0]) if same_cohort else None
 
     presence = {
@@ -1064,8 +1143,11 @@ def _load_manifest_by_condition(run_dir: Path) -> dict[str, dict[int, dict[str, 
 def _clean_delta_map(stats0: str | Path, stats1: str | Path) -> dict[str, float]:
     ids0 = _evaluation_cohort_ids(stats0)
     ids1 = _evaluation_cohort_ids(stats1)
-    if ids0 != ids1:
-        raise RuntimeError(f"Clean-null U(j) cohort mismatch: {stats0} vs {stats1}")
+    if not _same_evaluation_cohort(ids0, ids1):
+        raise RuntimeError(
+            f"Clean-null U(j) cohort membership mismatch: {stats0} vs {stats1}; "
+            + _cohort_mismatch_summary(ids0, ids1)
+        )
     a, b = _singleton_map(stats0), _singleton_map(stats1)
     out: dict[str, float] = {}
     for unit in set(a) & set(b):
@@ -1585,10 +1667,18 @@ def _score_exposure_batch_wanda(
         (int(group["control_abs_delta_rows"].shape[0]) for group in mapped_groups.values()),
         default=0,
     )
-    weighted = torch.zeros(batch_size, dtype=torch.float64, device=device)
-    controls_weighted = torch.zeros((batch_size, n_control_draws), dtype=torch.float64, device=device)
-    unweighted_sum = torch.zeros(batch_size, dtype=torch.float64, device=device)
-    input_l1_sum = torch.zeros(batch_size, dtype=torch.float64, device=device)
+
+    # MPS does not implement float64 tensors.  The WANDA terms below are
+    # computed from float32 activations/update rows, so accumulate in float32
+    # on MPS and retain the previous float64 accumulator on backends that
+    # support it.  Results are moved to CPU before conversion to Python floats.
+    accumulator_dtype = torch.float32 if device.type == "mps" else torch.float64
+    weighted = torch.zeros(batch_size, dtype=accumulator_dtype, device=device)
+    controls_weighted = torch.zeros(
+        (batch_size, n_control_draws), dtype=accumulator_dtype, device=device
+    )
+    unweighted_sum = torch.zeros(batch_size, dtype=accumulator_dtype, device=device)
+    input_l1_sum = torch.zeros(batch_size, dtype=accumulator_dtype, device=device)
     n_rows_total = 0
     update_sq = 0.0
     matched_random_update_sq = 0.0
@@ -1617,19 +1707,19 @@ def _score_exposure_batch_wanda(
                 f"WANDA input/update dimension mismatch for {key}: input={mean_abs_x.shape[-1]} update={candidate_abs.shape[-1]}"
             )
         candidate_rows = mean_abs_x @ candidate_abs.transpose(0, 1)  # [batch, rows]
-        weighted += (candidate_rows * weights.unsqueeze(0)).sum(dim=1).to(torch.float64)
-        unweighted_sum += candidate_rows.sum(dim=1).to(torch.float64)
+        weighted += (candidate_rows * weights.unsqueeze(0)).sum(dim=1).to(dtype=accumulator_dtype)
+        unweighted_sum += candidate_rows.sum(dim=1).to(dtype=accumulator_dtype)
 
         control_abs = group["control_abs_delta_rows"].to(device=device, dtype=torch.float32)  # [draw,row,feature]
         if int(control_abs.shape[0]) != n_control_draws:
             raise RuntimeError("Matched-control draw count differs across mapped projections")
         control_rows = torch.einsum("bf,drf->bdr", mean_abs_x, control_abs)
-        controls_weighted += (control_rows * weights.view(1, 1, -1)).sum(dim=2).to(torch.float64)
+        controls_weighted += (control_rows * weights.view(1, 1, -1)).sum(dim=2).to(dtype=accumulator_dtype)
 
         n_group_rows = int(candidate_abs.shape[0])
         # Preserve the previous diagnostic definition, which averaged each
         # projection-input mean once per mapped parameter row.
-        input_l1_sum += mean_abs_x.mean(dim=1).to(torch.float64) * float(n_group_rows)
+        input_l1_sum += mean_abs_x.mean(dim=1).to(dtype=accumulator_dtype) * float(n_group_rows)
         n_rows_total += n_group_rows
         update_sq += float(group["candidate_update_sq"])
         matched_random_update_sq += float(group["matched_random_update_sq"])
@@ -1908,6 +1998,45 @@ def main() -> None:
                 required_tau=float(args.required_tau),
             )
 
+    # Preflight the Stage-03 source feature reports *before* expensive fixed-union
+    # ablations.  A true membership mismatch cannot be repaired by Stage 07 and
+    # should fail immediately, rather than after every checkpoint has spent
+    # minutes materializing singleton interventions.  Different row ordering is
+    # harmless and is aligned later by immutable identity.
+    source_test_cohorts: list[tuple[tuple[str, int], tuple[tuple[str, str], ...]]] = []
+    for condition in ("clean", "poisoned"):
+        for key in shared_fracs:
+            row = manifests[condition][key]
+            feature_report = _control_correctness_output_dir(
+                run_dir, row, phase, args.eval_intervention
+            ) / "feature_report"
+            source_test_cohorts.append(
+                ((condition, key), _feature_report_test_cohort_ids(feature_report))
+            )
+    if source_test_cohorts:
+        reference_state, reference_ids = source_test_cohorts[0]
+        mismatches = [
+            (state, ids)
+            for state, ids in source_test_cohorts[1:]
+            if not _same_evaluation_cohort(reference_ids, ids)
+        ]
+        if mismatches:
+            state, ids = mismatches[0]
+            raise RuntimeError(
+                "Stage-03 control-correctness feature reports do not expose one fixed held-out test cohort "
+                "across checkpoints, so longitudinal U(j) is not comparable. "
+                f"Reference={reference_state}, mismatch={state}; "
+                + _cohort_mismatch_summary(reference_ids, ids)
+                + ". Regenerate the checkpoint causal feature reports with a fixed scan universe; "
+                  "TRIGGER_LIFT_SCAN_EARLY_STOP must be 0 for these longitudinal materializations."
+            )
+        if any(tuple(ids) != tuple(reference_ids) for _, ids in source_test_cohorts[1:]):
+            print(
+                "[poison-detection] Stage-03 held-out cohort membership is fixed but row order differs across "
+                "checkpoints; Stage 07 will align rows by immutable (ID, gold) identity.",
+                flush=True,
+            )
+
     candidate_union = _build_candidate_union(candidate_stats)
     if candidate_union.empty:
         raise RuntimeError(
@@ -1939,9 +2068,31 @@ def main() -> None:
 
     # The fixed test cohort must be identical not only within each interval but
     # across the whole primary trajectory.
-    primary_cohorts = [_evaluation_cohort_ids(path) for path in materialized.values()]
-    if primary_cohorts and any(ids != primary_cohorts[0] for ids in primary_cohorts[1:]):
-        raise RuntimeError("Ordinary U(j) materializations do not share one fixed held-out cohort across checkpoints")
+    primary_items = list(materialized.items())
+    primary_cohorts = [(state, _evaluation_cohort_ids(path)) for state, path in primary_items]
+    if primary_cohorts:
+        reference_state, reference_ids = primary_cohorts[0]
+        mismatches = [
+            (state, ids)
+            for state, ids in primary_cohorts[1:]
+            if not _same_evaluation_cohort(reference_ids, ids)
+        ]
+        if mismatches:
+            state, ids = mismatches[0]
+            raise RuntimeError(
+                "Ordinary U(j) materializations do not share one fixed held-out cohort membership across checkpoints. "
+                f"Reference={reference_state}, mismatch={state}; "
+                + _cohort_mismatch_summary(reference_ids, ids)
+                + ". If membership counts differ, rerun the checkpoint causal feature reports with a fixed scan "
+                  "universe (in particular TRIGGER_LIFT_SCAN_EARLY_STOP=0). If counts match, this diagnostic "
+                  "indicates an actual ID/gold mismatch rather than harmless row reordering."
+            )
+        if any(tuple(ids) != tuple(reference_ids) for _, ids in primary_cohorts[1:]):
+            print(
+                "[poison-detection] fixed U(j) cohort membership matches across checkpoints; "
+                "row ordering differs and will be aligned by immutable (ID, gold) identity for paired inference.",
+                flush=True,
+            )
 
     # Evaluate that same frozen control-correctness candidate union on the poisoned trigger
     # endpoint. This supplies longitudinal attack-side singleton effects even
@@ -1994,11 +2145,12 @@ def main() -> None:
             )
             primary_ids = _evaluation_cohort_ids(materialized[("clean", key)])
             null_ids = _evaluation_cohort_ids(null_map[key])
-            if null_ids != primary_ids:
+            if not _same_evaluation_cohort(null_ids, primary_ids):
                 raise ValueError(
-                    "Clean-null fixed-cohort identity mismatch at "
-                    f"fraction={key/1000.0:g}: {null_run}. "
-                    "Null inference requires the same ordered immutable (example ID, gold) cohort as the primary run."
+                    "Clean-null fixed-cohort membership mismatch at "
+                    f"fraction={key/1000.0:g}: {null_run}; "
+                    + _cohort_mismatch_summary(primary_ids, null_ids)
+                    + ". Null inference requires the same immutable (example ID, gold) cohort as the primary run."
                 )
         clean_null_materialized.append((null_run, null_map, null_cfg))
 
