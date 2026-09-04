@@ -793,7 +793,7 @@ def _ensure_fixed_u_j_materialization(
     checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
     task_module = f"studies.poisoning.tasks.{task}:ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC"
     cmd = [
-        sys.executable, "-m", "pipeline.stage07_refine_neuron_anchored_rules",
+        sys.executable, "-m", "pipeline.stage07_singleton_causal_evaluation",
         "--task_module", task_module,
         "--ai_model", str(checkpoint_dir),
         "--rules_dir", str(rules_dir),
@@ -826,12 +826,44 @@ def _ensure_fixed_u_j_materialization(
 
 
 
+def _attack_positive_test_row_counts(features_dir: Path) -> tuple[int, int]:
+    """Return (positive_test_rows, all_test_rows) for the trigger-lift endpoint.
+
+    Fixed attack-side U(j) is explicitly conditioned on baseline-positive
+    trigger-lift examples.  A checkpoint can therefore have a perfectly valid
+    fixed held-out test cohort while containing zero rows in that conditional
+    endpoint (most naturally before the backdoor has emerged).  That is an
+    undefined/not-applicable attack U(j), not a missing source artifact.
+    """
+    scores_path = features_dir / "scores.csv"
+    try:
+        frame = pd.read_csv(
+            scores_path,
+            usecols=["is_test", "is_trigger_lift_success"],
+            low_memory=False,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Trigger-test feature report must expose is_test and "
+            f"is_trigger_lift_success for fixed attack materialization: {scores_path}"
+        ) from exc
+    test_mask = frame["is_test"].map(truthy)
+    positive_mask = frame["is_trigger_lift_success"].map(truthy)
+    return int((test_mask & positive_mask).sum()), int(test_mask.sum())
+
+
 def _ensure_fixed_attack_u_j_materialization(
     *, run_dir: Path, row: Mapping[str, Any], task: str, phase: str,
     eval_intervention: str, candidate_union_csv: Path, output_root: Path,
     run_config: Mapping[str, Any], u_j_batch_size: int, u_j_neuron_batch_size: int,
-) -> Path:
-    """Evaluate the fixed control-correctness candidate union on the trigger-test endpoint."""
+) -> Path | None:
+    """Evaluate the fixed control-correctness candidate union on the trigger-test endpoint.
+
+    Returns ``None`` when the fixed held-out test split contains no baseline-
+    positive trigger-lift examples.  In that case attack-side C->I is
+    mathematically undefined at the checkpoint, but the core poisoning detector
+    remains fully evaluable and later checkpoints must still be processed.
+    """
     if str(row.get("condition")) != "poisoned":
         raise ValueError("Attack-side fixed materialization is defined only for poisoned checkpoints")
     state_root = output_root / "poisoned" / checkpoint_progress_label(row)
@@ -839,18 +871,84 @@ def _ensure_fixed_attack_u_j_materialization(
     stats_dir = rules_dir / "stats" / "fixed_test_positive_candidates"
     union_frame = pd.read_csv(candidate_union_csv)
     union_units = {f"{str(a)}:{int(b)}" for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))}
+    backdoor_out = _backdoor_output_dir(run_dir, row, phase, eval_intervention)
+    features = backdoor_out / "feature_report"
+    if not (features / "scores.csv").is_file() or not (features / "features.json").is_file():
+        raise FileNotFoundError(f"Missing trigger-test feature report required for fixed attack effects: {features}")
+
+    # Check endpoint adequacy *before* accepting an existing materialization.
+    # Older Stage-07 runs could cache a positive-baseline attack table from a
+    # single accidental trigger-lift success at the 0% checkpoint.  Such a
+    # table is mechanically complete but is not a reportable attack endpoint.
+    n_positive_test, n_test = _attack_positive_test_row_counts(features)
+    discovery_status_path = backdoor_out / "discovery_status.json"
+    target_positive_test = 1
+    heldout_target_met = n_positive_test >= target_positive_test
+    if discovery_status_path.is_file():
+        try:
+            discovery_status = json.loads(discovery_status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not read trigger-test discovery status: {discovery_status_path}") from exc
+        raw_target = discovery_status.get("target_heldout_trigger_lift_positives")
+        try:
+            parsed_target = int(raw_target)
+        except (TypeError, ValueError):
+            parsed_target = 1
+        target_positive_test = max(1, parsed_target)
+        declared_met = discovery_status.get("heldout_target_met")
+        heldout_target_met = (
+            truthy(declared_met) if declared_met is not None
+            else n_positive_test >= target_positive_test
+        )
+        # Never let stale metadata claim adequacy when the source scores do not
+        # actually contain the required number of held-out positive rows.
+        heldout_target_met = bool(heldout_target_met and n_positive_test >= target_positive_test)
+
+    if not heldout_target_met:
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        status = (
+            "not_applicable_no_positive_test_rows"
+            if n_positive_test == 0
+            else "not_reportable_insufficient_positive_test_rows"
+        )
+        _atomic_write_json(
+            stats_dir / "materialization_status.json",
+            {
+                "status": status,
+                "endpoint": "trigger_lift",
+                "evaluation_split": "test",
+                "evaluation_baseline_subset": "positive",
+                "n_test_rows": int(n_test),
+                "n_positive_test_rows": int(n_positive_test),
+                "required_positive_test_rows": int(target_positive_test),
+                "heldout_target_met": False,
+                "source_feature_report": str(features),
+                "source_discovery_status": str(discovery_status_path) if discovery_status_path.is_file() else None,
+                "note": (
+                    "Attack-side correct-to-incorrect singleton effects are withheld because "
+                    "the held-out baseline-positive trigger-lift cohort does not meet the "
+                    "predeclared held-out target. Later checkpoints are still evaluated."
+                ),
+            },
+        )
+        print(
+            "[attack-u-j-materialization] "
+            f"{checkpoint_progress_label(row)}: skipped fixed attack U(j): "
+            f"{n_positive_test}/{n_test} held-out test rows are baseline-positive trigger lifts; "
+            f"required >= {target_positive_test}.",
+            flush=True,
+        )
+        return None
+
     if _materialization_complete(
         stats_dir, union_units, expected_baseline_subset="positive", expected_intervention=eval_intervention,
         expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
     ):
         return stats_dir
-    backdoor_out = _backdoor_output_dir(run_dir, row, phase, eval_intervention)
-    features = backdoor_out / "feature_report"
-    if not (features / "scores.csv").is_file() or not (features / "features.json").is_file():
-        raise FileNotFoundError(f"Missing trigger-test feature report required for fixed attack effects: {features}")
+
     checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
     cmd = [
-        sys.executable, "-m", "pipeline.stage07_refine_neuron_anchored_rules",
+        sys.executable, "-m", "pipeline.stage07_singleton_causal_evaluation",
         "--task_module", f"studies.poisoning.tasks.{task}:BACKDOOR_TASK_SPEC",
         "--ai_model", str(checkpoint_dir),
         "--rules_dir", str(rules_dir),

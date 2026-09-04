@@ -204,7 +204,7 @@ def _build_command(
     cmd = [
         args.python_bin,
         "-m",
-        "pipeline.stage07_refine_neuron_anchored_rules",
+        "pipeline.stage07_singleton_causal_evaluation",
         "--task_module",
         str(setting["task_module"]),
         "--ai_model",

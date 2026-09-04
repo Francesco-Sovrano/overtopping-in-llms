@@ -145,7 +145,48 @@ def _fixed_control_correctness_materialization(run_dir: Path, phase_dir: str) ->
     return pd.DataFrame(rows, columns=CONTROL_COLUMNS)
 
 
-def _fixed_attack_materialization(run_dir: Path, phase_dir: str) -> pd.DataFrame:
+def _trigger_attack_endpoint_reportable(
+    run_dir: Path, checkpoint: Path, phase_dir: str, intervention: str
+) -> bool:
+    """Whether trigger-lift singleton rates have the predeclared held-out support.
+
+    The 0% arithmetic checkpoint can contain one accidental trigger-lift success
+    out of thousands of examples.  Treating the resulting n=1 conditional
+    singleton rates as an established attack endpoint creates 0/100% artifacts
+    and a spurious 0% -> 10% prospective selection.  Stage 03 already records
+    the required held-out positive count and whether that target was met; the
+    story reader must honor that contract, including for legacy cached Stage-07
+    materializations.
+    """
+    eval_dir = f"eval_{intervention}"
+    status_path = (
+        _checkpoint_root(run_dir) / "poisoned" / checkpoint.name / phase_dir
+        / "backdoor_trigger_test" / eval_dir / "discovery_status.json"
+    )
+    if not status_path.is_file():
+        # Legacy runs without the status contract keep their previous behavior.
+        return True
+    try:
+        import json
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    raw_n = payload.get("n_trigger_lift_test")
+    raw_target = payload.get("target_heldout_trigger_lift_positives")
+    try:
+        n_positive = int(raw_n)
+    except (TypeError, ValueError):
+        return False
+    try:
+        target = max(1, int(raw_target))
+    except (TypeError, ValueError):
+        target = 1
+    declared = payload.get("heldout_target_met")
+    declared_met = str(declared).strip().lower() in {"1", "true", "t", "yes", "y"} if declared is not None else n_positive >= target
+    return bool(declared_met and n_positive >= target)
+
+
+def _fixed_attack_materialization(run_dir: Path, phase_dir: str, intervention: str) -> pd.DataFrame:
     root = detection_dir(run_dir) / phase_dir / "attack_u_j_materialization" / "poisoned"
     rows: list[dict[str, Any]] = []
     if not root.is_dir():
@@ -155,6 +196,8 @@ def _fixed_attack_materialization(run_dir: Path, phase_dir: str) -> pd.DataFrame
         if info is None:
             continue
         fraction, step = info
+        if not _trigger_attack_endpoint_reportable(run_dir, checkpoint, phase_dir, intervention):
+            continue
         flip_path = checkpoint / "neuron_flip_rules" / "stats" / "fixed_test_positive_candidates" / "flip_stats_by_neuron.csv"
         if not flip_path.is_file():
             continue
@@ -384,7 +427,8 @@ def load_cached_story(run_dir: Path, phase_dir: str, intervention: str) -> tuple
 
             if condition == "poisoned":
                 trigger_root = phase_root / "backdoor_trigger_test" / eval_dir
-                trigger_stats = _choose_stats_dir(trigger_root, baseline_positive=True)
+                trigger_reportable = _trigger_attack_endpoint_reportable(run_dir, checkpoint, phase_dir, intervention)
+                trigger_stats = _choose_stats_dir(trigger_root, baseline_positive=True) if trigger_reportable else None
                 if trigger_stats is not None:
                     set_df = pd.read_csv(trigger_stats / "singleton_set_metrics.csv")
                     if not set_df.empty:
@@ -415,7 +459,7 @@ def load_cached_story(run_dir: Path, phase_dir: str, intervention: str) -> tuple
     control = _combine_control_correctness_longitudinal(local_ordinary, fixed_ordinary)
     control = _fill_shared_zero_ordinary(control)
     local_trigger = pd.DataFrame(trigger_rows, columns=ATTACK_COLUMNS)
-    fixed_trigger = _fixed_attack_materialization(run_dir, phase_dir)
+    fixed_trigger = _fixed_attack_materialization(run_dir, phase_dir, intervention)
     trigger = _combine_attack_longitudinal(local_trigger, fixed_trigger)
     # Normalize after all legacy/fixed/local sources have been combined.  This
     # makes sparse and schema-only attack/control tables safe for np.isclose.
@@ -715,8 +759,17 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
 
     poisoned_control = fixed_control[fixed_control["condition"].astype(str).eq("poisoned")].copy()
     clean_control = fixed_control[fixed_control["condition"].astype(str).eq("clean")].copy()
-    fractions = sorted(set(poisoned_control["fraction"].dropna()).intersection(set(fixed_attack["fraction"].dropna())))
-    if len(fractions) < 2:
+    # Attack-side C->I is conditional on an already-successful trigger-lift.
+    # Before the backdoor emerges, the held-out test split can legitimately
+    # contain zero such examples, so fixed_attack may start after 0%.  Keep the
+    # baseline-locked probe selection anchored at the shared 0% control state
+    # rather than silently redefining "baseline" as the first attack-defined
+    # checkpoint.  Previous-checkpoint selection starts only once attack-side
+    # effects are actually defined.
+    attack_fractions = sorted(
+        set(poisoned_control["fraction"].dropna()).intersection(set(fixed_attack["fraction"].dropna()))
+    )
+    if not attack_fractions:
         return pd.DataFrame(columns=columns)
 
     def value_at(frame: pd.DataFrame, frac: float, unit: str, value_col: str) -> float:
@@ -724,10 +777,19 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
         return _finite(part.iloc[0][value_col]) if not part.empty else math.nan
 
     rows: list[dict[str, Any]] = []
-    base = float(fractions[0])
 
-    # Baseline-locked probes: because clean and poisoned are the same model at
-    # 0%, allow discovery from either condition at the shared initialization.
+    # Baseline-locked probes are defined at the shared initialization, whether
+    # or not attack-side C->I itself is defined there.
+    control_fractions = sorted(
+        set(clean_control["fraction"].dropna()).union(set(poisoned_control["fraction"].dropna()))
+    )
+    zero_candidates = [f for f in control_fractions if np.isclose(float(f), 0.0)]
+    if not zero_candidates:
+        return pd.DataFrame(columns=columns)
+    base = float(zero_candidates[0])
+
+    # Because clean and poisoned are the same model at 0%, allow discovery from
+    # either condition at the shared initialization.
     clean0 = clean_control[np.isclose(clean_control["fraction"].to_numpy(float), base, equal_nan=False)]
     poison0 = poisoned_control[np.isclose(poisoned_control["fraction"].to_numpy(float), base, equal_nan=False)]
     base_discovered = set(clean0.loc[clean0.get("discovered_at_checkpoint", False).fillna(False).astype(bool), "unit_key"].astype(str))
@@ -741,7 +803,7 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
             baseline_scores.append((unit, score))
     baseline_scores.sort(key=lambda x: (-x[1], x[0]))
     baseline_selected = baseline_scores[:max(1, int(top_k))]
-    for target in fractions:
+    for target in attack_fractions:
         for unit, score in baseline_selected:
             attack_value = value_at(fixed_attack, float(target), unit, "attack_c2i_rate")
             control_value = value_at(poisoned_control, float(target), unit, "c2i_rate")
@@ -777,7 +839,7 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
     for unit in base_discovered:
         first_discovery[unit] = min(base, first_discovery.get(unit, base))
 
-    for selection_frac, target_frac in zip(fractions, fractions[1:]):
+    for selection_frac, target_frac in zip(attack_fractions, attack_fractions[1:]):
         eligible = [u for u, first in first_discovery.items() if first <= float(selection_frac) + 1e-12]
         ranked: list[tuple[str, float]] = []
         for unit in eligible:
@@ -786,8 +848,13 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
             if not (np.isfinite(attack_value) and np.isfinite(control_value)):
                 continue
             gap = attack_value - control_value
-            if gap > 0:
-                ranked.append((unit, gap))
+            # Rank the finite prospective screen; do not condition inclusion on
+            # the sign of the screening statistic.  Requiring gap > 0 makes
+            # negative prospective results disappear entirely (the arithmetic
+            # trajectory), whereas the scientific question is whether the
+            # *best available* prior-checkpoint screen generalizes one step
+            # ahead.  A negative score is an informative failed screen.
+            ranked.append((unit, gap))
         ranked.sort(key=lambda x: (-x[1], x[0]))
         for unit, score in ranked[:max(1, int(top_k))]:
             attack_value = value_at(fixed_attack, float(target_frac), unit, "attack_c2i_rate")
@@ -805,7 +872,7 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
                 "target_attack_suppression_rate": attack_value,
                 "target_benign_damage_rate": control_value,
                 "target_defense_leverage_proxy": attack_value - control_value,
-                "selection_basis": "positive defense-leverage proxy (attack suppression minus benign damage) at previous checkpoint; eligible only if previously discovered",
+                "selection_basis": "top finite defense-leverage proxy (attack suppression minus benign damage) at previous checkpoint; eligible only if previously discovered; sign is reported, not used as an inclusion filter",
             })
     return pd.DataFrame(rows, columns=columns)
 
@@ -814,6 +881,43 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
     if selection.empty:
         output.unlink(missing_ok=True)
         return False
+
+    # Do not let matplotlib infer the checkpoint domain from only the rows that
+    # happened to survive prospective selection.  In particular, a run can
+    # have a valid one-step-ahead target at 10% and no positive previous-
+    # checkpoint candidates thereafter.  Autoscaling that single point produces
+    # a misleading ~9.6--10.4% x-axis and makes the panel look like the remaining
+    # checkpoints were never evaluated.  The baseline-locked rows encode the
+    # attack-defined checkpoint schedule, so use that schedule to define both
+    # panels' x domains.
+    baseline_targets = sorted(
+        pd.to_numeric(
+            selection.loc[selection["strategy"].astype(str).eq("baseline_locked"), "target_fraction"],
+            errors="coerce",
+        ).dropna().unique()
+    )
+    expected_targets = {
+        "baseline_locked": baseline_targets,
+        # A one-checkpoint-ahead target cannot be the first attack-defined
+        # checkpoint because there is no preceding attack-defined checkpoint
+        # from which to select it.
+        "previous_checkpoint": baseline_targets[1:] if len(baseline_targets) > 1 else [],
+    }
+
+    def _set_checkpoint_axis(ax: Any, fracs: list[float]) -> None:
+        if not fracs:
+            return
+        ticks = 100.0 * np.asarray(fracs, dtype=float)
+        ax.set_xticks(ticks)
+        lo = float(np.nanmin(ticks)); hi = float(np.nanmax(ticks))
+        if np.isclose(lo, hi):
+            # Defensive fallback; normally the previous-checkpoint grid has
+            # multiple planned targets even when only one target has data.
+            pad = 5.0
+        else:
+            pad = max(2.5, 0.05 * (hi - lo))
+        ax.set_xlim(max(0.0, lo - pad), min(100.0, hi + pad))
+
     fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.7), sharey=True)
     specs = [
         ("baseline_locked", "Pre-training-locked candidates (selected at 0%)"),
@@ -822,6 +926,8 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
     any_panel = False
     for ax, (strategy, title) in zip(axes, specs):
         part = selection[selection["strategy"].astype(str).eq(strategy)].copy()
+        planned = expected_targets.get(strategy, [])
+        _set_checkpoint_axis(ax, planned)
         if part.empty:
             ax.text(0.5, 0.5, "No leakage-free selection available", ha="center", va="center", transform=ax.transAxes, color="0.35")
             ax.set_title(title, fontweight="bold")
@@ -847,11 +953,29 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
         ax.fill_between(x, benign, attack, where=(attack >= benign), alpha=0.12, interpolate=True, label="Potential defense leverage (Δ>0)")
         ax.fill_between(x, benign, attack, where=(attack < benign), alpha=0.06, interpolate=True)
         for rec, lev in zip(agg.itertuples(index=False), leverage):
+            y = 100 * float(rec.attack_suppression)
+            # Keep annotations inside the axes for near-zero attack suppression.
+            offset = (0, 10) if y < 12 else (0, -24)
+            lev_text = f"{lev:+.1f}" if abs(float(lev)) < 1.0 else f"{lev:+.0f}"
             ax.annotate(
-                f"n={int(rec.n_selected)}\nΔdef={lev:+.0f} pp",
-                (100*float(rec.target_fraction), 100*float(rec.attack_suppression)),
-                xytext=(0,-24), textcoords="offset points", fontsize=7.0, ha="center",
+                f"n={int(rec.n_selected)}\nΔdef={lev_text} pp",
+                (100*float(rec.target_fraction), y),
+                xytext=offset, textcoords="offset points", fontsize=7.0, ha="center",
             )
+
+        # Show that absent points are a selection outcome, not a truncated
+        # checkpoint series.  Do not fabricate rates for those checkpoints.
+        if strategy == "previous_checkpoint" and planned:
+            observed = set(np.round(pd.to_numeric(agg["target_fraction"], errors="coerce").dropna().to_numpy(float), 12))
+            missing = [f for f in planned if round(float(f), 12) not in observed]
+            if missing:
+                labels = ", ".join(f"{100*float(f):g}%" for f in missing)
+                ax.text(
+                    0.98, 0.97,
+                    f"No finite prior-checkpoint screen at: {labels}",
+                    transform=ax.transAxes, ha="right", va="top", fontsize=7.0, color="0.4",
+                )
+
         ax.set_title(title, fontweight="bold")
         ax.set_xlabel("Target checkpoint (%)")
         ax.grid(True, alpha=0.15)

@@ -22,13 +22,13 @@ import pandas as pd
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis.layer_widths import layer_width_for_model, per_1000_layer_coordinates, per_layer_fraction
 from studies.overtopping.analysis.lib.directional_metrics import DIRECTIONAL_MIN_ELIGIBLE_N
+from studies.overtopping.analysis.lib.interaction_schema import is_exact_interaction_schema
 from studies.overtopping.analysis.lib.primary_matrix import (
     PRIMARY_PROFILE_CHOICES,
     normalize_primary_table,
     write_normalization_audit,
 )
 
-CURRENT_INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,7 +102,7 @@ def augment_row(row: pd.Series, stats_dir: Path) -> dict:
     singleton = load_json(singleton_path) if singleton_path.exists() else {}
     interaction = load_json(interaction_path) if interaction_path.exists() else {}
     schema = interaction.get("definition_version")
-    interaction_current = schema == CURRENT_INTERACTION_SCHEMA
+    interaction_current = is_exact_interaction_schema(schema)
     summary_rows = interaction_summary_rows(summary_csv_path)
 
     output.update({
@@ -131,7 +131,7 @@ def augment_row(row: pd.Series, stats_dir: Path) -> dict:
             "heldout_v3_directional" if singleton.get("definition_version") == "heldout-set-metrics-v3-directional"
             else "missing_or_incompatible"
         ),
-        "interaction_metrics_status": "conditional_v1" if interaction_current else "missing_or_incompatible",
+        "interaction_metrics_status": (f"exact:{schema}" if interaction_current else "missing_or_incompatible"),
     })
 
     for direction in ("i2c", "c2i"):
@@ -173,7 +173,7 @@ def augment_row(row: pd.Series, stats_dir: Path) -> dict:
             output.get(f"N_eff_{direction}"), model_name
         )
 
-    candidate_effect = interaction.get("candidate_E_J") if schema == CURRENT_INTERACTION_SCHEMA else {}
+    candidate_effect = interaction.get("candidate_E_J") if interaction_current else {}
     candidate_effect = candidate_effect if isinstance(candidate_effect, dict) else {}
     output["E_J"] = _pick(candidate_effect.get("effect"), global_payload.get("E_J"))
     output["E_J_status"] = _pick(candidate_effect.get("status"), global_payload.get("E_J_status"))

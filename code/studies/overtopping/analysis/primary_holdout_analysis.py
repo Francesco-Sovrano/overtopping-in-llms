@@ -280,7 +280,7 @@ def run_holdout(setting: dict[str, Any], args: argparse.Namespace, repo_dir: Pat
         print(f"[reuse heldout] {setting['label']} -> {setting['heldout_stats']}")
         return "reused"
     cmd = [
-        args.python_bin, "-m", "pipeline.stage07_refine_neuron_anchored_rules",
+        args.python_bin, "-m", "pipeline.stage07_singleton_causal_evaluation",
         "--task_module", str(setting["task_module"]),
         "--ai_model", str(setting["model_id"]),
         "--rules_dir", str(setting["model_root"] / "rule_extraction_results" / "neuron_flip_rules"),

@@ -455,7 +455,7 @@ def plot_superadditive_boundary(frame: pd.DataFrame, out: Path, data_dir: Path |
         ax.set_yticks(y); ax.set_yticklabels([compact_setting_label(row) for _,row in work.iterrows()], fontsize=7.2)
         ax.set_xlim(0.0, min(1.02, xmax + delta_pad + 0.18))
         ax.set_xlabel(r"Held-out behavioural effect (light bar: singleton-union baseline $U(J)$; dark bar: observed joint effect $E(J)$)")
-        ax.set_title(r"Boundary cases with superadditive composition: $E(J) > U(J)$", fontsize=9.3, pad=8)
+        ax.set_title(r"Boundary cases where joint effect exceeds singleton-union reach: $E(J) > U(J)$", fontsize=9.3, pad=8)
         handles, labels = ax.get_legend_handles_labels()
         seen = set(); uniq_h=[]; uniq_l=[]
         for h,l in zip(handles, labels):
@@ -464,7 +464,7 @@ def plot_superadditive_boundary(frame: pd.DataFrame, out: Path, data_dir: Path |
         ax.legend(uniq_h, uniq_l, frameon=False, loc="lower right", ncol=1, fontsize=7.0)
         ax.grid(axis="x", alpha=0.22, linewidth=0.45); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
         fig.text(0.312, 0.055,
-                 r"Interpretation: $U(J)$ is the best effect suggested by the singleton members of $J$; $E(J)$ is the realised held-out effect of intervening on the full set $J$. Positive $\Delta=E(J)-U(J)$ indicates non-additive / superadditive composition.",
+                 r"Interpretation: $U(J)$ is singleton-union reach—the fraction of held-out examples flipped by at least one singleton member of $J$; $E(J)$ is the held-out effect of intervening on the full set $J$ simultaneously. Positive $\Delta=E(J)-U(J)$ means the joint intervention exceeds singleton-union reach.",
                  ha="left", va="bottom", fontsize=6.6, color="0.18")
         fig.subplots_adjust(left=0.31,right=0.988,bottom=0.26,top=0.91)
         out.parent.mkdir(parents=True,exist_ok=True); fig.savefig(out,bbox_inches="tight",pad_inches=0.03); plt.close(fig)

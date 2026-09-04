@@ -304,12 +304,33 @@ def _fit_positional_repl(repl_pos: torch.Tensor, T: int, fallback_row: torch.Ten
 	pad = fallback_row.view(1, -1).expand(T - Tp, -1)
 	return torch.cat([repl_pos, pad], dim=0)
 
+def _graded_index_replace_(dest, dim: int, indices: torch.Tensor, replacement: torch.Tensor, strength: float):
+	"""Replace selected coordinates by a controlled fraction of the usual intervention.
+
+	``strength=0`` leaves the activation unchanged and ``strength=1`` is exactly
+	the historical full replacement. Intermediate values linearly interpolate
+	from the observed activation to the same replacement value used by the
+	corresponding full intervention.
+	"""
+	strength = float(strength)
+	if strength <= 0.0:
+		return dest
+	if strength >= 1.0:
+		dest.index_copy_(dim, indices, replacement)
+		return dest
+	current = dest.index_select(dim, indices)
+	blended = current + strength * (replacement - current)
+	dest.index_copy_(dim, indices, blended)
+	return dest
+
+
 def build_ablation_hooks(
 	neurons_for_ablation,
 	last_pos_only: bool,
 	intervention="zero",
 	mean_activations=None,
 	device=None,
+	intervention_strength: float = 1.0,
 ):
 	"""
 	Build TransformerLens forward hooks for ablation.
@@ -323,9 +344,17 @@ def build_ablation_hooks(
 	  - For attn.hook_z: indices in d_head for that head.
 
 	Note: mean / mean-donor / mean-positional / mean-donor-positional require `mean_activations` computed over the SAME unit keys.
+
+	``intervention_strength`` is a graded dose in ``[0, 1]``.  The default 1.0
+	preserves the historical behavior exactly.  A value of 0.0 is a no-op and
+	intermediate values interpolate each selected activation toward the same
+	replacement used by the full intervention.
 	"""
 	if device is None:
 		device = get_device()
+	intervention_strength = float(intervention_strength)
+	if not (0.0 <= intervention_strength <= 1.0):
+		raise ValueError("intervention_strength must be in [0, 1]")
 
 	# Dedup early in Python (cheaper than sorting huge lists repeatedly)
 	mlp_layer_to_neurons = defaultdict(set)          # L -> set[idx]
@@ -356,14 +385,17 @@ def build_ablation_hooks(
 
 		if intervention == "zero":
 			if last_pos_only:
-				def _hook(mlp_out, hook, ablate_ids=ablate_ids):
+				def _hook(mlp_out, hook, ablate_ids=ablate_ids, strength=intervention_strength):
 					if mlp_out.ndim == 3:
-						mlp_out[:, -1].index_fill_(1, ablate_ids, 0)
+						dest = mlp_out[:, -1]
+						current = dest.index_select(1, ablate_ids)
+						_graded_index_replace_(dest, 1, ablate_ids, torch.zeros_like(current), strength)
 					return mlp_out
 			else:
-				def _hook(mlp_out, hook, ablate_ids=ablate_ids):
+				def _hook(mlp_out, hook, ablate_ids=ablate_ids, strength=intervention_strength):
 					if mlp_out.ndim == 3:
-						mlp_out.index_fill_(2, ablate_ids, 0)
+						current = mlp_out.index_select(2, ablate_ids)
+						_graded_index_replace_(mlp_out, 2, ablate_ids, torch.zeros_like(current), strength)
 					return mlp_out
 
 		elif intervention in ("mean", "mean-donor"):
@@ -387,18 +419,18 @@ def build_ablation_hooks(
 				return repl_base.to(dtype)
 
 			if last_pos_only:
-				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_for=_repl_for):
+				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_for=_repl_for, strength=intervention_strength):
 					if mlp_out.ndim == 3:
 						dest = mlp_out[:, -1]
 						r = _repl_for(dest.dtype).expand(dest.size(0), -1)
-						dest.index_copy_(1, ablate_ids, r)
+						_graded_index_replace_(dest, 1, ablate_ids, r, strength)
 					return mlp_out
 			else:
-				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_for=_repl_for):
+				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_for=_repl_for, strength=intervention_strength):
 					if mlp_out.ndim == 3:
 						B, T, _ = mlp_out.shape
 						r = _repl_for(mlp_out.dtype).view(1, 1, -1).expand(B, T, -1)
-						mlp_out.index_copy_(2, ablate_ids, r)
+						_graded_index_replace_(mlp_out, 2, ablate_ids, r, strength)
 					return mlp_out
 
 		elif intervention in ("mean-positional", "mean-donor-positional"):
@@ -433,7 +465,7 @@ def build_ablation_hooks(
 				return repl_glob_base.to(dtype)
 
 			if last_pos_only:
-				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for):
+				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for, strength=intervention_strength):
 					if mlp_out.ndim == 3:
 						t = mlp_out.size(1) - 1
 						dest = mlp_out[:, -1]
@@ -442,15 +474,15 @@ def build_ablation_hooks(
 							r = repl_pos[t].expand(dest.size(0), -1)
 						else:
 							r = _repl_glob_for(dest.dtype).expand(dest.size(0), -1)
-						dest.index_copy_(1, ablate_ids, r)
+						_graded_index_replace_(dest, 1, ablate_ids, r, strength)
 					return mlp_out
 			else:
-				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for):
+				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for, strength=intervention_strength):
 					if mlp_out.ndim == 3:
 						B, T, _ = mlp_out.shape
 						repl = _fit_positional_repl(_repl_pos_for(mlp_out.dtype), T, _repl_glob_for(mlp_out.dtype))
 						r = repl.unsqueeze(0).expand(B, T, -1)
-						mlp_out.index_copy_(2, ablate_ids, r)
+						_graded_index_replace_(mlp_out, 2, ablate_ids, r, strength)
 					return mlp_out
 		else:
 			raise ValueError(f"Unknown intervention: {intervention}")
@@ -470,21 +502,25 @@ def build_ablation_hooks(
 
 		if intervention == "zero":
 			if last_pos_only:
-				def _hook(z, hook, H=H, ablate_ids=ablate_ids):
+				def _hook(z, hook, H=H, ablate_ids=ablate_ids, strength=intervention_strength):
 					if z.ndim == 4:
 						dest = z[:, -1, H, :]
-						dest.index_fill_(1, ablate_ids, 0)
+						current = dest.index_select(1, ablate_ids)
+						_graded_index_replace_(dest, 1, ablate_ids, torch.zeros_like(current), strength)
 					elif z.ndim == 3:
 						dest = z[:, -1, :]
-						dest.index_fill_(1, ablate_ids, 0)
+						current = dest.index_select(1, ablate_ids)
+						_graded_index_replace_(dest, 1, ablate_ids, torch.zeros_like(current), strength)
 					return z
 			else:
-				def _hook(z, hook, H=H, ablate_ids=ablate_ids):
+				def _hook(z, hook, H=H, ablate_ids=ablate_ids, strength=intervention_strength):
 					if z.ndim == 4:
 						dest = z[:, :, H, :]
-						dest.index_fill_(2, ablate_ids, 0)
+						current = dest.index_select(2, ablate_ids)
+						_graded_index_replace_(dest, 2, ablate_ids, torch.zeros_like(current), strength)
 					elif z.ndim == 3:
-						z.index_fill_(2, ablate_ids, 0)
+						current = z.index_select(2, ablate_ids)
+						_graded_index_replace_(z, 2, ablate_ids, torch.zeros_like(current), strength)
 					return z
 
 		elif intervention in ("mean", "mean-donor"):
@@ -508,27 +544,27 @@ def build_ablation_hooks(
 				return repl_base.to(dtype)
 
 			if last_pos_only:
-				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_for=_repl_for):
+				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_for=_repl_for, strength=intervention_strength):
 					if z.ndim == 4:
 						dest = z[:, -1, H, :]
 						r = _repl_for(dest.dtype).expand(dest.size(0), -1)
-						dest.index_copy_(1, ablate_ids, r)
+						_graded_index_replace_(dest, 1, ablate_ids, r, strength)
 					elif z.ndim == 3:
 						dest = z[:, -1, :]
 						r = _repl_for(dest.dtype).expand(dest.size(0), -1)
-						dest.index_copy_(1, ablate_ids, r)
+						_graded_index_replace_(dest, 1, ablate_ids, r, strength)
 					return z
 			else:
-				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_for=_repl_for):
+				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_for=_repl_for, strength=intervention_strength):
 					if z.ndim == 4:
 						B, T, _, _ = z.shape
 						dest = z[:, :, H, :]
 						r = _repl_for(z.dtype).view(1, 1, -1).expand(B, T, -1)
-						dest.index_copy_(2, ablate_ids, r)
+						_graded_index_replace_(dest, 2, ablate_ids, r, strength)
 					elif z.ndim == 3:
 						B, T, _ = z.shape
 						r = _repl_for(z.dtype).view(1, 1, -1).expand(B, T, -1)
-						z.index_copy_(2, ablate_ids, r)
+						_graded_index_replace_(z, 2, ablate_ids, r, strength)
 					return z
 
 		elif intervention in ("mean-positional", "mean-donor-positional"):
@@ -563,7 +599,7 @@ def build_ablation_hooks(
 				return repl_glob_base.to(dtype)
 
 			if last_pos_only:
-				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for):
+				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for, strength=intervention_strength):
 					t = z.size(1) - 1
 					if z.ndim == 4:
 						dest = z[:, -1, H, :]
@@ -576,21 +612,21 @@ def build_ablation_hooks(
 						r = repl_pos[t].expand(dest.size(0), -1)
 					else:
 						r = _repl_glob_for(dest.dtype).expand(dest.size(0), -1)
-					dest.index_copy_(1, ablate_ids, r)
+					_graded_index_replace_(dest, 1, ablate_ids, r, strength)
 					return z
 			else:
-				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for):
+				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for, strength=intervention_strength):
 					if z.ndim == 4:
 						B, T, _, _ = z.shape
 						dest = z[:, :, H, :]
 						repl = _fit_positional_repl(_repl_pos_for(z.dtype), T, _repl_glob_for(z.dtype))
 						r = repl.unsqueeze(0).expand(B, T, -1)
-						dest.index_copy_(2, ablate_ids, r)
+						_graded_index_replace_(dest, 2, ablate_ids, r, strength)
 					elif z.ndim == 3:
 						B, T, _ = z.shape
 						repl = _fit_positional_repl(_repl_pos_for(z.dtype), T, _repl_glob_for(z.dtype))
 						r = repl.unsqueeze(0).expand(B, T, -1)
-						z.index_copy_(2, ablate_ids, r)
+						_graded_index_replace_(z, 2, ablate_ids, r, strength)
 					return z
 		else:
 			raise ValueError(f"Unknown intervention: {intervention}")

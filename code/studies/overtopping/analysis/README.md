@@ -1,7 +1,11 @@
 # Overtopping analysis
 
-This package converts completed causal-pipeline outputs into the primary experiment matrix, statistical analyses, manuscript figures, RQ3 threshold/spiking diagnostics, and audit tables.
+Analysis, validation, statistical aggregation, and manuscript-facing figure generation for the overtopping study.
 
-The final-results orchestrator is `reporting.generate_final_results`; individual analysis modules remain runnable for focused regeneration.
+Documentation:
 
-See [../../../docs/overtopping-analysis.md](../../../docs/overtopping-analysis.md) and [../../../docs/manuscript-figure-map.md](../../../docs/manuscript-figure-map.md).
+- [Analysis and reporting pipeline](../../../docs/reporting/analysis-pipeline.md)
+- [Figure ownership](../../../docs/reporting/figures.md)
+- [Metric interpretation](../../../docs/reporting/interpretation.md)
+- [Research-question index](../../../docs/research-questions/README.md)
+- [Operations and regeneration](../../../docs/operations/README.md)

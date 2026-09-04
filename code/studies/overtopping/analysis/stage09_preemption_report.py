@@ -64,6 +64,24 @@ def load_all(root: Path, args: argparse.Namespace, out: Path) -> pd.DataFrame:
             try: df=pd.read_csv(path)
             except Exception: df=pd.DataFrame()
             if not df.empty:
+                required_cols={"candidate_direction_policy","discovery_baseline_subset","interaction_validation_schema"}
+                missing=sorted(required_cols-set(df.columns))
+                if missing:
+                    raise RuntimeError(
+                        f"Stale preemption summary at {path}: missing {missing}. "
+                        "Rerun interaction validation with discovery-direction-aware preemption before Figure 4c."
+                    )
+                expected_schema="conditional-marginal-validation-v2-direction-aware-preemption"
+                bad_schema=df["interaction_validation_schema"].astype(str).ne(expected_schema)
+                bad_policy=df["candidate_direction_policy"].astype(str).ne("discovery_baseline_only")
+                expected_baseline=df["direction"].astype(str).map({"c2i":"positive","i2c":"negative"})
+                bad_baseline=df["discovery_baseline_subset"].astype(str).ne(expected_baseline.astype(str))
+                if bool((bad_schema|bad_policy|bad_baseline).any()):
+                    preview=df.loc[bad_schema|bad_policy|bad_baseline,[c for c in ["direction","discovery_baseline_subset","candidate_direction_policy","interaction_validation_schema"] if c in df.columns]].head(8).to_dict("records")
+                    raise RuntimeError(
+                        f"Stale/misaligned directional preemption summary at {path}; examples={preview}. "
+                        "Rerun interaction validation before Figure 4c."
+                    )
                 n_rows=int(len(df))
                 for k,v in _meta(path,root).items(): df[k]=v
                 df["run_id"]=spec["run_id"]
@@ -106,31 +124,38 @@ def _condition_summary(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def plot(condition: pd.DataFrame, out: Path) -> None:
-    """Paper plot uses one point per run/baseline/direction condition."""
+    """Paper plot uses one point per run/baseline/direction condition, split by direction."""
     if condition.empty:
         out.unlink(missing_ok=True)
         return
-    x=pd.to_numeric(condition.get("median_delta_absent"),errors="coerce")
-    y=pd.to_numeric(condition.get("median_delta_present"),errors="coerce")
-    finite=condition.loc[np.isfinite(x)&np.isfinite(y)].copy()
-    if finite.empty:
-        out.unlink(missing_ok=True)
-        return
-    x=pd.to_numeric(finite["median_delta_absent"],errors="coerce").to_numpy(float)
-    y=pd.to_numeric(finite["median_delta_present"],errors="coerce").to_numpy(float)
-    fig,ax=plt.subplots(figsize=(4.6,3.4))
-    ax.scatter(x,y,s=28,alpha=.80)
-    lo=min(float(np.min(x)),float(np.min(y)),0.0); hi=max(float(np.max(x)),float(np.max(y)),0.0)
-    pad=max(.01,.08*(hi-lo if hi>lo else 1.0)); lo-=pad; hi+=pad
-    ax.plot([lo,hi],[lo,hi],linestyle="--",linewidth=1.0,label="equal condition-median effect")
-    ax.set_xlim(lo,hi); ax.set_ylim(lo,hi)
-    ax.set_xlabel(r"Condition median: secondary marginal when dominant absent $\Delta_k^-$")
-    ax.set_ylabel(r"Condition median: secondary marginal when dominant present $\Delta_k^+$")
-    support=float((x>y).mean())
-    ax.text(.03,.97,f"conditions={len(x)}\n" + r"$\tilde\Delta_k^+<\tilde\Delta_k^-$" + f": {support:.0%}",transform=ax.transAxes,ha="left",va="top",bbox=dict(boxstyle="round,pad=.2",facecolor="white",edgecolor="0.8",alpha=.9))
-    ax.grid(alpha=.25,linewidth=.45); ax.legend(frameon=False,loc="lower right")
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-    fig.tight_layout(); out.parent.mkdir(parents=True,exist_ok=True); fig.savefig(out,bbox_inches="tight"); plt.close(fig)
+    with plt.rc_context({}):
+        fig,axes=plt.subplots(1,2,figsize=(7.1,3.25),sharex=True,sharey=True)
+        made=False
+        for ax,direction in zip(axes,["c2i","i2c"]):
+            g=condition.loc[condition.direction.astype(str)==direction].copy() if "direction" in condition.columns else pd.DataFrame()
+            x=pd.to_numeric(g.get("median_delta_absent"),errors="coerce") if not g.empty else pd.Series(dtype=float)
+            y=pd.to_numeric(g.get("median_delta_present"),errors="coerce") if not g.empty else pd.Series(dtype=float)
+            finite=g.loc[np.isfinite(x)&np.isfinite(y)].copy() if not g.empty else pd.DataFrame()
+            if not finite.empty:
+                made=True
+                xv=pd.to_numeric(finite["median_delta_absent"],errors="coerce").to_numpy(float)
+                yv=pd.to_numeric(finite["median_delta_present"],errors="coerce").to_numpy(float)
+                lo=min(float(np.min(xv)),float(np.min(yv)),0.0); hi=max(float(np.max(xv)),float(np.max(yv)),0.0)
+                pad=max(.01,.08*(hi-lo if hi>lo else 1.0)); lo-=pad; hi+=pad
+                ax.scatter(xv,yv,s=28,alpha=.80)
+                ax.plot([lo,hi],[lo,hi],linestyle="--",linewidth=1.0,label="equal condition-median effect")
+                ax.set_xlim(lo,hi); ax.set_ylim(lo,hi)
+                support=float((xv>yv).mean())
+                ax.text(.03,.97,f"conditions={len(xv)}\n" + r"$\tilde\Delta_k^+<\tilde\Delta_k^-$" + f": {support:.0%}",transform=ax.transAxes,ha="left",va="top",fontsize=7.2)
+            ax.set_title("Discovery direction 1→0" if direction=="c2i" else "Discovery direction 0→1")
+            ax.set_xlabel(r"Secondary marginal when dominant absent $\Delta_k^-$")
+            ax.grid(alpha=.25,linewidth=.45); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        axes[0].set_ylabel(r"Secondary marginal when dominant present $\Delta_k^+$")
+        if made: axes[0].legend(frameon=False,loc="lower right",fontsize=7)
+        fig.tight_layout(); out.parent.mkdir(parents=True,exist_ok=True)
+        if made: fig.savefig(out,bbox_inches="tight")
+        else: out.unlink(missing_ok=True)
+        plt.close(fig)
 
 
 def main() -> None:
@@ -150,9 +175,23 @@ def main() -> None:
         n_pos = int((cond_idx > 0).sum()) if len(cond_idx) else 0
         n_nonzero = int((cond_idx != 0).sum()) if len(cond_idx) else 0
         p_sign = binom_p_greater(n_pos, n_nonzero, .5) if n_nonzero else math.nan
+        directional_status={}
+        if not condition.empty and "direction" in condition.columns:
+            for direction in ["c2i","i2c"]:
+                vals=pd.to_numeric(condition.loc[condition.direction.astype(str)==direction,"median_preemption_index"],errors="coerce").dropna().to_numpy(float)
+                p_dir,rb_dir,dz_dir=wilcoxon_greater(vals) if len(vals) else (math.nan,math.nan,math.nan)
+                directional_status[direction]={
+                    "direction_label":"1to0" if direction=="c2i" else "0to1",
+                    "n_conditions":int(len(vals)),
+                    "median_preemption_index":float(np.median(vals)) if len(vals) else math.nan,
+                    "fraction_positive":float((vals>0).mean()) if len(vals) else math.nan,
+                    "wilcoxon_greater_p":float(p_dir),
+                }
         status={
             "status":"ok",
             "population_scope":args.population_scope,
+            "candidate_direction_policy":"frozen discovery baseline only",
+            "directional_results":directional_status,
             "excluded_poisoning":True,
             "n_pairs":int(len(frame)),
             "n_pairs_defined":int(len(finite)),

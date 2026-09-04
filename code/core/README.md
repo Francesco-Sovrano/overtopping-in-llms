@@ -1,7 +1,11 @@
-# Core package
+# Core library
 
-`core/` contains study-independent task interfaces, model wrappers, prompt/cache handling, activation extraction, interventions, EAP/EAP-IG, held-out causal metrics, and shared threshold-event utilities.
+Shared causal-intervention, task, attribution, statistics, caching, and model utilities used by the pipeline and study packages.
 
-Study-specific experiment policy belongs under `studies/`; stage orchestration belongs under `pipeline/`.
+Documentation:
 
-See [../docs/architecture.md](../docs/architecture.md), [../docs/concepts.md](../docs/concepts.md), and [../docs/eap.md](../docs/eap.md).
+- [Methods overview](../docs/methods/README.md)
+- [Architecture and artifact ownership](../docs/methods/architecture.md)
+- [Causal concepts and metrics](../docs/methods/concepts.md)
+- [EAP / EAP-IG](../docs/methods/eap.md)
+- [Repository documentation index](../docs/README.md)

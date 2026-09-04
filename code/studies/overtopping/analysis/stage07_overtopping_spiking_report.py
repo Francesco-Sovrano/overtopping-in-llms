@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Generate aggregate overtopping-as-spiking statistics, figures, and an updated
-Markdown report from spiking_diagnostics_results_for_inspection.zip.
+"""Generate aggregate RQ3 causal threshold-event statistics and figures.
+
+The input can be a data root containing experiment-level threshold diagnostics
+or an archive containing the same aggregate CSV contract. The analysis resolves
+the exact primary/supplementary overtopping manifest and excludes poisoning.
 
 Example:
   python3 -m studies.overtopping.analysis.stage07_overtopping_spiking_report \
     --root data \
     --out results/analysis/rq3_threshold_event/spiking_diagnostics \
     --paper-figures-dir results/paper/figures/04_rq3_spiking_cut
-
-The script reads only the aggregate CSV files it needs directly from the zip;
-it does not extract the whole bundle.
-
-Dependencies: pandas, numpy, matplotlib.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -30,6 +28,31 @@ import pandas as pd
 POP_CAND = "flip_rule_candidate"
 POP_CTRL = "random_nonagonist_control"
 POP_LABELS = {POP_CAND: "Candidates", POP_CTRL: "Non-candidate controls"}
+# Machine-readable provenance written by threshold_event_diagnostics.py.
+# Keep this separate from the typographic labels used in figures/tables.
+DIRECTION_KEY_BY_BASELINE = {"positive": "1to0", "negative": "0to1"}
+DIRECTION_BY_BASELINE = {"positive": "1→0", "negative": "0→1"}
+BASELINE_ORDER = ("positive", "negative")
+
+
+def _normalize_rq3_direction(value: object) -> str:
+    """Normalize persisted RQ3 direction provenance to its canonical machine key.
+
+    Current experiment-level diagnostics persist ``1to0``/``0to1``.  Older or
+    hand-produced summaries may contain typographic/ASCII arrow spellings; they
+    are semantically identical and are accepted here without rewriting source
+    artifacts.
+    """
+    token = str(value).strip().lower().replace(" ", "")
+    aliases = {
+        "1to0": "1to0",
+        "1->0": "1to0",
+        "1→0": "1to0",
+        "0to1": "0to1",
+        "0->1": "0to1",
+        "0→1": "0to1",
+    }
+    return aliases.get(token, token)
 RNG = np.random.default_rng(20260502)
 
 
@@ -226,6 +249,83 @@ def _zip_member_for_expected(zf: zipfile.ZipFile, expected_rel: str) -> str | No
     return matches[0] if matches else None
 
 
+def _parse_discovery_baseline_values(*values) -> set[str]:
+    """Normalize frozen Stage-6 discovery-baseline provenance."""
+    out: set[str] = set()
+    for value in values:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            continue
+        for token in str(value).replace(",", "|").replace(";", "|").split("|"):
+            token = token.strip().lower()
+            if token in DIRECTION_BY_BASELINE:
+                out.add(token)
+    return out
+
+
+def _expected_candidate_baselines(
+    source_kind: str, source_path: Path, spec: dict, data_root: Path, zf: zipfile.ZipFile | None
+) -> tuple[set[str], str, str]:
+    """Return discovery-eligible RQ3 baselines for one configured run.
+
+    RQ3 candidate identity is directional: a Stage-7 candidate is eligible only
+    in a baseline subset in which it was discovered by Stage 6.  Therefore a
+    run with no negative-baseline candidates is complete with a positive-only
+    diagnostic; requiring both baselines would invent an unevaluated candidate
+    population that does not exist.
+
+    Frozen candidate ranking is the authority.  If it is unavailable, retain
+    the historical conservative contract (require both baselines) rather than
+    silently weakening completeness checks.
+    """
+    stats_dir = Path(spec["stats_dir"])
+    ranking_name = "frozen_candidate_ranking.csv"
+    ranking = pd.DataFrame()
+    ranking_source = str(stats_dir / ranking_name)
+
+    if source_kind == "root":
+        ranking_path = stats_dir / ranking_name
+        if ranking_path.is_file():
+            try:
+                ranking = pd.read_csv(ranking_path)
+            except pd.errors.EmptyDataError:
+                ranking = pd.DataFrame()
+    else:
+        try:
+            rel = (Path("data") / stats_dir.relative_to(data_root) / ranking_name).as_posix()
+            member = _zip_member_for_expected(zf, rel) if zf is not None else None
+        except ValueError:
+            member = None
+            rel = ranking_source
+        if member is not None and zf is not None:
+            ranking_source = member
+            with zf.open(member) as fh:
+                try:
+                    ranking = pd.read_csv(io.BytesIO(fh.read()))
+                except pd.errors.EmptyDataError:
+                    ranking = pd.DataFrame()
+        else:
+            # A diagnostics-only archive may omit Stage-7 stats while the
+            # explicitly supplied canonical data root still contains them.
+            ranking_path = stats_dir / ranking_name
+            if ranking_path.is_file():
+                ranking_source = str(ranking_path)
+                try:
+                    ranking = pd.read_csv(ranking_path)
+                except pd.errors.EmptyDataError:
+                    ranking = pd.DataFrame()
+
+    baselines: set[str] = set()
+    if not ranking.empty:
+        subset_values = ranking.get("discovery_baseline_subsets", pd.Series(index=ranking.index, dtype=object))
+        primary_values = ranking.get("discovery_baseline_subset", pd.Series(index=ranking.index, dtype=object))
+        for subsets, primary in zip(subset_values, primary_values):
+            baselines.update(_parse_discovery_baseline_values(subsets, primary))
+
+    if baselines:
+        return baselines, "frozen_candidate_ranking", ranking_source
+    return set(BASELINE_ORDER), "fallback_require_both", ranking_source
+
+
 def _read_exact_primary_table(source_kind: str, source_path: Path, expected: list[dict],
                               data_root: Path, suffix: str) -> tuple[pd.DataFrame, list[dict]]:
     frames = []
@@ -258,18 +358,57 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
                             df = pd.DataFrame()
                 else:
                     df = pd.DataFrame()
-            baselines = set(df.get("baseline_subset", pd.Series(dtype=str)).dropna().astype(str)) if not df.empty else set()
-            populations = set(df.get("population", pd.Series(dtype=str)).dropna().astype(str)) if not df.empty else set()
-            missing_baselines = sorted({"positive", "negative"} - baselines)
-            missing_populations = sorted({POP_CAND, POP_CTRL} - populations)
-            ok = bool(exists and not df.empty and not missing_baselines and not missing_populations)
+
+            expected_baselines, baseline_contract, ranking_source = _expected_candidate_baselines(
+                source_kind, source_path, spec, data_root, zf
+            )
+            baselines = (
+                set(df.get("baseline_subset", pd.Series(dtype=str)).dropna().astype(str).str.strip().str.lower())
+                if not df.empty else set()
+            )
+            populations = (
+                set(df.get("population", pd.Series(dtype=str)).dropna().astype(str))
+                if not df.empty else set()
+            )
+            missing_baselines = sorted(expected_baselines - baselines)
+            unexpected_baselines = sorted(baselines - expected_baselines)
+
+            # Completeness is baseline-specific.  Seeing a candidate somewhere
+            # in the file and a control somewhere else is not sufficient; each
+            # discovery-eligible directional stratum must contain both.
+            missing_population_cells: list[str] = []
+            if not df.empty and {"baseline_subset", "population"}.issubset(df.columns):
+                baseline_norm = df["baseline_subset"].astype(str).str.strip().str.lower()
+                population_norm = df["population"].astype(str)
+                for baseline in sorted(expected_baselines):
+                    observed = set(population_norm.loc[baseline_norm.eq(baseline)])
+                    for population in (POP_CAND, POP_CTRL):
+                        if population not in observed:
+                            missing_population_cells.append(f"{baseline}:{population}")
+            else:
+                missing_population_cells = [
+                    f"{baseline}:{population}"
+                    for baseline in sorted(expected_baselines)
+                    for population in (POP_CAND, POP_CTRL)
+                ]
+            missing_populations = sorted({cell.split(":", 1)[1] for cell in missing_population_cells})
+            ok = bool(
+                exists and not df.empty
+                and not missing_baselines
+                and not unexpected_baselines
+                and not missing_population_cells
+            )
             audit.append({
                 "row_index": spec["row_index"], "run_id": spec["run_id"], "task": spec["task"],
                 "model": spec["model"], "phase": spec["phase"], "source_scope": spec.get("source_scope", "primary"),
                 "required": bool(spec.get("required", True)), "file": suffix,
                 "source": source_label, "exists": bool(exists), "n_rows": int(len(df)),
+                "expected_baseline_subsets": ",".join(sorted(expected_baselines)),
+                "baseline_contract": baseline_contract, "candidate_ranking_source": ranking_source,
                 "baseline_subsets": ",".join(sorted(baselines)), "populations": ",".join(sorted(populations)),
                 "missing_baseline_subsets": ",".join(missing_baselines),
+                "unexpected_baseline_subsets": ",".join(unexpected_baselines),
+                "missing_population_cells": ",".join(missing_population_cells),
                 "missing_populations": ",".join(missing_populations), "complete": ok,
             })
             if exists and not df.empty:
@@ -295,8 +434,10 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
     b, audit_b = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_binned_curves.csv")
     audit = pd.DataFrame(audit_fs + audit_ut + audit_b)
     # The model-backed flip table is the population-completeness authority: it
-    # proves that both baseline subsets and both candidate/control populations
-    # were actually evaluated. Threshold-unit tests are conditional on there
+    # proves that every discovery-eligible directional subset contains both the
+    # candidate and corresponding structural-control populations. A baseline
+    # with zero frozen discovery candidates is not an RQ3 candidate stratum and
+    # is therefore not required. Threshold-unit tests are conditional on there
     # being enough flip and non-flip examples for repeated held-out fitting. A
     # population can therefore be present in aggregate_flip_stats.csv but
     # legitimately absent from aggregate_unit_tests.csv (for example, inert
@@ -319,12 +460,17 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
     flip_audit = audit[audit["file"].eq("aggregate_flip_stats.csv")].copy()
     incomplete_primary = flip_audit[flip_audit["required"].astype(bool) & ~flip_audit["complete"].astype(bool)]
     if not incomplete_primary.empty:
-        preview = incomplete_primary[["row_index", "task", "model", "phase", "file", "missing_baseline_subsets", "missing_populations", "exists"]].to_dict(orient="records")[:8]
+        preview_cols = [c for c in [
+            "row_index", "task", "model", "phase", "file", "expected_baseline_subsets",
+            "missing_baseline_subsets", "unexpected_baseline_subsets",
+            "missing_population_cells", "exists",
+        ] if c in incomplete_primary.columns]
+        preview = incomplete_primary[preview_cols].to_dict(orient="records")[:8]
         raise RuntimeError(
             "RQ3 primary evaluation population is incomplete; refusing to report unevaluated primary rows. "
             "Supplementary rows are audited separately and may be unavailable, but every primary "
-            "model-backed flip-stat population must contain both baseline subsets and both "
-            "candidate/control populations. "
+            "model-backed flip-stat population must cover every discovery-eligible baseline "
+            "subset and contain both candidate/control populations within each eligible subset. "
             f"See {out / 'population_audit.csv'}. First failures: {preview}"
         )
     included_runs = set(flip_audit.loc[flip_audit["complete"].astype(bool), "run_id"].astype(str))
@@ -334,6 +480,33 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
     for frame in (fs, ut, b):
         if not frame.empty and "run_id" in frame.columns:
             frame.drop(frame.index[~frame["run_id"].astype(str).isin(included_runs)], inplace=True)
+    cand_fs = fs.loc[fs.population.astype(str) == POP_CAND].copy() if not fs.empty and "population" in fs.columns else pd.DataFrame()
+    required_direction_cols = {"baseline_subset", "rq3_direction", "candidate_direction_policy"}
+    if not cand_fs.empty and not required_direction_cols.issubset(cand_fs.columns):
+        missing = sorted(required_direction_cols - set(cand_fs.columns))
+        raise RuntimeError(
+            "Stale direction-agnostic RQ3 diagnostics detected before reporting: "
+            f"aggregate_flip_stats.csv is missing {missing}. Rebuild per-experiment "
+            "spiking_diagnostics-* outputs with discovery-direction-aware diagnostics."
+        )
+    if not cand_fs.empty:
+        baseline_norm = cand_fs["baseline_subset"].astype(str).str.strip().str.lower()
+        expected = baseline_norm.map(DIRECTION_KEY_BY_BASELINE)
+        observed = cand_fs["rq3_direction"].map(_normalize_rq3_direction)
+        policy = cand_fs["candidate_direction_policy"].astype(str).str.strip().str.lower()
+        wrong = expected.isna() | observed.ne(expected) | policy.ne("discovery_baseline_only")
+        if bool(wrong.any()):
+            preview_cols = [c for c in [
+                "run_id", "task", "model", "baseline_subset", "unit_key",
+                "rq3_direction", "candidate_direction_policy",
+            ] if c in cand_fs.columns]
+            preview = cand_fs.loc[wrong, preview_cols].head(8).to_dict("records")
+            raise RuntimeError(
+                "RQ3 candidate direction provenance conflicts with baseline_subset; "
+                "refusing mixed-direction reporting. Expected machine provenance "
+                "positive->1to0 and negative->0to1. "
+                f"First mismatches: {preview}"
+            )
     coverage = {
         "population_scope": str(getattr(args, "population_scope", "primary+supplementary")),
         "configured_primary": int((flip_audit["source_scope"] == "primary").sum()),
@@ -667,19 +840,23 @@ def plot_outputs(out:Path, fs:pd.DataFrame, best:pd.DataFrame, rich:pd.DataFrame
 
     if not binned_agg.empty:
         with paper_figure_rc():
-            fig_obj, ax = plt.subplots(figsize=(4.9, 2.8))
-            for fam in ["activation", "activation-magnitude", "wanda/activation-magnitude", "gradient/effect"]:
-                for pop in [POP_CAND, POP_CTRL]:
-                    g=binned_agg[(binned_agg.feature_family==fam)&(binned_agg.population==pop)].sort_values("bin_index")
-                    if not g.empty:
-                        ax.plot(g.bin_index, g.median_flip_enrichment, marker="o", markersize=3.8, linewidth=1.3, label=f"{fam} | {POP_LABELS[pop]}")
-            ax.axhline(1.0, color="0.10", linewidth=0.8)
-            ax.set_xlabel("Oriented proxy bin", labelpad=1.0)
-            ax.set_ylabel("Median flip-rate enrichment", labelpad=1.0)
-            ax.grid(axis="y", alpha=0.35, linewidth=0.45)
-            ax.legend(frameon=False, fontsize=7.2, ncol=1, loc="upper left", borderaxespad=0.15)
-            fig_obj.subplots_adjust(left=0.15, right=0.995, bottom=0.17, top=0.985)
-            save_pdf_only(fig_obj, fig/"binned_flip_curves_oriented_proxy.pdf")
+            fig_obj, axes = plt.subplots(1, 2, figsize=(7.0, 2.8), sharey=True)
+            made=False
+            for ax, baseline in zip(axes, BASELINE_ORDER):
+                bd=binned_agg.loc[binned_agg.baseline_subset.astype(str).str.lower()==baseline]
+                for fam in ["activation", "activation-magnitude", "wanda/activation-magnitude", "gradient/effect"]:
+                    for pop in [POP_CAND, POP_CTRL]:
+                        g=bd[(bd.feature_family==fam)&(bd.population==pop)].sort_values("bin_index")
+                        if not g.empty:
+                            made=True
+                            ax.plot(g.bin_index,g.median_flip_rate,marker="o",markersize=3.6,linewidth=1.2,label=f"{fam} | {POP_LABELS[pop]}")
+                ax.set_xlabel("Oriented proxy bin"); ax.set_title(f"Discovery direction {DIRECTION_BY_BASELINE[baseline]}")
+                ax.grid(axis="y",alpha=.35,linewidth=.45); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+            axes[0].set_ylabel("Median held-out flip probability")
+            if made:
+                axes[0].legend(frameon=False,fontsize=6.4,ncol=1,loc="upper left",borderaxespad=.15)
+                fig_obj.subplots_adjust(left=.10,right=.995,bottom=.17,top=.88,wspace=.18)
+                save_pdf_only(fig_obj,fig/"binned_flip_curves_oriented_proxy.pdf")
             plt.close(fig_obj)
 
 
@@ -693,12 +870,11 @@ def plot_manuscript_spiking_cut(
     best: pd.DataFrame,
     binned_agg: pd.DataFrame,
 ) -> None:
-    """Promote the RQ3 evidence into compact manuscript-facing figures.
+    """Write compact manuscript-facing RQ3 figures from Stage-7 diagnostics.
 
-    The detailed ECDF/proxy-family diagnostics stay under analysis/.  This paper
-    view reports only causal strength and threshold testability. Stage 8 overwrites
-    it with nested feature-selection and causal-strength-matched threshold-shape
-    inference when those direct experiments are available.
+    This stage can report causal strength and threshold testability directly.
+    Stage 8 writes the complete primary structural-control figure after nested
+    feature selection and held-out threshold evaluation are available.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -710,9 +886,9 @@ def plot_manuscript_spiking_cut(
     adj = results.get("planned_tests_holm_corrected_p", {}) or {}
     test_eff = results.get("threshold_testability_effect", {}) or {}
 
-    # Stage 7 reports only endpoints that are valid before nested feature
-    # selection.  Stage 8 overwrites this paper figure with the full robust
-    # three-part analysis (strength, testability, strength-matched nested MCC).
+    # Stage 7 reports endpoints that do not require nested feature selection.
+    # Stage 8 writes the complete structural-control phenotype analysis
+    # Legacy scalar/threshold diagnostics only; manuscript RQ3 uses graded agonist intervention.
     panels = [
         ("Singleton causal effect", float(ctrl_flip.get("median_flip_any", math.nan)), float(cand_flip.get("median_flip_any", math.nan)), float(adj.get("strength_flip_rate", math.nan))),
         ("Threshold-testable fraction", float(test_eff.get("control_median", math.nan)), float(test_eff.get("candidate_median", math.nan)), float(adj.get("threshold_testability", math.nan))),
@@ -730,7 +906,7 @@ def plot_manuscript_spiking_cut(
                 pad = max(0.01, 0.18 * (hi - lo if hi > lo else max(abs(hi), 0.05)))
                 ax.set_xlim(lo - 0.1 * pad, hi + pad)
             if ax is axes[0]:
-                ax.set_yticks([0, 1], ["Matched control", "Candidate"])
+                ax.set_yticks([0, 1], ["Structural control", "Candidate"])
             else:
                 ax.tick_params(axis="y", labelleft=False)
             ax.set_title(title)
@@ -742,50 +918,70 @@ def plot_manuscript_spiking_cut(
         save_pdf_only(fig_obj, paper_dir / "fig4a_candidate_control_spiking_cut_summary.pdf")
         plt.close(fig_obj)
 
-    # Legacy max-feature thresholdability/TECS paper plots were statistically
-    # selection-biased.  Keep their tables in analysis/ for auditability, but
-    # actively remove stale manuscript copies.  Stage 8 writes the nested,
-    # causal-strength-matched supplementary figures instead.
+    # Max-feature thresholdability/TECS summaries are exploratory because the
+    # held-out metric would otherwise participate in feature selection.  Their
+    # machine-readable tables remain under analysis/, while manuscript inference
+    # uses Stage-8 nested feature selection.
     for stale_name in [
         "fig4s1_thresholdability_ecdf.pdf",
         "fig4s2_tecs_ecdf.pdf",
     ]:
         (paper_dir / stale_name).unlink(missing_ok=True)
 
+    # Plot absolute held-out flip probability by discovery direction. Relative
+    # enrichment is retained only in binned_curve_aggregate.csv because a tiny
+    # control baseline can make innocuous absolute changes look arbitrarily large.
+    (paper_dir / "fig4b_threshold_tail_enrichment.pdf").unlink(missing_ok=True)
     if not binned_agg.empty:
         with paper_figure_rc():
-            fig_obj, ax = plt.subplots(figsize=(4.9, 2.65))
-            for fam in ["activation", "activation-magnitude", "wanda/activation-magnitude", "gradient/effect"]:
-                for pop in [POP_CAND, POP_CTRL]:
-                    g = binned_agg[(binned_agg.feature_family == fam) & (binned_agg.population == pop)].sort_values("bin_index")
-                    if not g.empty:
-                        ax.plot(g.bin_index, g.median_flip_enrichment, marker="o", markersize=3.5, linewidth=1.2,
-                                label=f"{fam} | {POP_LABELS[pop]}")
-            ax.axhline(1.0, color="0.15", linewidth=0.75)
-            ax.set_xlabel("Oriented endogenous-proxy bin")
-            ax.set_ylabel("Median flip-rate enrichment")
-            ax.grid(axis="y", alpha=0.30, linewidth=0.45)
-            ax.legend(frameon=False, fontsize=6.6, ncol=2, loc="upper left")
-            fig_obj.subplots_adjust(left=0.15, right=0.995, bottom=0.18, top=0.985)
-            save_pdf_only(fig_obj, paper_dir / "fig4b_threshold_tail_enrichment.pdf")
+            fig_obj, axes = plt.subplots(1, 2, figsize=(7.0, 2.8), sharey=True)
+            made = False
+            for ax, baseline in zip(axes, BASELINE_ORDER):
+                bd = binned_agg.loc[binned_agg.baseline_subset.astype(str).str.lower() == baseline]
+                for fam in ["activation", "activation-magnitude", "wanda/activation-magnitude", "gradient/effect"]:
+                    for pop in [POP_CAND, POP_CTRL]:
+                        g = bd[(bd.feature_family == fam) & (bd.population == pop)].sort_values("bin_index")
+                        if not g.empty:
+                            made = True
+                            ax.plot(g.bin_index, g.median_flip_rate, marker="o", markersize=3.3, linewidth=1.15,
+                                    label=f"{fam} | {POP_LABELS[pop]}")
+                ax.set_xlabel("Oriented endogenous-proxy bin")
+                ax.set_title(f"Discovery direction {DIRECTION_BY_BASELINE[baseline]}")
+                ax.grid(axis="y", alpha=0.30, linewidth=0.45)
+                ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+            axes[0].set_ylabel("Median held-out flip probability")
+            target = paper_dir / "fig4s4_threshold_tail_response_by_direction.pdf"
+            if made:
+                axes[0].legend(frameon=False, fontsize=6.2, ncol=1, loc="upper left")
+                fig_obj.subplots_adjust(left=0.10, right=0.995, bottom=0.18, top=0.88, wspace=0.18)
+                save_pdf_only(fig_obj, target)
+            else:
+                target.unlink(missing_ok=True)
             plt.close(fig_obj)
 
-    status = """# Figure 4 - RQ3: the spiking cut
+    status = """# Figure 4 - RQ3: causal threshold-event analysis
 
-Available from the threshold/spiking diagnostics:
+The RQ3 experiment compares frozen Stage-7 overtopping candidates with random same-layer/head non-candidate controls selected independently of intervention outcomes. Each candidate is evaluated only in its frozen Stage-6 discovery baseline/direction (positive baseline = 1→0; negative baseline = 0→1). The analysis population is manifest-driven and excludes poisoning experiments.
 
-- `fig4a_candidate_control_spiking_cut_summary.pdf`: candidate vs matched-control singleton strength and threshold-testability (Stage 8 overwrites this with the full nested/matched analysis).
-- `fig4b_threshold_tail_enrichment.pdf`: descriptive binned endogenous-proxy/flip enrichment.
-- Legacy max-feature thresholdability/TECS ECDFs are intentionally not published because conditioning on testable units and choosing each unit's best feature are selection-biased. Stage 8 publishes nested, matched replacements.
+Stage-7 diagnostics provide:
 
-The detailed analysis directory also contains `threshold_testability_audit.csv`, which records how many model-evaluated units in each run/baseline/population had enough flip/non-flip events for a held-out threshold test. Missing threshold tests are not treated as missing interventions.
+- candidate/control singleton causal strength;
+- threshold-testability audits;
+- descriptive direction-specific endogenous-proxy tail response in absolute held-out flip probability.
 
-Additional experiment stages invoked by `generate_final_results.py`:
+Stage 8 provides the primary nested held-out analysis:
 
-- P1.1 `stage08_threshold_shape_validation`: nested held-out constant/threshold/logistic/isotonic comparison plus representative held-out `P(F_j=1 | z_j)` response curves (`fig4b_threshold_shape_model_comparison.pdf`, `fig4b_threshold_response_curves.pdf`).
-- P0.3 `stage09_preemption_report`: aggregates genuine dominant-secondary pair interventions from Pipeline Stage 8 (`fig4c_preemption.pdf`).
+- singleton causal strength;
+- threshold-testable fraction;
+- legacy scalar/flip predictability diagnostics for inspection only.
 
-Still not generated automatically: graded intervention dose-response (P1.2).
+The manuscript RQ3 endpoint is the graded agonist intervention, not a nested threshold-MCC comparison.
+
+The primary comparison preserves same-layer/head structural controls and does not condition on causal strength. Causal-strength matching is a supplementary same-layer/head sensitivity analysis. Scalar selection, threshold fitting, and event orientation occur on training folds; held-out folds are used only for evaluation.
+
+`threshold_testability_audit.csv` records how many model-evaluated units in each run/baseline/population have enough flip and non-flip events for threshold fitting. An undefined threshold test is not treated as a missing intervention.
+
+`stage09_preemption_report` aggregates dominant-secondary pair-intervention outputs to run/baseline/direction conditions. The current interaction-stage pair selection and event-orientation contract makes this branch exploratory rather than a standalone confirmatory test.
 """
     (paper_dir / "README.md").write_text(status, encoding="utf-8")
 
@@ -803,7 +999,7 @@ def build_report(base_md: Optional[Path], results: Dict[str,object]) -> str:
     adj=results.get("planned_tests_holm_corrected_p", {})
     empirical=f'''
 
-## Empirical Update from the Completed Diagnostic Runs
+## RQ3 population-level diagnostics
 
 ### Stage-7 endpoints that are statistically interpretable
 
@@ -818,21 +1014,21 @@ Paired by run and baseline subset, the singleton causal-strength candidate-contr
 
 Threshold fitting is possible for a much larger or smaller fraction of one population than the other, so testability is a separate endpoint rather than silently conditioning on the testable tail. The paired candidate-control testability-fraction delta is **{fmt(te.get('median_delta'))}**, Holm-corrected p **{fmt(adj.get('threshold_testability'))}**.
 
-### Why max-feature MCC and the old TECS are not primary inferential endpoints
+### Exploratory max-feature summaries
 
-`aggregate_unit_tests.csv` contains held-out results for many scalar features. Choosing the feature with the largest held-out MCC and then testing that maximum reuses held-out outcomes for feature selection. In addition, thresholdability is only defined for units with enough flip/non-flip events; conditioning on this subset can select unusually causal controls. The old `best_mcc` and TECS tables are therefore retained only for backward-compatible/exploratory inspection.
+`aggregate_unit_tests.csv` contains held-out results for multiple scalar features. Choosing a feature by its held-out MCC and reporting that same maximum reuses held-out outcomes for selection. Thresholdability is also defined only for units with enough flip and non-flip events. Max-feature `best_mcc` and non-nested TECS tables are therefore descriptive diagnostics rather than primary inferential endpoints.
 
-The inferential threshold-shape analysis is produced by Stage 8. It selects the scalar inside each training fold, evaluates the selected scalar on untouched held-out data, compares testability over all evaluated units, and compares conditional threshold MCC only after candidate/control matching on singleton causal strength within the same run and baseline.
+These scalar-to-flip diagnostics are legacy descriptive analyses. They are not used to establish the manuscript RQ3 spiking phenotype. The primary RQ3 experiment is `graded_agonist_intervention.py`, which sweeps the same validated agonist intervention over its known held-out directional flip support.
 
 ### Supported Stage-7 claim
 
-> Overtopping candidates are more causally consequential than sampled same-layer non-candidate controls, and the probability that threshold structure is statistically testable must be reported separately from the magnitude of thresholdability among testable units.
+> These scalar-to-flip summaries are legacy diagnostics only. They are not used to establish RQ3's spiking phenotype.
 
-Do not claim from Stage 7 alone that candidates have higher thresholdability. Use `threshold_shape_validation/threshold_shape_statistical_results.json` for that question.
+Use the graded agonist intervention outputs for manuscript-facing RQ3 claims.
 '''
     if base_md and base_md.exists():
         base=base_md.read_text()
-        if "## Empirical Update from the Completed Diagnostic Runs" in base: base=base.split("## Empirical Update from the Completed Diagnostic Runs",1)[0].rstrip()+"\n"
+        if "## RQ3 population-level diagnostics" in base: base=base.split("## RQ3 population-level diagnostics",1)[0].rstrip()+"\n"
         return base.replace("## Core Concepts", empirical+"\n## Core Concepts", 1) if "## Core Concepts" in base else base.rstrip()+"\n"+empirical
     return "# Overtopping-as-Spiking Diagnostics\n"+empirical
 
@@ -904,7 +1100,11 @@ def main():
             b["baseline_subset"] = b.get("source_baseline_dir", "unknown").astype(str).str.replace("_baseline", "", regex=False)
         keys=["run_id","baseline_subset","population","unit_key","feature","target"]
         b["curve_mean"]=b.groupby(keys,dropna=False).flip_rate.transform("mean"); b["flip_enrichment"]=b.flip_rate/b.curve_mean.replace(0,np.nan)
-        binned_agg=b.groupby(["feature_family","population","bin_index"],dropna=False).agg(median_flip_enrichment=("flip_enrichment","median"),mean_flip_enrichment=("flip_enrichment","mean"),median_flip_rate=("flip_rate","median"),n_curves=("unit_key","count")).reset_index()
+        binned_agg=b.groupby(["baseline_subset","feature_family","population","bin_index"],dropna=False).agg(
+            median_flip_enrichment=("flip_enrichment","median"),mean_flip_enrichment=("flip_enrichment","mean"),
+            median_flip_rate=("flip_rate","median"),mean_flip_rate=("flip_rate","mean"),n_curves=("unit_key","count")
+        ).reset_index()
+        binned_agg["direction"] = binned_agg["baseline_subset"].astype(str).str.lower().map(DIRECTION_BY_BASELINE)
     for name,df in {"flip_rate_summary.csv":flip_summary,"paired_flip_rate_by_run_baseline.csv":flip_med.reset_index(),"unit_primary_spiking_scores.csv":best,"threshold_testability_audit.csv":testability,"primary_spiking_score_summary.csv":primary,"paired_css_by_run_baseline.csv":css_med.reset_index(),"paired_best_mcc_by_run_baseline.csv":mcc_med.reset_index(),"paired_threshold_testability_by_run_baseline.csv":test_med.reset_index(),"paired_css_delta_rich.csv":rich,"feature_level_stat_summary.csv":feature_comp,"binned_curve_aggregate.csv":binned_agg}.items(): df.to_csv(out/name,index=False)
     results={"populations":{"candidate":POP_CAND,"control":POP_CTRL},"flip_summary":flip_summary.to_dict(orient="records"),"flip_effect":flip_eff,"flip_unit_cliffs_delta":flip_cd,"primary_summary":primary.to_dict(orient="records"),"threshold_testability":testability.to_dict(orient="records"),"css_effect_exploratory":css_eff,"css_unit_cliffs_delta_exploratory":css_cd,"best_mcc_effect_exploratory":mcc_eff,"best_mcc_unit_cliffs_delta_exploratory":mcc_cd,"threshold_testability_effect":test_eff,"planned_tests_holm_corrected_p":adj,"n_aggregate_flip_stats_files":int(len(fs_all.rel.unique())) if "rel" in fs_all else 0,"n_aggregate_unit_tests_files":int(len(ut_all.rel.unique())) if (not ut_all.empty and "rel" in ut_all) else 0}
     (out/"statistical_results.json").write_text(json.dumps(results,indent=2))

@@ -60,10 +60,11 @@ from core.high_n_singleton_eval import (
     precompute_replacements_for_units,
 )
 from core.modeling_and_ablation import LMWrapper, get_device
+from studies.overtopping.analysis.lib.interaction_schema import CURRENT_INTERACTION_SCHEMA
 
 
 LOG_PREFIX = "[conditional-validation]"
-SCHEMA = "conditional-marginal-validation-v1"
+SCHEMA = CURRENT_INTERACTION_SCHEMA
 GROUP_CACHE_SCHEMA = "simultaneous-group-eval-v2"
 
 
@@ -340,10 +341,31 @@ def _candidate_stat_frame(path: Path, candidates: list[UnitSpec]) -> pd.DataFram
     return frame.loc[frame["unit_key"].astype(str).isin(keys)].copy()
 
 
+def _ranking_direction_keys(ranking: pd.DataFrame, baseline_subset: str) -> set[str]:
+    baseline = str(baseline_subset).strip().lower()
+    if baseline not in {"positive", "negative"}:
+        raise ValueError(f"Unsupported discovery baseline: {baseline_subset!r}")
+    if "unit_key" not in ranking.columns:
+        raise ValueError("Frozen ranking lacks unit_key for directional preemption selection")
+    if "discovery_baseline_subsets" in ranking.columns:
+        def eligible(value):
+            tokens={x.strip().lower() for x in str(value).replace(",","|").replace(";","|").split("|")}
+            return baseline in tokens
+        mask=ranking["discovery_baseline_subsets"].map(eligible)
+    elif "discovery_baseline_subset" in ranking.columns:
+        mask=ranking["discovery_baseline_subset"].astype(str).str.strip().str.lower().eq(baseline)
+    else:
+        raise RuntimeError(
+            "Frozen ranking lacks discovery_baseline_subset provenance; refusing direction-agnostic preemption selection."
+        )
+    return set(ranking.loc[mask,"unit_key"].astype(str))
+
+
 def _preemption_pair_plan(
     *,
     candidates: list[UnitSpec],
     candidate_stats: pd.DataFrame,
+    ranking: pd.DataFrame,
     min_rate: float,
     max_secondaries: int,
 ) -> tuple[list[dict], dict[str, GroupSpec]]:
@@ -359,7 +381,10 @@ def _preemption_pair_plan(
     for direction, rate_col in (("c2i", "c2i_rate"), ("i2c", "i2c_rate")):
         if rate_col not in candidate_stats.columns:
             continue
+        discovery_baseline = "positive" if direction == "c2i" else "negative"
+        directional_keys = _ranking_direction_keys(ranking, discovery_baseline)
         work = candidate_stats[["unit_key", rate_col]].copy()
+        work = work.loc[work["unit_key"].astype(str).isin(directional_keys)]
         work[rate_col] = pd.to_numeric(work[rate_col], errors="coerce")
         work = work.loc[work["unit_key"].astype(str).isin(unit_by_key)]
         work = work.loc[np.isfinite(work[rate_col]) & (work[rate_col] >= float(min_rate))]
@@ -376,6 +401,8 @@ def _preemption_pair_plan(
             groups[pair.key] = pair
             plans.append({
                 "direction": direction,
+                "discovery_baseline_subset": discovery_baseline,
+                "candidate_direction_policy": "discovery_baseline_only",
                 "dominant_unit": dominant_key,
                 "secondary_unit": secondary_key,
                 "dominant_singleton_rate": float(work.iloc[0][rate_col]),
@@ -419,7 +446,10 @@ def _fit_preemption_threshold(x: np.ndarray, y: np.ndarray, min_class: int) -> d
             candidate=(abs(float(mcc)),float(threshold),direction,float(mcc))
             if best is None or candidate[0]>best[0]: best=candidate
     if best is None: return None
-    return {"abs_mcc":best[0],"threshold":best[1],"direction":best[2],"mcc":best[3]}
+    return {
+        "abs_mcc":best[0],"threshold":best[1],"direction":best[2],"mcc":best[3],
+        "prediction_inverted":bool(best[3] < 0.0),
+    }
 
 
 def _threshold_event_indicator(
@@ -470,6 +500,8 @@ def _threshold_event_indicator(
     _,feature,fit,x=best
     finite=np.isfinite(x[test]); test=test[finite]
     pred=x[test]>=fit["threshold"] if fit["direction"]==">=" else x[test]<=fit["threshold"]
+    if bool(fit.get("prediction_inverted", False)):
+        pred = ~pred
     ytest=y[test]
     local=pd.to_numeric(raw.iloc[test]["example_local_index"],errors="coerce").to_numpy()
     id_col="original_idx" if "original_idx" in high.columns else ("_orig_row" if "_orig_row" in high.columns else None)
@@ -481,6 +513,8 @@ def _threshold_event_indicator(
         if 0<=pos<len(high): mapping[high.iloc[pos][id_col]]=bool(event)
     return mapping, {
         "status":"ok","feature":feature,"threshold":float(fit["threshold"]),"direction":str(fit["direction"]),
+        "prediction_inverted":bool(fit.get("prediction_inverted", False)),
+        "event_direction":("<=" if str(fit["direction"]) == ">=" else ">=") if bool(fit.get("prediction_inverted", False)) else str(fit["direction"]),
         "train_abs_mcc":float(fit["abs_mcc"]),"heldout_abs_mcc":abs(float(_mcc_binary(ytest,pred))),
         "n_threshold_holdout":int(len(test)),"n_threshold_event_present":int(np.sum(pred)),"target":target,"row_id_column":id_col,
     }
@@ -555,9 +589,13 @@ def _analyze_preemption(
             "n_threshold_event_defined": int(t_defined.sum()),
             "n_threshold_event_present": int(dom_present.sum()),
             "n_threshold_event_absent": int(dom_absent.sum()),
+            "interaction_validation_schema": SCHEMA,
             "threshold_event_status": str(threshold_meta.get(direction, {}).get("status", "unavailable")),
             "threshold_event_feature": threshold_meta.get(direction, {}).get("feature"),
             "threshold_event_heldout_abs_mcc": threshold_meta.get(direction, {}).get("heldout_abs_mcc"),
+            "threshold_event_prediction_inverted": threshold_meta.get(direction, {}).get("prediction_inverted"),
+            "threshold_event_raw_direction": threshold_meta.get(direction, {}).get("direction"),
+            "threshold_event_effective_direction": threshold_meta.get(direction, {}).get("event_direction"),
             "dominant_rate_observed": _mean_or_nan(f_dom[source].astype(float)),
             "secondary_rate_observed": _mean_or_nan(f_sec[source].astype(float)),
             "pair_rate": _mean_or_nan(f_pair[source].astype(float)),
@@ -858,6 +896,7 @@ def main() -> None:
         _preemption_pair_plan(
             candidates=candidates,
             candidate_stats=candidate_stats,
+            ranking=ranking,
             min_rate=float(args.preemption_min_singleton_rate),
             max_secondaries=int(args.preemption_max_secondaries),
         )

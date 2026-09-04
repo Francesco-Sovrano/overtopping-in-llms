@@ -22,6 +22,7 @@ from studies.overtopping.analysis.lib.files import read_json
 from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, normalize_primary_table, write_normalization_audit
 from studies.overtopping.analysis.layer_widths import layer_width_for_model, per_1000_layer_coordinates, per_layer_fraction
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, competence, raw_task_score
+from studies.overtopping.analysis.lib.interaction_schema import is_exact_interaction_schema
 
 
 
@@ -236,12 +237,12 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
         schema = interaction.get("definition_version") if isinstance(interaction, dict) else None
         candidate_effect = (
             interaction.get("candidate_E_J", {})
-            if schema == "conditional-marginal-validation-v1"
+            if is_exact_interaction_schema(schema)
             else {}
         )
         interaction_ej = candidate_effect.get("effect") if isinstance(candidate_effect, dict) else None
         cmc_1x = None
-        if schema == "conditional-marginal-validation-v1":
+        if is_exact_interaction_schema(schema):
             for item in interaction.get("conditional_marginal", []) or []:
                 try:
                     multiplier = int(item.get("background_multiplier"))

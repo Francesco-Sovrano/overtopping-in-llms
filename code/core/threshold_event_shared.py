@@ -2,7 +2,7 @@
 
 This module holds helper code used by:
   - stage06_analyze_bag_of_rules.py for post-hoc agonist activation diagnostics
-  - stage07_refine_neuron_anchored_rules.py for stable layer-key naming
+  - stage07_singleton_causal_evaluation.py (legacy implementation module retained) for stable layer-key naming
   - threshold_event_diagnostics.py / core.threshold_event_spiking for high-N
     overtopping-vs-control threshold/spiking diagnostics
 

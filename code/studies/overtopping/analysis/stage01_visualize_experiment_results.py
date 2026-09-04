@@ -16,8 +16,7 @@ import pandas as pd
 from studies.overtopping.analysis.lib.task_metrics import raw_task_score, chance_baseline, competence
 from studies.overtopping.experiments.execution import RunSpec
 from core.project_paths import PROJECT_ROOT
-
-CURRENT_INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
+from studies.overtopping.analysis.lib.interaction_schema import is_exact_interaction_schema
 
 
 def row_for(spec: RunSpec, data_root: Path) -> dict | None:
@@ -48,7 +47,7 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
     toc = singleton.get("TOC_m", {}).get("1", {}) if isinstance(singleton.get("TOC_m"), dict) else {}
     toc1 = toc.get("value", math.nan) if isinstance(toc, dict) else math.nan
 
-    candidate_e = interaction.get("candidate_E_J", {}) if schema == CURRENT_INTERACTION_SCHEMA else {}
+    candidate_e = interaction.get("candidate_E_J", {}) if is_exact_interaction_schema(schema) else {}
     candidate_e = candidate_e if isinstance(candidate_e, dict) else {}
     output = {
         **spec.__dict__, "phase": spec.phase, "stats_dir": str(stats_dir),
@@ -85,7 +84,7 @@ def row_for(spec: RunSpec, data_root: Path) -> dict | None:
     for m, item in (singleton.get("TOC_m", {}) or {}).items():
         output[f"TOC_{m}"] = item.get("value") if isinstance(item, dict) else item
 
-    if schema == CURRENT_INTERACTION_SCHEMA:
+    if is_exact_interaction_schema(schema):
         for item in interaction.get("conditional_marginal", []) or []:
             try:
                 multiplier = int(item.get("background_multiplier"))

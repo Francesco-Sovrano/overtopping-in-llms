@@ -801,6 +801,7 @@ def extract_frozen_candidate_ranking(
 	"""
 	selected = {(str(layer), int(nid)) for layer, nid, _ in selected_neurons}
 	records = {}
+	discovery_baselines = defaultdict(set)
 
 	def _consume(buckets, source_name):
 		nca = buckets.get("non_catastrophic_agonists", {})
@@ -829,6 +830,9 @@ def extract_frozen_candidate_ranking(
 			unit = (layer, nid)
 			if unit not in selected:
 				continue
+			baseline_subset = str(rec.get("baseline_subset", "")).strip().lower()
+			if baseline_subset in {"positive", "negative"}:
+				discovery_baselines[unit].add(baseline_subset)
 			previous = records.get(unit)
 			payload = {
 				"layer_label": layer,
@@ -863,6 +867,15 @@ def extract_frozen_candidate_ranking(
 
 	rows = list(records.values())
 	for row in rows:
+		unit = (str(row["layer_label"]), int(row["neuron_id"]))
+		baselines = sorted(discovery_baselines.get(unit, set()))
+		primary = str(row.get("discovery_baseline_subset", "")).strip().lower()
+		if primary in {"positive", "negative"} and primary not in baselines:
+			baselines.append(primary)
+		baselines = sorted(set(baselines))
+		row["discovery_baseline_subset"] = primary if primary in {"positive", "negative"} else (baselines[0] if baselines else "")
+		row["discovery_baseline_subsets"] = "|".join(baselines)
+		row["n_discovery_baseline_subsets"] = int(len(baselines))
 		parsed = get_layer_type_and_ids(row["layer_label"])
 		if parsed is None:
 			row.update({
@@ -928,6 +941,12 @@ def load_candidate_ranking_override(path: str | Path):
 		df["discovery_score_signed"] = np.nan
 	if "discovery_baseline_subset" not in df.columns:
 		df["discovery_baseline_subset"] = "positive"
+	if "discovery_baseline_subsets" not in df.columns:
+		df["discovery_baseline_subsets"] = df["discovery_baseline_subset"].astype(str)
+	if "n_discovery_baseline_subsets" not in df.columns:
+		df["n_discovery_baseline_subsets"] = df["discovery_baseline_subsets"].astype(str).map(
+			lambda value: len({x.strip().lower() for x in value.split("|") if x.strip().lower() in {"positive", "negative"}})
+		)
 	if "discovery_rank_global" not in df.columns:
 		df["discovery_rank_global"] = np.arange(1, len(df) + 1, dtype=int)
 	df["ranking_source"] = df.get("ranking_source", pd.Series("fixed_candidate_override", index=df.index)).fillna("fixed_candidate_override")
@@ -1142,6 +1161,7 @@ def write_flip_stats(
 	baseline_metric_col: str = None,
 	search_epsilon: float = None,
 	reference_n_per_side: int = None,
+	frozen_candidate_ranking_df: pd.DataFrame | None = None,
 ):
 	"""
 	Write per-neuron counts of c2i and i2c flips, and a bar plot for the top-K neurons
@@ -1247,7 +1267,21 @@ def write_flip_stats(
 		print("[Stats] No flip columns found; skipping flip stats.")
 		return None
 
-	stats_df = pd.DataFrame(rows).sort_values(["flip_any_count", "flip_semantic_wrong_count", "c2i_count", "i2c_count"], ascending=False)
+	stats_df = pd.DataFrame(rows)
+	if frozen_candidate_ranking_df is not None and not frozen_candidate_ranking_df.empty:
+		ranking = frozen_candidate_ranking_df.copy()
+		if "layer_label" not in ranking.columns and "layer_key" in ranking.columns:
+			ranking["layer_label"] = ranking["layer_key"].astype(str)
+		if {"layer_label", "neuron_id"}.issubset(ranking.columns):
+			keep = [c for c in [
+				"layer_label", "neuron_id", "discovery_baseline_subset", "discovery_baseline_subsets",
+				"n_discovery_baseline_subsets", "discovery_score", "discovery_score_signed",
+				"discovery_rank_global", "discovery_rank_within_layer", "channel_type",
+				"computational_locus", "transformer_layer",
+			] if c in ranking.columns]
+			ranking = ranking[keep].drop_duplicates(["layer_label", "neuron_id"], keep="first")
+			stats_df = stats_df.merge(ranking, on=["layer_label", "neuron_id"], how="left", validate="one_to_one")
+	stats_df = stats_df.sort_values(["flip_any_count", "flip_semantic_wrong_count", "c2i_count", "i2c_count"], ascending=False)
 	stats_path = os.path.join(out_dir, 'stats', stats_dirname, f"flip_stats_by_neuron.csv")
 	stats_df.to_csv(stats_path, index=False)
 	print(f"[Stats] Wrote {stats_path}")
@@ -3840,6 +3874,7 @@ def main():
 			scores_stats, neurons, args.rules_dir, topk=50, stats_dirname=stats_dirname,
 			baseline_metric_col=main_metric, search_epsilon=args.search_epsilon,
 			reference_n_per_side=(int(os.environ["SEARCH_EPSILON_REFERENCE_N"]) if os.environ.get("SEARCH_EPSILON_REFERENCE_N", "").strip() else None),
+			frozen_candidate_ranking_df=frozen_candidate_ranking_df,
 		)
 		thresholds = [
 			float(value.strip())
@@ -5138,6 +5173,7 @@ def main():
 		scores_for_final_stats, neurons, args.rules_dir, topk=50, stats_dirname=args.stats_dirname,
 		baseline_metric_col=main_metric, search_epsilon=args.search_epsilon,
 		reference_n_per_side=(int(os.environ["SEARCH_EPSILON_REFERENCE_N"]) if os.environ.get("SEARCH_EPSILON_REFERENCE_N", "").strip() else None),
+		frozen_candidate_ranking_df=frozen_candidate_ranking_df,
 	)
 	thresholds = [
 		float(value.strip())

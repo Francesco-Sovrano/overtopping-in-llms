@@ -89,7 +89,17 @@ def _ranked_candidates(
         "discovery_score", "discovery_score_signed", "ranking_source",
         "computational_locus", "channel_type", "transformer_layer",
     ] if c in rank.columns]
-    merged = candidates.merge(rank[keep], on="unit_key", how="left", validate="one_to_one")
+    # Candidate statistics may already carry discovery-ranking metadata (for
+    # example after Stage 7 writes flip_stats_by_neuron.csv).  The explicit
+    # frozen_ranking argument is authoritative.  Drop overlapping metadata
+    # before the join so pandas cannot create *_x/*_y columns and make the
+    # canonical unsuffixed ranking fields disappear.
+    overlapping_rank_cols = [
+        column for column in keep
+        if column != "unit_key" and column in candidates.columns
+    ]
+    merge_base = candidates.drop(columns=overlapping_rank_cols)
+    merged = merge_base.merge(rank[keep], on="unit_key", how="left", validate="one_to_one")
     if merged["discovery_rank_global"].isna().any():
         missing = merged.loc[merged["discovery_rank_global"].isna(), "unit_key"].tolist()
         raise ValueError(

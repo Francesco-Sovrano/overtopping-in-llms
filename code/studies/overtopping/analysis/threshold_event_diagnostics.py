@@ -95,6 +95,15 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--candidate_ranking_path",
+        default=None,
+        help=(
+            "Frozen Stage-7 candidate ranking carrying discovery_baseline_subset provenance. "
+            "Defaults to frozen_candidate_ranking.csv beside --candidate_flip_stats_path. "
+            "RQ3 candidates are evaluated only in the baseline direction in which they were discovered."
+        ),
+    )
+    p.add_argument(
         "--materialized_stage7_scores_path",
         default=None,
         help=(
@@ -537,6 +546,86 @@ def _materialized_stage7_scores_path(args) -> Path | None:
     return None
 
 
+def _candidate_ranking_path(args) -> Path | None:
+    explicit = getattr(args, "candidate_ranking_path", None)
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    candidate = getattr(args, "candidate_flip_stats_path", None)
+    if candidate:
+        inferred = Path(candidate).expanduser().resolve().parent / "frozen_candidate_ranking.csv"
+        if inferred.is_file():
+            return inferred
+    return None
+
+
+def _parse_discovery_baselines(value, primary=None) -> set[str]:
+    out: set[str] = set()
+    if value is not None and not (isinstance(value, float) and np.isnan(value)):
+        for token in re.split(r"[|,;]", str(value)):
+            token = token.strip().lower()
+            if token in {"positive", "negative"}:
+                out.add(token)
+    if primary is not None and not (isinstance(primary, float) and np.isnan(primary)):
+        token = str(primary).strip().lower()
+        if token in {"positive", "negative"}:
+            out.add(token)
+    return out
+
+
+def _candidate_provenance_frame(path: str | Path, ranking_path: str | Path | None = None) -> pd.DataFrame:
+    """Load candidate units together with frozen discovery-direction provenance.
+
+    Direction membership must come from discovery, never from held-out flip rates.
+    New Stage-7 flip tables carry the fields directly; older tables are repaired
+    from the sibling frozen_candidate_ranking.csv without rerunning ablations.
+    """
+    fp = Path(path).expanduser().resolve()
+    frame = pd.read_csv(fp)
+    if "layer_label" not in frame.columns and "layer_key" in frame.columns:
+        frame["layer_label"] = frame["layer_key"].astype(str)
+    if "unit_key" not in frame.columns and {"layer_label", "neuron_id"}.issubset(frame.columns):
+        frame["unit_key"] = [f"{layer}:{int(nid)}" for layer, nid in zip(frame["layer_label"], frame["neuron_id"])]
+
+    direction_fields = ["discovery_baseline_subset", "discovery_baseline_subsets", "n_discovery_baseline_subsets"]
+    missing_direction_fields = [c for c in direction_fields if c not in frame.columns]
+    rp = Path(ranking_path).expanduser().resolve() if ranking_path else fp.parent / "frozen_candidate_ranking.csv"
+    if missing_direction_fields:
+        if not rp.is_file():
+            raise RuntimeError(
+                f"RQ3 candidate direction provenance is incomplete in {fp} (missing {missing_direction_fields}) "
+                f"and no frozen ranking exists at {rp}. Refusing direction-agnostic evaluation."
+            )
+        ranking = pd.read_csv(rp)
+        if "unit_key" not in ranking.columns:
+            if not {"layer_label", "neuron_id"}.issubset(ranking.columns):
+                raise ValueError(f"Frozen ranking lacks unit identity: {rp}")
+            ranking["unit_key"] = [f"{layer}:{int(nid)}" for layer, nid in zip(ranking["layer_label"], ranking["neuron_id"])]
+        available = [c for c in missing_direction_fields + ["discovery_score", "discovery_score_signed"] if c in ranking.columns and c not in frame.columns]
+        if not any(c in ranking.columns for c in missing_direction_fields):
+            raise RuntimeError(
+                f"Frozen ranking {rp} does not contain the missing direction fields {missing_direction_fields}. "
+                "Run rebuild_spiking_diagnostics once to backfill provenance from Stage-6 neuron_buckets.json."
+            )
+        frame = frame.merge(ranking[["unit_key"] + available].drop_duplicates("unit_key"), on="unit_key", how="left", validate="one_to_one")
+
+    memberships = []
+    for row in frame.to_dict("records"):
+        dirs = _parse_discovery_baselines(row.get("discovery_baseline_subsets"), row.get("discovery_baseline_subset"))
+        memberships.append("|".join(sorted(dirs)))
+    frame["discovery_baseline_subsets"] = memberships
+    frame["n_discovery_baseline_subsets"] = [len(v.split("|")) if v else 0 for v in memberships]
+    if "discovery_baseline_subset" not in frame.columns:
+        frame["discovery_baseline_subset"] = [v.split("|")[0] if v else "" for v in memberships]
+    missing = frame[frame["n_discovery_baseline_subsets"] == 0]
+    if not missing.empty:
+        preview = ", ".join(missing["unit_key"].astype(str).head(12).tolist())
+        raise RuntimeError(
+            "RQ3 candidate direction provenance is undefined for "
+            f"{len(missing)} candidate(s): {preview}. Refusing direction-agnostic evaluation."
+        )
+    return frame
+
+
 def _scientific_method_config(args, baseline: str) -> dict:
     """Explicit fields that determine the scientific computation for reuse.
 
@@ -545,10 +634,12 @@ def _scientific_method_config(args, baseline: str) -> dict:
     dimensions.
     """
     return {
-        "analysis_schema_version": "threshold-event-v3-nested-safe",
+        "analysis_schema_version": "threshold-event-v4-discovery-direction-aware",
         "baseline_subset": str(baseline),
         "input_data_dir": _resolved_optional_path(getattr(args, "input_data_dir", None)),
         "candidate_flip_stats_sha256": _content_identity(getattr(args, "candidate_flip_stats_path", None)),
+        "candidate_ranking_sha256": _content_identity(_candidate_ranking_path(args)),
+        "candidate_direction_policy": "discovery_baseline_only",
         "materialized_stage7_scores_sha256": _content_identity(_materialized_stage7_scores_path(args)),
         "task_module": str(getattr(args, "task_module", "")),
         "ai_model": str(getattr(args, "ai_model", "")) if getattr(args, "ai_model", None) else None,
@@ -759,19 +850,32 @@ def _units_from_rules(rule_df: pd.DataFrame) -> list[UnitSpec]:
     return units
 
 
-def _units_from_flip_stats(path: str | Path | None) -> list[UnitSpec]:
+def _units_from_flip_stats(
+    path: str | Path | None,
+    *,
+    baseline_subset: str | None = None,
+    ranking_path: str | Path | None = None,
+) -> list[UnitSpec]:
     if path is None:
         return []
     fp = Path(path).expanduser()
     if not fp.exists():
         raise FileNotFoundError(f"Candidate flip-stat table not found: {fp}")
-    df = pd.read_csv(fp)
+    df = _candidate_provenance_frame(fp, ranking_path)
     required = {"neuron_id"}
     if not required.issubset(df.columns) or not ({"layer_label", "layer_key"} & set(df.columns)):
         raise ValueError(
             f"{fp} must contain neuron_id and layer_label (preferred) or layer_key."
         )
     layer_col = "layer_label" if "layer_label" in df.columns else "layer_key"
+    baseline = str(baseline_subset).strip().lower() if baseline_subset is not None else None
+    if baseline is not None:
+        if baseline not in {"positive", "negative"}:
+            raise ValueError(f"Unsupported RQ3 candidate baseline subset: {baseline_subset!r}")
+        eligible = df["discovery_baseline_subsets"].astype(str).map(
+            lambda value: baseline in _parse_discovery_baselines(value)
+        )
+        df = df.loc[eligible].copy()
     strength_col = next(
         (c for c in ["flip_any_rate", "singleton_flip_any_rate", "seed_strength"] if c in df.columns),
         None,
@@ -789,7 +893,7 @@ def _units_from_flip_stats(path: str | Path | None) -> list[UnitSpec]:
                 int(row["neuron_id"]),
                 source="cha_discovered_candidate",
                 circuit_id=None,
-                circuit_label="candidate_flip_stats",
+                circuit_label=f"candidate_flip_stats:{baseline or 'all'}",
                 seed_strength=strength,
             )
         )
@@ -1989,6 +2093,9 @@ def _candidate_flips_from_stage7(*, args, baseline: str, scores_df: pd.DataFrame
             "circuit_label": u.circuit_label,
             "seed_strength": np.nan if u.seed_strength is None else float(u.seed_strength),
             "baseline_subset": baseline,
+            "discovery_baseline_subset": baseline,
+            "discovery_direction": "1to0" if baseline == "positive" else "0to1",
+            "direction_provenance": "frozen_stage6_discovery",
             "n_eval": int(len(selected)),
             "flip_any_rate": float(copied["any"].mean()) if len(selected) else np.nan,
             "c2i_rate": float(copied["c2i"].mean()) if len(selected) else np.nan,
@@ -2040,8 +2147,12 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
             _log(args, f"{LOG_PREFIX} {baseline}: loaded {len(rule_df)} rule candidate(s)", "normal")
 
     rule_conditioned_only = bool(getattr(args, "rule_conditioned_only", False)) and not rule_df.empty
-    units = _units_from_flip_stats(getattr(args, "candidate_flip_stats_path", None))
-    candidate_source = "script-7 flip statistics"
+    units = _units_from_flip_stats(
+        getattr(args, "candidate_flip_stats_path", None),
+        baseline_subset=baseline,
+        ranking_path=_candidate_ranking_path(args),
+    )
+    candidate_source = f"script-7 frozen candidates discovered on {baseline} baseline"
     if not units:
         units = _units_from_rules(rule_df)
         candidate_source = "script-7 rules"
@@ -2054,7 +2165,11 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         _write_and_print_baseline_summary(baseline_out, payload)
         return payload
 
-    selected_units_seed = pd.DataFrame([u.__dict__ | {"unit_key": u.unit_key, "layer_key": u.layer_key} for u in units])
+    selected_units_seed = pd.DataFrame([u.__dict__ | {
+        "unit_key": u.unit_key, "layer_key": u.layer_key,
+        "discovery_baseline_subset": baseline,
+        "discovery_direction": "1to0" if baseline == "positive" else "0to1",
+    } for u in units])
     selected_units_seed.to_csv(baseline_out / "selected_units_from_rules.csv", index=False)
 
     scores_path = Path(dataset_info.get("scores_path", ""))
@@ -2179,6 +2294,9 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         elif str(r.get("source", "")) == "same_layer_nonagonist_candidate":
             pop = "same_layer_nonagonist_pool_unselected"
         r["population"] = pop; r["population_strength"] = strength
+        r["rq3_baseline_subset"] = baseline
+        r["rq3_direction"] = "1to0" if baseline == "positive" else "0to1"
+        r["candidate_direction_policy"] = "discovery_baseline_only"
         pop_rows.append(r)
     flip_stats = pd.DataFrame(pop_rows)
     flip_stats.to_csv(baseline_out / "high_n_flip_stats_by_unit.csv", index=False)
@@ -2273,7 +2391,7 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
     if bool(getattr(args, "rule_conditioned_diagnostics", False)):
         rule_payload = _rule_conditioned_threshold_tests(args, baseline=baseline, baseline_out=baseline_out, rule_df=rule_df, scores_out=scores_out, raw_df=raw_df, feature_list=feature_list)
 
-    payload = {"baseline": baseline, "status": "ok", "scientific_method": _scientific_method_config(args, baseline), "evaluation_split": str(args.evaluation_split), "candidate_source": candidate_source, "candidate_flip_stats_path": str(args.candidate_flip_stats_path) if args.candidate_flip_stats_path else None, "mean_replacement_reference_split": "train", "n_scores_available": int(len(scores_df)), "n_high_n_rows": int(len(scores_out)), "n_units": int(len(analysis_units)), "n_eval_units": int(len(eval_units)), "n_rules": int(len(rule_df)), "rule_metrics_path": str(rule_path) if rule_path is not None else None, "rule_conditioned_only": bool(rule_conditioned_only), "spectral_sampling_config": None, "sampling": sample_meta, "same_layer_nonagonist_controls": nonagonist_payload, "population_counts": flip_stats["population"].value_counts().to_dict() if not flip_stats.empty else {}, "rule_conditioned": rule_payload, "files": {"scores_with_flips": "high_n_scores_with_flips.csv", "flip_stats": "high_n_flip_stats_by_unit.csv", "unit_tests": "threshold_unit_tests.csv", "population_summary": "threshold_population_summary.csv", "binned_curves": "threshold_binned_flip_curves.csv", "activation_flip_rows_gz": "threshold_activation_flip_rows.csv.gz", "same_layer_nonagonist_control_pool": "same_layer_nonagonist_control_pool.csv", "same_layer_nonagonist_control_selection": "same_layer_nonagonist_control_selection.csv", "rule_conditioned_sampling_plan": "rule_conditioned_sampling_plan.csv", "flip_conditioned_threshold_summary": "flip_conditioned_threshold_summary.csv"}}
+    payload = {"baseline": baseline, "status": "ok", "scientific_method": _scientific_method_config(args, baseline), "evaluation_split": str(args.evaluation_split), "candidate_source": candidate_source, "candidate_flip_stats_path": str(args.candidate_flip_stats_path) if args.candidate_flip_stats_path else None, "candidate_ranking_path": str(_candidate_ranking_path(args)) if _candidate_ranking_path(args) else None, "candidate_direction_policy": "discovery_baseline_only", "mean_replacement_reference_split": "train", "n_scores_available": int(len(scores_df)), "n_high_n_rows": int(len(scores_out)), "n_units": int(len(analysis_units)), "n_eval_units": int(len(eval_units)), "n_rules": int(len(rule_df)), "rule_metrics_path": str(rule_path) if rule_path is not None else None, "rule_conditioned_only": bool(rule_conditioned_only), "spectral_sampling_config": None, "sampling": sample_meta, "same_layer_nonagonist_controls": nonagonist_payload, "population_counts": flip_stats["population"].value_counts().to_dict() if not flip_stats.empty else {}, "rule_conditioned": rule_payload, "files": {"scores_with_flips": "high_n_scores_with_flips.csv", "flip_stats": "high_n_flip_stats_by_unit.csv", "unit_tests": "threshold_unit_tests.csv", "population_summary": "threshold_population_summary.csv", "binned_curves": "threshold_binned_flip_curves.csv", "activation_flip_rows_gz": "threshold_activation_flip_rows.csv.gz", "same_layer_nonagonist_control_pool": "same_layer_nonagonist_control_pool.csv", "same_layer_nonagonist_control_selection": "same_layer_nonagonist_control_selection.csv", "rule_conditioned_sampling_plan": "rule_conditioned_sampling_plan.csv", "flip_conditioned_threshold_summary": "flip_conditioned_threshold_summary.csv"}}
     (baseline_out / "threshold_spiking_experiment.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     _write_and_print_baseline_summary(baseline_out, payload)
     return payload

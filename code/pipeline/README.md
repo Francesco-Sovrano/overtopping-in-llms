@@ -1,5 +1,10 @@
-# Shared causal pipeline
+# Causal pipeline
 
-`pipeline/` implements the numbered causal workflow used by the overtopping study and by poisoning checkpoint analysis.
+Numbered discovery and validation stages from prompt generation through interaction validation.
 
-The canonical stage contracts, evaluation populations, cache rules, and Stage-7/7b behavior are documented in [../docs/pipeline.md](../docs/pipeline.md).
+Documentation:
+
+- [Pipeline stages](../docs/methods/pipeline.md)
+- [Core concepts and metrics](../docs/methods/concepts.md)
+- [Architecture and artifacts](../docs/methods/architecture.md)
+- [Operations and regeneration](../docs/operations/README.md)

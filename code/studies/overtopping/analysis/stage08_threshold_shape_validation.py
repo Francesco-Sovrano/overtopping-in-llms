@@ -11,12 +11,18 @@ nested inside each training fold.  The selected scalar is then evaluated on the
 untouched test fold with a constant predictor, an oriented hard threshold,
 logistic regression, and isotonic regression.
 
-Population inference is deliberately two-part:
-1. threshold *testability* is compared over all model-evaluated units;
-2. conditional threshold shape is compared only after matching testable
-   candidate/control units on singleton causal strength within run/baseline.
-This avoids comparing a broad candidate population to the tiny, selected tail of
-controls that happen to generate enough flips for a threshold fit.
+Population inference preserves the phenotype's causal component rather than
+conditioning it away.  The primary comparison uses the independently sampled
+same-layer/head non-candidate controls from Stage 7 and asks, at the experimental
+condition level, whether candidates differ in:
+1. singleton causal strength;
+2. threshold-testability;
+3. nested held-out threshold visibility among testable units; and
+4. a conservative nested TECS score over all evaluated units.
+
+Causal-strength matching is retained only as a supplementary sensitivity
+analysis asking whether threshold structure remains after conditioning on causal
+strength.  It does not define the primary RQ3 phenotype test.
 """
 from __future__ import annotations
 
@@ -40,6 +46,8 @@ from studies.overtopping.analysis.stage07_overtopping_spiking_report import (
     POP_CAND,
     POP_CTRL,
     POP_LABELS,
+    DIRECTION_KEY_BY_BASELINE,
+    _normalize_rq3_direction,
     _read_exact_primary_table,
     effect_summary,
     expected_rq3_sources,
@@ -51,7 +59,9 @@ from studies.overtopping.analysis.stage07_overtopping_spiking_report import (
 
 TARGETS = ("flip_any", "flip_c2i", "flip_i2c")
 MODELS = ("constant", "threshold", "logistic", "isotonic")
-ANALYSIS_SCHEMA_VERSION = "threshold-shape-v4-exact-population-nested-matched"
+DIRECTION_BY_BASELINE = {"positive": "1→0", "negative": "0→1"}
+BASELINE_ORDER = ("positive", "negative")
+ANALYSIS_SCHEMA_VERSION = "threshold-shape-v6-discovery-direction-aware-structural-primary"
 
 
 def _mcc_from_confusion(tp: np.ndarray, fp: np.ndarray, tn: np.ndarray, fn: np.ndarray) -> np.ndarray:
@@ -153,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--holdout-fraction", type=float, default=0.25)
     p.add_argument("--min-class", type=int, default=8)
     p.add_argument("--threshold-match-caliper", type=float, default=0.05,
-                   help="Maximum absolute singleton flip-rate difference for conditional MCC matching.")
+                   help="Maximum absolute singleton flip-rate difference for the supplementary causal-strength-matched sensitivity analysis.")
     p.add_argument("--bootstrap", type=int, default=3000)
     p.add_argument("--seed", type=int, default=20260829)
     return p.parse_args()
@@ -435,7 +445,11 @@ def _load_exact_tables(args: argparse.Namespace, out: Path) -> tuple[pd.DataFram
     bad_primary_raw = raw_audit[raw_audit.required.astype(bool) & ~raw_audit.complete.astype(bool)]
     if not bad_primary_flip.empty or not bad_primary_raw.empty:
         bad = pd.concat([bad_primary_flip, bad_primary_raw], ignore_index=True)
-        preview = bad[["run_id", "task", "model", "phase", "file", "exists", "missing_baseline_subsets", "missing_populations"]].head(8).to_dict("records")
+        preview_cols = [c for c in [
+            "run_id", "task", "model", "phase", "file", "exists", "expected_baseline_subsets",
+            "missing_baseline_subsets", "unexpected_baseline_subsets", "missing_population_cells",
+        ] if c in bad.columns]
+        preview = bad[preview_cols].head(8).to_dict("records")
         raise RuntimeError(
             "RQ3 nested threshold-shape primary population is incomplete; refusing a silently selected subset. "
             f"First failures: {preview}"
@@ -452,6 +466,28 @@ def _load_exact_tables(args: argparse.Namespace, out: Path) -> tuple[pd.DataFram
             frame.drop(frame.index[~frame.run_id.astype(str).isin(included)], inplace=True)
             if frame.run_id.astype(str).str.startswith("poisoning__").any():
                 raise RuntimeError("Poisoning rows leaked into exact RQ3 threshold-shape population")
+
+    cand_fs = fs.loc[fs.population.astype(str) == POP_CAND].copy() if not fs.empty and "population" in fs.columns else pd.DataFrame()
+    required_direction_cols = {"baseline_subset", "rq3_direction", "candidate_direction_policy"}
+    if not cand_fs.empty and not required_direction_cols.issubset(cand_fs.columns):
+        missing = sorted(required_direction_cols - set(cand_fs.columns))
+        raise RuntimeError(
+            "Stale direction-agnostic RQ3 diagnostics detected: aggregate_flip_stats.csv "
+            f"is missing {missing}. Rebuild per-experiment spiking_diagnostics-* with "
+            "threshold-event-v4-discovery-direction-aware before generating Figure 4."
+        )
+    if not cand_fs.empty:
+        baseline_norm = cand_fs["baseline_subset"].astype(str).str.strip().str.lower()
+        expected_dir = baseline_norm.map(DIRECTION_KEY_BY_BASELINE)
+        observed_dir = cand_fs["rq3_direction"].map(_normalize_rq3_direction)
+        policy = cand_fs["candidate_direction_policy"].astype(str).str.strip().str.lower()
+        wrong = expected_dir.isna() | observed_dir.ne(expected_dir) | policy.ne("discovery_baseline_only")
+        if bool(wrong.any()):
+            preview = cand_fs.loc[wrong, [c for c in ["run_id", "baseline_subset", "unit_key", "rq3_direction", "candidate_direction_policy"] if c in cand_fs.columns]].head(8).to_dict("records")
+            raise RuntimeError(
+                "RQ3 candidate direction provenance mismatch; expected machine provenance "
+                f"positive->1to0 and negative->0to1; examples={preview}"
+            )
 
     coverage = pd.DataFrame([
         {
@@ -508,6 +544,7 @@ def _condition_population_summary(units: pd.DataFrame) -> pd.DataFrame:
         median_nested_threshold_mcc=("nested_threshold_mcc", "median"),
         median_nested_tecs_observed=("nested_tecs_observed", "median"),
         median_nested_tecs_lower_bound=("nested_tecs_lower_bound", "median"),
+        mean_nested_tecs_lower_bound=("nested_tecs_lower_bound", "mean"),
     ).reset_index()
 
 
@@ -520,11 +557,94 @@ def _paired_condition_effect(condition: pd.DataFrame, metric: str, bootstrap: in
     return g, effect_summary(g, bootstrap)
 
 
+def _structural_condition_effect(
+    units: pd.DataFrame,
+    metric: str,
+    bootstrap: int,
+    *,
+    within_layer_agg: str = "median",
+    across_layer_agg: str = "median",
+) -> tuple[pd.DataFrame, dict]:
+    """Compare candidate/control populations without conditioning on causal strength.
+
+    Stage 7 samples controls independently of intervention outcomes from the same
+    layer/head as candidates.  This function preserves that structural control by
+    first comparing only layer/head strata containing both populations, then
+    collapsing those paired strata to one value per run/baseline condition.
+    The experimental condition, not the neuron, is the inferential unit.
+    """
+    if units.empty or metric not in units.columns or "layer_label" not in units.columns:
+        return pd.DataFrame(), effect_summary(pd.DataFrame(), bootstrap)
+    d = units.copy()
+    d[metric] = pd.to_numeric(d[metric], errors="coerce")
+    d = d.dropna(subset=[metric])
+    if d.empty:
+        return pd.DataFrame(), effect_summary(pd.DataFrame(), bootstrap)
+
+    layer_keys = ["run_id", "source_scope", "baseline_subset", "layer_label", "population"]
+    layer = d.groupby(layer_keys, dropna=False)[metric].agg(within_layer_agg).unstack("population")
+    if POP_CAND not in layer.columns or POP_CTRL not in layer.columns:
+        return pd.DataFrame(), effect_summary(pd.DataFrame(), bootstrap)
+    layer = layer.dropna(subset=[POP_CAND, POP_CTRL]).reset_index()
+    if layer.empty:
+        return pd.DataFrame(), effect_summary(pd.DataFrame(), bootstrap)
+
+    cond_keys = ["run_id", "source_scope", "baseline_subset"]
+    cond = layer.groupby(cond_keys, dropna=False)[[POP_CAND, POP_CTRL]].agg(across_layer_agg).reset_index()
+    cond["delta"] = cond[POP_CAND] - cond[POP_CTRL]
+    n_layers = layer.groupby(cond_keys, dropna=False).size().rename("n_paired_layers").reset_index()
+    cond = cond.merge(n_layers, on=cond_keys, how="left", validate="one_to_one")
+    return cond, effect_summary(cond, bootstrap)
+
+
+def _structural_testable_pairs(units: pd.DataFrame) -> pd.DataFrame:
+    """Deterministic same-condition, same-layer pairs for visualization only.
+
+    Pair construction uses structure and unit identifiers, never causal strength or
+    threshold MCC.  Requiring both units to be threshold-testable is only a
+    feasibility condition for drawing response curves and is not used for inference.
+    """
+    if units.empty or "layer_label" not in units.columns:
+        return pd.DataFrame()
+    d = units.loc[units.threshold_testable].copy()
+    rows: list[dict] = []
+    group_keys = ["run_id", "source_scope", "baseline_subset", "layer_label"]
+    for keys, g in d.groupby(group_keys, dropna=False):
+        cand = g.loc[g.population == POP_CAND].sort_values("unit_key")
+        ctrl = g.loc[g.population == POP_CTRL].sort_values("unit_key")
+        n = min(len(cand), len(ctrl))
+        if n <= 0:
+            continue
+        run_id, source_scope, baseline, layer_label = keys
+        for i in range(n):
+            cr = cand.iloc[i]
+            rr = ctrl.iloc[i]
+            rows.append({
+                "run_id": run_id,
+                "source_scope": source_scope,
+                "baseline_subset": baseline,
+                "layer_label": layer_label,
+                "candidate_unit_key": cr.unit_key,
+                "control_unit_key": rr.unit_key,
+                "candidate_strength": float(cr.causal_strength),
+                "control_strength": float(rr.causal_strength),
+                "strength_gap": float(abs(float(cr.causal_strength) - float(rr.causal_strength))),
+                "candidate_nested_mcc": float(cr.nested_threshold_mcc),
+                "control_nested_mcc": float(rr.nested_threshold_mcc),
+            })
+    return pd.DataFrame(rows)
+
+
 def _match_threshold_testable_units(units: pd.DataFrame, caliper: float) -> pd.DataFrame:
-    """Greedy one-to-one matching on causal strength within run/baseline."""
+    """Supplementary greedy matching on causal strength within run/baseline/layer.
+
+    This is a sensitivity analysis, not the primary RQ3 comparison.  Matching
+    remains inside the Stage-7 structural control stratum so causal-strength
+    conditioning cannot introduce an additional layer/head mismatch.
+    """
     rows: list[dict] = []
     testable = units.loc[units.threshold_testable].copy()
-    for (run_id, baseline), g in testable.groupby(["run_id", "baseline_subset"], dropna=False):
+    for (run_id, source_scope, baseline, layer_label), g in testable.groupby(["run_id", "source_scope", "baseline_subset", "layer_label"], dropna=False):
         cand = g.loc[g.population == POP_CAND].copy()
         ctrl = g.loc[g.population == POP_CTRL].copy()
         if cand.empty or ctrl.empty:
@@ -549,8 +669,9 @@ def _match_threshold_testable_units(units: pd.DataFrame, caliper: float) -> pd.D
             cr = cand.loc[ci]; rr = ctrl.loc[ri]
             rows.append({
                 "run_id": run_id,
-                "source_scope": cr.get("source_scope", "unknown"),
+                "source_scope": source_scope,
                 "baseline_subset": baseline,
+                "layer_label": layer_label,
                 "candidate_unit_key": cr.unit_key,
                 "control_unit_key": rr.unit_key,
                 "candidate_strength": float(cr.causal_strength),
@@ -568,7 +689,7 @@ def _match_threshold_testable_units(units: pd.DataFrame, caliper: float) -> pd.D
 def _matched_condition_effect(matches: pd.DataFrame, bootstrap: int) -> tuple[pd.DataFrame, dict]:
     if matches.empty:
         return pd.DataFrame(), effect_summary(pd.DataFrame(), bootstrap)
-    cond = matches.groupby(["run_id", "baseline_subset"], dropna=False).agg(
+    cond = matches.groupby(["run_id", "source_scope", "baseline_subset"], dropna=False).agg(
         candidate=("candidate_nested_mcc", "median"),
         control=("control_nested_mcc", "median"),
         median_strength_gap=("strength_gap", "median"),
@@ -579,35 +700,102 @@ def _matched_condition_effect(matches: pd.DataFrame, bootstrap: int) -> tuple[pd
     return med, effect_summary(med, bootstrap)
 
 
+def _direction_label(baseline: str) -> str:
+    return DIRECTION_BY_BASELINE.get(str(baseline).strip().lower(), str(baseline))
+
+
+def _directional_primary_effects(units: pd.DataFrame, bootstrap: int) -> dict[str, dict]:
+    """Primary structural-control effects separately for discovery-frozen directions."""
+    out: dict[str, dict] = {}
+    raw_p: dict[str, float] = {}
+    for baseline in BASELINE_ORDER:
+        d = units.loc[units.baseline_subset.astype(str).str.lower() == baseline].copy()
+        strength_med, strength_eff = _structural_condition_effect(d, "causal_strength", bootstrap, within_layer_agg="median", across_layer_agg="median")
+        test_med, test_eff = _structural_condition_effect(d, "threshold_testable", bootstrap, within_layer_agg="mean", across_layer_agg="mean")
+        threshold_med, threshold_eff = _structural_condition_effect(d, "nested_threshold_mcc", bootstrap, within_layer_agg="median", across_layer_agg="median")
+        tecs_med, tecs_eff = _structural_condition_effect(d, "nested_tecs_lower_bound", bootstrap, within_layer_agg="mean", across_layer_agg="mean")
+        effects = {
+            "baseline_subset": baseline,
+            "direction": _direction_label(baseline),
+            "causal_strength_effect": strength_eff,
+            "threshold_testability_effect": test_eff,
+            "nested_threshold_mcc_effect": threshold_eff,
+            "nested_tecs_lower_bound_effect": tecs_eff,
+            "n_strength_conditions": int(len(strength_med)),
+            "n_testability_conditions": int(len(test_med)),
+            "n_threshold_mcc_conditions": int(len(threshold_med)),
+            "n_tecs_conditions": int(len(tecs_med)),
+        }
+        out[baseline] = effects
+        for endpoint, effect in [
+            ("causal_strength", strength_eff),
+            ("threshold_testability", test_eff),
+            ("nested_threshold_mcc", threshold_eff),
+            ("nested_tecs_lower_bound", tecs_eff),
+        ]:
+            raw_p[f"{baseline}:{endpoint}"] = effect.get("wilcoxon_p_greater", math.nan)
+    adjusted = holm(raw_p)
+    for baseline, effects in out.items():
+        effects["holm_primary_endpoints_across_directions"] = {
+            endpoint: adjusted.get(f"{baseline}:{endpoint}", math.nan)
+            for endpoint in ["causal_strength", "threshold_testability", "nested_threshold_mcc", "nested_tecs_lower_bound"]
+        }
+    return out
+
+
 def _scope_results(units: pd.DataFrame, condition: pd.DataFrame, matches: pd.DataFrame, *, scope: str, args: argparse.Namespace) -> dict:
     if scope == "primary":
-        u = units.loc[units.source_scope == "primary"]
-        c = condition.loc[condition.source_scope == "primary"]
-        m = matches.loc[matches.source_scope == "primary"] if not matches.empty else matches
+        u = units.loc[units.source_scope == "primary"].copy()
+        m = matches.loc[matches.source_scope == "primary"].copy() if not matches.empty else matches
     else:
-        u, c, m = units, condition, matches
-    strength_med, strength_eff = _paired_condition_effect(c, "median_causal_strength", args.bootstrap)
-    test_med, test_eff = _paired_condition_effect(c, "threshold_testable_fraction", args.bootstrap)
+        u, m = units.copy(), matches
+
+    # Primary RQ3 estimands: preserve the independently sampled same-layer/head
+    # control design and do not condition on causal strength.
+    strength_med, strength_eff = _structural_condition_effect(
+        u, "causal_strength", args.bootstrap, within_layer_agg="median", across_layer_agg="median"
+    )
+    test_med, test_eff = _structural_condition_effect(
+        u, "threshold_testable", args.bootstrap, within_layer_agg="mean", across_layer_agg="mean"
+    )
+    threshold_med, threshold_eff = _structural_condition_effect(
+        u, "nested_threshold_mcc", args.bootstrap, within_layer_agg="median", across_layer_agg="median"
+    )
+    tecs_med, tecs_eff = _structural_condition_effect(
+        u, "nested_tecs_lower_bound", args.bootstrap, within_layer_agg="mean", across_layer_agg="mean"
+    )
+
+    # Secondary sensitivity: ask whether thresholdability differs after causal
+    # strength is explicitly conditioned on.  This is deliberately not part of
+    # the primary multiple-testing family.
     match_med, match_eff = _matched_condition_effect(m, args.bootstrap)
-    tecs_med, tecs_eff = _paired_condition_effect(c, "median_nested_tecs_lower_bound", args.bootstrap)
+
     adj = holm({
         "causal_strength": strength_eff.get("wilcoxon_p_greater", math.nan),
         "threshold_testability": test_eff.get("wilcoxon_p_greater", math.nan),
-        "matched_threshold_mcc": match_eff.get("wilcoxon_p_greater", math.nan),
+        "nested_threshold_mcc": threshold_eff.get("wilcoxon_p_greater", math.nan),
+        "nested_tecs_lower_bound": tecs_eff.get("wilcoxon_p_greater", math.nan),
     })
+    directional = _directional_primary_effects(u, args.bootstrap)
     return {
         "scope": scope,
+        "primary_estimand": "same-layer/head non-candidate controls; no causal-strength conditioning",
         "n_runs": int(u.run_id.nunique()) if not u.empty else 0,
         "n_units": int(len(u)),
         "causal_strength_effect": strength_eff,
         "threshold_testability_effect": test_eff,
-        "matched_threshold_mcc_effect": match_eff,
+        "nested_threshold_mcc_effect": threshold_eff,
         "nested_tecs_lower_bound_effect": tecs_eff,
         "holm_primary_endpoints": adj,
+        "directional_primary_effects": directional,
+        "direction_policy": "candidate evaluated only in frozen discovery baseline; controls sampled within that directional candidate stratum",
         "n_strength_conditions": int(len(strength_med)),
         "n_testability_conditions": int(len(test_med)),
-        "n_matched_mcc_conditions": int(len(match_med)),
-        "n_matched_unit_pairs": int(len(m)),
+        "n_threshold_mcc_conditions": int(len(threshold_med)),
+        "n_tecs_conditions": int(len(tecs_med)),
+        "strength_matched_threshold_mcc_sensitivity": match_eff,
+        "n_strength_matched_mcc_conditions": int(len(match_med)),
+        "n_strength_matched_unit_pairs": int(len(m)),
         "matching_caliper": float(args.threshold_match_caliper),
     }
 
@@ -681,31 +869,43 @@ def _visualization_curve_for_unit(raw_all: pd.DataFrame, tests_all: pd.DataFrame
             "heldout_flip_rate": float(g.y.mean()),
             "logistic_probability": float(logit.predict_proba(np.array([[score]]))[:,1][0]),
             "isotonic_probability": float(iso.predict([score])[0]),
-            "selection_rule": "causal-strength-matched pair; feature selected on visualization training fold only",
+            "selection_rule": "same-condition same-layer pair selected without causal-strength/MCC ranking; feature selected on visualization training fold only",
         })
     return rows
 
 
-def _representative_response_curves(raw_all: pd.DataFrame, tests_all: pd.DataFrame, matches: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
-    """Choose a same-condition pair using causal strength only, never MCC."""
-    if matches.empty:
+def _representative_response_curves(raw_all: pd.DataFrame, tests_all: pd.DataFrame, structural_pairs: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    """Choose one deterministic same-condition, same-layer pair per discovery direction.
+
+    Pair selection never uses causal strength or threshold MCC.  Threshold-feature
+    selection within each displayed unit remains training-fold only.
+    """
+    if structural_pairs.empty:
         return pd.DataFrame()
-    chosen = matches.sort_values(["strength_gap", "run_id", "baseline_subset", "candidate_unit_key", "control_unit_key"]).iloc[0]
     rows = []
-    rows.extend(_visualization_curve_for_unit(
-        raw_all, tests_all, run_id=str(chosen.run_id), baseline=str(chosen.baseline_subset),
-        population=POP_CAND, unit_key=str(chosen.candidate_unit_key), args=args,
-    ))
-    rows.extend(_visualization_curve_for_unit(
-        raw_all, tests_all, run_id=str(chosen.run_id), baseline=str(chosen.baseline_subset),
-        population=POP_CTRL, unit_key=str(chosen.control_unit_key), args=args,
-    ))
-    frame = pd.DataFrame(rows)
-    if not frame.empty:
-        frame["matched_candidate_strength"] = float(chosen.candidate_strength)
-        frame["matched_control_strength"] = float(chosen.control_strength)
-        frame["matched_strength_gap"] = float(chosen.strength_gap)
-    return frame
+    for baseline in BASELINE_ORDER:
+        eligible = structural_pairs.loc[structural_pairs.baseline_subset.astype(str).str.lower() == baseline].copy()
+        if eligible.empty:
+            continue
+        chosen = eligible.sort_values(
+            ["run_id", "baseline_subset", "layer_label", "candidate_unit_key", "control_unit_key"]
+        ).iloc[0]
+        candidate_rows = _visualization_curve_for_unit(
+            raw_all, tests_all, run_id=str(chosen.run_id), baseline=str(chosen.baseline_subset),
+            population=POP_CAND, unit_key=str(chosen.candidate_unit_key), args=args,
+        )
+        control_rows = _visualization_curve_for_unit(
+            raw_all, tests_all, run_id=str(chosen.run_id), baseline=str(chosen.baseline_subset),
+            population=POP_CTRL, unit_key=str(chosen.control_unit_key), args=args,
+        )
+        for row in candidate_rows + control_rows:
+            row["structural_layer_label"] = str(chosen.layer_label)
+            row["candidate_strength"] = float(chosen.candidate_strength)
+            row["control_strength"] = float(chosen.control_strength)
+            row["strength_gap_descriptive"] = float(chosen.strength_gap)
+            row["discovery_direction"] = _direction_label(baseline)
+        rows.extend(candidate_rows); rows.extend(control_rows)
+    return pd.DataFrame(rows)
 
 
 def _plot_response_curves(curves: pd.DataFrame, paper_dir: Path) -> None:
@@ -714,26 +914,34 @@ def _plot_response_curves(curves: pd.DataFrame, paper_dir: Path) -> None:
         target.unlink(missing_ok=True)
         return
     with paper_figure_rc():
-        fig, axes = plt.subplots(1, 2, figsize=(6.4, 2.65), sharey=True)
-        for ax, population in zip(axes, [POP_CAND, POP_CTRL]):
-            g = curves.loc[curves.population == population].sort_values("mean_oriented_score")
-            if g.empty:
-                ax.axis("off"); continue
-            ax.plot(g.mean_oriented_score, g.heldout_flip_rate, marker="o", linewidth=1.4, label="Held-out empirical")
-            ax.plot(g.mean_oriented_score, g.logistic_probability, linestyle="--", linewidth=1.2, label="Logistic")
-            ax.plot(g.mean_oriented_score, g.isotonic_probability, linestyle=":", linewidth=1.4, label="Isotonic")
-            unit = str(g.unit_key.iloc[0])
-            ax.set_title(f"{POP_LABELS[population]}\n{unit}")
-            ax.set_xlabel("Oriented endogenous scalar")
-            ax.set_ylim(-.03, 1.03)
-            ax.grid(alpha=.25, linewidth=.45)
-            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-        axes[0].set_ylabel(r"Held-out $P(F_j=1\mid z_j)$")
-        axes[0].legend(frameon=False, fontsize=7.0)
-        gap = float(curves.matched_strength_gap.iloc[0]) if "matched_strength_gap" in curves else math.nan
-        fig.suptitle(f"Illustrative same-condition causal-strength match (|Δ strength|={gap:.3f}); not an inferential sample", fontsize=8.5)
-        fig.subplots_adjust(left=.10, right=.995, bottom=.20, top=.78, wspace=.18)
-        save_pdf_only(fig, target); plt.close(fig)
+        fig, axes = plt.subplots(2, 2, figsize=(6.5, 4.8), sharey=True)
+        made=False
+        for row_idx, baseline in enumerate(BASELINE_ORDER):
+            for col_idx, population in enumerate([POP_CAND, POP_CTRL]):
+                ax=axes[row_idx,col_idx]
+                g=curves.loc[
+                    curves.baseline_subset.astype(str).str.lower().eq(baseline)
+                    & curves.population.astype(str).eq(population)
+                ].sort_values("mean_oriented_score")
+                if g.empty:
+                    ax.axis("off"); continue
+                made=True
+                ax.plot(g.mean_oriented_score, g.heldout_flip_rate, marker="o", linewidth=1.4, label="Held-out empirical")
+                ax.plot(g.mean_oriented_score, g.logistic_probability, linestyle="--", linewidth=1.2, label="Logistic")
+                ax.plot(g.mean_oriented_score, g.isotonic_probability, linestyle=":", linewidth=1.4, label="Isotonic")
+                unit=str(g.unit_key.iloc[0]); layer=str(g.structural_layer_label.iloc[0]) if "structural_layer_label" in g else ""
+                ax.set_title(f"{_direction_label(baseline)} | {POP_LABELS[population]}\n{unit} ({layer})")
+                ax.set_xlabel("Oriented endogenous scalar"); ax.set_ylim(-.03,1.03); ax.grid(alpha=.25,linewidth=.45)
+                ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        axes[0,0].set_ylabel(r"Held-out $P(F_j=1\mid z_j)$"); axes[1,0].set_ylabel(r"Held-out $P(F_j=1\mid z_j)$")
+        if made:
+            axes[0,0].legend(frameon=False,fontsize=7.0)
+            fig.suptitle("Illustrative same-layer/head structural controls by frozen discovery direction; not inferential samples",fontsize=8.5)
+            fig.subplots_adjust(left=.10,right=.995,bottom=.12,top=.86,wspace=.18,hspace=.48)
+            save_pdf_only(fig,target)
+        else:
+            target.unlink(missing_ok=True)
+        plt.close(fig)
 
 
 def _condition_weighted_model_summary(summary: pd.DataFrame) -> pd.DataFrame:
@@ -742,16 +950,16 @@ def _condition_weighted_model_summary(summary: pd.DataFrame) -> pd.DataFrame:
     pop = summary.loc[summary.population.isin([POP_CAND, POP_CTRL]) & (summary.target == "flip_any")].copy()
     metrics = ["median_abs_mcc", "median_brier", "median_log_loss", "median_ece", "median_transition_sharpness"]
     cond = pop.groupby(["run_id", "baseline_subset", "population", "model"], dropna=False)[metrics].median().reset_index()
-    return cond.groupby(["population", "model"], dropna=False).agg(
+    return cond.groupby(["baseline_subset", "population", "model"], dropna=False).agg(
         n_conditions=("run_id", "count"),
         **{m: (m, "median") for m in metrics},
     ).reset_index()
 
 
 def _plot_model_comparison(summary: pd.DataFrame, paper_dir: Path) -> None:
-    target = paper_dir / "fig4b_threshold_shape_model_comparison.pdf"
-    agg = _condition_weighted_model_summary(summary)
-    if agg.empty:
+    (paper_dir / "fig4b_threshold_shape_model_comparison.pdf").unlink(missing_ok=True)
+    target = paper_dir / "fig4s5_threshold_shape_model_comparison_by_direction.pdf"
+    if summary.empty:
         target.unlink(missing_ok=True)
         return
     metrics = [
@@ -761,118 +969,128 @@ def _plot_model_comparison(summary: pd.DataFrame, paper_dir: Path) -> None:
         ("median_ece", "Calibration error"),
     ]
     with paper_figure_rc():
-        fig, axes = plt.subplots(1, 4, figsize=(8.2, 2.35))
-        for ax, (metric, label) in zip(axes, metrics):
-            x = np.arange(len(MODELS), dtype=float)
-            width = .34
-            for offset, population in [(-width/2, POP_CTRL), (width/2, POP_CAND)]:
-                vals = []
-                for model in MODELS:
-                    q = agg[(agg.population == population) & (agg.model == model)][metric]
-                    vals.append(float(q.iloc[0]) if len(q) else np.nan)
-                ax.bar(x+offset, vals, width=width, label=POP_LABELS[population])
-            ax.set_xticks(x, ["Const.", "Thresh.", "Logit", "Isotonic"], rotation=30, ha="right")
-            ax.set_ylabel(label)
-            ax.grid(axis="y", alpha=.25, linewidth=.45)
-            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-        axes[0].legend(frameon=False, fontsize=7.0)
-        fig.suptitle("Condition-weighted held-out model comparison (nested feature selection)", fontsize=9.0)
-        fig.subplots_adjust(left=.07, right=.995, bottom=.27, top=.83, wspace=.48)
-        save_pdf_only(fig, target); plt.close(fig)
+        fig, axes = plt.subplots(2, 4, figsize=(8.6, 4.35))
+        made = False
+        for row_idx, baseline in enumerate(BASELINE_ORDER):
+            agg_all = _condition_weighted_model_summary(summary)
+            agg = agg_all.loc[agg_all.baseline_subset.astype(str).str.lower() == baseline] if not agg_all.empty else agg_all
+            for col_idx, (metric, label) in enumerate(metrics):
+                ax = axes[row_idx, col_idx]
+                x = np.arange(len(MODELS), dtype=float)
+                width = .34
+                for offset, population in [(-width/2, POP_CTRL), (width/2, POP_CAND)]:
+                    vals = []
+                    for model in MODELS:
+                        q = agg[(agg.population == population) & (agg.model == model)][metric] if not agg.empty else pd.Series(dtype=float)
+                        vals.append(float(q.iloc[0]) if len(q) else np.nan)
+                    if np.isfinite(np.asarray(vals, dtype=float)).any():
+                        made = True
+                    ax.bar(x+offset, vals, width=width, label=POP_LABELS[population])
+                ax.set_xticks(x, ["Const.", "Thresh.", "Logit", "Isotonic"], rotation=30, ha="right")
+                if row_idx == 0:
+                    ax.set_title(label)
+                if col_idx == 0:
+                    ax.set_ylabel(f"{_direction_label(baseline)}\n{label}")
+                else:
+                    ax.set_ylabel(label)
+                ax.grid(axis="y", alpha=.25, linewidth=.45)
+                ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        axes[0,0].legend(frameon=False, fontsize=7.0)
+        fig.suptitle("Direction-specific condition-weighted held-out model comparison", fontsize=9.0)
+        fig.subplots_adjust(left=.075, right=.995, bottom=.15, top=.89, wspace=.48, hspace=.58)
+        if made:
+            save_pdf_only(fig, target)
+        else:
+            target.unlink(missing_ok=True)
+        plt.close(fig)
 
 
-def _plot_main_summary(condition: pd.DataFrame, matches: pd.DataFrame, robust: dict, paper_dir: Path) -> None:
+def _plot_main_summary(units: pd.DataFrame, robust: dict, paper_dir: Path) -> None:
     target = paper_dir / "fig4a_candidate_control_spiking_cut_summary.pdf"
-    strength_med, _ = _paired_condition_effect(condition, "median_causal_strength", 0)
-    test_med, _ = _paired_condition_effect(condition, "threshold_testable_fraction", 0)
-    match_med, _ = _matched_condition_effect(matches, 0)
-    adj = robust.get("holm_primary_endpoints", {})
-
-    def med_pair(frame: pd.DataFrame) -> tuple[float,float]:
-        if frame.empty:
-            return math.nan, math.nan
-        return float(frame[POP_CTRL].median()), float(frame[POP_CAND].median())
-    sc, sa = med_pair(strength_med)
-    tc, ta = med_pair(test_med)
-    mc, ma = med_pair(match_med)
-    panels = [
-        ("Singleton causal strength", sc, sa, adj.get("causal_strength", math.nan)),
-        ("Threshold-testable fraction", tc, ta, adj.get("threshold_testability", math.nan)),
-        ("Strength-matched threshold |MCC|", mc, ma, adj.get("matched_threshold_mcc", math.nan)),
+    directional = robust.get("directional_primary_effects", {}) or {}
+    # Held-out threshold |MCC| is intentionally not a manuscript-facing RQ3
+    # endpoint.  Keep the remaining historical diagnostics while the graded
+    # agonist intervention supplies the direct causal-threshold experiment.
+    endpoint_specs = [
+        ("causal_strength_effect", "Singleton causal strength", "causal_strength"),
+        ("threshold_testability_effect", "Threshold-testable fraction", "threshold_testability"),
+        ("nested_tecs_lower_bound_effect", "Nested TECS\nlower bound", "nested_tecs_lower_bound"),
     ]
     with paper_figure_rc():
-        fig, axes = plt.subplots(1, 3, figsize=(7.7, 2.45), sharey=True)
-        for ax, (title, ctrl, cand, p_adj) in zip(axes, panels):
-            if np.isfinite(ctrl) and np.isfinite(cand):
-                ax.plot([ctrl, cand], [0,1], color="0.55", linewidth=1.1, zorder=1)
-                ax.scatter([ctrl],[0], marker="o", facecolor="white", edgecolor="0.25", s=34, zorder=3)
-                ax.scatter([cand],[1], marker="o", color="0.25", s=34, zorder=3)
-                ax.text(ctrl, -.13, f"{ctrl:.3f}", ha="center", va="top", fontsize=7)
-                ax.text(cand, 1.13, f"{cand:.3f}", ha="center", va="bottom", fontsize=7)
-                lo=min(0.0,ctrl,cand); hi=max(ctrl,cand); pad=max(.01,.18*(hi-lo if hi>lo else max(abs(hi),.05)))
-                ax.set_xlim(lo-.1*pad, hi+pad)
-            if ax is axes[0]:
-                ax.set_yticks([0,1],["Matched control","Candidate"])
-            else:
-                ax.tick_params(axis="y", labelleft=False)
-            ax.set_title(title)
-            ax.grid(axis="x", alpha=.25, linewidth=.45)
-            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-            ax.text(.98,.04,f"Holm p={p_adj:.3g}" if np.isfinite(float(p_adj)) else "Holm p=n/a",transform=ax.transAxes,ha="right",va="bottom",fontsize=7.0)
-        fig.suptitle("RQ3: causal dominance + threshold-event evidence (primary + supplementary)", fontsize=9.2)
-        fig.subplots_adjust(left=.115,right=.995,bottom=.22,top=.78,wspace=.38)
+        fig, axes = plt.subplots(2, 3, figsize=(8.1, 4.65), sharey=True)
+        for row_idx, baseline in enumerate(BASELINE_ORDER):
+            row = directional.get(baseline, {})
+            adj = row.get("holm_primary_endpoints_across_directions", {}) or {}
+            for col_idx, (effect_key, title, p_key) in enumerate(endpoint_specs):
+                ax = axes[row_idx, col_idx]
+                effect = row.get(effect_key, {}) or {}
+                ctrl = float(effect.get("control_median", math.nan))
+                cand = float(effect.get("candidate_median", math.nan))
+                p_adj = float(adj.get(p_key, math.nan))
+                if np.isfinite(ctrl) and np.isfinite(cand):
+                    ax.plot([ctrl, cand], [0,1], color="0.55", linewidth=1.1, zorder=1)
+                    ax.scatter([ctrl],[0], marker="o", facecolor="white", edgecolor="0.25", s=34, zorder=3)
+                    ax.scatter([cand],[1], marker="o", color="0.25", s=34, zorder=3)
+                    ax.annotate(f"{ctrl:.3f}", (ctrl, 0), xytext=(4, -9), textcoords="offset points", ha="left", va="top", fontsize=7)
+                    ax.annotate(f"{cand:.3f}", (cand, 1), xytext=(4, 0), textcoords="offset points", ha="left", va="center", fontsize=7)
+                    lo=min(0.0,ctrl,cand); hi=max(ctrl,cand); pad=max(.01,.18*(hi-lo if hi>lo else max(abs(hi),.05)))
+                    ax.set_xlim(lo-.1*pad, hi+pad)
+                if col_idx == 0:
+                    ax.set_yticks([0,1],["Structural control","Candidate"])
+                    ax.set_ylabel(f"Discovery direction {_direction_label(baseline)}")
+                else:
+                    ax.tick_params(axis="y", labelleft=False)
+                if row_idx == 0:
+                    ax.set_title(title)
+                ax.grid(axis="x", alpha=.25, linewidth=.45)
+                ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+                n_pairs = int(effect.get("n_pairs", 0) or 0)
+                p_text = f"Holm p={p_adj:.3g}" if np.isfinite(p_adj) else "Holm p=n/a"
+                ax.text(.98,.04,f"n={n_pairs}; {p_text}",transform=ax.transAxes,ha="right",va="bottom",fontsize=6.8)
+        fig.suptitle("RQ3: discovery-direction causal-threshold phenotype vs same-layer/head controls", fontsize=9.4)
+        fig.subplots_adjust(left=.11,right=.995,bottom=.11,top=.88,wspace=.46,hspace=.42)
         save_pdf_only(fig,target); plt.close(fig)
 
 
 def _plot_supplements(units: pd.DataFrame, matches: pd.DataFrame, paper_dir: Path) -> None:
-    # Testability fractions by condition: shows the selection process directly.
     target = paper_dir / "fig4s1_threshold_testability_by_condition.pdf"
-    cond = _condition_population_summary(units)
-    pivot = cond.pivot_table(index=["run_id","baseline_subset"], columns="population", values="threshold_testable_fraction", aggfunc="first").dropna()
-    if not pivot.empty and POP_CAND in pivot and POP_CTRL in pivot:
-        with paper_figure_rc():
-            fig, ax = plt.subplots(figsize=(4.6,2.6))
-            for _, r in pivot.iterrows():
-                ax.plot([0,1],[r[POP_CTRL],r[POP_CAND]],color="0.75",linewidth=.7,alpha=.7)
-            ax.scatter(np.zeros(len(pivot)), pivot[POP_CTRL], facecolor="white", edgecolor="0.25", s=18)
-            ax.scatter(np.ones(len(pivot)), pivot[POP_CAND], color="0.25", s=18)
-            ax.set_xticks([0,1],["Controls","Candidates"]); ax.set_ylabel("Threshold-testable fraction")
-            ax.set_ylim(-.02,1.02); ax.grid(axis="y",alpha=.25,linewidth=.45)
-            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-            fig.tight_layout(); save_pdf_only(fig,target); plt.close(fig)
-    else:
-        target.unlink(missing_ok=True)
+    with paper_figure_rc():
+        fig, axes = plt.subplots(1, 2, figsize=(6.6,2.7), sharey=True)
+        made=False
+        for ax, baseline in zip(axes, BASELINE_ORDER):
+            d=units.loc[units.baseline_subset.astype(str).str.lower()==baseline]
+            cond,_=_structural_condition_effect(d,"threshold_testable",0,within_layer_agg="mean",across_layer_agg="mean")
+            if not cond.empty:
+                made=True
+                for _,r in cond.iterrows(): ax.plot([0,1],[r[POP_CTRL],r[POP_CAND]],color="0.75",linewidth=.7,alpha=.7)
+                ax.scatter(np.zeros(len(cond)),cond[POP_CTRL],facecolor="white",edgecolor="0.25",s=18)
+                ax.scatter(np.ones(len(cond)),cond[POP_CAND],color="0.25",s=18)
+            ax.set_xticks([0,1],["Controls","Candidates"]); ax.set_title(f"Discovery direction {_direction_label(baseline)}")
+            ax.set_ylim(-.02,1.02); ax.grid(axis="y",alpha=.25,linewidth=.45); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        axes[0].set_ylabel("Threshold-testable fraction")
+        fig.tight_layout()
+        if made: save_pdf_only(fig,target)
+        else: target.unlink(missing_ok=True)
+        plt.close(fig)
 
-    target2 = paper_dir / "fig4s2_strength_matched_thresholdability.pdf"
-    if not matches.empty:
-        with paper_figure_rc():
-            fig, ax = plt.subplots(figsize=(4.6,2.6))
-            ax.scatter(matches.control_nested_mcc, matches.candidate_nested_mcc, s=20, alpha=.72)
-            lo=min(float(matches.control_nested_mcc.min()),float(matches.candidate_nested_mcc.min()),0.0)
-            hi=max(float(matches.control_nested_mcc.max()),float(matches.candidate_nested_mcc.max()),0.0)
-            ax.plot([lo,hi],[lo,hi],linestyle="--",linewidth=.9,label="equal thresholdability")
-            ax.set_xlabel("Matched control held-out |MCC|"); ax.set_ylabel("Candidate held-out |MCC|")
-            ax.grid(alpha=.25,linewidth=.45); ax.legend(frameon=False,fontsize=7)
-            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-            fig.tight_layout(); save_pdf_only(fig,target2); plt.close(fig)
-    else:
-        target2.unlink(missing_ok=True)
+    # The direct held-out threshold-|MCC| comparison was removed from RQ3.
+    (paper_dir / "fig4s2_strength_matched_thresholdability.pdf").unlink(missing_ok=True)
 
     target3 = paper_dir / "fig4s3_nested_tecs_lower_bound_ecdf.pdf"
     with paper_figure_rc():
-        fig, ax = plt.subplots(figsize=(4.5,2.5))
-        made=False
-        for pop in [POP_CAND,POP_CTRL]:
-            vals=np.sort(pd.to_numeric(units.loc[units.population==pop,"nested_tecs_lower_bound"],errors="coerce").dropna().to_numpy(float))
-            if len(vals):
-                ax.plot(vals,np.arange(1,len(vals)+1)/len(vals),linewidth=1.6,label=POP_LABELS[pop]); made=True
-        if made:
-            ax.set_xlabel("Nested TECS lower bound"); ax.set_ylabel("Empirical CDF")
-            ax.grid(axis="y",alpha=.25,linewidth=.45); ax.legend(frameon=False)
-            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-            fig.tight_layout(); save_pdf_only(fig,target3)
+        fig,axes=plt.subplots(1,2,figsize=(6.8,2.65),sharey=True); made=False
+        for ax,baseline in zip(axes,BASELINE_ORDER):
+            d=units.loc[units.baseline_subset.astype(str).str.lower()==baseline]
+            for pop in [POP_CAND,POP_CTRL]:
+                vals=np.sort(pd.to_numeric(d.loc[d.population==pop,"nested_tecs_lower_bound"],errors="coerce").dropna().to_numpy(float))
+                if len(vals):
+                    ax.plot(vals,np.arange(1,len(vals)+1)/len(vals),linewidth=1.6,label=POP_LABELS[pop]); made=True
+            ax.set_xlabel("Nested TECS lower bound"); ax.set_title(f"Discovery direction {_direction_label(baseline)}"); ax.grid(axis="y",alpha=.25,linewidth=.45); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        axes[0].set_ylabel("Empirical CDF"); axes[0].legend(frameon=False) if made else None
+        fig.tight_layout()
+        if made: save_pdf_only(fig,target3)
+        else: target3.unlink(missing_ok=True)
         plt.close(fig)
-        if not made: target3.unlink(missing_ok=True)
 
 
 def _write_paper_readme(paper_dir: Path, robust: dict, coverage: pd.DataFrame) -> None:
@@ -887,10 +1105,12 @@ Population is exact and manifest-driven. Poisoning experiments are excluded by c
 - Supplementary configured/included: {getattr(supp,'configured_runs',0)}/{getattr(supp,'included_runs',0)}
 - Nested feature selection: training fold only; held-out fold is never used to choose the scalar.
 - Hard-threshold predictions are oriented by the sign of training MCC before Brier/log-loss/calibration are computed.
-- Thresholdability inference is two-part: all-unit testability first, then causal-strength-matched held-out |MCC| among testable units.
-- Matching caliper on singleton flip-any rate: {robust.get('matching_caliper', math.nan):.3f}.
+- Candidates are evaluated **only in their frozen Stage-6 discovery baseline/direction**: positive-baseline agonists test 1→0 events and negative-baseline agonists test 0→1 events. A candidate discovered in both directions may contribute to both; the opposite direction is never invented from held-out data.
+- Primary inference preserves the Stage-7 same-layer/head random non-candidate controls and does **not** match away causal strength.
+- Manuscript-facing legacy endpoints are causal strength, testability, and nested TECS lower bound, reported separately for 1→0 and 0→1. The direct held-out threshold-|MCC| endpoint is intentionally omitted; graded agonist intervention is the direct causal-threshold experiment.
+- Causal-strength matching is a supplementary sensitivity analysis only (caliper: {robust.get('matching_caliper', math.nan):.3f}) and is performed within the same layer/head.
 
-`fig4a_candidate_control_spiking_cut_summary.pdf` reports causal strength, testability, and strength-matched thresholdability. `fig4b_threshold_response_curves.pdf` is only an illustrative same-condition strength-matched pair, not a best-case or inferential sample. `fig4b_threshold_shape_model_comparison.pdf` uses condition-weighted medians.
+`fig4a_candidate_control_spiking_cut_summary.pdf` reports the retained legacy phenotype endpoints in separate 1→0 and 0→1 rows, with held-out threshold |MCC| removed. `fig4b_threshold_response_curves.pdf` is only an illustrative same-condition same-layer/head pair selected without causal-strength or MCC ranking. `fig4s5_threshold_shape_model_comparison_by_direction.pdf` uses direction-specific condition-weighted medians.
 """
     (paper_dir / "README.md").write_text(text, encoding="utf-8")
 
@@ -903,13 +1123,15 @@ def main() -> None:
         raise ValueError("--threshold-match-caliper must be non-negative")
     out = Path(args.out).expanduser().resolve(); out.mkdir(parents=True, exist_ok=True)
 
-    # Remove known derived outputs before recomputation so an unavailable new
-    # analysis cannot leave a stale PDF/CSV from a previous broader population.
+    # Remove derived outputs before recomputation so an unavailable analysis
+    # cannot leave a PDF/CSV that does not match the active population.
     for name in [
         "threshold_shape_model_comparison_repeats.csv", "threshold_shape_model_comparison.csv",
         "threshold_response_curves_heldout.csv", "threshold_shape_population_summary.csv",
         "threshold_shape_unit_population.csv", "threshold_shape_condition_population.csv",
         "threshold_strength_matched_pairs.csv", "threshold_strength_matched_condition.csv",
+        "threshold_structural_visualization_pairs.csv",
+        "threshold_primary_structural_condition_effects.csv",
         "threshold_shape_scope_sensitivity.csv", "threshold_shape_statistical_results.json",
     ]:
         (out / name).unlink(missing_ok=True)
@@ -940,12 +1162,31 @@ def main() -> None:
     condition=_condition_population_summary(units)
     matches=_match_threshold_testable_units(units, float(args.threshold_match_caliper))
     match_condition, _ = _matched_condition_effect(matches, args.bootstrap)
+    structural_pairs = _structural_testable_pairs(units)
+    structural_condition_frames = []
+    for endpoint, metric, within_agg, across_agg in [
+        ("causal_strength", "causal_strength", "median", "median"),
+        ("threshold_testability", "threshold_testable", "mean", "mean"),
+        ("nested_threshold_mcc", "nested_threshold_mcc", "median", "median"),
+        ("nested_tecs_lower_bound", "nested_tecs_lower_bound", "mean", "mean"),
+    ]:
+        frame, _ = _structural_condition_effect(
+            units, metric, 0, within_layer_agg=within_agg, across_layer_agg=across_agg
+        )
+        if not frame.empty:
+            frame = frame.copy()
+            frame.insert(0, "endpoint", endpoint)
+            structural_condition_frames.append(frame)
+    structural_conditions = pd.concat(structural_condition_frames, ignore_index=True) if structural_condition_frames else pd.DataFrame()
+    if not structural_conditions.empty:
+        structural_conditions["direction"] = structural_conditions["baseline_subset"].astype(str).str.lower().map(DIRECTION_BY_BASELINE)
 
     robust_extended = _scope_results(units, condition, matches, scope="primary+supplementary", args=args)
     robust_primary = _scope_results(units, condition, matches, scope="primary", args=args)
     robust = robust_extended if args.population_scope == "primary+supplementary" else robust_primary
 
-    curves=_representative_response_curves(raw_all, tests_all, matches, args)
+    curve_pairs = structural_pairs if args.population_scope == "primary+supplementary" else structural_pairs.loc[structural_pairs.source_scope == "primary"]
+    curves=_representative_response_curves(raw_all, tests_all, curve_pairs, args)
     model_population=_condition_weighted_model_summary(summary)
     coverage=pd.read_csv(out/"threshold_shape_population_coverage.csv") if (out/"threshold_shape_population_coverage.csv").exists() else pd.DataFrame()
 
@@ -957,17 +1198,24 @@ def main() -> None:
     condition.to_csv(out/"threshold_shape_condition_population.csv",index=False)
     matches.to_csv(out/"threshold_strength_matched_pairs.csv",index=False)
     match_condition.reset_index().to_csv(out/"threshold_strength_matched_condition.csv",index=False)
+    structural_pairs.to_csv(out/"threshold_structural_visualization_pairs.csv",index=False)
+    structural_conditions.to_csv(out/"threshold_primary_structural_condition_effects.csv",index=False)
     sensitivity=pd.DataFrame([
         {
             "scope": r["scope"], "n_runs":r["n_runs"], "n_units":r["n_units"],
             "n_strength_conditions":r["n_strength_conditions"], "n_testability_conditions":r["n_testability_conditions"],
-            "n_matched_mcc_conditions":r["n_matched_mcc_conditions"], "n_matched_unit_pairs":r["n_matched_unit_pairs"],
+            "n_threshold_mcc_conditions":r["n_threshold_mcc_conditions"], "n_tecs_conditions":r["n_tecs_conditions"],
+            "n_strength_matched_mcc_conditions":r["n_strength_matched_mcc_conditions"], "n_strength_matched_unit_pairs":r["n_strength_matched_unit_pairs"],
             "strength_median_delta":r["causal_strength_effect"].get("median_delta",math.nan),
             "strength_p":r["causal_strength_effect"].get("wilcoxon_p_greater",math.nan),
             "testability_median_delta":r["threshold_testability_effect"].get("median_delta",math.nan),
             "testability_p":r["threshold_testability_effect"].get("wilcoxon_p_greater",math.nan),
-            "matched_mcc_median_delta":r["matched_threshold_mcc_effect"].get("median_delta",math.nan),
-            "matched_mcc_p":r["matched_threshold_mcc_effect"].get("wilcoxon_p_greater",math.nan),
+            "nested_mcc_median_delta":r["nested_threshold_mcc_effect"].get("median_delta",math.nan),
+            "nested_mcc_p":r["nested_threshold_mcc_effect"].get("wilcoxon_p_greater",math.nan),
+            "nested_tecs_median_delta":r["nested_tecs_lower_bound_effect"].get("median_delta",math.nan),
+            "nested_tecs_p":r["nested_tecs_lower_bound_effect"].get("wilcoxon_p_greater",math.nan),
+            "strength_matched_mcc_median_delta":r["strength_matched_threshold_mcc_sensitivity"].get("median_delta",math.nan),
+            "strength_matched_mcc_p":r["strength_matched_threshold_mcc_sensitivity"].get("wilcoxon_p_greater",math.nan),
         }
         for r in [robust_primary, robust_extended]
     ])
@@ -984,8 +1232,7 @@ def main() -> None:
 
     if args.paper_figures_dir:
         paper_dir=Path(args.paper_figures_dir).expanduser().resolve(); paper_dir.mkdir(parents=True,exist_ok=True)
-        _plot_main_summary(condition if args.population_scope=="primary+supplementary" else condition.loc[condition.source_scope=="primary"],
-                           matches if args.population_scope=="primary+supplementary" else matches.loc[matches.source_scope=="primary"],
+        _plot_main_summary(units if args.population_scope=="primary+supplementary" else units.loc[units.source_scope=="primary"],
                            robust,paper_dir)
         _plot_model_comparison(summary if args.population_scope=="primary+supplementary" else summary.loc[summary.source_scope=="primary"],paper_dir)
         _plot_response_curves(curves,paper_dir)
@@ -1002,12 +1249,16 @@ def main() -> None:
         "n_unit_model_rows":int(len(summary)),
         "n_complete_units":int(len(units)),
         "n_threshold_testable_units":int(units.threshold_testable.sum()) if not units.empty else 0,
-        "n_strength_matched_pairs":int(len(matches)),
+        "n_strength_matched_pairs_sensitivity":int(len(matches)),
+        "n_structural_visualization_pairs":int(len(structural_pairs)),
+        "primary_threshold_comparison":"discovery-direction-specific same-layer/head controls without causal-strength matching",
+        "candidate_direction_policy":"frozen Stage-6 discovery baseline only",
+        "causal_strength_matching":"supplementary sensitivity only",
         "nested_feature_selection":True,
         "threshold_search":"vectorized_cumulative_confusion",
         "threshold_prediction_orientation":"training_mcc_sign",
         "isotonic_orientation":"training_threshold_event_direction",
-        "representative_curve_selection":"same_condition_minimum_causal_strength_gap; no MCC selection",
+        "representative_curve_selection":"same_condition_same_layer deterministic pair; no causal-strength or MCC ranking",
         "models":list(MODELS),
         "metrics":["abs_mcc","brier","log_loss","ece","transition_sharpness"],
     }

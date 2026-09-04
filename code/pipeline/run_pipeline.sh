@@ -169,8 +169,26 @@ SKIP_STAGE1=false
 THRESHOLD_EVENT_CLAMP_TOPK="${THRESHOLD_EVENT_CLAMP_TOPK:-0}"
 FORCE_THRESHOLD_EVENT_POSTHOC="${FORCE_THRESHOLD_EVENT_POSTHOC:-false}"
 NO_LLM_FEATURE_GENERATION="${NO_LLM_FEATURE_GENERATION:-false}"
-RUN_REFINE_NEURON_RULES="${RUN_REFINE_NEURON_RULES:-true}"
-RUN_THRESHOLD_EVENT_POSTHOC="${RUN_THRESHOLD_EVENT_POSTHOC:-true}"
+# Stage 7 is a held-out singleton causal evaluation, not a neuron-rule refinement stage.
+# RUN_SINGLETON_CAUSAL_EVALUATION is the canonical flag. Preserve the old name only
+# as a deprecated compatibility alias for existing external launchers.
+if [[ -n "${RUN_REFINE_NEURON_RULES+x}" && -z "${RUN_SINGLETON_CAUSAL_EVALUATION+x}" ]]; then
+	RUN_SINGLETON_CAUSAL_EVALUATION="$RUN_REFINE_NEURON_RULES"
+	echo "[deprecated] RUN_REFINE_NEURON_RULES is now RUN_SINGLETON_CAUSAL_EVALUATION" >&2
+elif [[ -n "${RUN_REFINE_NEURON_RULES+x}" && -n "${RUN_SINGLETON_CAUSAL_EVALUATION+x}" ]]; then
+	echo "[deprecated] ignoring RUN_REFINE_NEURON_RULES because RUN_SINGLETON_CAUSAL_EVALUATION is set" >&2
+fi
+RUN_SINGLETON_CAUSAL_EVALUATION="${RUN_SINGLETON_CAUSAL_EVALUATION:-true}"
+RUN_THRESHOLD_EVENT_POSTHOC="${RUN_THRESHOLD_EVENT_POSTHOC:-false}"
+RUN_GRADED_AGONIST_INTERVENTION="${RUN_GRADED_AGONIST_INTERVENTION:-true}"
+GRADED_AGONIST_DOSES="${GRADED_AGONIST_DOSES:-0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1}"
+GRADED_AGONIST_MAX_UNITS_PER_DIRECTION="${GRADED_AGONIST_MAX_UNITS_PER_DIRECTION:-16}"
+GRADED_AGONIST_MAX_POSITIVE_SUPPORT="${GRADED_AGONIST_MAX_POSITIVE_SUPPORT:-256}"
+GRADED_AGONIST_NEGATIVE_SUPPORT="${GRADED_AGONIST_NEGATIVE_SUPPORT:-false}"
+GRADED_AGONIST_NEGATIVE_RATIO="${GRADED_AGONIST_NEGATIVE_RATIO:-1.0}"
+GRADED_AGONIST_MAX_NEGATIVE_SUPPORT="${GRADED_AGONIST_MAX_NEGATIVE_SUPPORT:-256}"
+GRADED_AGONIST_SEED="${GRADED_AGONIST_SEED:-42}"
+FORCE_GRADED_AGONIST_INTERVENTION="${FORCE_GRADED_AGONIST_INTERVENTION:-false}"
 THRESHOLD_EVENT_TARGET="${THRESHOLD_EVENT_TARGET:-all}"
 THRESHOLD_EVENT_MAX_POINTS="${THRESHOLD_EVENT_MAX_POINTS:-10000}"
 THRESHOLD_EVENT_MIN_POINTS="${THRESHOLD_EVENT_MIN_POINTS:-512}"
@@ -178,8 +196,8 @@ THRESHOLD_EVENT_REPEATS="${THRESHOLD_EVENT_REPEATS:-20}"
 THRESHOLD_EVENT_HOLDOUT_FRACTION="${THRESHOLD_EVENT_HOLDOUT_FRACTION:-0.5}"
 THRESHOLD_EVENT_N_BINS="${THRESHOLD_EVENT_N_BINS:-10}"
 THRESHOLD_EVENT_SEED="${THRESHOLD_EVENT_SEED:-42}"
-REFINE_EXTRACT_RULES="${REFINE_EXTRACT_RULES:-true}"
-REFINE_SUMMARIZE_RULE_METRICS="${REFINE_SUMMARIZE_RULE_METRICS:-true}"
+REFINE_EXTRACT_RULES="${REFINE_EXTRACT_RULES:-false}"
+REFINE_SUMMARIZE_RULE_METRICS="${REFINE_SUMMARIZE_RULE_METRICS:-false}"
 REFINE_MAX_NEURONS="${REFINE_MAX_NEURONS:-0}"
 REFINE_NEURON_BATCH_SIZE="${REFINE_NEURON_BATCH_SIZE:-8}"
 REFINE_SAMPLING_MAX_POINTS="${REFINE_SAMPLING_MAX_POINTS:-10000}"
@@ -339,8 +357,12 @@ echo "MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE: $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
 echo "NO_LLM_FEATURE_GENERATION: $NO_LLM_FEATURE_GENERATION"
 echo "TASK_MODULE_OVERRIDE: ${TASK_MODULE_OVERRIDE:-<default>}"
 echo "SKIP_STAGE1: $SKIP_STAGE1"
-echo "RUN_REFINE_NEURON_RULES: $RUN_REFINE_NEURON_RULES"
+echo "RUN_SINGLETON_CAUSAL_EVALUATION: $RUN_SINGLETON_CAUSAL_EVALUATION"
 echo "RUN_THRESHOLD_EVENT_POSTHOC: $RUN_THRESHOLD_EVENT_POSTHOC"
+echo "RUN_GRADED_AGONIST_INTERVENTION: $RUN_GRADED_AGONIST_INTERVENTION"
+echo "GRADED_AGONIST_DOSES: $GRADED_AGONIST_DOSES"
+echo "GRADED_AGONIST_MAX_UNITS_PER_DIRECTION: $GRADED_AGONIST_MAX_UNITS_PER_DIRECTION"
+echo "GRADED_AGONIST_NEGATIVE_SUPPORT: $GRADED_AGONIST_NEGATIVE_SUPPORT"
 echo "THRESHOLD_EVENT_TARGET: $THRESHOLD_EVENT_TARGET"
 echo "THRESHOLD_EVENT_MAX_POINTS: $THRESHOLD_EVENT_MAX_POINTS"
 echo "THRESHOLD_EVENT_MIN_POINTS: $THRESHOLD_EVENT_MIN_POINTS"
@@ -1008,7 +1030,7 @@ if [[ -s "$STATS_DIR/flip_stats_global.json" \
    && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
 	STAGE7_COMPLETE=true
 fi
-if [[ "$RUN_REFINE_NEURON_RULES" == "true" || "$RUN_REFINE_NEURON_RULES" == "1" ]]; then
+if [[ "$RUN_SINGLETON_CAUSAL_EVALUATION" == "true" || "$RUN_SINGLETON_CAUSAL_EVALUATION" == "1" ]]; then
 	REFINE_FLAGS=(
 		--task_module "$TASK_MODULE"
 		--ai_model "$ANALYZED_LLM"
@@ -1054,16 +1076,58 @@ if [[ "$RUN_REFINE_NEURON_RULES" == "true" || "$RUN_REFINE_NEURON_RULES" == "1" 
 	if [[ "$STAGE7_COMPLETE" == "true" && "$FORCE_STAGE7" != "true" && "$FORCE_STAGE7" != "1" ]]; then
 		echo "Step 7: complete singleton artifacts for split=$EVALUATION_SPLIT found -> reusing $STATS_DIR"
 	else
-		python3 -m pipeline.stage07_refine_neuron_anchored_rules "${REFINE_FLAGS[@]}"
+		python3 -m pipeline.stage07_singleton_causal_evaluation "${REFINE_FLAGS[@]}"
 	fi
 else
-	echo "Step 7: RUN_REFINE_NEURON_RULES=$RUN_REFINE_NEURON_RULES -> skipping stage07_refine_neuron_anchored_rules.py"
+	echo "Step 7: RUN_SINGLETON_CAUSAL_EVALUATION=$RUN_SINGLETON_CAUSAL_EVALUATION -> skipping stage07_singleton_causal_evaluation.py"
 fi
 
-# Post-hoc threshold/spiking diagnostics. This flag historically existed but was
-# never wired to the actual diagnostic runner, so no spiking artifacts were
-# generated by run_pipeline.sh. It is enabled by default for all workflows;
-# callers can explicitly set RUN_THRESHOLD_EVENT_POSTHOC=false to opt out.
+# RQ3 primary spiking experiment: graded intervention on each frozen agonist's
+# own held-out directional flip support.  This is intentionally distinct from
+# the optional scalar/threshold diagnostics below: no classifier is fit to
+# predict which examples the agonist flips.
+if [[ "$RUN_GRADED_AGONIST_INTERVENTION" == "true" || "$RUN_GRADED_AGONIST_INTERVENTION" == "1" ]]; then
+	if [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" && -s "$STATS_DIR/scores.csv" && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
+		GRADED_AGONIST_OUT_DIR="$STATS_DIR/graded_agonist_intervention"
+		GRADED_AGONIST_FLAGS=(
+			--input_data_dir "$DISCOVERY_INPUT_AUTODISCOVERY_DIR"
+			--candidate_flip_stats_path "$STATS_DIR/flip_stats_by_neuron.csv"
+			--singleton_scores_path "$STATS_DIR/scores.csv"
+			--candidate_ranking_path "$STATS_DIR/frozen_candidate_ranking.csv"
+			--out_dir "$GRADED_AGONIST_OUT_DIR"
+			--task_module "$TASK_MODULE"
+			--ai_model "$ANALYZED_LLM"
+			"${HF_MODEL_CACHE_FLAG[@]}"
+			--evaluation_split "$EVALUATION_SPLIT"
+			--intervention "$EVAL_INTERVENTION"
+			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
+			--batch_size "$BATCH_SIZE"
+			--doses "$GRADED_AGONIST_DOSES"
+			--max_agonists_per_direction "$GRADED_AGONIST_MAX_UNITS_PER_DIRECTION"
+			--max_positive_support_per_agonist "$GRADED_AGONIST_MAX_POSITIVE_SUPPORT"
+			--negative_support_ratio "$GRADED_AGONIST_NEGATIVE_RATIO"
+			--max_negative_support_per_agonist "$GRADED_AGONIST_MAX_NEGATIVE_SUPPORT"
+			--seed "$GRADED_AGONIST_SEED"
+			"${DECODE_FLAG[@]}"
+		)
+		if [[ "$GRADED_AGONIST_NEGATIVE_SUPPORT" == "true" || "$GRADED_AGONIST_NEGATIVE_SUPPORT" == "1" ]]; then
+			GRADED_AGONIST_FLAGS+=(--same_agonist_negative_support)
+		fi
+		if [[ "$FORCE_GRADED_AGONIST_INTERVENTION" == "true" || "$FORCE_GRADED_AGONIST_INTERVENTION" == "1" ]]; then
+			GRADED_AGONIST_FLAGS+=(--force)
+		fi
+		echo "Step 7b: graded agonist intervention -> $GRADED_AGONIST_OUT_DIR"
+		python3 -m studies.overtopping.analysis.graded_agonist_intervention "${GRADED_AGONIST_FLAGS[@]}"
+	else
+		echo "Step 7b: graded agonist intervention skipped; complete Stage-7 singleton artifacts are missing"
+	fi
+else
+	echo "Step 7b: RUN_GRADED_AGONIST_INTERVENTION=$RUN_GRADED_AGONIST_INTERVENTION -> skipping graded agonist intervention"
+fi
+
+# Legacy scalar-to-flip diagnostics. These are not part of the RQ3 spiking test.
+# They are disabled by default and retained only for explicit historical/diagnostic runs.
+# The primary RQ3 experiment is the graded agonist intervention above.
 if [[ "$RUN_THRESHOLD_EVENT_POSTHOC" == "true" || "$RUN_THRESHOLD_EVENT_POSTHOC" == "1" ]]; then
 	if [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" ]]; then
 		THRESHOLD_EVENT_OUT_LABEL="spiking_diagnostics-${BAG_LABEL}"
@@ -1084,6 +1148,7 @@ if [[ "$RUN_THRESHOLD_EVENT_POSTHOC" == "true" || "$RUN_THRESHOLD_EVENT_POSTHOC"
 			--ai_model "$ANALYZED_LLM"
 			"${HF_MODEL_CACHE_FLAG[@]}"
 			--candidate_flip_stats_path "$STATS_DIR/flip_stats_by_neuron.csv"
+			--candidate_ranking_path "$STATS_DIR/frozen_candidate_ranking.csv"
 			--materialized_stage7_scores_path "$STATS_DIR/scores.csv"
 			--evaluation_split "$EVALUATION_SPLIT"
 			--intervention "$EVAL_INTERVENTION"
@@ -1104,13 +1169,13 @@ if [[ "$RUN_THRESHOLD_EVENT_POSTHOC" == "true" || "$RUN_THRESHOLD_EVENT_POSTHOC"
 		if [[ "$FORCE_THRESHOLD_EVENT_POSTHOC" == "true" || "$FORCE_THRESHOLD_EVENT_POSTHOC" == "1" ]]; then
 			THRESHOLD_EVENT_FLAGS+=(--force_threshold_event --force_spiking_eval --no_skip_existing)
 		fi
-		echo "Step 7b: threshold/spiking diagnostics -> $THRESHOLD_EVENT_OUT_DIR"
+		echo "Step 7c: optional scalar/threshold diagnostics -> $THRESHOLD_EVENT_OUT_DIR"
 		python3 -m studies.overtopping.analysis.threshold_event_diagnostics "${THRESHOLD_EVENT_FLAGS[@]}"
 	else
-		echo "Step 7b: threshold/spiking diagnostics skipped; missing $STATS_DIR/flip_stats_by_neuron.csv"
+		echo "Step 7c: optional scalar/threshold diagnostics skipped; missing $STATS_DIR/flip_stats_by_neuron.csv"
 	fi
 else
-	echo "Step 7b: RUN_THRESHOLD_EVENT_POSTHOC=$RUN_THRESHOLD_EVENT_POSTHOC -> skipping threshold_event_diagnostics.py"
+	echo "Step 7c: RUN_THRESHOLD_EVENT_POSTHOC=$RUN_THRESHOLD_EVENT_POSTHOC -> skipping threshold_event_diagnostics.py"
 fi
 
 if [[ "$RUN_INTERACTION_VALIDATION" == "true" || "$RUN_INTERACTION_VALIDATION" == "1" ]]; then

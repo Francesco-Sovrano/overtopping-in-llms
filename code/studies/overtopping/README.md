@@ -1,19 +1,12 @@
-# Overtopping study package
+# Overtopping study
 
-This package owns the non-poisoning experiment catalogue, primary-matrix construction, RQ1–RQ4 analyses, threshold/spiking reporting, manuscript figures, and study audits. Shared numbered pipeline stages and intervention mechanics live in `pipeline/` and `core/`.
+Experiment execution and scientific analysis for the primary overtopping study.
 
-Repository commands:
+Documentation:
 
-```bash
-./run_overtopping_experiments.sh --list
-./run_overtopping_experiments.sh --dry-run
-./run_overtopping_experiments.sh
-./generate_results.sh
-```
-
-Canonical documentation:
-
-- [Experiment catalogue](../../docs/overtopping-experiments.md)
-- [Overtopping analysis](../../docs/overtopping-analysis.md)
-- [Numbered causal pipeline](../../docs/pipeline.md)
-- [Manuscript figure map](../../docs/manuscript-figure-map.md)
+- [Overtopping experiment catalogue](../../docs/experiments/overtopping.md)
+- [RQ1 — prevalence](../../docs/research-questions/rq1-prevalence.md)
+- [RQ2 — composition](../../docs/research-questions/rq2-composition.md)
+- [RQ3 — threshold events](../../docs/research-questions/rq3-threshold-event.md)
+- [RQ4 — learning](../../docs/research-questions/rq4-learning.md)
+- [Reporting pipeline](../../docs/reporting/README.md)

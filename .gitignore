@@ -27,3 +27,8 @@ __MACOSX/
 /results/
 _*
 *.zip
+
+# Local credentials. Keep the example file tracked.
+.secrets.env
+.secrets.env.*
+!.secrets.env.example

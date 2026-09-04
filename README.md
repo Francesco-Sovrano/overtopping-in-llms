@@ -1,113 +1,101 @@
 # Overtopping Phenomenology
 
-This repository contains two related causal-analysis studies for language models:
+This repository contains causal-intervention studies of language-model behavior.
 
-- **Overtopping:** discovers task-relevant activation channels, measures singleton and set-level causal effects, validates interactions, and studies how causal organization relates to competence.
-- **Poisoning:** trains matched clean and poisoned trajectories, evaluates behavior and causal organization at checkpoints, and tests whether poisoning-specific causal disruption identifies responsible training examples.
+The two experiment families are:
 
-Shared model loading, task interfaces, interventions, statistics, and the numbered causal pipeline live under `code/core/` and `code/pipeline/`. Study-specific experiment definitions and analyses live under `code/studies/`.
+- **Overtopping:** discovery and held-out evaluation of high-leverage internal channels, directional singleton reach, joint composition, threshold-event visibility, preemption, and checkpoint trajectories.
+- **Poisoning:** matched clean/poisoned training trajectories, checkpoint causal analysis, fixed-channel materialization, poisoning-example detection, and cross-seed aggregation.
+
+The repository separates persistent scientific artifacts from regenerable reporting and caches:
+
+```text
+code/       source code and documentation
+data/       persistent experiment outputs and provenance
+cache/      regenerable computation caches
+results/    generated analysis tables, audits, and manuscript figures
+```
+
+`data/` defines scientific provenance. `cache/` accelerates computation but does not determine which runs, examples, candidates, or controls enter an analysis.
+
+## Documentation
+
+**Start with [`code/docs/README.md`](code/docs/README.md).** It is the canonical documentation index and routes readers to installation, methods, experiment definitions, RQ1–RQ4, reporting, and operations.
 
 ## Installation
-
-From the repository root:
 
 ```bash
 ./setup.sh
 ```
 
-`setup.sh` creates a Python 3.12 virtual environment and installs the full repository dependency set. For an overtopping-only environment, install the base requirements manually:
+`setup.sh` creates a Python 3.12 virtual environment in `.env/`, installs the repository requirements, installs poisoning-specific runtime helpers, and pulls the default Ollama feature models when Ollama is available.
 
-```bash
-pip install -r requirements.txt
-```
+Provider credentials are optional and depend on the configured prompt/classifier models. See [`code/docs/getting-started/credentials.md`](code/docs/getting-started/credentials.md).
 
-For poisoning support, install `code/studies/poisoning/requirements.txt`; it includes the base requirements and the additional runtime helpers.
+## Overtopping study
 
-## Runtime roots
-
-```text
-code/       source code
-data/       persistent experiment outputs
-cache/      regenerable model and pipeline caches
-results/    generated paper and analysis products
-```
-
-The launchers resolve these paths from the repository root. Most roots can also be overridden with environment variables documented under `code/docs/`.
-
-## Overtopping
-
-List the configured experiments:
+Inspect the explicit experiment catalogue before execution:
 
 ```bash
 ./run_overtopping_experiments.sh --list
-```
-
-Inspect commands:
-
-```bash
 ./run_overtopping_experiments.sh --dry-run
 ```
 
-Run the configured catalogue:
+Run the configured non-poisoning experiment programme:
 
 ```bash
 ./run_overtopping_experiments.sh
 ```
 
-The primary manuscript profile contains 28 task/model/phase settings. Test is the default evaluation split. The shared causal pipeline runs Stages 01–08; study-level analysis then builds the primary matrix, statistical analyses, manuscript figures, threshold/spiking diagnostics, and audits.
+The catalogue contains 28 `paper-primary` settings and 11 `paper-auxiliary` settings. Paper-facing overtopping evaluation uses the `test` split unless another split is explicitly requested.
 
-## Poisoning
+RQ3 requires additional high-N threshold-event diagnostics. From `code/`:
 
-Inspect the configured run matrix:
+```bash
+python -m studies.overtopping.analysis.rebuild_spiking_diagnostics \
+  --primary-table ../results/analysis/primary_matrix/tables/primary_table.csv \
+  --data-root ../data \
+  --population-scope primary+supplementary
+```
+
+## Poisoning study
+
+Inspect the configured poisoning commands:
 
 ```bash
 ./run_poisoning_experiments.sh --dry-run
 ```
 
-Run it:
+Run the configured poisoning study:
 
 ```bash
 ./run_poisoning_experiments.sh
 ```
 
-Each task/model/seed has one run directory with stages for training checkpoints, evaluation cohorts, checkpoint causal analysis, matched comparisons, trajectories, circuit overlap, and poisoning-example detection. Cross-seed aggregation is stored separately under `data/poisoning/final/`.
+For a reduced execution-path test:
 
-Three checkpoint endpoints are intentionally separate:
+```bash
+POISONING_FAST_TEST=1 ./run_poisoning_experiments.sh
+```
 
-1. `normal_task`: no-trigger behavioral accuracy on a deterministic proportional stratified held-out sample. `NORMAL_TASK_SCAN_MAX_ROWS` defaults to 10,000; `0` requests the complete held-out population.
-2. `backdoor_trigger_test`: paired trigger/control behavior on the attack-eligible cohort.
-3. `attack_cohort_control_correctness`: causal control-correctness analysis on the exact attack-eligible non-target cohort.
+Poisoning is a separate experiment family under `data/poisoning/`; it is not included in RQ1–RQ3 overtopping populations.
 
-The normal-task cap is independent of trigger-lift and Stage-7 caps. Exact cached no-trigger generations may be reused when row identities overlap, but cache overlap does not define the normal-task population.
-
-Full-run generation/evaluation uses `PIPELINE_BATCH_SIZE=32` unless overridden. Smoke mode uses a smaller batch and reduced cohorts.
-
-## Reporting
-
-Generate final outputs:
+## Generate analysis and manuscript outputs
 
 ```bash
 ./generate_results.sh
 ```
 
-The result tree is organized under:
+The main analysis populations are:
 
-```text
-results/
-├── paper/       manuscript-facing figures and tables
-└── analysis/    matrices, audits, diagnostics, and machine-readable figure data
-```
+| Analysis | Population |
+|---|---|
+| Primary matrix | 28 `paper-primary` settings |
+| RQ1 Figure 2 | 39 primary + auxiliary settings |
+| RQ2 composition | 28 primary settings |
+| RQ3 threshold-event analysis | 28 primary settings plus auxiliary settings with complete exact diagnostics |
+| RQ4 checkpoint analysis | configured checkpoint runs |
+| Poisoning | configured poisoning task/model/seed runs |
 
-Directional causal quantities use explicit names such as `U_J_i2c` for baseline 0→1 and `U_J_c2i` for baseline 1→0.
+Generated human-facing artifacts are written under `results/paper/`. Machine-readable analysis products and audits are written under `results/analysis/`.
 
-RQ3 threshold diagnostics can be rebuilt during reporting with:
-
-```bash
-REBUILD_SPIKING_DIAGNOSTICS=true ./generate_results.sh
-```
-
-The reporting pipeline restricts RQ3 to the exact primary-table population and audits required positive/negative baseline subsets before producing the report.
-
-## Documentation
-
-Start with [code/docs/index.md](code/docs/index.md). It links the installation, architecture, pipeline, overtopping, poisoning, output, figure, and troubleshooting references.

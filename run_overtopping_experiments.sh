@@ -8,6 +8,17 @@ if [[ -f "$PROJECT_ROOT/.env/bin/activate" ]]; then
   . "$PROJECT_ROOT/.env/bin/activate"
 fi
 
+# Optional provider credentials. The file is shell syntax and should contain
+# entries such as: export GROQ_API_KEY="...". Existing environment variables
+# remain available and can be used without this file.
+SECRETS_FILE="${SECRETS_FILE:-$PROJECT_ROOT/.secrets.env}"
+if [[ -f "$SECRETS_FILE" ]]; then
+  # shellcheck disable=SC1090
+  set -a
+  . "$SECRETS_FILE"
+  set +a
+fi
+###########################
 export API_MAX_RETRIES=0
 export API_RECOVERY_PASSES=3
 export INTERACTION_NULL_DRAWS=30

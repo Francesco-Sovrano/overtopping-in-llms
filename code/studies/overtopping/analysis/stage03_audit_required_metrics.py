@@ -15,9 +15,9 @@ import pandas as pd
 from studies.overtopping.analysis.primary_holdout_analysis import reference_stats_dir
 
 from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, normalize_primary_table
+from studies.overtopping.analysis.lib.interaction_schema import is_exact_interaction_schema
 
 SINGLETON_SCHEMAS = {"heldout-set-metrics-v3-directional"}
-INTERACTION_SCHEMA = "conditional-marginal-validation-v1"
 
 
 def resolve_stats_dir(raw: object, data_root: Path) -> Path:
@@ -86,7 +86,7 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
     )
     ranking_exact = bool(singleton_exact and ranking_path.exists())
     interaction_schema = interaction.get("definition_version")
-    interaction_exact = interaction_schema == INTERACTION_SCHEMA
+    interaction_exact = is_exact_interaction_schema(interaction_schema)
     e_j_exact = interaction_exact
     null_exact = bool(null_path.exists() and e_j_exact)
     conditional_exact = bool(interaction_exact and interaction.get("conditional_marginal"))
