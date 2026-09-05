@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary+supplementary")
     p.add_argument("--evaluation-split", default="test", choices=["test", "train", "all"])
     p.add_argument(
-        "--spiking-max-points", dest="sampling_max_points", type=int, default=10000,
+        "--spiking-max-points", type=int, default=10000,
         help="Stage-7/threshold-diagnostic row cap used to resolve the exact RQ3 source paths.",
     )
     p.add_argument("--repeats", type=int, default=20)
