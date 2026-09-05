@@ -73,7 +73,6 @@ def parse_args():
     # high-N evaluation knobs.  This is the script-7 style 10k cap.
     p.add_argument("--spiking_max_points", type=int, default=10000, help="Max examples per baseline subset used for the threshold/spiking experiment.")
     p.add_argument("--spiking_min_points", type=int, default=512)
-    p.add_argument("--spiking_global_n_clusters", type=int, default=64)
     p.add_argument("--spiking_eval_cache_dir", default=None)
     p.add_argument("--force_spiking_eval", action="store_true")
     p.add_argument(
@@ -159,22 +158,6 @@ def parse_args():
     p.add_argument("--log_level", default="quiet", choices=["quiet", "normal", "verbose"], help="Control non-tqdm logging. quiet prints only warnings/results; normal prints essential milestones; verbose prints paths/debug details.")
     p.add_argument("--print_json_summary", action="store_true", help="Also print the full machine-readable JSON summary at the end.")
 
-    # Spectral args passed to the shared high-N sampler.
-    p.add_argument("--spectral_space", default="hidden", choices=["hidden", "logits"])
-    p.add_argument("--rep_hook_name", default="ln_final.hook_normalized")
-    p.add_argument("--rep_pooling", default="mean", choices=["last", "mean"])
-    p.add_argument("--spectral_dim", type=int, default=32)
-    p.add_argument("--spectral_cache_dir", default=None)
-    p.add_argument("--max_seq_len", type=int, default=None)
-    p.add_argument(
-        "--spectral_embedding_batch_size",
-        type=int,
-        default=32,
-        help=(
-            "Execution-only batch size for spectral representation extraction. "
-            "Kept separate from --batch_size used by singleton/circuit evaluation."
-        ),
-    )
 
     return p.parse_args()
 
@@ -2191,9 +2174,6 @@ def run_for_baseline(args, baseline: str, *, dataset_info: dict, task, prompt_co
         model = LMWrapper(model_name=ai_model, device=device, eval_mode=True, circuit_discovery=False, cache_dir=args.ai_model_cache_dir)
     _log(args, f"{LOG_PREFIX} {baseline}: model loaded", "verbose")
     args.ai_model = ai_model
-    if args.spectral_cache_dir is None:
-        args.spectral_cache_dir = str(Path("./cache") / "threshold_events" / baseline)
-
     agonist_units = _filter_units_with_valid_capacity(args, model=model, units=list(units), context="agonist")
     if not agonist_units:
         payload = {"baseline": baseline, "status": "empty_valid_units", "n_units": 0, "n_rules": int(len(rule_df))}

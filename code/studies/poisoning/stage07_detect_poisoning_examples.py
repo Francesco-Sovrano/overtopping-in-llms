@@ -1095,7 +1095,7 @@ def compute_channel_disruption(
     }
 
     rows: list[dict[str, Any]] = []
-    for unit_index, unit in enumerate(units):
+    for unit in units:
         template = p1.get(unit) or p0.get(unit) or c1.get(unit) or c0.get(unit)
         if template is None:
             continue

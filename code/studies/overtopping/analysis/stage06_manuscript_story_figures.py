@@ -419,9 +419,7 @@ def plot_superadditive_boundary(frame: pd.DataFrame, out: Path, data_dir: Path |
         fig, ax = plt.subplots(figsize=(6.35, max(2.55, 0.64*len(work)+1.05))); y=np.arange(len(work))
         u_values = numeric(work, "U")
         e_values = numeric(work, "E_J")
-        delta_values = numeric(work, "Delta_comp")
         xmax = float(np.nanmax(np.concatenate([u_values.to_numpy(float), e_values.to_numpy(float), [0.0]])))
-        label_pad = max(0.012, 0.028 * max(xmax, 0.22))
         delta_pad = max(0.018, 0.05 * max(xmax, 0.22))
 
         ax.barh(y-0.13, u_values, height=0.24, color="0.80", edgecolor="0.45", linewidth=0.5,

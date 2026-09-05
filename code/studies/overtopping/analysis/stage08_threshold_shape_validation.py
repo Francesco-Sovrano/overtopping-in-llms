@@ -158,7 +158,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-root", required=True)
     p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary+supplementary")
     p.add_argument("--evaluation-split", default="test", choices=["test", "train", "all"])
-    p.add_argument("--spiking-max-points", type=int, default=10000)
+    p.add_argument(
+        "--spiking-max-points", dest="sampling_max_points", type=int, default=10000,
+        help="Stage-7/threshold-diagnostic row cap used to resolve the exact RQ3 source paths.",
+    )
     p.add_argument("--repeats", type=int, default=20)
     p.add_argument("--holdout-fraction", type=float, default=0.25)
     p.add_argument("--min-class", type=int, default=8)
@@ -429,7 +432,7 @@ def _summarize(repeats: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
 
 
-def _load_exact_tables(args: argparse.Namespace, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _load_exact_tables(args: argparse.Namespace, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     source_kind = "zip" if args.zip else "root"
     source_path = Path(args.zip or args.root).expanduser().resolve()
     data_root = Path(args.data_root).expanduser().resolve()
@@ -500,7 +503,7 @@ def _load_exact_tables(args: argparse.Namespace, out: Path) -> tuple[pd.DataFram
         for scope in ["primary", "supplementary"]
     ])
     coverage.to_csv(out / "threshold_shape_population_coverage.csv", index=False)
-    return fs, raw, tests, audit
+    return fs, raw, tests
 
 
 def _unit_population(fs: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
@@ -1150,7 +1153,7 @@ def main() -> None:
     ]:
         (out / name).unlink(missing_ok=True)
 
-    fs_all, raw_all, tests_all, audit = _load_exact_tables(args, out)
+    fs_all, raw_all, tests_all = _load_exact_tables(args, out)
     if raw_all.empty:
         status = {"status":"not_available","reason":"No exact-population aggregate_activation_flip_rows.csv found"}
         (out/"threshold_shape_status.json").write_text(json.dumps(status,indent=2),encoding="utf-8")

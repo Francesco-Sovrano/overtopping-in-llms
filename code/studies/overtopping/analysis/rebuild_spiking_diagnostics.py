@@ -41,7 +41,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target", default=os.environ.get("THRESHOLD_EVENT_TARGET", "all"), help="flip_any, flip_c2i, flip_i2c, comma-list, or all")
     p.add_argument("--spiking-max-points", type=int, default=_env_int("THRESHOLD_EVENT_MAX_POINTS", 10000))
     p.add_argument("--spiking-min-points", type=int, default=_env_int("THRESHOLD_EVENT_MIN_POINTS", 512))
-    p.add_argument("--global-n-clusters", type=int, default=_env_int("MAX_POINTS_PER_ABLATION", _env_int("CHA_REFERENCE_N_PER_SIDE", 64)))
     p.add_argument(
         "--batch-size", type=int, default=None,
         help="Explicit override only. Default: exact per-run RunSpec.batch_size from the overtopping experiment catalogue.",
@@ -54,15 +53,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=_env_int("THRESHOLD_EVENT_SEED", 42))
     p.add_argument("--ai-model-cache-dir", default=os.environ.get("HF_MODEL_CACHE_DIR") or None)
 
-    # Exact spectral arguments passed by run_pipeline.sh.  Step 7b currently
-    # reuses Stage-7 rows, but keeping these identical prevents launcher drift
-    # if spectral-backed diagnostics are re-enabled later.
-    p.add_argument("--spectral-space", default=os.environ.get("SPECTRAL_SPACE", "hidden"))
-    p.add_argument("--rep-hook-name", default=os.environ.get("REP_HOOK_NAME", "ln_final.hook_normalized"))
-    p.add_argument("--rep-pooling", default=os.environ.get("REP_POOLING", "mean"))
-    p.add_argument("--spectral-dim", type=int, default=_env_int("SPECTRAL_DIM", 16))
-    p.add_argument("--spectral-embedding-batch-size", type=int, default=_env_int("SPECTRAL_EMBEDDING_BATCH_SIZE", 32))
-    p.add_argument("--spectral-max-seq-len", type=int, default=(int(os.environ["SPECTRAL_MAX_SEQ_LEN"]) if os.environ.get("SPECTRAL_MAX_SEQ_LEN") else None))
 
     p.add_argument("--force", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -290,9 +280,6 @@ def main() -> None:
         points_to_use = int(args.points_to_use_for_mean_ablation)
         if "donor" in spec.intervention and points_to_use < 2048:
             points_to_use = 2048
-        circuit_bag_label = f"{spec.circuit_label()}-{spec.bag_label()}"
-        spectral_cache = PROJECT_ROOT / "cache" / spec.task / "threshold_events" / circuit_bag_label
-
         cmd = [
             str(args.python_bin), "-m", "studies.overtopping.analysis.threshold_event_diagnostics",
             "--input_data_dir", str(spec.input_data_dir(data_root)),
@@ -309,22 +296,13 @@ def main() -> None:
             "--batch_size", str(batch_size),
             "--spiking_max_points", str(args.spiking_max_points),
             "--spiking_min_points", str(args.spiking_min_points),
-            "--spiking_global_n_clusters", str(args.global_n_clusters),
             "--threshold_event_min_examples", str(args.threshold_event_min_examples),
             "--threshold_event_repeats", str(args.threshold_event_repeats),
             "--threshold_event_holdout_fraction", str(args.threshold_event_holdout_fraction),
             "--threshold_event_n_bins", str(args.threshold_event_n_bins),
             "--target", str(args.target),
             "--seed", str(args.seed),
-            "--spectral_cache_dir", str(spectral_cache),
-            "--spectral_space", str(args.spectral_space),
-            "--rep_hook_name", str(args.rep_hook_name),
-            "--rep_pooling", str(args.rep_pooling),
-            "--spectral_dim", str(args.spectral_dim),
-            "--spectral_embedding_batch_size", str(args.spectral_embedding_batch_size),
         ]
-        if args.spectral_max_seq_len is not None:
-            cmd.extend(["--max_seq_len", str(args.spectral_max_seq_len)])
         if spec.decode_only:
             cmd.append("--decode_only")
         if args.ai_model_cache_dir:
@@ -336,7 +314,6 @@ def main() -> None:
         print(f"  RunSpec:     intervention={spec.intervention} decode_only={spec.decode_only} batch_size={batch_size}")
         print(f"  candidates:  {candidate_stats}")
         print(f"  output:      {out_dir}")
-        print(f"  cache:       {spectral_cache}")
         print("  command:     " + " ".join(cmd), flush=True)
         n_planned += 1
         if not args.dry_run:

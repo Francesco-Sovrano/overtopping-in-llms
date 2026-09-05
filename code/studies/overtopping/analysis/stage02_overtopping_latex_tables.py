@@ -186,8 +186,6 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
         n_eval = int(glob.get("n_evaluated_rows", 0))
         j = int(glob.get("n_neurons", len(by)))
         u = float(glob.get("union_flip_any_unique_rate", 0.0))
-        c2i = float(glob.get("union_c2i_unique_rate", 0.0))
-        i2c = float(glob.get("union_i2c_unique_rate", 0.0))
 
         singleton_path = stats_dir / "singleton_set_metrics.json"
         if not singleton_path.exists():

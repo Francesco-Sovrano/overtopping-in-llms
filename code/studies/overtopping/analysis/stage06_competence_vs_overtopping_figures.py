@@ -909,45 +909,7 @@ def annotate_fit_stats(ax, points: list[PlotPoint], args: argparse.Namespace) ->
         return
 
     fig = ax.figure
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    axbb = ax.get_window_extent(renderer)
-    safe_axbb = Bbox.from_extents(axbb.x0 + 2.0, axbb.y0 + 2.0, axbb.x1 - 2.0, axbb.y1 - 2.0)
-    marker_obstacles = _marker_obstacles(ax, points, args, extra_px=3.0)
-    line_obstacles = _trend_line_obstacles(ax, renderer, pad_px=2.5, step_px=5.0)
-
     bbox_kwargs = dict(boxstyle="round,pad=0.18", facecolor="white", edgecolor="0.80", linewidth=0.42, alpha=0.88)
-
-    def _candidate_score(bb: Bbox, x_ax: float, y_ax: float) -> tuple[bool, float]:
-        outside = _bbox_outside_distance(bb, safe_axbb)
-        if outside > 0.0:
-            return False, float("inf")
-
-        marker_overlap = 0.0
-        for ob in marker_obstacles:
-            marker_overlap += _bbox_overlap_area(bb, ob)
-        if marker_overlap > 0.0:
-            return False, float("inf")
-
-        line_overlap = 0.0
-        for ob in line_obstacles:
-            line_overlap += 0.35 * _bbox_overlap_area(bb, ob)
-
-        top_bias = 0.0 if y_ax >= 0.5 else 18.0
-        edge_bias = 0.0 if (x_ax <= 0.08 or x_ax >= 0.92) else 3.0
-        center_penalty = 6.0 * abs(x_ax - 0.5)
-        score = line_overlap + top_bias + edge_bias + center_penalty
-        return True, score
-
-    def _trial_bbox(x: float, y: float, ha: str, va: str, fontsize: float) -> Bbox:
-        trial = ax.text(
-            x, y, text, transform=ax.transAxes, ha=ha, va=va,
-            fontsize=fontsize, linespacing=1.05,
-            bbox=bbox_kwargs, zorder=6,
-        )
-        bb = _text_artist_obstacle_bbox(trial, renderer, 3.0)
-        trial.remove()
-        return bb
 
     # Deterministic placement for the OLS statistics box.
     # The current figure has clear unused space in the upper-left panel.
@@ -3227,7 +3189,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fig-height", type=float, default=None, help="Override figure height in inches.")
     parser.add_argument("--legend-position", choices=["bottom", "inside", "right", "none"], default="bottom", help="Legend placement. Bottom is the compact paper default.")
     parser.add_argument("--legend-cols", type=int, default=None, help="Override number of legend columns.")
-    parser.add_argument("--long-labels", action="store_true", help="Use the longer axis labels from the original script.")
     parser.add_argument("--long-legend-labels", action="store_true", help="Use full phase/baseline names in the legend.")
     parser.add_argument("--tick-step", type=float, default=0.3, help="Tick spacing. Default 0.3 for the recommended compact paper figure.")
     parser.add_argument("--tasks", default="any", help="Comma-separated task names, or any.")

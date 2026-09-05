@@ -597,5 +597,4 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
 		
 	graph.scores[:] =  scores.to(graph.scores.device)
 
-	# graph.aggregate_edge_scores_to_nodes()
 

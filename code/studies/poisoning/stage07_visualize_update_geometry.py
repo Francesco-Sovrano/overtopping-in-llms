@@ -548,7 +548,7 @@ def _plot_channel_geometry(frame: pd.DataFrame, output: Path) -> None:
     if frame.empty:
         return
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.4))
-    scatter = axes[0].scatter(
+    axes[0].scatter(
         frame["poison_orthogonal_fraction_to_clean"],
         frame["max_abs_disruption_score"],
         s=28,
@@ -596,7 +596,7 @@ def _plot_candidate_vs_controls(candidate: pd.DataFrame, controls: pd.DataFrame,
     if all(frame.empty for _, _, frame in summaries):
         return
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.4))
-    for ax, (metric, label, frame) in zip(axes, summaries):
+    for ax, (_, label, frame) in zip(axes, summaries):
         if frame.empty:
             ax.axis("off")
             continue

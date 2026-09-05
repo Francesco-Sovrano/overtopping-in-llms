@@ -978,7 +978,7 @@ Stage-7 aggregate reporting estimates candidate/control causal strength and thre
 
 def main():
     args=parse_args(); out=Path(args.out).resolve(); out.mkdir(parents=True, exist_ok=True)
-    source_kind="zip" if args.zip else "root"; source_path=Path(args.zip or args.root).resolve(); base_md=Path(args.base_md).resolve() if args.base_md else None
+    base_md=Path(args.base_md).resolve() if args.base_md else None
     fs_all, ut_all, b_primary = load_exact_rq3_population(args, out)
     if fs_all.empty: raise RuntimeError("No aggregate_flip_stats.csv found")
     fs=fs_all[fs_all.population.isin([POP_CAND,POP_CTRL])].copy()

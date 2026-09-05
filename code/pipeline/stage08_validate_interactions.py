@@ -331,7 +331,6 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     global_path = stats_dir / "flip_stats_global.json"
 
-    dataset_info_path = input_data_dir / "dataset_info.json"
     dataset_info = load_dataset_info(input_data_dir)
     task = resolve_task_spec(args.task_module)
     prompt_col = dataset_info.get("prompt_col") or task.DEFAULT_INPUT

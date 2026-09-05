@@ -199,7 +199,6 @@ def _plot_poison_detection(input_dir: Path, output_dir: Path) -> None:
         figsize=(4.0 * len(specs), 3.2 * len(families) + 0.8),
         squeeze=False,
     )
-    legend_handles = legend_labels = None
     all_end = pd.to_numeric(df.get("end_fraction"), errors="coerce").dropna().tolist()
     for r, (task, model) in enumerate(families):
         fam = df[(df["task"].astype(str) == task) & (df["model_name"].astype(str) == model)]

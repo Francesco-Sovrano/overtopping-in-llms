@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _load(root: Path, args: argparse.Namespace, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _load(root: Path, args: argparse.Namespace, out: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     args.data_root = str(Path(args.data_root or root).expanduser().resolve())
     expected = expected_rq3_sources(args)
     units = []
@@ -87,7 +87,7 @@ def _load(root: Path, args: argparse.Namespace, out: Path) -> tuple[pd.DataFrame
     audit_df.to_csv(out / "graded_agonist_population_audit.csv", index=False)
     unit_df = pd.concat(units, ignore_index=True) if units else pd.DataFrame()
     dose_df = pd.concat(doses, ignore_index=True) if doses else pd.DataFrame()
-    return unit_df, dose_df, audit_df
+    return unit_df, dose_df
 
 
 def _condition_summary(unit_df: pd.DataFrame) -> pd.DataFrame:
@@ -208,7 +208,7 @@ def main() -> None:
     root = Path(args.root).expanduser().resolve()
     out = Path(args.out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
-    unit_df, dose_df, audit = _load(root, args, out)
+    unit_df, dose_df = _load(root, args, out)
     unit_df.to_csv(out / "graded_agonist_all_units.csv", index=False)
     condition = _condition_summary(unit_df)
     condition.to_csv(out / "graded_agonist_by_condition.csv", index=False)
