@@ -440,33 +440,6 @@ def _batch_outputs_for_range(
     return complete, sources
 
 
-def has_complete_group_batch_cache(
-    *,
-    cache_dir: Path,
-    groups: Sequence[GroupSpec],
-    n_examples: int,
-    batch_size: int,
-    cache_context: Mapping,
-) -> bool:
-    """Return whether all requested groups have compatible cached row coverage."""
-    required_keys = {group.key for group in groups if group.size > 0}
-    if not required_keys:
-        return True
-    cache_dir = Path(cache_dir)
-    if not cache_dir.exists():
-        return False
-    for start in range(0, int(n_examples), int(batch_size)):
-        end = min(start + int(batch_size), int(n_examples))
-        outputs, _ = _batch_outputs_for_range(
-            cache_dir,
-            start=start,
-            end=end,
-            expected_context=cache_context,
-        )
-        if not required_keys.issubset(outputs):
-            return False
-    return True
-
 
 def load_complete_group_batch_cache(
     *,
@@ -525,30 +498,6 @@ def _write_batch_cache(
                 pass
 
 
-
-def persist_complete_group_batch_cache(
-    *,
-    cache_dir: Path,
-    outputs: Mapping[str, np.ndarray],
-    n_examples: int,
-    batch_size: int,
-    cache_context: Mapping,
-) -> None:
-    """Persist already validated complete outputs in the current cache format."""
-    cache_dir = Path(cache_dir)
-    for start in range(0, int(n_examples), int(batch_size)):
-        end = min(start + int(batch_size), int(n_examples))
-        batch_outputs = {
-            str(key): np.asarray(value, dtype=bool)[start:end]
-            for key, value in outputs.items()
-        }
-        _write_batch_cache(
-            _batch_cache_path(cache_dir, start, end),
-            start=start,
-            end=end,
-            outputs=batch_outputs,
-            context=cache_context,
-        )
 
 def evaluate_groups(
     *,

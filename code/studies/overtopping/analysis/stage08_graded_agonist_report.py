@@ -14,18 +14,18 @@ import numpy as np
 import pandas as pd
 
 from core.project_paths import PROJECT_ROOT
-from studies.overtopping.analysis.stage07_overtopping_spiking_report import expected_rq3_sources
+from studies.overtopping.analysis.rq3_population import expected_rq3_sources
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", default=str(PROJECT_ROOT / "data"))
-    p.add_argument("--out", default=str(PROJECT_ROOT / "results/analysis/rq3_threshold_event/graded_agonist"))
+    p.add_argument("--out", default=str(PROJECT_ROOT / "results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist"))
     p.add_argument("--paper-figures-dir", default=None)
     p.add_argument("--primary-table", required=True)
     p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary+supplementary")
     p.add_argument("--evaluation-split", choices=["test", "train", "all"], default="test")
-    p.add_argument("--spiking-max-points", type=int, default=10000)
+    p.add_argument("--sampling-max-points", type=int, default=10000)
     p.add_argument("--data-root", default=None)
     return p.parse_args()
 
@@ -219,8 +219,16 @@ def main() -> None:
     _plot_crossing(condition, out / "graded_agonist_single_crossing.pdf")
     if args.paper_figures_dir:
         paper = Path(args.paper_figures_dir).expanduser().resolve()
-        _plot_dose(cond_dose, paper / "fig4d_graded_agonist_dose_response.pdf")
-        _plot_crossing(condition, paper / "fig4s6_graded_agonist_single_crossing.pdf")
+        paper.mkdir(parents=True, exist_ok=True)
+        # Remove Figure-4 names that are outside the current manuscript contract.
+        for stale in [
+            "fig4c_preemption.pdf",
+            "fig4d_graded_agonist_dose_response.pdf",
+            "fig4s6_graded_agonist_single_crossing.pdf",
+        ]:
+            (paper / stale).unlink(missing_ok=True)
+        _plot_dose(cond_dose, paper / "fig4c_graded_agonist_dose_response.pdf")
+        _plot_crossing(condition, paper / "fig4s5_graded_agonist_single_crossing.pdf")
 
     known = condition.loc[condition.get("support_kind", pd.Series(dtype=str)).astype(str) == "known_flip"] if not condition.empty else pd.DataFrame()
     rates = pd.to_numeric(known.get("median_single_crossing_rate"), errors="coerce").dropna().to_numpy(float) if not known.empty else np.asarray([])

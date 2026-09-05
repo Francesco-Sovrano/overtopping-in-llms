@@ -209,7 +209,7 @@ def _build_command(
         str(setting["task_module"]),
         "--ai_model",
         str(setting["model_id"]),
-        "--rules_dir",
+        "--output_dir",
         str(target_stats.parents[1]),
         "--features_scores_dir",
         str(setting["model_root"] / "feature_report"),

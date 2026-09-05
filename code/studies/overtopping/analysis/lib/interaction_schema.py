@@ -1,10 +1,7 @@
-"""Canonical interaction-validation schema compatibility helpers.
+"""Interaction-validation schema identifiers and validation helpers.
 
-The v2 format extends v1 with direction-aware preemption metadata but preserves
-the exact simultaneous-set E(J), matched-null, and conditional-marginal fields
-used by the manuscript analysis.  Readers that consume those shared metrics
-therefore accept both schemas, while producers emit only the canonical v2
-schema.
+Schema identifier strings are opaque artifact identities. Active v2 fields cover
+simultaneous-set, matched-null, and conditional-marginal-contribution validation.
 """
 from __future__ import annotations
 

@@ -1,17 +1,29 @@
 # Reporting and generated results
 
-The reporting layer converts completed experiment artifacts under `data/` into validated analysis tables, statistical summaries, audits, and manuscript-facing figures under `results/`.
+The reporting layer converts persistent experiment artifacts under `data/` into validated analysis tables, population audits, statistical summaries, and manuscript-facing outputs under `results/`.
 
-Run the standard reporting pipeline from the repository root:
+Standard repository command:
 
 ```bash
 ./generate_results.sh
 ```
 
-Use the following documents according to purpose:
+Direct invocation from `code/`:
 
-- [Analysis pipeline](analysis-pipeline.md) — reporting stages, declared analysis populations, schemas, and result tree.
-- [Manuscript figure map](figures.md) — figure filenames, scientific populations, and source analyses.
-- [Interpretation and limitations](interpretation.md) — what each metric supports and what it does not establish.
+```bash
+python -m reporting.generate_final_results \
+  --data-root ../data \
+  --results-root ../results \
+  --primary-profile iclr-28
+```
 
-Research-question methods are documented separately under [Research questions](../research-questions/). Regeneration and recovery procedures are in [Operations](../operations/).
+The reporting driver does not rerun missing model-backed experiments. It aggregates compatible persistent outputs, records availability, and validates the configured manuscript contract.
+
+Use:
+
+- [Analysis pipeline](analysis-pipeline.md) for modules, populations, inputs, and result-tree structure;
+- [Figure map](figures.md) for manuscript filenames and source analyses;
+- [Interpretation](interpretation.md) for metric scope and statistical units;
+- [Operations](../operations/README.md) for targeted regeneration and troubleshooting.
+
+Research-question methods are documented under [Research questions](../research-questions/README.md).

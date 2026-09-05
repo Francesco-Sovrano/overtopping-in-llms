@@ -47,10 +47,8 @@ from core.neuron_intervention import (
 	get_adjusted_search_epsilon,
 	get_alpha_node,
 )
-from core.threshold_event_shared import (
-	_next_token_id_for_completion,
+from core.activation_diagnostics import (
 	activation_hook_spec,
-	completion_text_from_row_for_saliency,
 	collect_reference_activations,
 	collect_reference_margin_tensors,
 )
@@ -859,100 +857,9 @@ def _bucket_counts(buckets):
 
 
 
-def _arithmetic_margin_from_last_logits(task, prompt_batch, logits_last, tokenizer, prompt_col):
-	if logits_last.ndim != 2:
-		return None
-	target_ids = []
-	for row in prompt_batch:
-		prompt_text = str(row.get(prompt_col, row.get(getattr(task, "DEFAULT_INPUT", "prompt"), "")))
-		few_shot_sep = ';' if ';' in prompt_text else (',' if ',' in prompt_text else None)
-		prompt_eval = prompt_text[prompt_text.rfind(few_shot_sep) + 1:] if few_shot_sep is not None else prompt_text
-		try:
-			correct_answer = str(eval(prompt_eval.replace('=', '')))
-		except Exception:
-			target_ids.append(-1)
-			continue
-		target_ids.append(_next_token_id_for_completion(tokenizer, prompt_text, correct_answer) or -1)
-	target_ids = torch.tensor(target_ids, device=logits_last.device, dtype=torch.long)
-	valid = target_ids >= 0
-	if not bool(valid.any()):
-		return None
-	safe_ids = target_ids.clamp_min(0)
-	target_logits = logits_last.gather(1, safe_ids.unsqueeze(1)).squeeze(1)
-	masked = logits_last.clone()
-	masked[torch.arange(masked.size(0), device=masked.device), safe_ids] = float('-inf')
-	other_logits = masked.max(dim=1).values
-	margin = target_logits - other_logits
-	return torch.where(valid, margin, torch.zeros_like(margin))
-
-
-def _safe_task_margin_from_last_logits(task, prompt_batch, logits_last, tokenizer, prompt_col):
-	margin_fn = getattr(task, "margin_from_last_logits", None)
-	if callable(margin_fn):
-		margin = margin_fn(prompt_batch, logits_last, tokenizer)
-		if margin is None:
-			return None
-		if not torch.is_tensor(margin):
-			margin = torch.as_tensor(margin, device=logits_last.device, dtype=logits_last.dtype)
-		margin = margin.reshape(-1).to(device=logits_last.device, dtype=logits_last.dtype)
-		if margin.numel() != logits_last.shape[0]:
-			raise ValueError(f"task.margin_from_last_logits returned {margin.numel()} values for batch size {logits_last.shape[0]}")
-		return torch.nan_to_num(margin, nan=0.0, posinf=0.0, neginf=0.0)
-	cls_name = getattr(task.__class__, "__name__", "").lower()
-	module_name = getattr(task.__class__, "__module__", "").lower()
-	if "arithmetic" in cls_name or "arithmetic" in module_name:
-		return _arithmetic_margin_from_last_logits(task, prompt_batch, logits_last, tokenizer, prompt_col)
-	return None
 
 
 
-SALIENCY_COMPLETION_KEYS = (
-	"answer", "answers", "completion", "target_text", "correct_answer",
-	"output", "outputs", "label_text", "gold", "gold_answer",
-)
-
-
-def _saliency_objective_from_last_logits(task, prompt_batch, logits_last, tokenizer, prompt_col):
-	"""Return a differentiable scalar-per-example objective for saliency.
-
-	Priority:
-	1. true task margin, if the task exposes one;
-	2. logit of a cached textual completion/answer column, if we can infer it;
-	3. model top next-token logit, with the argmax detached.
-
-	The fallback objectives are not causal task margins, but they let Wanda/grad
-	diagnostics run for older/non-margin tasks instead of silently skipping.
-	"""
-	margin = _safe_task_margin_from_last_logits(task, prompt_batch, logits_last, tokenizer, prompt_col)
-	if margin is not None:
-		return margin, "task_margin"
-
-	device = logits_last.device
-	batch_size = int(logits_last.shape[0])
-	top_ids = logits_last.detach().argmax(dim=1).to(device=device, dtype=torch.long)
-	target_ids = []
-	used_cached = []
-	for i, row in enumerate(prompt_batch):
-		prompt_text = str(row.get(prompt_col, row.get(getattr(task, "DEFAULT_INPUT", "prompt"), "")))
-		completion_text = completion_text_from_row_for_saliency(task, row, prompt_col, candidate_keys=SALIENCY_COMPLETION_KEYS)
-		tok_id = None
-		if completion_text is not None:
-			tok_id = _next_token_id_for_completion(tokenizer, prompt_text, str(completion_text))
-		if tok_id is None:
-			tok_id = int(top_ids[i].item())
-			used_cached.append(False)
-		else:
-			used_cached.append(True)
-		target_ids.append(int(tok_id))
-
-	ids = torch.tensor(target_ids, device=device, dtype=torch.long).clamp(0, logits_last.shape[1] - 1)
-	objective = logits_last.gather(1, ids.unsqueeze(1)).squeeze(1)
-	objective = torch.nan_to_num(objective.reshape(batch_size), nan=0.0, posinf=0.0, neginf=0.0)
-	if any(used_cached):
-		name = "cached_completion_logit" if all(used_cached) else "cached_completion_logit+top_logit"
-	else:
-		name = "top_next_token_logit"
-	return objective, name
 
 def _intervention_baseline_values_for_unit(agonist, positions, intervention, mean_activations):
 	positions = positions.to(torch.long).cpu()

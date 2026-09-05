@@ -1,23 +1,23 @@
 # Operations and troubleshooting
 
-For method definitions, see [Research questions](../research-questions/) and [Methods](../methods/). This document covers execution failures, incomplete artifacts, and targeted regeneration.
+This document covers targeted regeneration, incomplete outputs, and cache handling. Scientific definitions are documented under [Methods](../methods/README.md) and [Research questions](../research-questions/README.md).
 
 ## Inspect commands before execution
 
-```bash
-./run_overtopping_experiments.sh --dry-run
-./run_poisoning_experiments.sh --dry-run
-```
-
-Use `--list` for the overtopping catalogue:
+Overtopping catalogue:
 
 ```bash
 ./run_overtopping_experiments.sh --list
+./run_overtopping_experiments.sh --dry-run
 ```
 
-## Import errors
+Poisoning configuration:
 
-Run Python modules from `code/`:
+```bash
+./run_poisoning_experiments.sh --dry-run
+```
+
+For direct module execution, run from `code/`:
 
 ```bash
 cd code
@@ -30,291 +30,258 @@ or export:
 export PYTHONPATH="$PWD/code${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-Use the repository virtual environment created by `setup.sh`.
+## Regenerate reporting without rerunning experiments
 
-## RQ1 reports fewer than 39 settings
-
-Figure 2 is defined by the exact 28 primary + 11 auxiliary catalogue. The expected phase split is:
-
-```text
-17 input+output
-22 decode-only
-```
-
-The analysis resolves each expected statistics directory from `RunSpec`. Decode-only and input+output runs use distinct directory names; decode-only statistics paths contain `-decode_only-`.
-
-A missing required path indicates an incomplete catalogue setting. A completed zero-candidate setting is represented according to its persisted pipeline status/artifact contract rather than inferred from an unrelated directory.
-
-## Required directional metrics are missing
-
-Directional manuscript metrics are computed from Stage-7 singleton intervention materializations. If `scores.csv` already contains the required intervention columns, use the statistics-rebuild utilities rather than rerunning model interventions.
-
-`generate_results.sh` validates metrics; it does not create missing model-backed causal data.
-
-## RQ3 population audit fails
-
-RQ3 uses an explicit manifest:
-
-- every primary run is required;
-- auxiliary runs are included only when their exact diagnostic artifacts are complete;
-- poisoning is excluded.
-
-Inspect:
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/population_audit.csv
-results/analysis/rq3_threshold_event/spiking_diagnostics/population_coverage.json
-results/analysis/rq3_threshold_event/spiking_diagnostics/threshold_shape_validation/threshold_shape_population_audit.csv
-results/analysis/rq3_threshold_event/spiking_diagnostics/threshold_shape_validation/threshold_shape_population_coverage.csv
-```
-
-## RQ3 direction audit fails
-
-Candidate rows must satisfy:
-
-```text
-positive baseline -> rq3_direction=1to0
-negative baseline -> rq3_direction=0to1
-candidate_direction_policy=discovery_baseline_only
-```
-
-The experiment-level threshold schema is:
-
-```text
-threshold-event-v4-discovery-direction-aware
-```
-
-The nested threshold-shape schema is:
-
-```text
-graded-agonist-intervention-v1
-```
-
-Rebuild experiment-level RQ3 diagnostics when per-baseline files do not contain the required discovery-direction fields.
-
-## Regenerate only the model-free RQ3 threshold-shape analysis
-
-Use this when experiment-level `spiking_diagnostics-*` products already have the correct directional schema and only the aggregate Stage-8 statistics or Figure-4 presentation need to be recomputed.
-
-From the repository root:
-
-```bash
-rm -rf results/analysis/rq3_threshold_event/spiking_diagnostics/threshold_shape_validation
-rm -rf results/paper/figures/04_rq3_spiking_cut
-```
-
-Then run:
+If persistent experiment data under `data/` are complete, manuscript analyses can be regenerated with:
 
 ```bash
 ./generate_results.sh
 ```
 
-No high-N model cache needs to be deleted for this case.
-
-## Regenerate RQ3 experiment-level directional diagnostics
-
-Use this when the per-baseline diagnostic products were generated without the required discovery-direction contract, when the candidate/control population definition changed, or when the experiment-level threshold method changed.
-
-Delete the aggregate RQ3 reporting products:
+or from `code/`:
 
 ```bash
-rm -rf results/analysis/rq3_threshold_event/spiking_diagnostics
-rm -rf results/paper/figures/04_rq3_spiking_cut
+python -m reporting.generate_final_results \
+  --data-root ../data \
+  --results-root ../results \
+  --primary-profile iclr-28
 ```
 
-Delete only the per-baseline derived threshold files while preserving high-N model caches:
+This uses existing experiment artifacts and does not require deletion of valid model-backed caches.
 
-```bash
-find data -type d -name 'spiking_diagnostics-*' -print0 |
-while IFS= read -r -d '' d; do
-  for baseline in positive_baseline negative_baseline; do
-    b="$d/$baseline"
-    [ -d "$b" ] || continue
-    rm -f \
-      "$b/threshold_spiking_experiment.json" \
-      "$b/threshold_event_results_summary.json" \
-      "$b/selected_units_from_rules.csv" \
-      "$b/same_layer_nonagonist_control_pool.csv" \
-      "$b/same_layer_nonagonist_control_selection.csv" \
-      "$b/rule_conditioned_sampling_plan.csv" \
-      "$b/high_n_scores_with_flips.csv" \
-      "$b/high_n_flip_stats_by_unit.csv" \
-      "$b/threshold_activation_flip_rows.csv.gz" \
-      "$b/threshold_unit_tests.csv" \
-      "$b/threshold_population_summary.csv" \
-      "$b/threshold_binned_flip_curves.csv" \
-      "$b/flip_conditioned_candidate_units.csv" \
-      "$b/flip_conditioned_flip_support.csv" \
-      "$b/flip_conditioned_threshold_unit_tests.csv" \
-      "$b/flip_conditioned_threshold_summary.csv" \
-      "$b/flip_conditioned_threshold_experiment.json"
-  done
+## Regenerate only RQ3 manuscript figures
 
-  for f in "$d"/aggregate_*.csv; do
-    [ -e "$f" ] && rm -f "$f"
-  done
-
-  rm -f \
-    "$d/threshold_spiking_experiment_aggregate.json" \
-    "$d/threshold_event_results_summary.json"
-  rm -rf "$d/figures"
-done
-```
-
-Preserve these experiment inputs and model caches:
+The Figure 4 paper directory is:
 
 ```text
-scores.csv
-frozen_candidate_ranking.csv
-flip_stats_by_neuron.csv
-high_n_eval_cache/
-ablation_cache/
-replacement_scores_cache/
+results/paper/figures/04_rq3_spiking_cut/
 ```
 
-Then rebuild the exact RQ3 diagnostic population from `code/`:
+From `code/`, run the threshold-event reporters against an aggregate diagnostics source:
+
+```bash
+python -m studies.overtopping.analysis.stage07_overtopping_spiking_report \
+  --root /path/to/threshold_diagnostics \
+  --out ../results/analysis/rq3_threshold_event/spiking_diagnostics \
+  --paper-figures-dir ../results/paper/figures/04_rq3_spiking_cut \
+  --primary-table ../results/paper/tables/primary_table.csv \
+  --data-root ../data \
+  --evaluation-split test \
+  --population-scope primary+supplementary
+
+python -m studies.overtopping.analysis.stage08_threshold_shape_validation \
+  --root /path/to/threshold_diagnostics \
+  --out ../results/analysis/rq3_threshold_event/spiking_diagnostics/threshold_shape_validation \
+  --paper-figures-dir ../results/paper/figures/04_rq3_spiking_cut \
+  --primary-table ../results/paper/tables/primary_table.csv \
+  --data-root ../data \
+  --evaluation-split test \
+  --population-scope primary+supplementary
+
+python -m studies.overtopping.analysis.stage08_graded_agonist_report \
+  --root ../data \
+  --out ../results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist \
+  --paper-figures-dir ../results/paper/figures/04_rq3_spiking_cut \
+  --primary-table ../results/paper/tables/primary_table.csv \
+  --population-scope primary+supplementary \
+  --evaluation-split test
+```
+
+The threshold source can also be supplied as a compatible zip using `--zip` in place of `--root` for the first two commands.
+
+### Required RQ3 threshold data
+
+Basic aggregate reporting requires:
+
+```text
+aggregate_flip_stats.csv
+aggregate_unit_tests.csv
+```
+
+Full threshold-shape reporting requires:
+
+```text
+aggregate_activation_flip_rows.csv
+```
+
+The oriented proxy-bin panel requires:
+
+```text
+aggregate_binned_curves.csv
+```
+
+### Required graded data
+
+For each expected run:
+
+```text
+<stage7 stats dir>/graded_agonist_intervention/
+├── graded_agonist_intervention.json
+├── graded_agonist_unit_summary.csv
+└── graded_agonist_dose_rows.csv.gz
+```
+
+The graded report resolves these directories from the RQ3 manifest.
+
+## RQ3 output status
+
+Combined threshold report status:
+
+```text
+results/analysis/rq3_threshold_event/spiking_diagnostics/report_status.json
+```
+
+Threshold-shape status:
+
+```text
+results/analysis/rq3_threshold_event/spiking_diagnostics/
+  threshold_shape_validation/threshold_shape_status.json
+```
+
+Graded report status and audit:
+
+```text
+results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/
+├── graded_agonist_report_status.json
+└── graded_agonist_population_audit.csv
+```
+
+## RQ3 graded experiment is missing
+
+The model-backed graded step requires these Stage-7 files:
+
+```text
+flip_stats_by_neuron.csv
+scores.csv
+frozen_candidate_ranking.csv
+```
+
+Per-run output directory:
+
+```text
+<stage7 stats dir>/graded_agonist_intervention/
+```
+
+To force recomputation through the overtopping launcher:
+
+```bash
+FORCE_GRADED_AGONIST_INTERVENTION=true \
+  ./run_overtopping_experiments.sh --suite paper-primary --evaluation-split test
+```
+
+Enable the same-agonist non-flip reference with:
+
+```bash
+GRADED_AGONIST_NEGATIVE_SUPPORT=true
+```
+
+## RQ3 threshold diagnostics are missing
+
+Threshold-event diagnostics are generated by:
+
+```text
+studies.overtopping.analysis.threshold_event_diagnostics
+```
+
+The normal pipeline enables them with:
+
+```text
+RUN_THRESHOLD_EVENT_POSTHOC=true
+```
+
+Force recomputation with:
+
+```text
+FORCE_THRESHOLD_EVENT_POSTHOC=true
+```
+
+Use model-backed recomputation only when the persistent aggregate threshold inputs are absent or do not match the required scientific configuration. To backfill threshold diagnostics for the configured RQ3 population while preserving the experiment catalogue settings:
 
 ```bash
 python -m studies.overtopping.analysis.rebuild_spiking_diagnostics \
   --primary-table ../results/analysis/primary_matrix/tables/primary_table.csv \
   --data-root ../data \
-  --population-scope primary+supplementary
+  --population-scope primary+supplementary \
+  --evaluation-split test
 ```
 
-The rebuild reconstructs discovery-direction provenance from Stage-6 candidate artifacts when the frozen Stage-7 tables do not already carry the required fields.
+This recovery command can load models and regenerate model-backed threshold diagnostics. It is not a reporting-only command.
 
-## Regenerate preemption products
+## RQ1 reports fewer than 39 settings
 
-Preemption products depend on directional candidate membership and the interaction threshold-event method.
-
-Delete only the preemption-specific files inside `interaction_validation/`:
-
-```bash
-find data -type d -name interaction_validation -print0 |
-while IFS= read -r -d '' d; do
-  rm -f \
-    "$d/preemption_pair_plan.csv" \
-    "$d/preemption_pair_summary.csv" \
-    "$d/preemption_example_masks.csv.gz" \
-    "$d/preemption_summary.json"
-done
-```
-
-Preserve:
+Figure 2 uses the exact catalogue:
 
 ```text
-group_eval_cache/
-matched_null_draws.csv
-matched_random_set_membership.csv
-conditional_marginal_draws.csv
-conditional_marginal_summary.csv
+28 paper-primary
+11 paper-auxiliary
+17 input+output
+22 decode-only
 ```
 
-Rerun the overtopping pipeline on the test split so Stage 08 recreates the preemption products:
+The analysis resolves expected paths from `RunSpec`. A missing required experiment path is incomplete data; a completed zero-candidate setting remains an explicit catalogue observation.
+
+## Required directional metrics are missing
+
+Directional manuscript metrics are derived from Stage-7 singleton materializations. If `scores.csv` already contains the required intervention columns, rebuild the derived statistics without rerunning model interventions:
 
 ```bash
-./run_overtopping_experiments.sh --suite all --evaluation-split test
+python -m studies.overtopping.analysis.rebuild_directional_stats \
+  --primary_table ../results/analysis/primary_matrix/tables/primary_table.csv \
+  --data_root ../data \
+  --population both \
+  --evaluation_split test
 ```
 
-Then regenerate reporting:
+Reporting validates required metrics but does not create missing model-backed causal outcomes.
 
-```bash
-./generate_results.sh
-```
+## Interaction validation is missing
 
-## RQ3 diagnostics collide across point caps
-
-A non-default `spiking_max_points` value is encoded in the diagnostics path, for example `-cap512`. Distinct point caps should not write into the same derived directory.
-
-## Preemption values have unexpected sign
-
-Check the interaction schema and threshold metadata. The required interaction schema is:
+RQ2 simultaneous-set and optional CMC quantities are produced by:
 
 ```text
-conditional-marginal-validation-v2-direction-aware-preemption
+pipeline.stage08_validate_interactions
 ```
 
-Signed training MCC determines whether the fitted threshold predicate is inverted before event-present and event-absent subsets are evaluated.
-
-The preemption analysis remains sensitive to dominant/secondary pair selection because pair identity is selected from singleton statistics on the interaction population.
-
-## Legacy RQ3 scalar diagnostics
-
-Threshold fitting requires enough flip and non-flip examples. Low-effect controls can therefore have valid causal-strength estimates but no threshold result.
-
-Interpret these outputs separately:
+Default controls:
 
 ```text
-threshold-testable fraction       population-level feasibility
-graded agonist dose response      primary RQ3 causal crossing experiment
-same-agonist negative support      optional within-agonist reference
+RUN_INTERACTION_VALIDATION=true
+RUN_CMC=true
 ```
 
-Legacy threshold/TECS diagnostics may still contain sparse control support. They are no longer manuscript-facing RQ3 endpoints; use the graded agonist experiment for the primary spiking analysis.
+Interaction evaluation has its own multi-channel cache. Missing derived interaction summaries do not imply that Stage-7 singleton caches must be deleted.
 
-## Poisoning normal-task scan is unexpectedly large
+## Cache policy
 
-The normal-task cap is:
+Treat artifact classes separately:
 
-```bash
-printf '%s\n' "${NORMAL_TASK_SCAN_MAX_ROWS:-unset}"
-```
+### Persistent scientific outputs
 
-`NORMAL_TASK_SCAN_MAX_ROWS=0` requests exhaustive evaluation. This cap is independent of trigger-lift and Stage-7 caps.
+Under `data/`. Preserve these unless the scientific computation itself must be rerun.
 
-## Poisoning normal-task population mismatch
+### Reusable caches
 
-Normal-task cache metadata include row identity, sampling strategy, stratification, cap, seed, and population size. Clean and poisoned comparisons require matching population definitions.
+Under `cache/` or experiment-local cache directories. Preserve them when model state, population identity, intervention semantics, and cache schema match the requested computation.
 
-Regenerate both endpoint populations when these metadata differ.
+### Derived reports
 
-## Trigger behavior exists but trigger-specific CHA is absent
+Under `results/`. These can be regenerated from compatible persistent inputs.
 
-Check:
-
-```text
-RUN_TRIGGER_LIFT_CHA
-```
-
-When it is `0`, trigger/control behavior can still be measured while trigger-specific causal discovery is omitted.
-
-## Attack-cohort control-correctness CHA is missing
-
-Inspect the checkpoint's `attack_cohort_control_correctness/` status metadata. The configured low-data policy can skip causal discovery when the required source-state population is unavailable.
-
-## Arithmetic correctness mismatches
-
-Arithmetic model generations are textual data. Load fields such as `prompt_control`, `raw_output_control`, and `original_prompt` as strings. Numeric-looking completions must not be silently converted to floating-point values before task correctness is recomputed.
-
-## Fixed candidate materialization is missing in poisoning Stage 07
-
-Longitudinal fixed-union analysis requires explicit evaluation of the frozen control-correctness candidate set at each relevant checkpoint. A missing fixed candidate measurement is not equivalent to zero effect.
-
-Rerun the checkpoint causal workflow for the affected run/checkpoint/condition.
-
-## Poisoning aggregation rejects a run family
-
-Cross-seed aggregation retains scientific configuration. Runs with different poison rates, marker definitions, targets, training schedules, or other required configuration fields are not combined into one trajectory.
-
-Aggregate one compatible scientific configuration at a time.
-
-## Poison-detection metrics are empty
-
-Inspect `07_poisoning_example_detection/` status and interval tables. Empty detector metrics can result from no channels meeting the causal-disruption selection criteria or missing prerequisite materializations.
+Deleting `results/paper/figures/` does not require deleting `data/` or `cache/`.
 
 ## Accelerator memory pressure
 
-Reduce execution batch size while leaving the scientific row population unchanged:
+Reduce execution batch size while leaving the scientific population unchanged. For example:
 
 ```bash
 PIPELINE_BATCH_SIZE=8 ./run_poisoning_experiments.sh
 ```
 
-High-N RQ3 evaluation, WANDA scoring, fixed-union evaluation, and group interventions have separate batch controls. Change batch size rather than population caps when the goal is only to reduce memory use.
+High-N threshold evaluation, graded interventions, group interventions, WANDA scoring, and fixed-union evaluation have separate batch controls. Change batch size rather than population caps when only memory use must be reduced.
 
-## API authentication failures
+## Provider authentication
 
-Check credential presence without printing values:
+Check whether credentials are set without printing values:
 
 ```bash
 python - <<'PY'
@@ -332,4 +299,44 @@ set -a
 set +a
 ```
 
-If Hugging Face cannot find a model that should be downloaded, check `HF_HUB_OFFLINE`. Use `HF_HUB_OFFLINE=0` only for the command that intentionally fetches model files.
+If Hugging Face cannot resolve a model that must be downloaded, inspect `HF_HUB_OFFLINE`. Enable network access only for the command intended to fetch model files.
+
+## Poisoning normal-task population mismatch
+
+Normal-task cache metadata include row identity, sampling strategy, stratification, cap, seed, and population size. Clean and poisoned comparisons require matching population definitions.
+
+Regenerate the affected endpoint population when these metadata differ.
+
+## Trigger behavior exists but trigger-specific causal discovery is absent
+
+Inspect:
+
+```text
+RUN_TRIGGER_LIFT_CHA
+```
+
+When disabled, trigger/control behavior can be measured without trigger-specific causal discovery.
+
+## Attack-cohort control-correctness causal discovery is missing
+
+Inspect the checkpoint's `attack_cohort_control_correctness/` status metadata. The configured low-data policy can skip causal discovery when the required source-state population is unavailable.
+
+## Arithmetic correctness mismatches
+
+Arithmetic generations are textual data. Load fields such as `prompt_control`, `raw_output_control`, and `original_prompt` as strings. Numeric-looking completions should not be converted to floating-point values before task correctness is recomputed.
+
+## Fixed candidate materialization is missing in poisoning
+
+Longitudinal fixed-union analysis requires explicit evaluation of the frozen candidate set at each relevant checkpoint. Missing materialization is not equivalent to zero effect.
+
+Rerun the checkpoint causal workflow for the affected run/checkpoint/condition.
+
+## Poisoning aggregation rejects a run family
+
+Cross-seed aggregation retains scientific configuration. Runs with different poison rates, marker definitions, targets, training schedules, or other required configuration fields are not combined into one trajectory.
+
+Aggregate one compatible scientific configuration at a time.
+
+## Poison-detection metrics are empty
+
+Inspect the `07_poisoning_example_detection/` status and interval tables. Empty metrics can result from absent prerequisite materializations or from no channels meeting the configured causal-disruption selection criteria.

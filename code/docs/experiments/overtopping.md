@@ -67,7 +67,7 @@ All auxiliary settings use `M=200000` and `tau=0.3` in the catalogue.
 
 - Primary matrix and RQ2: 28 primary settings.
 - RQ1 Figure 2: all 39 settings.
-- RQ3: all 28 primary settings plus auxiliary settings whose exact RQ3 diagnostics are complete.
+- RQ3: all 28 primary settings are required by the reporting manifest; auxiliary settings are supplementary. Threshold diagnostics are filtered to this manifest, and graded outputs contribute when the corresponding per-run artifacts are available.
 - Poisoning: separate configuration under `studies/poisoning/`.
 
 ## Inspect the catalogue

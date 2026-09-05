@@ -1,20 +1,20 @@
 # Getting started
 
-## Prerequisites
+## Requirements
 
-The repository targets Python 3.12. Model-backed experiments require local access to the analyzed model weights. Prompt generation and classification may use Ollama, Groq, or OpenAI depending on configuration.
+The repository targets Python 3.12. Model-backed experiments require access to the analyzed model weights. Feature proposal or classification steps may also require Ollama, Groq, or OpenAI, depending on the selected configuration.
 
-The top-level experiment launchers set `HF_HUB_OFFLINE=1` unless explicitly overridden, so model weights should normally be available locally before long runs begin.
+The repository launchers normally run Hugging Face in offline mode. Ensure required model weights are available locally before starting long model-backed runs, or explicitly enable online access for the command that downloads them.
 
-## Install the environment
+## Environment
 
-From the repository root:
+From the repository root, use the repository setup script when available:
 
 ```bash
 ./setup.sh
 ```
 
-Equivalent manual installation:
+A manual environment can be created with:
 
 ```bash
 python3.12 -m venv .env
@@ -24,11 +24,16 @@ python -m pip install -r requirements.txt
 python -m pip install -r code/studies/poisoning/requirements.txt
 ```
 
-Direct Python modules should be run from `code/` or with `code/` on `PYTHONPATH`.
+Run Python modules from `code/` or add `code/` to `PYTHONPATH`:
 
-## Configure provider credentials
+```bash
+cd code
+python -m studies.overtopping.experiments.run_experiments --dry-run
+```
 
-Create a local secrets file when a configured provider requires credentials:
+## Provider credentials
+
+Create `.secrets.env` in the repository root when the selected providers require credentials:
 
 ```bash
 cat > .secrets.env <<'EOF_SECRETS'
@@ -39,31 +44,29 @@ EOF_SECRETS
 chmod 600 .secrets.env
 ```
 
-Fill only the variables required by the selected providers.
-
-The top-level launchers source `.secrets.env` when it exists. Direct module invocations require the variables to be exported in the invoking shell. See [API keys and provider credentials](credentials.md).
+Set only the credentials required by the selected configuration. Direct Python invocations require the variables to be exported in the invoking shell. See [Credentials](credentials.md).
 
 ## Runtime roots
 
 ```text
 data/       persistent experiment outputs and provenance
-cache/      regenerable computation caches
-results/    generated analysis and manuscript products
+cache/      reusable computation caches
+results/    generated analyses, audits, tables, and figures
 code/       source packages and documentation
 ```
 
-Scientific populations are determined by catalogue entries, task manifests, persisted row identities, and analysis contracts. Cache contents do not define analysis membership.
+Persistent experiment artifacts under `data/` define scientific computations and populations. Caches accelerate those computations but do not define analysis membership.
 
 ## Inspect the overtopping catalogue
+
+From the repository root:
 
 ```bash
 ./run_overtopping_experiments.sh --list
 ./run_overtopping_experiments.sh --dry-run
 ```
 
-The repository-level launcher selects the union of the primary and auxiliary overtopping suites unless `--suite` is supplied. Its paper-facing evaluation split defaults to `test`.
-
-Useful direct filters from `code/` include:
+Direct invocation from `code/`:
 
 ```bash
 python -m studies.overtopping.experiments.run_experiments \
@@ -73,7 +76,7 @@ python -m studies.overtopping.experiments.run_experiments \
   --dry-run
 ```
 
-The Python runner supports filters for task, model, replacement intervention, intervention mode, execution phase, and evaluation split.
+The catalogue contains 28 `paper-primary` settings and 11 `paper-auxiliary` settings. The paper-facing overtopping evaluation split is `test`. See [Overtopping experiment catalogue](../experiments/overtopping.md).
 
 ## Run overtopping experiments
 
@@ -83,47 +86,141 @@ From the repository root:
 ./run_overtopping_experiments.sh
 ```
 
-The launcher writes `results/configured_experiments.json`, executes the selected pipeline runs, and requests the `iclr-28` manuscript profile when the evaluation split is `test`.
-
-Execution phases can be selected with the Python runner:
+The Python runner supports three execution phases:
 
 ```text
-pipeline    execute the causal pipeline
-analysis    analyze existing experiment outputs
+pipeline    execute model-backed pipeline stages
+analysis    analyze existing persistent experiment outputs
 all         execute both
 ```
 
-See [Overtopping experiment catalogue](../experiments/overtopping.md) and [Numbered causal pipeline](../methods/pipeline.md).
+The numbered pipeline is documented in [Pipeline](../methods/pipeline.md).
 
-## Build RQ3 threshold-event diagnostics
+### RQ3 model-backed stages
 
-RQ3 uses model-backed high-N candidate/control diagnostics in addition to ordinary Stage-7 singleton outputs. From `code/`:
+RQ3 uses two model-backed analyses after held-out singleton evaluation:
 
-```bash
-python -m studies.overtopping.analysis.rebuild_spiking_diagnostics \
-  --primary-table ../results/analysis/primary_matrix/tables/primary_table.csv \
-  --data-root ../data \
-  --population-scope primary+supplementary
+```text
+Stage 7b   graded agonist intervention
+Stage 7c   threshold-event diagnostics
 ```
 
-The command requires all primary RQ3 runs. Auxiliary runs enter the RQ3 analysis only when their exact diagnostic artifacts are complete. Candidate membership is restricted to the baseline subset in which each agonist was discovered.
+Both are enabled by default in `pipeline/run_pipeline.sh`:
 
-See [RQ3 threshold-event analysis](../research-questions/rq3-threshold-event.md).
+```text
+RUN_GRADED_AGONIST_INTERVENTION=true
+RUN_THRESHOLD_EVENT_POSTHOC=true
+```
 
-## Inspect and run poisoning experiments
+The graded step requires these files in the Stage-7 statistics directory:
+
+```text
+flip_stats_by_neuron.csv
+scores.csv
+frozen_candidate_ranking.csv
+```
+
+It writes:
+
+```text
+<stage7 stats dir>/graded_agonist_intervention/
+```
+
+Threshold-event diagnostics write per-baseline and aggregate candidate/control data, including:
+
+```text
+aggregate_flip_stats.csv
+aggregate_unit_tests.csv
+aggregate_binned_curves.csv
+aggregate_activation_flip_rows.csv
+```
+
+These aggregate files are the source for the threshold-shape reporting pipeline.
+
+## Generate final results
+
+From the repository root:
+
+```bash
+./generate_results.sh
+```
+
+Direct invocation from `code/`:
+
+```bash
+python -m reporting.generate_final_results \
+  --data-root ../data \
+  --results-root ../results \
+  --primary-profile iclr-28
+```
+
+The reporting driver:
+
+1. builds and audits the primary overtopping matrix;
+2. computes RQ1/RQ2 statistics and manuscript outputs;
+3. generates Pythia checkpoint figures;
+4. aggregates poisoning results when available;
+5. locates RQ3 threshold diagnostics and runs aggregate threshold-shape reporting;
+6. aggregates per-run graded agonist outputs;
+7. validates required manuscript products.
+
+### RQ3 source resolution
+
+The reporting driver can discover an RQ3 diagnostics directory under `data/` when it contains the expected aggregate payload. An explicit source can be provided with:
+
+```bash
+python -m reporting.generate_final_results \
+  --data-root ../data \
+  --results-root ../results \
+  --primary-profile iclr-28 \
+  --spiking-source /absolute/path/to/threshold_diagnostics
+```
+
+The repository wrapper may expose the same path through `SPIKING_SOURCE`:
+
+```bash
+SPIKING_SOURCE=/absolute/path/to/threshold_diagnostics ./generate_results.sh
+```
+
+A complete threshold-shape manuscript build requires the aggregate activation/flip rows in addition to aggregate flip statistics and unit tests.
+
+### Current Figure 4 outputs
+
+```text
+results/paper/figures/04_rq3_spiking_cut/
+├── fig4a_candidate_control_spiking_cut_summary.pdf
+├── fig4b_threshold_shape_model_comparison_by_direction.pdf
+├── fig4c_graded_agonist_dose_response.pdf
+├── fig4s1_threshold_testability_by_condition.pdf
+├── fig4s2_strength_matched_thresholdability.pdf
+├── fig4s3_nested_tecs_lower_bound_ecdf.pdf
+├── fig4s4_threshold_tail_response_by_direction.pdf
+└── fig4s5_graded_agonist_single_crossing.pdf
+```
+
+Threshold diagnostics provide Figure 4a, Figure 4b, and S1–S4. Per-run graded agonist outputs provide Figure 4c and S5. See [RQ3](../research-questions/rq3-threshold-event.md) and [Figure map](../reporting/figures.md).
+
+## Run poisoning experiments
+
+Inspect the configured run family:
 
 ```bash
 ./run_poisoning_experiments.sh --dry-run
+```
+
+Execute it with:
+
+```bash
 ./run_poisoning_experiments.sh
 ```
 
-For an execution-path test with reduced data sizes:
+A reduced execution-path test is available through:
 
 ```bash
 POISONING_FAST_TEST=1 ./run_poisoning_experiments.sh
 ```
 
-One poisoning run is organized as:
+One poisoning run uses the stage-numbered tree:
 
 ```text
 data/poisoning/<task>/<run>/
@@ -136,50 +233,37 @@ data/poisoning/<task>/<run>/
 └── 07_poisoning_example_detection/
 ```
 
-See [Poisoning protocol](../experiments/poisoning/), [Poisoning configuration](../experiments/poisoning/configuration.md), and [Poisoning outputs](../experiments/poisoning/outputs.md).
+See [Poisoning protocol](../experiments/poisoning/README.md), [Configuration](../experiments/poisoning/configuration.md), and [Outputs](../experiments/poisoning/outputs.md).
 
-## Generate final results
+## Inspect results
 
-```bash
-./generate_results.sh
-```
-
-Equivalent direct invocation from `code/`:
-
-```bash
-python -m reporting.generate_final_results \
-  --data-root ../data \
-  --results-root ../results \
-  --primary-profile iclr-28
-```
-
-The wrapper supports these environment controls:
-
-```text
-SPIKING_SOURCE=<absolute diagnostic root>   use an explicit RQ3 diagnostic source
-REQUIRE_CMC=1                              require optional CMC interaction validation
-ALLOW_INCOMPLETE_METRICS=1                 allow reporting with missing required metrics
-```
-
-The default reporting path requires complete primary metrics. `ALLOW_INCOMPLETE_METRICS=1` is intended for diagnostic inspection rather than complete manuscript generation.
-
-## Inspect generated outputs
-
-Human-facing outputs are under:
+Human-facing products:
 
 ```text
 results/paper/figures/
 results/paper/tables/
 ```
 
-Machine-readable tables and audits are under:
+Machine-readable analyses and audits:
 
 ```text
 results/analysis/
 ```
 
-The main reproducibility checks are written under `results/analysis/reproducibility/`. RQ3 has separate population and threshold-shape audits under `results/analysis/rq3_threshold_event/`.
+Population and output audits are written under:
 
-## Cache handling
+```text
+results/analysis/reproducibility/
+```
 
-Model-backed caches can be expensive to rebuild. Delete caches only when the scientific configuration they encode changes. Procedures for regenerating RQ3 derived outputs without deleting reusable model evaluations are documented in [Operations and troubleshooting](../operations/).
+RQ3 has additional audits under:
+
+```text
+results/analysis/rq3_threshold_event/spiking_diagnostics/
+```
+
+## Cache policy
+
+Do not delete model-backed caches to regenerate figures or statistical summaries. Reporting products under `results/` are derived from persistent inputs and can be regenerated independently. Delete or invalidate a cache only when the scientific configuration, model state, intervention semantics, or cached row population has changed.
+
+See [Operations](../operations/README.md) for targeted regeneration commands.

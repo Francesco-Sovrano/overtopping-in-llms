@@ -1,9 +1,15 @@
 # Overtopping experiment execution
 
-Experiment catalogue and launch/execution code for the overtopping study.
+This package defines the explicit overtopping experiment catalogue and translates each `RunSpec` into pipeline execution and analysis commands.
 
-Documentation:
+Inspect from `code/`:
 
-- [Overtopping experiment catalogue](../../../docs/experiments/overtopping.md)
+```bash
+python -m studies.overtopping.experiments.run_experiments --suite paper-primary --dry-run
+```
+
+References:
+
+- [Experiment catalogue](../../../docs/experiments/overtopping.md)
 - [Getting started](../../../docs/getting-started/README.md)
-- [Pipeline stages](../../../docs/methods/pipeline.md)
+- [Pipeline](../../../docs/methods/pipeline.md)

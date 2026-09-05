@@ -1315,39 +1315,6 @@ class LMWrapper:
 		)
 
 
-	def _supports_forward_kwarg(self, model, kw: str) -> bool:
-		"""Return True if `model.forward` explicitly accepts kwarg `kw`."""
-		sig = inspect.signature(model.forward)
-		return kw in sig.parameters
-
-	def _position_ids_from_attention_mask(self, attention_mask: torch.Tensor, *, past_kv_cache=None) -> torch.Tensor:
-		"""Compute padding-safe position_ids.
-
-		- For full-prefix (no cache): use cumsum(attention_mask)-1 (pads -> 0).
-		- For cached incremental steps: offset by the number of *real* tokens already in the cache
-		  (sum of cache.previous_attention_mask), if available.
-		"""
-		am = attention_mask.long()
-		if am.ndim != 2:
-			raise ValueError(f"Expected attention_mask [B,T], got shape {tuple(attention_mask.shape)}")
-
-		_, T = am.shape
-
-		# Cached incremental step: position starts at previous real length
-		if past_kv_cache is not None:
-			prev = getattr(past_kv_cache, "previous_attention_mask", None)
-			if torch.is_tensor(prev):
-				prev_lens = prev.long().sum(dim=1, keepdim=True)  # [B,1]
-				ar = torch.arange(T, device=attention_mask.device, dtype=prev_lens.dtype).view(1, T)
-				return prev_lens + ar
-
-		# Full-prefix path
-		pos = am.cumsum(dim=1) - 1
-		pos = pos.clamp(min=0)
-		# Force pads to position 0 (keeps things well-defined even if pads are present)
-		pos = torch.where(am == 0, torch.zeros_like(pos), pos)
-		return pos
-
 	def tokenize_with_mask(self, texts, device, *, add_special_tokens=True, padding=True, truncation=True, max_length=None, padding_side: Optional[str]=None, truncation_side: Optional[str]=None):
 		"""Single source of truth: text -> (input_ids, attention_mask, lengths).
 

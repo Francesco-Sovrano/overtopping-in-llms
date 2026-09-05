@@ -477,7 +477,7 @@ Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnos
 
 - `paper/figures/02_rq1_prevalence/` - **RQ1**: directional reach and width-normalized high-effect density using the canonical all-settings phase-panel population and layout.
 - `paper/figures/03_rq2_composition/` - **RQ2**: composition gap, super-additive boundary cases, matched-set specificity.
-- `paper/figures/04_rq3_spiking_cut/` - **RQ3**: retained causal/spiking diagnostics plus graded agonist dose-response; the direct held-out threshold-|MCC| endpoint is removed. Status: **{rq3_status}**.
+- `paper/figures/04_rq3_spiking_cut/` - **RQ3**: candidate/control phenotype, aggregate threshold-shape comparison, graded intervention, and supporting diagnostics. Status: **{rq3_status}**.
 - `paper/figures/05_rq4_learning/` - **RQ4**: pooled-U(J)/competence Pythia trajectory plus directional companions and poisoning learning-time role changes. `poisoning/per_run/` preserves the individual-channel/agonist figures; the poisoning directory root contains cross-seed summaries.
 - `paper/figures/appendix_context/` - pooled U(J), phase, and size context only.
 - `paper/tables/` - LaTeX manuscript tables only.
@@ -487,7 +487,7 @@ Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnos
 - `analysis/figure_data/` - CSV/JSON sidecars for every paper figure, mirroring the figure subfolders.
 - `analysis/table_data/` - machine-readable sidecars for manuscript tables.
 - `analysis/primary_matrix/` - full 28-setting metric matrix and competence analyses.
-- `analysis/rq3_threshold_event/` - retained RQ3 diagnostics plus the graded agonist dose-response analysis; the direct held-out threshold-|MCC| endpoint is removed.
+- `analysis/rq3_threshold_event/` - detailed threshold/spiking diagnostics.
 - `analysis/rq4_learning/` - poisoning/cross-seed analysis outputs.
 - `analysis/reproducibility/` - experiment catalogue, completeness audit, and manuscript-output audit.
 
@@ -496,7 +496,7 @@ Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnos
 1. Figure 2a/2c: 0->1 reach and high-effect density.
 2. Figure 2b/2d: 1->0 companions; low-denominator estimates are explicitly marked as uncertain but remain in the declared setting-level fits.
 3. Figure 3a/3b: composition and coalition boundary.
-4. Figure 4: retained RQ3 spiking diagnostics plus graded causal agonist evidence.
+4. Figure 4: candidate/control phenotype, aggregate threshold-shape comparison, and graded-agonist dose response.
 5. Figure 5: learning-time role change.
 
 Paper figure directories contain only PDFs and README files; raw CSV/JSON exports are intentionally kept under `analysis/`.
@@ -546,15 +546,10 @@ def validate_generated_paper_view(results_root: Path, *, spiking_expected: bool)
         figures / "05_rq4_learning" / "fig5a_pythia_checkpoint_trajectory.pdf",
     ]
     if spiking_expected:
-        rq3_candidates = [
+        required_figures.extend([
             figures / "04_rq3_spiking_cut" / "fig4a_candidate_control_spiking_cut_summary.pdf",
-            figures / "04_rq3_spiking_cut" / "fig4d_graded_agonist_dose_response.pdf",
-        ]
-        if not any(path.is_file() and path.stat().st_size >= 2_000 for path in rq3_candidates):
-            errors.append(
-                "missing manuscript RQ3 figure: expected retained fig4a diagnostics and/or "
-                "fig4d graded agonist dose-response"
-            )
+            figures / "04_rq3_spiking_cut" / "fig4b_threshold_shape_model_comparison_by_direction.pdf",
+        ])
 
     for path in required_figures:
         if not path.is_file():
@@ -710,9 +705,8 @@ def main() -> None:
     data_root = Path(args.data_root).expanduser().resolve()
     results_root = Path(args.results_root).expanduser().resolve()
     poisoning_root = Path(args.poisoning_root).expanduser().resolve()
-    # Legacy scalar/threshold diagnostics are optional supporting material.
-    # The manuscript-facing RQ3 experiment is now the model-backed graded
-    # agonist intervention stored with each Stage-7 stats run.
+    # Resolve the RQ3 diagnostics source before report generation so missing
+    # threshold-event inputs fail before manuscript figures are written.
     spiking_source = None if args.skip_spiking_report else resolve_spiking_source(args.spiking_source, data_root)
     results_root.mkdir(parents=True, exist_ok=True)
 
@@ -876,54 +870,76 @@ def main() -> None:
 
     spiking_out = overtopping_spiking_diagnostics(results_root)
     spiking_out.mkdir(parents=True, exist_ok=True)
-    rq3_dir = rq3_figures(results_root)
-    rq3_dir.mkdir(parents=True, exist_ok=True)
-    legacy_spiking_available = False
-    graded_available = False
     if args.skip_spiking_report:
         status = {"status": "skipped", "reason": "--skip-spiking-report"}
         (spiking_out / "report_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
-        (rq3_dir / "README.md").write_text("# Figure 4 - RQ3: the spiking cut\n\nGeneration was skipped with `--skip-spiking-report`.\n", encoding="utf-8")
-    else:
-        # Restore the established RQ3 diagnostics/figures.  The direct held-out
-        # threshold-|MCC| endpoint is suppressed inside Stage 8; the rest of the
-        # historical RQ3 panels are preserved.
-        if spiking_source is not None:
-            cmd = [
-                sys.executable, "-m", "studies.overtopping.analysis.stage07_overtopping_spiking_report",
-                "--out", str(spiking_out),
-                "--paper-figures-dir", str(rq3_dir),
-                "--primary-table", str(paper_tables / "primary_table.csv"),
-                "--data-root", str(data_root),
-                "--evaluation-split", "test",
-                "--spiking-max-points", str(args.spiking_max_points),
-                "--population-scope", "primary+supplementary",
-            ]
-            if spiking_source.is_file():
-                cmd.extend(["--zip", str(spiking_source)])
-            else:
-                cmd.extend(["--root", str(spiking_source)])
-            run(cmd)
-            shape_cmd = [
-                sys.executable, "-m", "studies.overtopping.analysis.stage08_threshold_shape_validation",
-                "--out", str(spiking_out / "threshold_shape_validation"),
-                "--paper-figures-dir", str(rq3_dir),
-                "--primary-table", str(paper_tables / "primary_table.csv"),
-                "--data-root", str(data_root),
-                "--evaluation-split", "test",
-                "--spiking-max-points", str(args.spiking_max_points),
-                "--population-scope", "primary+supplementary",
-            ]
-            if spiking_source.is_file():
-                shape_cmd.extend(["--zip", str(spiking_source)])
-            else:
-                shape_cmd.extend(["--root", str(spiking_source)])
-            run(shape_cmd)
-            legacy_spiking_available = True
+        rq3 = rq3_figures(results_root); rq3.mkdir(parents=True, exist_ok=True)
+        (rq3 / "README.md").write_text("# Figure 4 - RQ3: the spiking cut\n\nGeneration was skipped with `--skip-spiking-report`.\n", encoding="utf-8")
+    elif spiking_source is not None:
+        cmd = [
+            sys.executable, "-m", "studies.overtopping.analysis.stage07_overtopping_spiking_report",
+            "--out", str(spiking_out),
+            "--paper-figures-dir", str(rq3_figures(results_root)),
+            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--data-root", str(data_root),
+            "--evaluation-split", "test",
+            "--spiking-max-points", str(args.spiking_max_points),
+            "--population-scope", "primary+supplementary",
+        ]
+        if spiking_source.is_file():
+            cmd.extend(["--zip", str(spiking_source)])
         else:
-            print("[final-results] legacy RQ3 diagnostic source unavailable; retaining graded RQ3 generation", flush=True)
+            cmd.extend(["--root", str(spiking_source)])
+        run(cmd)
+        shape_cmd = [
+            sys.executable, "-m", "studies.overtopping.analysis.stage08_threshold_shape_validation",
+            "--out", str(spiking_out / "threshold_shape_validation"),
+            "--paper-figures-dir", str(rq3_figures(results_root)),
+            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--data-root", str(data_root),
+            "--evaluation-split", "test",
+            "--spiking-max-points", str(args.spiking_max_points),
+            "--population-scope", "primary+supplementary",
+        ]
+        if spiking_source.is_file():
+            shape_cmd.extend(["--zip", str(spiking_source)])
+        else:
+            shape_cmd.extend(["--root", str(spiking_source)])
+        run(shape_cmd)
+    else:
+        status = {
+            "status": "not_available",
+            "reason": "No aggregate_flip_stats.csv + aggregate_unit_tests.csv diagnostics source was found.",
+            "searched_data_root": str(data_root),
+            "hint": "Set SPIKING_SOURCE=/path/to/spiking_diagnostics_results_for_inspection.zip or rerun threshold_event_diagnostics.",
+        }
+        (spiking_out / "report_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+        rq3 = rq3_figures(results_root); rq3.mkdir(parents=True, exist_ok=True)
+        (rq3 / "README.md").write_text(
+            "# Figure 4 - RQ3: the spiking cut\n\n"
+            "**RQ3 source missing.** No aggregate threshold/spiking diagnostics were found.\n\n"
+            "Set `SPIKING_SOURCE=/path/to/spiking_diagnostics_results_for_inspection.zip` before running `./generate_results.sh`, "
+            "or rerun `threshold_event_diagnostics` to create the aggregate diagnostics.\n",
+            encoding="utf-8",
+        )
+        print(f"[final-results] RQ3 source unavailable; see {rq3 / 'README.md'}")
 
-        # Add the new graded agonist experiment; do not replace the other RQ3 figures.
+    if not args.skip_spiking_report:
+        rq3_dir = rq3_figures(results_root)
+        rq3_dir.mkdir(parents=True, exist_ok=True)
+        # Remove Figure-4 PDFs that are outside the current manuscript contract.
+        for stale in (
+            "fig4b_threshold_response_curves.pdf",
+            "fig4c_preemption.pdf",
+            "fig4d_graded_agonist_dose_response.pdf",
+            "fig4s5_threshold_shape_model_comparison_by_direction.pdf",
+            "fig4s6_graded_agonist_single_crossing.pdf",
+            "fig4s7_candidate_control_support_summary.pdf",
+            "fig4s8_threshold_testability_support_by_condition.pdf",
+            "fig4s9_threshold_tail_support_by_direction.pdf",
+        ):
+            (rq3_dir / stale).unlink(missing_ok=True)
+
         run([
             sys.executable, "-m", "studies.overtopping.analysis.stage08_graded_agonist_report",
             "--root", str(data_root),
@@ -933,48 +949,45 @@ def main() -> None:
             "--population-scope", "primary+supplementary",
             "--evaluation-split", "test",
         ])
+
+        rq3_readme = rq3_dir / "README.md"
+        appendix = (
+            "\n\n## Figure 4 layout\n\n"
+            "- `fig4a_candidate_control_spiking_cut_summary.pdf` - candidate/control phenotype endpoints.\n"
+            "- `fig4b_threshold_shape_model_comparison_by_direction.pdf` - aggregate held-out threshold/logistic/isotonic comparison by discovery direction.\n"
+            "- `fig4c_graded_agonist_dose_response.pdf` - graded intervention dose response.\n"
+            "- `fig4s1_threshold_testability_by_condition.pdf` - condition-level testability.\n"
+            "- `fig4s2_strength_matched_thresholdability.pdf` - strength-matched sensitivity.\n"
+            "- `fig4s3_nested_tecs_lower_bound_ecdf.pdf` - nested TECS lower bound.\n"
+            "- `fig4s4_threshold_tail_response_by_direction.pdf` - descriptive endogenous-proxy tail response.\n"
+            "- `fig4s5_graded_agonist_single_crossing.pdf` - graded single-persistent-crossing summary.\n"
+            "\nRepresentative response curves remain an analysis diagnostic rather than a paper figure.\n"
+        )
+        existing = rq3_readme.read_text(encoding="utf-8") if rq3_readme.is_file() else "# Figure 4 - RQ3\n"
+        marker = "## Figure 4 layout"
+        if marker in existing:
+            existing = existing.split(marker, 1)[0].rstrip()
+        rq3_readme.write_text(existing.rstrip() + appendix, encoding="utf-8")
+
         graded_status_path = spiking_out / "graded_agonist" / "graded_agonist_report_status.json"
-        graded_status = {}
         if graded_status_path.is_file():
             try:
                 graded_status = json.loads(graded_status_path.read_text(encoding="utf-8"))
             except Exception:
                 graded_status = {}
-        graded_available = graded_status.get("status") == "ok"
-        combined_status = {
-            "status": "ok" if (legacy_spiking_available or graded_available) else "not_available",
-            "legacy_rq3_figures_available": legacy_spiking_available,
-            "graded_agonist_available": graded_available,
-            "heldout_threshold_mcc_endpoint": "removed",
-        }
-        (spiking_out / "report_status.json").write_text(json.dumps(combined_status, indent=2), encoding="utf-8")
-
-    # P0.3 is produced directly by Stage 8 interaction validation and therefore
-    # lives in the normal data tree rather than the optional spiking archive.
-    # Aggregate whatever completed preemption runs are present; absence is a
-    # recorded not-available state rather than a final-results failure.
-    run([
-        sys.executable, "-m", "studies.overtopping.analysis.stage09_preemption_report",
-        "--root", str(data_root),
-        "--out", str(spiking_out / "preemption"),
-        "--paper-figures-dir", str(rq3_figures(results_root)),
-        "--primary-table", str(paper_tables / "primary_table.csv"),
-        "--population-scope", "primary+supplementary",
-        "--evaluation-split", "test",
-    ])
+            if graded_status.get("status") == "ok":
+                for expected in (
+                    rq3_dir / "fig4c_graded_agonist_dose_response.pdf",
+                    rq3_dir / "fig4s5_graded_agonist_single_crossing.pdf",
+                ):
+                    if not expected.is_file():
+                        raise RuntimeError(f"graded RQ3 report claimed success but figure is missing: {expected}")
 
     # Paper-facing directories contain PDFs/TEX/README only. Machine-readable
     # figure/table sidecars are kept under analysis/ with the same relative names.
     relocate_paper_sidecars(results_root)
 
-    rq3_status = {}
-    status_path = spiking_out / "report_status.json"
-    if status_path.is_file():
-        try:
-            rq3_status = json.loads(status_path.read_text(encoding="utf-8"))
-        except Exception:
-            rq3_status = {}
-    spiking_available = (not args.skip_spiking_report) and rq3_status.get("status") == "ok"
+    spiking_available = spiking_source is not None and not args.skip_spiking_report
     write_results_index(results_root, spiking_available=spiking_available)
     validate_generated_paper_view(results_root, spiking_expected=spiking_available)
 

@@ -49,7 +49,7 @@ def evaluate_graph(model: HookedTransformer, graph: Graph, dataloader: DataLoade
 				   metrics: Union[Callable[[Tensor],Tensor], List[Callable[[Tensor], Tensor]]],
 				   quiet=False, intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching',
 				   intervention_dataloader: Optional[DataLoader]=None, skip_clean:bool=True, precomputed_means: Optional[torch.Tensor] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
-	"""Evaluate a circuit (i.e. a graph where only some nodes are false, probably created by calling graph.apply_threshold). You probably want to prune
+	"""Evaluate a circuit represented by a graph where only a subset of nodes is included. You probably want to prune
 		beforehand to make sure your circuit is valid.
 	"""
 	assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"

@@ -548,14 +548,6 @@ def _condition_population_summary(units: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
 
 
-def _paired_condition_effect(condition: pd.DataFrame, metric: str, bootstrap: int) -> tuple[pd.DataFrame, dict]:
-    g = condition.dropna(subset=[metric]).groupby(["run_id", "baseline_subset", "population"], dropna=False)[metric].median().unstack("population")
-    if POP_CAND not in g.columns or POP_CTRL not in g.columns:
-        return pd.DataFrame(), effect_summary(pd.DataFrame(), bootstrap)
-    g = g.dropna(subset=[POP_CAND, POP_CTRL]).copy()
-    g["delta"] = g[POP_CAND] - g[POP_CTRL]
-    return g, effect_summary(g, bootstrap)
-
 
 def _structural_condition_effect(
     units: pd.DataFrame,
@@ -908,8 +900,15 @@ def _representative_response_curves(raw_all: pd.DataFrame, tests_all: pd.DataFra
     return pd.DataFrame(rows)
 
 
-def _plot_response_curves(curves: pd.DataFrame, paper_dir: Path) -> None:
-    target = paper_dir / "fig4b_threshold_response_curves.pdf"
+def _plot_response_curves(curves: pd.DataFrame, diagnostic_dir: Path) -> None:
+    """Write representative response curves as an analysis diagnostic only.
+
+    These curves are intentionally not manuscript figures: each panel is one
+    deterministic structural pair and can have very small per-bin held-out n.
+    The paper-facing Figure 4b is the aggregate model-comparison result.
+    """
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    target = diagnostic_dir / "illustrative_threshold_response_curves.pdf"
     if curves.empty:
         target.unlink(missing_ok=True)
         return
@@ -957,8 +956,12 @@ def _condition_weighted_model_summary(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def _plot_model_comparison(summary: pd.DataFrame, paper_dir: Path) -> None:
+    # Canonical paper-facing panel: aggregate, direction-specific held-out model comparison.
+    # Remove Figure-4 names that are outside the current manuscript contract.
     (paper_dir / "fig4b_threshold_shape_model_comparison.pdf").unlink(missing_ok=True)
-    target = paper_dir / "fig4s5_threshold_shape_model_comparison_by_direction.pdf"
+    (paper_dir / "fig4b_threshold_response_curves.pdf").unlink(missing_ok=True)
+    (paper_dir / "fig4s5_threshold_shape_model_comparison_by_direction.pdf").unlink(missing_ok=True)
+    target = paper_dir / "fig4b_threshold_shape_model_comparison_by_direction.pdf"
     if summary.empty:
         target.unlink(missing_ok=True)
         return
@@ -1008,16 +1011,14 @@ def _plot_model_comparison(summary: pd.DataFrame, paper_dir: Path) -> None:
 def _plot_main_summary(units: pd.DataFrame, robust: dict, paper_dir: Path) -> None:
     target = paper_dir / "fig4a_candidate_control_spiking_cut_summary.pdf"
     directional = robust.get("directional_primary_effects", {}) or {}
-    # Held-out threshold |MCC| is intentionally not a manuscript-facing RQ3
-    # endpoint.  Keep the remaining historical diagnostics while the graded
-    # agonist intervention supplies the direct causal-threshold experiment.
     endpoint_specs = [
         ("causal_strength_effect", "Singleton causal strength", "causal_strength"),
         ("threshold_testability_effect", "Threshold-testable fraction", "threshold_testability"),
+        ("nested_threshold_mcc_effect", "Nested held-out\nthreshold |MCC|", "nested_threshold_mcc"),
         ("nested_tecs_lower_bound_effect", "Nested TECS\nlower bound", "nested_tecs_lower_bound"),
     ]
     with paper_figure_rc():
-        fig, axes = plt.subplots(2, 3, figsize=(8.1, 4.65), sharey=True)
+        fig, axes = plt.subplots(2, 4, figsize=(10.2, 4.65), sharey=True)
         for row_idx, baseline in enumerate(BASELINE_ORDER):
             row = directional.get(baseline, {})
             adj = row.get("holm_primary_endpoints_across_directions", {}) or {}
@@ -1073,8 +1074,21 @@ def _plot_supplements(units: pd.DataFrame, matches: pd.DataFrame, paper_dir: Pat
         else: target.unlink(missing_ok=True)
         plt.close(fig)
 
-    # The direct held-out threshold-|MCC| comparison was removed from RQ3.
-    (paper_dir / "fig4s2_strength_matched_thresholdability.pdf").unlink(missing_ok=True)
+    target2 = paper_dir / "fig4s2_strength_matched_thresholdability.pdf"
+    with paper_figure_rc():
+        fig,axes=plt.subplots(1,2,figsize=(6.8,2.8),sharex=True,sharey=True); made=False
+        for ax,baseline in zip(axes,BASELINE_ORDER):
+            g=matches.loc[matches.baseline_subset.astype(str).str.lower()==baseline] if not matches.empty else pd.DataFrame()
+            if not g.empty:
+                made=True; ax.scatter(g.control_nested_mcc,g.candidate_nested_mcc,s=20,alpha=.72)
+                lo=min(float(g.control_nested_mcc.min()),float(g.candidate_nested_mcc.min()),0.0); hi=max(float(g.control_nested_mcc.max()),float(g.candidate_nested_mcc.max()),0.0)
+                ax.plot([lo,hi],[lo,hi],linestyle="--",linewidth=.9,label="equal thresholdability")
+            ax.set_title(f"Discovery direction {_direction_label(baseline)}"); ax.set_xlabel("Strength-matched control |MCC|"); ax.grid(alpha=.25,linewidth=.45); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        axes[0].set_ylabel("Candidate held-out |MCC|"); axes[0].legend(frameon=False,fontsize=7) if made else None
+        fig.tight_layout()
+        if made: save_pdf_only(fig,target2)
+        else: target2.unlink(missing_ok=True)
+        plt.close(fig)
 
     target3 = paper_dir / "fig4s3_nested_tecs_lower_bound_ecdf.pdf"
     with paper_figure_rc():
@@ -1103,14 +1117,14 @@ Population is exact and manifest-driven. Poisoning experiments are excluded by c
 
 - Primary configured/included: {getattr(prim,'configured_runs',0)}/{getattr(prim,'included_runs',0)}
 - Supplementary configured/included: {getattr(supp,'configured_runs',0)}/{getattr(supp,'included_runs',0)}
-- Nested feature selection: training fold only; held-out fold is never used to choose the scalar.
+- Nested feature selection uses the training fold; the held-out fold is used only for evaluation.
 - Hard-threshold predictions are oriented by the sign of training MCC before Brier/log-loss/calibration are computed.
-- Candidates are evaluated **only in their frozen Stage-6 discovery baseline/direction**: positive-baseline agonists test 1→0 events and negative-baseline agonists test 0→1 events. A candidate discovered in both directions may contribute to both; the opposite direction is never invented from held-out data.
-- Primary inference preserves the Stage-7 same-layer/head random non-candidate controls and does **not** match away causal strength.
-- Manuscript-facing legacy endpoints are causal strength, testability, and nested TECS lower bound, reported separately for 1→0 and 0→1. The direct held-out threshold-|MCC| endpoint is intentionally omitted; graded agonist intervention is the direct causal-threshold experiment.
-- Causal-strength matching is a supplementary sensitivity analysis only (caliper: {robust.get('matching_caliper', math.nan):.3f}) and is performed within the same layer/head.
+- Candidates are evaluated in their frozen Stage-6 discovery baseline/direction: positive-baseline agonists test 1→0 events and negative-baseline agonists test 0→1 events. A candidate independently discovered in both directions may contribute to both.
+- Primary inference uses the Stage-7 same-layer/head random non-candidate controls without causal-strength matching.
+- Primary endpoints are causal strength, testability, nested held-out threshold |MCC|, and nested TECS lower bound, reported separately for 1→0 and 0→1; inference is at the run/baseline condition level after same-layer/head stratification.
+- Causal-strength matching is a supplementary sensitivity analysis (caliper: {robust.get('matching_caliper', math.nan):.3f}) and is performed within the same layer/head.
 
-`fig4a_candidate_control_spiking_cut_summary.pdf` reports the retained legacy phenotype endpoints in separate 1→0 and 0→1 rows, with held-out threshold |MCC| removed. `fig4b_threshold_response_curves.pdf` is only an illustrative same-condition same-layer/head pair selected without causal-strength or MCC ranking. `fig4s5_threshold_shape_model_comparison_by_direction.pdf` uses direction-specific condition-weighted medians.
+`fig4a_candidate_control_spiking_cut_summary.pdf` reports the four primary phenotype endpoints in separate 1→0 and 0→1 rows. `fig4b_threshold_shape_model_comparison_by_direction.pdf` is the aggregate direction-specific held-out comparison of constant, threshold, logistic, and isotonic models using condition-weighted medians. Representative same-condition/same-layer response curves are retained only under the analysis diagnostics directory because they are illustrative rather than inferential.
 """
     (paper_dir / "README.md").write_text(text, encoding="utf-8")
 
@@ -1235,7 +1249,7 @@ def main() -> None:
         _plot_main_summary(units if args.population_scope=="primary+supplementary" else units.loc[units.source_scope=="primary"],
                            robust,paper_dir)
         _plot_model_comparison(summary if args.population_scope=="primary+supplementary" else summary.loc[summary.source_scope=="primary"],paper_dir)
-        _plot_response_curves(curves,paper_dir)
+        _plot_response_curves(curves, out / "figures")
         _plot_supplements(units if args.population_scope=="primary+supplementary" else units.loc[units.source_scope=="primary"],
                           matches if args.population_scope=="primary+supplementary" else matches.loc[matches.source_scope=="primary"],paper_dir)
         _write_paper_readme(paper_dir,robust,coverage)

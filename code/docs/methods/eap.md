@@ -12,7 +12,6 @@ evaluate.py       circuit evaluation
 data.py           attribution data helpers
 metrics.py        attribution and evaluation metrics
 utils.py          shared utilities
-visualization.py  graph visualization
 ```
 
 ## Graph granularity

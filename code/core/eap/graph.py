@@ -1,15 +1,11 @@
 from typing import List, Dict, Union, Tuple, Literal, Optional, Set
-import json
-import heapq
 
 from einops import einsum
 import torch
 from transformer_lens import HookedTransformer, HookedTransformerConfig
-import numpy as np
 import math
 from collections import defaultdict
 
-from .visualization import get_color, generate_random_color
 
 class Node:
 	"""
@@ -224,53 +220,6 @@ class Graph:
 		self.n_forward = 0
 		self.n_backward = 0
 		
-	def aggregate_edge_scores_to_nodes(
-		self,
-		how = "max",     # "max" | "sum" | "mean"
-		absolute = False
-	):
-		"""
-		Aggregate outgoing edge scores into per-node scores.
-		Leaves nodes with no real outgoing edges as NaN.
-		"""
-		if self.nodes_scores is None:
-			# mirror the dtype/device of scores
-			self.nodes_scores = torch.full(
-				(self.n_forward,),
-				float("nan"),
-				dtype=self.scores.dtype,
-				device=self.scores.device,
-			)
-
-		S = self.scores
-		if absolute:
-			S = S.abs()
-
-		# Mask non-real edges
-		S = S.masked_fill(~self.real_edge_mask, float("-inf"))
-
-		if how == "max":
-			agg = S.max(dim=1).values
-		elif how == "sum":
-			# sum over real edges; keep NaN if there are none
-			tmp = S.clone()
-			tmp[tmp == float("-inf")] = 0.0
-			counts = self.real_edge_mask.sum(dim=1)
-			agg = tmp.sum(dim=1)
-			agg[counts == 0] = float("nan")
-		elif how == "mean":
-			tmp = S.clone()
-			tmp[tmp == float("-inf")] = 0.0
-			counts = self.real_edge_mask.sum(dim=1).clamp_min(1)
-			agg = tmp.sum(dim=1) / counts
-			agg[self.real_edge_mask.sum(dim=1) == 0] = float("nan")
-		else:
-			raise ValueError(f"Unknown aggregation '{how}'")
-
-		# Convert -inf (no edges) back to NaN
-		agg[agg == float("-inf")] = float("nan")
-		self.nodes_scores[:] = agg
-
 
 	def copy(self):
 		"""
@@ -363,14 +312,6 @@ class Graph:
 			raise ValueError(f"Invalid node: {node} of type {type(node)}")
 		
 	@classmethod
-	def _n_forward(cls, cfg) -> int:
-		return 1 + cfg.n_layers * (cfg.n_heads + 1)
-	
-	@classmethod
-	def _n_backward(cls, cfg) -> int:
-		return cfg.n_layers * (3 * cfg.n_heads + 1) + 1
-		
-	@classmethod
 	def _forward_index(cls, cfg, node_name:str, attn_slice:bool=False) -> int:
 		"""Given a model's config and a node specification, return the forward (source) index of the node in the graph. The forward index is the index of the node in the forward pass of the model, which is used to index into the graph's tensors.
 		
@@ -434,33 +375,6 @@ class Graph:
 	def backward_index(self, node:Node, qkv=None, attn_slice=True) -> int:
 		return Graph._backward_index(self.cfg, node.name, qkv, attn_slice)
 		
-	def get_dst_nodes(self) -> List[str]:
-		heads = []
-		for layer in range(self.cfg['n_layers']):
-			for letter in 'qkv':
-				for attention_head in range(self.cfg['n_heads']):
-					heads.append(f'a{layer}.h{attention_head}<{letter}>')
-			heads.append(f'm{layer}')
-		heads.append('logits')
-		return heads
-
-	def weighted_edge_count(self) -> float:
-		"""Generates a count of the edges, weighted by number of neurons included if applicable
-
-		Returns:
-			float: weighted edge count
-		"""
-		if self.neurons_in_graph is not None:
-			return (einsum(self.in_graph.float(), self.neurons_in_graph.float(), 'forward backward, forward d_model ->') / self.cfg['d_model']).item()
-		else:
-			return float(self.count_included_edges())
-
-	def count_included_edges(self) -> int:
-		return self.in_graph.sum().item()
-	
-	def count_included_nodes(self) -> int:
-		return self.nodes_in_graph.sum().item()
-	
 	def count_included_neurons(self) -> int:
 		if self.neurons_in_graph is None:
 			return None
@@ -483,68 +397,6 @@ class Graph:
 			if self.neurons_in_graph is not None:
 				self.neurons_in_graph[:] = True
 				
-	def apply_threshold(self, threshold, absolute = True, reset = True, level: Literal['edge', 'node', 'neuron'] = 'node', prune = True):
-		"""
-		Apply a threshold to the graph, setting in_graph / nodes_in_graph /
-		neurons_in_graph based on the score.
-		"""
-		threshold = float(threshold)
-
-		if reset:
-			self.reset()
-
-		if level == 'neuron':
-			included_neurons = self._threshold_mask_1d(
-				self.neurons_scores,
-				threshold,
-				absolute=absolute,
-				treat_nan="always_in",   # unscored neurons are always in
-			)
-			self.neurons_in_graph[:] = included_neurons
-
-			if reset:
-				self.nodes_in_graph |= self.neurons_in_graph.any(dim=1)
-				self.in_graph |= (self.nodes_in_graph.view(-1, 1) & self.real_edge_mask)
-
-		elif level == 'node':
-			included_nodes = self._threshold_mask_1d(
-				self.nodes_scores,
-				threshold,
-				absolute=absolute,
-				treat_nan="always_in",   # unscored nodes are always in
-			)
-			self.nodes_in_graph[:] = included_nodes
-			self.saturate_selected_nodes(include_edges="both", include_neurons=True)
-
-			if reset:
-				self.in_graph |= (self.nodes_in_graph.view(-1, 1) & self.real_edge_mask)
-
-		elif level == 'edge':
-			included_edges = self._threshold_mask_1d(
-				self.scores,
-				threshold,
-				absolute=absolute,
-				treat_nan="always_out",      # NaN edges are excluded
-				valid_mask=self.real_edge_mask,
-			)
-			self.in_graph[:] = included_edges
-
-			if reset:
-				nodes_with_outgoing = self.in_graph.any(dim=1)
-				nodes_with_ingoing = einsum(
-					self.in_graph.any(dim=0).float(),
-					self.forward_to_backward.float(),
-					'backward, forward backward -> forward',
-				) > 0
-				nodes_with_ingoing[0] = True
-				self.nodes_in_graph |= nodes_with_outgoing & nodes_with_ingoing
-
-		else:
-			raise ValueError(f"Invalid level: {level}")
-
-		if prune:
-			self.prune()
-
 	def zero_out_attention_neuron_scores(graph):
 		if graph.neurons_scores is None:
 			return
@@ -565,37 +417,6 @@ class Graph:
 		for edge in graph.edges.values():
 			if isinstance(edge.parent, AttentionNode) and isinstance(edge.child, AttentionNode):
 				graph.scores[edge.matrix_index] = 0
-
-	def normalize_neuron_scores(graph, mode = "z"):
-		"""
-		In-place normalization of graph.neurons_scores per forward node.
-		mode='maxabs': divide by max |score| per node.
-		mode='z': z-score within each node.
-		"""
-		if graph.neurons_scores is None:
-			return
-
-		scores = graph.neurons_scores
-		mask = torch.isfinite(scores)
-
-		if mode == "maxabs":
-			# [n_forward, 1]
-			maxabs = scores.abs().masked_fill(~mask, 0.0).amax(dim=1, keepdim=True)
-			maxabs = maxabs.clamp_min(1e-9)
-			graph.neurons_scores = torch.where(mask, scores / maxabs, scores)
-
-		elif mode == "z":
-			# mean
-			denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-			mean = scores.masked_fill(~mask, 0.0).sum(dim=1, keepdim=True) / denom
-			centered = scores - mean
-			# std
-			var = centered.pow(2).masked_fill(~mask, 0.0).sum(dim=1, keepdim=True) / denom
-			std = var.sqrt().clamp_min(1e-9)
-			graph.neurons_scores = torch.where(mask, centered / std, scores)
-
-		else:
-			raise ValueError(f"Unknown normalization mode: {mode}")
 
 	def saturate_selected_nodes(
 		self,
@@ -627,17 +448,6 @@ class Graph:
 			# dst_mask[b] = True if ANY selected forward node maps to backward b
 			dst_mask = (self.forward_to_backward & sel.view(-1, 1)).any(dim=0)  # [n_backward] (bool)
 			self.in_graph |= (self.real_edge_mask & dst_mask.view(1, -1)) 
-
-	def ensure_incoming_for_selected_nodes(self):
-		# For every node that is in_graph at node-level, turn on all real incoming edges
-		sel = self.nodes_in_graph.clone()                         # [n_forward]
-
-		# Which backward (destination) slots correspond to the selected nodes?
-		# forward_to_backward: [n_forward, n_backward] boolean
-		dst_mask = (sel.float() @ self.forward_to_backward.float()) > 0  # [n_backward]
-
-		# Turn on all REAL edges whose destination is one of the selected nodes
-		self.in_graph |= (self.real_edge_mask & dst_mask.unsqueeze(0))        # [n_forward, n_backward]
 
 	def _rank_indices_1d(self, scores, valid_mask, n, *, absolute = True, include_zero_scores = False):
 		"""
@@ -719,47 +529,6 @@ class Graph:
 			"score_range": score_range,
 			"threshold": threshold,
 		}
-
-	def _threshold_mask_1d(self, scores, threshold, *, absolute = True, treat_nan: Literal["always_in", "always_out", "ignore"] = "always_in", valid_mask = None):
-		"""
-		Shared threshold helper.
-
-		scores:     tensor of scores (any shape)
-		threshold:  numeric threshold (already float)
-		absolute:   compare |score| to threshold if True
-		treat_nan:  how to handle NaNs:
-					  - "always_in": NaN -> included
-					  - "always_out": NaN -> excluded
-					  - "ignore": treated as excluded
-		valid_mask: optional bool mask of population; False entries can never be included
-		"""
-		s = scores.clone()
-
-		if valid_mask is not None:
-			vm = valid_mask.to(dtype=torch.bool)
-			s = s.view(-1)
-			vm_flat = vm.view(-1)
-			# invalid positions are treated as NaN so they don't pass threshold
-			s[~vm_flat] = float('nan')
-			s = s.view_as(scores)
-
-		if absolute:
-			s = s.abs()
-
-		nan_mask = torch.isnan(s)
-		include = s >= threshold
-
-		if treat_nan == "always_in":
-			include = torch.where(nan_mask, torch.ones_like(include, dtype=torch.bool), include)
-		elif treat_nan in ("always_out", "ignore"):
-			include = torch.where(nan_mask, torch.zeros_like(include, dtype=torch.bool), include)
-		else:
-			raise ValueError(f"Unknown treat_nan={treat_nan!r}")
-
-		if valid_mask is not None:
-			include = include & valid_mask
-
-		return include
 
 	def get_topn(self, n, level: Literal['edge', 'node', 'neuron'] = 'node', absolute = True, include_special = False, return_scores = False, return_metadata = False, include_zero_scores = False):
 		"""
@@ -1051,41 +820,6 @@ class Graph:
 		if prune:
 			self.prune()
 
-	def apply_greedy(self, n_edges:int, absolute: bool = True, reset:bool = True, prune:bool = True):
-		"""
-		Gets the topn edges of the graph using a greedy algorithm that works from the logits up. Only defined over edges
-		
-		Args:
-			n_edges (int): the number of edges to include
-			reset (bool): whether to reset the graph before applying the greedy algorithm
-			absolute (bool): whether to take the absolute value of the scores before applying the greedy algorithm
-		"""
-		if n_edges > len(self.edges):
-			raise ValueError(f"n ({n_edges}) is greater than the number of edges ({len(self.edges)})")
-		
-		if reset:
-			self.nodes_in_graph *= False
-			self.in_graph *= False
-
-		def abs_id(s: float):
-			return abs(s) if absolute else s
-
-		candidate_edges = sorted([edge for edge in self.edges.values() if edge.child.in_graph], key = lambda edge: abs_id(edge.score), reverse=True)
-
-		edges = heapq.merge(candidate_edges, key = lambda edge: abs_id(edge.score), reverse=True)
-		while n_edges > 0:
-			n_edges -= 1
-			top_edge = next(edges)
-			top_edge.in_graph = True
-			parent = top_edge.parent
-			if not parent.in_graph:
-				parent.in_graph = True
-				parent_parent_edges = sorted([parent_edge for parent_edge in parent.parent_edges], key = lambda edge: abs_id(edge.score), reverse=True)
-				edges = heapq.merge(edges, parent_parent_edges, key = lambda edge: abs_id(edge.score), reverse=True)
-		
-		if prune:
-			self.prune()
-		
 	def prune(self):
 		"""Converts a potentially messy Graph into one that is fully connected. The number of components after this is done is strictly non-increasing; it may remove nodes or edges from the graph, but it won't add them. This function first removes nodes with no neurons (if applicable). Then, it repeatedly removes nodes that lack incoming or outgoing edges (or both), and then edges missing a parent or child. Finally, it pruned the neurons of any removed nodes.
 		"""
@@ -1227,176 +961,4 @@ class Graph:
 		return graph
 
 
-	def to_json(self, filename: str):
-		d = {'cfg': dict(self.cfg)}
-		node_dict = {}
-
-		for node_name, node in self.nodes.items():
-			if isinstance(node, LogitNode):
-				node_dict[node_name] = {'in_graph': True}
-				continue
-
-			node_dict[node_name] = {'in_graph': bool(node.in_graph)}
-			if self.nodes_scores is not None:
-				v = node.score
-				if v is not None and not (isinstance(v, float) and (np.isnan(v))):
-					node_dict[node_name]['score'] = float(v)
-			if self.neurons_in_graph is not None:
-				fi = self.forward_index(node, attn_slice=False)
-				node_dict[node_name]['neurons'] = self.neurons_in_graph[fi].tolist()
-				if self.neurons_scores is not None:
-					node_dict[node_name]['neurons_scores'] = self.neurons_scores[fi].tolist()
-
-		d['nodes'] = node_dict 
-		
-		edge_dict = {}
-		for edge_name, edge in self.edges.items():
-			edge_dict[edge_name] = {'score': edge.score.item(), 'in_graph': bool(edge.in_graph)}
-
-		d['edges'] = edge_dict
-		
-		with open(filename, 'w') as f:
-			json.dump(d, f)
 			
-			
-	def to_pt(self, filename: str):
-		"""Export this Graph as a .pt file
-
-		Args:
-			filename (str): The filename to save the graph to
-		"""
-		src_nodes = [node.name for node in self.nodes.values() if not isinstance(node, LogitNode)]
-		dst_nodes = self.get_dst_nodes()
-		d = {'cfg':dict(self.cfg), 'src_nodes': src_nodes, 'dst_nodes': dst_nodes, 'edges_scores': self.scores, 'edges_in_graph': self.in_graph, 'nodes_in_graph': self.nodes_in_graph}
-		if self.nodes_scores is not None:
-			d['nodes_scores'] = self.nodes_scores
-		if self.neurons_in_graph is not None:
-			d['neurons_in_graph'] = self.neurons_in_graph
-			d['neurons_scores'] = self.neurons_scores
-		torch.save(d, filename)
-
-	@classmethod
-	def from_json(cls, json_path: str) -> 'Graph':
-		"""
-		Load a Graph object from a JSON file.
-		The JSON should have the following keys:
-			1. 'cfg': Configuration dictionary, containing similar values to a TLens configuration object.
-			2. 'nodes': Dict[str, bool] which maps a node name (i.e. 'm11' or 'a0.h11') to a boolean value, indicating if the node is part of the circuit.
-			3. 'edges': Dict[str, Dict] which maps an edge name ('node->node') to a dictionary contains values 
-			4. 'neurons': Optional[Dict[str, List[bool]]] which maps a node name (i.e. 'm11' or 'a0.h11') to a list of boolean values, indicating which of its neurons are part of the circuit.
-
-		NOTE: This method isn't disk-space efficient, and shouldn't be used when the circuits contains edges between neuron-resolution nodes.
-		"""
-		with open(json_path, 'r') as f:
-			d = json.load(f)
-			assert all([k in d.keys() for k in ['cfg', 'nodes', 'edges']]), "Bad input JSON format - Missing keys"
-
-		g = Graph.from_model(d['cfg'], neuron_level=True, node_scores=True)
-		any_node_scores, any_neurons, any_neurons_scores = False, False, False
-		for name, node_dict in d['nodes'].items():
-			if name == 'logits':
-				continue
-			g.nodes[name].in_graph = node_dict['in_graph']
-			if 'score' in node_dict:
-				any_node_scores = True
-				g.nodes[name].score = node_dict['score']
-			if 'neurons' in node_dict:
-				any_neurons = True
-				g.neurons_in_graph[g.forward_index(g.nodes[name])] = torch.tensor(node_dict['neurons']).float()
-			if 'neurons_scores' in node_dict:
-				any_neurons_scores = True
-				g.neurons_scores[g.forward_index(g.nodes[name])] = torch.tensor(node_dict['neurons_scores']).float()
-				
-		if not any_node_scores:
-			g.nodes_scores = None
-		if not any_neurons:
-			g.neurons_in_graph = None
-		if not any_neurons_scores:
-			g.neurons_scores = None
-		
-		for name, info in d['edges'].items():
-			g.edges[name].score = info['score']
-			g.edges[name].in_graph = info['in_graph']
-			
-		return g
-
-	@classmethod
-	def from_pt(cls, pt_path: str) -> 'Graph':
-		"""
-		Load a graph object from a pytorch-serialized file.
-		The file should contain a dict with the following items -
-			1. 'cfg': Configuration dictionary, containing similar values to a TLens configuration object.
-			2. 'src_nodes': Dict[str, bool] which maps a node name (i.e. 'm11' or 'a0.h11') to a boolean value, indicating if the node is part of the circuit.
-			3. 'dst_nodes': List[str] containing the names of the possible destination nodes, in the same order as the edges tensor.
-			4. 'edges': torch.tensor[n_src_nodes, n_dst_nodes], where each value in (src, dst) represents the edge score between the src node and dst node.
-			5. 'edges_in_graph': torch.tensor[n_src_nodes, n_dst_nodes], where each value in (src, dst) represents if the edge is in the graph or not.
-			6. 'neurons': [Optional] torch.tensor[n_src_nodes, d_model], where each value in (src, neuron) indicates whether the neuron is in the graph or not
-		"""
-		d = torch.load(pt_path)
-		required_keys = ['cfg', 'src_nodes', 'dst_nodes', 'edges_scores', 'edges_in_graph', 'nodes_in_graph']
-		assert all([k in d.keys() for k in required_keys]), f"Bad torch circuit file format. Found keys - {d.keys()}, missing keys - {set(required_keys) - set(d.keys())}"
-		assert d['edges_scores'].shape == d['edges_in_graph'].shape, "Bad edges array shape"
-
-		g = Graph.from_model(d['cfg'])
-
-		g.in_graph[:] = d['edges_in_graph']
-		g.scores[:] = d['edges_scores']
-		g.nodes_in_graph[:] = d['nodes_in_graph']
-		
-		if 'nodes_scores' in d:
-			g.nodes_scores = d['nodes_scores']
-					
-		if 'neurons_in_graph' in d:
-			g.neurons_in_graph = d['neurons_in_graph']
-		
-		if 'neurons_scores' in d:
-			g.neurons_scores = d['neurons_scores']
-
-		return g
-
-	def to_image(
-		self,
-		filename:str,
-		colorscheme: str = "Pastel2",
-		minimum_penwidth: float = 0.6,
-		maximum_penwidth: float = 5.0,
-		layout: str="dot",
-		seed: Optional[int] = None
-	):
-
-		"""Export the graph as a .png file
-		
-		Filename: the filename to save the graph to
-		Colorscheme: a cmap colorscheme
-		"""
-		import pygraphviz as pgv
-		g = pgv.AGraph(directed=True, bgcolor="white", overlap="false", splines="true", layout=layout)
-
-		if seed is not None:
-			np.random.seed(seed)
-
-		colors = {node.name: generate_random_color(colorscheme) for node in self.nodes.values()}
-
-		for node in self.nodes.values():
-			if node.in_graph:
-				g.add_node(node.name, 
-						fillcolor=colors[node.name], 
-						color="black", 
-						style="filled, rounded",
-						shape="box", 
-						fontname="Helvetica",
-						)
-
-		scores = self.scores.view(-1).abs()
-		max_score = scores.max().item()
-		min_score = scores.min().item()
-		for edge in self.edges.values():
-			if edge.in_graph:
-				normalized_score = (abs(edge.score) - min_score) / (max_score - min_score) if max_score != min_score else abs(edge.score)
-				penwidth = max(minimum_penwidth, normalized_score * maximum_penwidth)
-				g.add_edge(edge.parent.name,
-						edge.child.name,
-						penwidth=str(penwidth),
-						color=get_color(edge.qkv, edge.score),
-						)
-		g.draw(filename, prog="dot")

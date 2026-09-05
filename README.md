@@ -4,7 +4,7 @@ This repository contains causal-intervention studies of language-model behavior.
 
 The two experiment families are:
 
-- **Overtopping:** discovery and held-out evaluation of high-leverage internal channels, directional singleton reach, joint composition, threshold-event visibility, preemption, and checkpoint trajectories.
+- **Overtopping:** discovery and held-out evaluation of high-leverage internal channels, directional singleton reach, joint composition, graded agonist causal crossings, and checkpoint trajectories.
 - **Poisoning:** matched clean/poisoned training trajectories, checkpoint causal analysis, fixed-channel materialization, poisoning-example detection, and cross-seed aggregation.
 
 The repository separates persistent scientific artifacts from regenerable reporting and caches:
@@ -49,14 +49,7 @@ Run the configured non-poisoning experiment programme:
 
 The catalogue contains 28 `paper-primary` settings and 11 `paper-auxiliary` settings. Paper-facing overtopping evaluation uses the `test` split unless another split is explicitly requested.
 
-RQ3 requires additional high-N threshold-event diagnostics. From `code/`:
-
-```bash
-python -m studies.overtopping.analysis.rebuild_spiking_diagnostics \
-  --primary-table ../results/analysis/primary_matrix/tables/primary_table.csv \
-  --data-root ../data \
-  --population-scope primary+supplementary
-```
+RQ3 graded agonist interventions run as part of the normal overtopping pipeline when Stage-7 singleton artifacts are available. No separate threshold-MCC diagnostic rebuild is required.
 
 ## Poisoning study
 

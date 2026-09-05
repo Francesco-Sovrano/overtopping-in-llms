@@ -39,13 +39,8 @@ CANONICAL_SINGLETON_SCHEMA = "heldout-set-metrics-v3-directional"
 LEGACY_SINGLETON_SCHEMA = "heldout-set-metrics-v2"
 STAGE07_RESUME_SCHEMA = 1
 
-THRESHOLD_RUNTIME_KEYS = {
-    "batch_size",
-    "spiking_global_n_clusters",
-    "spectral_cache_dir",
-    "spectral_embedding_batch_size",
-    "ai_model_cache_dir",
-}
+CANONICAL_GROUP_FILENAME_RE = re.compile(r"^batch_(\d{8})_(\d{8})\.pkl$")
+LEGACY_HASH_GROUP_FILENAME_RE = re.compile(r"^batch_([0-9a-f]{20})\.pkl$")
 
 
 VERBOSE = False
@@ -711,8 +706,297 @@ def group_context_from_config(config_path: Path, project: Path) -> tuple[dict[st
         "max_new_tokens": int(task.MAX_NEW_TOKENS),
     }, True)
 
-def migrate_group_caches(project: Path, *, apply: bool, purge_unverifiable: bool, unresolved: list[str]) -> int:
-    count = 0
+def _clean_group_outputs(raw_outputs: Any, *, start: int, end: int, path: Path) -> dict[str, np.ndarray]:
+    if start < 0 or end <= start or not isinstance(raw_outputs, dict):
+        raise ValueError(f"malformed group cache payload: {path}")
+    n = end - start
+    clean: dict[str, np.ndarray] = {}
+    for key, raw in raw_outputs.items():
+        arr = np.asarray(raw, dtype=bool)
+        if arr.ndim != 1 or len(arr) != n:
+            raise ValueError(f"invalid group array {key!r} in {path}: expected {n}, got {arr.shape}")
+        clean[str(key)] = arr
+    return clean
+
+
+def _canonical_group_payload(
+    payload: Any,
+    *,
+    path: Path,
+    context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Normalize a v1/v2 cache payload in memory without trusting its filename."""
+    if not isinstance(payload, dict):
+        return None
+    schema = payload.get("schema")
+    if schema not in {LEGACY_GROUP_SCHEMA, CANONICAL_GROUP_SCHEMA}:
+        return None
+    if schema == LEGACY_GROUP_SCHEMA:
+        if context is None:
+            return None
+        payload_context = context
+    else:
+        payload_context = payload.get("context")
+        if not isinstance(payload_context, dict):
+            return None
+    try:
+        start = int(payload.get("start", -1))
+        end = int(payload.get("end", -1))
+        outputs = _clean_group_outputs(payload.get("outputs"), start=start, end=end, path=path)
+    except Exception:
+        return None
+    return {
+        "schema": CANONICAL_GROUP_SCHEMA,
+        "context": payload_context,
+        "start": start,
+        "end": end,
+        "outputs": outputs,
+    }
+
+
+def _write_group_payload(path: Path, payload: dict[str, Any], *, apply: bool) -> None:
+    log_action(f"[migrate] write group cache: {path}")
+    if not apply:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def _canonical_group_range_path(cache_dir: Path, start: int, end: int) -> Path:
+    return cache_dir / f"batch_{int(start):08d}_{int(end):08d}.pkl"
+
+
+def _group_coverage_for_key(
+    entries: list[tuple[Path, dict[str, Any]]],
+    *,
+    start: int,
+    end: int,
+    key: str,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Return canonical values/coverage for one key over [start,end), plus conflict flag."""
+    n = end - start
+    values = np.zeros(n, dtype=bool)
+    covered = np.zeros(n, dtype=bool)
+    conflicted = False
+    for _, payload in entries:
+        cstart = int(payload["start"])
+        cend = int(payload["end"])
+        arr = payload["outputs"].get(key)
+        if arr is None:
+            continue
+        overlap_start = max(start, cstart)
+        overlap_end = min(end, cend)
+        if overlap_end <= overlap_start:
+            continue
+        src = arr[overlap_start - cstart: overlap_end - cstart]
+        dst = slice(overlap_start - start, overlap_end - start)
+        prior = covered[dst]
+        if np.any(prior):
+            prior_values = values[dst]
+            if np.any(prior_values[prior] != src[prior]):
+                conflicted = True
+                break
+        values[dst] = src
+        covered[dst] = True
+    return values, covered, conflicted
+
+
+def _load_current_canonical_group_entries(
+    cache_dir: Path,
+    *,
+    context: dict[str, Any],
+    n_examples: int,
+) -> list[tuple[Path, dict[str, Any]]]:
+    entries: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(cache_dir.glob("batch_*.pkl")):
+        if not CANONICAL_GROUP_FILENAME_RE.fullmatch(path.name):
+            continue
+        try:
+            with path.open("rb") as f:
+                raw = pickle.load(f)
+        except Exception:
+            continue
+        payload = _canonical_group_payload(raw, path=path, context=context)
+        if payload is None or payload.get("context") != context:
+            continue
+        start = int(payload["start"])
+        end = int(payload["end"])
+        if start < 0 or end <= start or end > n_examples:
+            continue
+        entries.append((path, payload))
+    return entries
+
+
+def _requested_group_keys(config_path: Path) -> set[str] | None:
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    raw = cfg.get("requested_group_keys")
+    if not isinstance(raw, list):
+        return None
+    return {str(key) for key in raw}
+
+
+def _consolidate_legacy_hash_group_caches(
+    cache_dir: Path,
+    *,
+    config_path: Path,
+    context: dict[str, Any] | None,
+    context_error: Exception | None,
+    apply: bool,
+    purge_unverifiable: bool,
+    unresolved: list[str],
+) -> tuple[int, int]:
+    """Promote usable hash-named shards into canonical files, then remove all hash shards.
+
+    Historical cache filenames encoded a content hash.  A previous migration could
+    upgrade those payloads to v2 *in place*, leaving overlapping hash-named shards
+    beside the new stable range files.  The runtime scans both and correctly rejects
+    a group when overlapping shards disagree.  This consolidation makes canonical
+    range files authoritative and removes the obsolete hash namespace everywhere.
+    """
+    migrated = 0
+    removed = 0
+    hash_paths = [p for p in sorted(cache_dir.glob("batch_*.pkl")) if LEGACY_HASH_GROUP_FILENAME_RE.fullmatch(p.name)]
+    if not hash_paths:
+        return migrated, removed
+    if context is None:
+        msg = f"unverifiable hash-named group cache directory {cache_dir}: {context_error}"
+        if purge_unverifiable:
+            for path in hash_paths:
+                remove_path(path, apply=apply)
+                removed += 1
+            return migrated, removed
+        unresolved.append(msg)
+        return migrated, removed
+
+    n_examples = len(context.get("evaluation_rows") or [])
+    if n_examples <= 0:
+        msg = f"group cache context has no evaluation rows: {cache_dir}"
+        if purge_unverifiable:
+            for path in hash_paths:
+                remove_path(path, apply=apply)
+                removed += 1
+            return migrated, removed
+        unresolved.append(msg)
+        return migrated, removed
+
+    requested = _requested_group_keys(config_path)
+    canonical_entries = _load_current_canonical_group_entries(
+        cache_dir, context=context, n_examples=n_examples
+    )
+
+    for path in hash_paths:
+        try:
+            with path.open("rb") as f:
+                raw = pickle.load(f)
+        except Exception as exc:
+            log_action(f"[migrate] purge unreadable hash group cache {path}: {exc}")
+            remove_path(path, apply=apply)
+            removed += 1
+            continue
+
+        payload = _canonical_group_payload(raw, path=path, context=context)
+        if payload is None:
+            log_action(f"[migrate] purge malformed/unrecognized hash group cache: {path}")
+            remove_path(path, apply=apply)
+            removed += 1
+            continue
+        if payload.get("context") != context:
+            log_action(f"[migrate] purge incompatible hash group cache: {path}")
+            remove_path(path, apply=apply)
+            removed += 1
+            continue
+
+        start = int(payload["start"])
+        end = int(payload["end"])
+        if start < 0 or end <= start or end > n_examples:
+            log_action(
+                f"[migrate] purge out-of-range hash group cache {path}: "
+                f"rows={start}:{end}, current_n={n_examples}"
+            )
+            remove_path(path, apply=apply)
+            removed += 1
+            continue
+
+        usable_outputs: dict[str, np.ndarray] = {}
+        for key, arr in payload["outputs"].items():
+            if requested is not None and key not in requested:
+                continue
+            canon_values, canon_covered, canon_conflict = _group_coverage_for_key(
+                canonical_entries, start=start, end=end, key=key
+            )
+            if canon_conflict:
+                # Canonical stable-range files are the authoritative namespace.
+                # Do not let a historical shard participate in an already-conflicted key.
+                log_action(f"[migrate] drop hash key shadowed by conflicting canonical coverage: {path} :: {key}")
+                continue
+            if bool(np.all(canon_covered)):
+                if np.any(canon_values != arr):
+                    log_action(f"[migrate] drop conflicting shadowed hash key: {path} :: {key}")
+                continue
+            if np.any(canon_covered) and np.any(canon_values[canon_covered] != arr[canon_covered]):
+                log_action(f"[migrate] drop partially conflicting hash key: {path} :: {key}")
+                continue
+            usable_outputs[key] = arr
+
+        if usable_outputs:
+            canonical_path = _canonical_group_range_path(cache_dir, start, end)
+            existing_payload: dict[str, Any] | None = None
+            if canonical_path.exists():
+                try:
+                    with canonical_path.open("rb") as f:
+                        existing_raw = pickle.load(f)
+                    existing_payload = _canonical_group_payload(
+                        existing_raw, path=canonical_path, context=context
+                    )
+                except Exception:
+                    existing_payload = None
+                if existing_payload is not None and (
+                    existing_payload.get("context") != context
+                    or int(existing_payload["start"]) != start
+                    or int(existing_payload["end"]) != end
+                ):
+                    existing_payload = None
+            merged_outputs: dict[str, np.ndarray] = {}
+            if existing_payload is not None:
+                merged_outputs.update(existing_payload["outputs"])
+            for key, arr in usable_outputs.items():
+                prior = merged_outputs.get(key)
+                if prior is not None and np.any(prior != arr):
+                    # Exact canonical file wins. This key is stale in the hash shard.
+                    continue
+                merged_outputs[key] = arr
+            if merged_outputs:
+                new_payload = {
+                    "schema": CANONICAL_GROUP_SCHEMA,
+                    "context": context,
+                    "start": start,
+                    "end": end,
+                    "outputs": merged_outputs,
+                }
+                if existing_payload is None or set(merged_outputs) != set(existing_payload["outputs"]):
+                    _write_group_payload(canonical_path, new_payload, apply=apply)
+                    migrated += 1
+                    # Make newly promoted coverage visible to later hash shards in this same pass.
+                    canonical_entries = [entry for entry in canonical_entries if entry[0] != canonical_path]
+                    canonical_entries.append((canonical_path, new_payload))
+
+        remove_path(path, apply=apply)
+        removed += 1
+
+    return migrated, removed
+
+
+def migrate_group_caches(project: Path, *, apply: bool, purge_unverifiable: bool, unresolved: list[str]) -> tuple[int, int, int]:
+    """Upgrade v1 group caches and globally consolidate obsolete hash-named shards."""
+    upgraded_v1 = 0
+    promoted_hash = 0
+    removed_hash = 0
     for cache_dir in sorted(p for p in project.rglob("group_eval_cache") if p.is_dir()):
         config_path = cache_dir.parent / "interaction_configuration.json"
         context: dict[str, Any] | None = None
@@ -724,145 +1008,49 @@ def migrate_group_caches(project: Path, *, apply: bool, purge_unverifiable: bool
                 _upgrade_group_config(config_path, context=context, apply=apply)
         except Exception as exc:
             context_error = exc
+
+        # First normalize v1 payloads. Keep their historical filenames for this
+        # pass; the consolidation step below will promote/remove hash names.
         for path in sorted(cache_dir.glob("batch_*.pkl")):
             try:
                 with path.open("rb") as f:
-                    payload = pickle.load(f)
+                    raw = pickle.load(f)
             except Exception:
                 continue
-            if not isinstance(payload, dict) or payload.get("schema") != LEGACY_GROUP_SCHEMA:
+            if not isinstance(raw, dict) or raw.get("schema") != LEGACY_GROUP_SCHEMA:
                 continue
             if context is None:
                 msg = f"unverifiable v1 group cache {path}: {context_error}"
                 if purge_unverifiable:
-                    log_action(f"[migrate] purge {msg}")
-                    if apply:
-                        path.unlink()
-                    count += 1
+                    remove_path(path, apply=apply)
+                    upgraded_v1 += 1
                     continue
                 unresolved.append(msg)
                 continue
-            start = int(payload.get("start", -1))
-            end = int(payload.get("end", -1))
-            outputs = payload.get("outputs")
-            if start < 0 or end <= start or not isinstance(outputs, dict):
+            payload = _canonical_group_payload(raw, path=path, context=context)
+            if payload is None:
                 unresolved.append(f"malformed v1 group cache: {path}")
                 continue
-            n = end - start
-            clean_outputs: dict[str, np.ndarray] = {}
-            for key, raw in outputs.items():
-                arr = np.asarray(raw, dtype=bool)
-                if arr.ndim != 1 or len(arr) != n:
-                    raise RuntimeError(f"Invalid group array {key!r} in {path}")
-                clean_outputs[str(key)] = arr
-            new_payload = {
-                "schema": CANONICAL_GROUP_SCHEMA,
-                "context": context,
-                "start": start,
-                "end": end,
-                "outputs": clean_outputs,
-            }
-            log_action(f"[migrate] group cache v1 -> v2: {path}")
-            if apply:
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                with tmp.open("wb") as f:
-                    pickle.dump(new_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-                tmp.replace(path)
-            count += 1
-    return count
+            _write_group_payload(path, payload, apply=apply)
+            upgraded_v1 += 1
+
+        promoted, removed = _consolidate_legacy_hash_group_caches(
+            cache_dir,
+            config_path=config_path,
+            context=context,
+            context_error=context_error,
+            apply=apply,
+            purge_unverifiable=purge_unverifiable,
+            unresolved=unresolved,
+        )
+        promoted_hash += promoted
+        removed_hash += removed
+
+    return upgraded_v1, promoted_hash, removed_hash
 
 
-def canonicalize_threshold_method(manifest_path: Path, payload: dict[str, Any]) -> bool:
-    method = dict(payload.get("scientific_method") or {})
-    if not method:
-        return False
-    original = dict(method)
-    for key in THRESHOLD_RUNTIME_KEYS:
-        method.pop(key, None)
-
-    cand = method.get("candidate_flip_stats_path") or payload.get("candidate_flip_stats_path")
-    mat = method.get("materialized_stage7_scores_path")
-    if mat in (None, "") and cand:
-        inferred = Path(str(cand)).expanduser().parent / "scores.csv"
-        if inferred.is_file():
-            mat = str(inferred)
-
-    if "candidate_flip_stats_sha256" not in method:
-        if cand and Path(str(cand)).expanduser().is_file():
-            method["candidate_flip_stats_sha256"] = sha256(Path(str(cand)).expanduser())
-        else:
-            raise RuntimeError(f"Cannot canonicalize candidate source identity in {manifest_path}: {cand!r}")
-    if "materialized_stage7_scores_sha256" not in method:
-        if mat and Path(str(mat)).expanduser().is_file():
-            method["materialized_stage7_scores_sha256"] = sha256(Path(str(mat)).expanduser())
-        else:
-            raise RuntimeError(f"Cannot canonicalize materialized Stage-7 identity in {manifest_path}: {mat!r}")
-
-    method.pop("candidate_flip_stats_path", None)
-    method.pop("materialized_stage7_scores_path", None)
-    payload["scientific_method"] = method
-    return method != original
 
 
-def extract_threshold_csv_schemas(code_root: Path) -> dict[str, list[str]]:
-    source = (code_root / "studies/overtopping/analysis/threshold_event_diagnostics.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    wanted = {
-        "THRESHOLD_UNIT_TEST_COLUMNS": "threshold_unit_tests.csv",
-        "THRESHOLD_POPULATION_SUMMARY_COLUMNS": "threshold_population_summary.csv",
-        "THRESHOLD_BINNED_CURVE_COLUMNS": "threshold_binned_flip_curves.csv",
-    }
-    out: dict[str, list[str]] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            value = node.value
-            for target in targets:
-                if isinstance(target, ast.Name) and target.id in wanted:
-                    out[wanted[target.id]] = list(ast.literal_eval(value))
-    missing = sorted(set(wanted.values()) - set(out))
-    if missing:
-        raise RuntimeError(f"Could not extract current threshold CSV schemas: {missing}")
-    return out
-
-
-def migrate_threshold_manifests_and_empty_csvs(project: Path, *, apply: bool) -> int:
-    count = 0
-    schemas = extract_threshold_csv_schemas(project / "code")
-    for manifest in sorted(project.rglob("threshold_spiking_experiment.json")):
-        try:
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if payload.get("status") == "ok" and payload.get("scientific_method"):
-            changed = canonicalize_threshold_method(manifest, payload)
-            if changed:
-                atomic_json(manifest, payload, apply=apply)
-                count += 1
-        if payload.get("status") != "ok":
-            continue
-        for filename, columns in schemas.items():
-            path = manifest.parent / filename
-            needs = False
-            if not path.exists() or path.stat().st_size == 0:
-                needs = True
-            else:
-                try:
-                    pd.read_csv(path, nrows=1)
-                except pd.errors.EmptyDataError:
-                    needs = True
-                except Exception:
-                    pass
-            if needs:
-                log_action(f"[migrate] materialize schema-valid empty threshold CSV: {path}")
-                if apply:
-                    pd.DataFrame(columns=columns).to_csv(path, index=False)
-                count += 1
-    return count
-
-
-def cache_hash(payload: dict[str, Any]) -> str:
-    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
 def candidate_old_batch_sizes(start: int, arr_len: int, declared_batch_size: int | None = None) -> list[int]:
@@ -889,224 +1077,14 @@ def load_task_max_new_tokens(project: Path, task_module: str) -> int:
             pass
 
 
-def high_n_context(manifest: Path, payload: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any], int | None]:
-    """Reconstruct the exact runtime cache-key context for a completed high-N run.
-
-    ``high_n_scores_with_flips.csv::_orig_row`` is the ORIGINAL source scores
-    row identity after candidate/control results are merged.  The runtime cache
-    key is instead built from ``eval_indices``: positions inside the
-    split/baseline-filtered ``scores_df``.  Reconstruct that filtered frame and
-    map the materialized source identities back to those positional indices.
-    """
-    method = payload.get("scientific_method") or {}
-    materialized_scores_path = manifest.parent / "high_n_scores_with_flips.csv"
-    if not materialized_scores_path.is_file():
-        raise RuntimeError("missing high_n_scores_with_flips.csv")
-    materialized = pd.read_csv(materialized_scores_path, usecols=lambda c: c == "_orig_row")
-    if "_orig_row" not in materialized.columns:
-        raise RuntimeError("high_n_scores_with_flips.csv lacks _orig_row")
-    source_orig = pd.to_numeric(materialized["_orig_row"], errors="raise").astype(int)
-    if source_orig.duplicated().any():
-        raise RuntimeError("high_n_scores_with_flips.csv has duplicate _orig_row identities")
-
-    input_data_dir = Path(str(method.get("input_data_dir", ""))).expanduser()
-    dataset_info_path = input_data_dir / "dataset_info.json"
-    if not dataset_info_path.is_file():
-        raise RuntimeError(f"missing dataset_info.json: {dataset_info_path}")
-    info = json.loads(dataset_info_path.read_text(encoding="utf-8"))
-
-    task_module = str(method.get("task_module", ""))
-    if not task_module:
-        raise RuntimeError("scientific_method lacks task_module")
-    task = _resolve_task(PROJECT_FOR_IMPORT, task_module)
-    prompt_col = info.get("prompt_col") or task.DEFAULT_INPUT
-    target_col = info.get("target_col") or task.DEFAULT_TARGETS[0]
-    if not prompt_col or not target_col:
-        raise RuntimeError(f"dataset_info/task spec lacks prompt_col/target_col: {dataset_info_path}")
-
-    raw_scores_path = info.get("scores_path")
-    if not raw_scores_path:
-        raise RuntimeError(f"dataset_info lacks scores_path: {dataset_info_path}")
-    raw_scores_path = Path(str(raw_scores_path)).expanduser()
-    if not raw_scores_path.is_absolute():
-        candidates = [input_data_dir / raw_scores_path, PROJECT_FOR_IMPORT / raw_scores_path]
-        raw_scores_path = next((c for c in candidates if c.is_file()), raw_scores_path)
-    if not raw_scores_path.is_file():
-        raise RuntimeError(f"scores_path from dataset_info does not exist: {raw_scores_path}")
-
-    baseline = str(method.get("baseline_subset", payload.get("baseline", "")))
-    evaluation_split = str(method.get("evaluation_split", payload.get("evaluation_split", "test")))
-
-    sys.path.insert(0, str(PROJECT_FOR_IMPORT / "code"))
-    try:
-        from core.high_n_singleton_eval import load_scores_for_baseline
-        filtered_scores = load_scores_for_baseline(
-            scores_path=raw_scores_path,
-            target_col=str(target_col),
-            baseline_subset=baseline,
-            task_targets=task.DEFAULT_TARGETS,
-            split=evaluation_split,
-        )
-    finally:
-        try:
-            sys.path.remove(str(PROJECT_FOR_IMPORT / "code"))
-        except ValueError:
-            pass
-
-    if "original_idx" not in filtered_scores.columns:
-        raise RuntimeError("filtered high-N score frame lacks original_idx")
-    filtered_orig = pd.to_numeric(filtered_scores["original_idx"], errors="raise").astype(int)
-    if filtered_orig.duplicated().any():
-        raise RuntimeError("filtered high-N score frame has duplicate original_idx identities")
-    pos_by_orig = {int(orig): int(pos) for pos, orig in enumerate(filtered_orig.tolist())}
-    missing = [int(orig) for orig in source_orig.tolist() if int(orig) not in pos_by_orig]
-    if missing:
-        preview = ", ".join(map(str, missing[:12]))
-        raise RuntimeError(
-            f"{len(missing)} materialized high-N source row(s) are absent from the "
-            f"current {evaluation_split}/{baseline} filtered frame: {preview}"
-        )
-    eval_indices = np.asarray([pos_by_orig[int(orig)] for orig in source_orig.tolist()], dtype=int)
-
-    context = {
-        "baseline_subset": baseline,
-        "target_col": str(target_col),
-        "prompt_col": str(prompt_col),
-        "decode_only": bool(method.get("decode_only", False)),
-        "intervention": str(method.get("intervention", "mean-donor")),
-        "max_new_tokens": int(task.MAX_NEW_TOKENS),
-    }
-    declared_batch = method.get("batch_size")
-    try:
-        declared_batch = int(declared_batch) if declared_batch is not None else None
-    except Exception:
-        declared_batch = None
-    return eval_indices, context, declared_batch
 
 
 # Set once by main; kept global only to avoid threading project through dynamic task import helper.
 PROJECT_FOR_IMPORT: Path
 
 
-def migrate_high_n_cache_for_manifest(
-    project: Path,
-    manifest: Path,
-    payload: dict[str, Any],
-    *,
-    apply: bool,
-    purge_unverifiable: bool,
-    unresolved: list[str],
-) -> int:
-    cache_dir = manifest.parent / "high_n_eval_cache" / "ablation_cache"
-    if not cache_dir.is_dir():
-        return 0
-    paths = sorted(cache_dir.glob("*.pkl"))
-    if not paths:
-        return 0
-    try:
-        eval_indices, ctx, declared_batch_size = high_n_context(manifest, payload)
-    except Exception as exc:
-        if purge_unverifiable:
-            for path in paths:
-                log_action(f"[migrate] purge unverifiable high-N cache: {path} ({exc})")
-                if apply:
-                    path.unlink()
-            return len(paths)
-        unresolved.append(f"cannot verify high-N cache under {cache_dir}: {exc}")
-        return 0
-
-    count = 0
-    rx = re.compile(r"^(?P<prefix>.+)_(?P<start>\d+)_(?P<key>[0-9a-f]{16})$")
-    for path in paths:
-        m = rx.match(path.stem)
-        if not m:
-            continue
-        start = int(m.group("start"))
-        file_key = m.group("key")
-        try:
-            with path.open("rb") as f:
-                arr = np.asarray(pickle.load(f), dtype=bool)
-        except Exception as exc:
-            msg = f"unreadable high-N cache {path}: {exc}"
-            if purge_unverifiable:
-                log_action(f"[migrate] purge {msg}")
-                if apply:
-                    path.unlink()
-                count += 1
-            else:
-                unresolved.append(msg)
-            continue
-        if arr.ndim != 1 or start + len(arr) > len(eval_indices):
-            msg = f"invalid/stale high-N cache range {path}"
-            if purge_unverifiable:
-                log_action(f"[migrate] purge {msg}")
-                if apply:
-                    path.unlink()
-                count += 1
-            else:
-                unresolved.append(msg)
-            continue
-        end = start + len(arr)
-        base_payload = {
-            "eval_indices": [int(i) for i in eval_indices[start:end].tolist()],
-            **ctx,
-        }
-        canonical_key = cache_hash(base_payload)
-        if file_key == canonical_key:
-            continue
-        matched_old = any(
-            file_key == cache_hash(base_payload | {"batch_size": int(old_batch)})
-            for old_batch in candidate_old_batch_sizes(start, len(arr), declared_batch_size)
-        )
-        if not matched_old:
-            msg = f"unverifiable high-N cache key {path}"
-            if purge_unverifiable:
-                log_action(f"[migrate] purge {msg}")
-                if apply:
-                    path.unlink()
-                count += 1
-            else:
-                unresolved.append(msg)
-            continue
-        new_path = path.with_name(f"{m.group('prefix')}_{start}_{canonical_key}.pkl")
-        try:
-            display_path = path.resolve().relative_to(project.resolve())
-            display_new_path = new_path.resolve().relative_to(project.resolve())
-        except ValueError:
-            display_path = path
-            display_new_path = new_path
-        log_action(
-            "[migrate] high-N cache key -> canonical: "
-            f"{display_path} -> {display_new_path}"
-        )
-        if apply:
-            if new_path.exists():
-                with new_path.open("rb") as f:
-                    existing = np.asarray(pickle.load(f), dtype=bool)
-                if not np.array_equal(existing, arr):
-                    raise RuntimeError(f"Conflicting canonical high-N cache: {new_path}")
-            else:
-                with new_path.open("wb") as f:
-                    pickle.dump(arr, f, protocol=pickle.HIGHEST_PROTOCOL)
-            path.unlink()
-        count += 1
-    return count
 
 
-def migrate_high_n_caches(project: Path, *, apply: bool, purge_unverifiable: bool, unresolved: list[str]) -> int:
-    count = 0
-    for manifest in sorted(project.rglob("threshold_spiking_experiment.json")):
-        try:
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if payload.get("status") != "ok" or not payload.get("scientific_method"):
-            continue
-        count += migrate_high_n_cache_for_manifest(
-            project, manifest, payload, apply=apply,
-            purge_unverifiable=purge_unverifiable, unresolved=unresolved,
-        )
-    return count
 
 
 def read_scope(stats_dir: Path) -> dict[str, Any]:
@@ -1282,10 +1260,10 @@ def migrate_directional_singletons(project: Path, *, apply: bool, python_bin: st
             continue
         split = infer_split(stats_dir)
         cmd = [
-            python_bin, "-m", "pipeline.stage07_refine_neuron_anchored_rules",
+            python_bin, "-m", "pipeline.stage07_singleton_causal_evaluation",
             "--task_module", str(setting["task_module"]),
             "--ai_model", str(setting["model_id"]),
-            "--rules_dir", str(setting.get("rules_dir", stats_dir.parents[1])),
+            "--output_dir", str(setting.get("rules_dir", stats_dir.parents[1])),
             "--features_scores_dir", str(setting.get("features_scores_dir", setting.get("model_root", stats_dir.parents[3]) / "feature_report")),
             "--circuit_agonists_path", str(setting["circuit_agonists_path"]),
             "--search_epsilon", str(setting["search_epsilon"]),
@@ -1399,46 +1377,6 @@ def migrate_poison_stage07_resume(project: Path, *, apply: bool, unresolved: lis
     return count
 
 
-def noncanonical_high_n_leftovers(project: Path) -> list[str]:
-    leftovers: list[str] = []
-    rx = re.compile(r"^(?P<prefix>.+)_(?P<start>\d+)_(?P<key>[0-9a-f]{16})$")
-    for manifest in sorted(project.rglob("threshold_spiking_experiment.json")):
-        try:
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if payload.get("status") != "ok" or not payload.get("scientific_method"):
-            continue
-        cache_dir = manifest.parent / "high_n_eval_cache" / "ablation_cache"
-        if not cache_dir.is_dir():
-            continue
-        try:
-            eval_indices, ctx, _ = high_n_context(manifest, payload)
-        except Exception:
-            # A cache directory whose completed manifest can no longer establish
-            # its identity is not canonical persisted state.
-            leftovers.extend(str(p) for p in cache_dir.glob("*.pkl"))
-            continue
-        for path in cache_dir.glob("*.pkl"):
-            m = rx.match(path.stem)
-            if not m:
-                leftovers.append(str(path)); continue
-            try:
-                start = int(m.group("start"))
-                with path.open("rb") as f:
-                    arr = np.asarray(pickle.load(f), dtype=bool)
-            except Exception:
-                leftovers.append(str(path)); continue
-            if arr.ndim != 1 or start < 0 or start + len(arr) > len(eval_indices):
-                leftovers.append(str(path)); continue
-            end = start + len(arr)
-            expected = cache_hash({
-                "eval_indices": [int(i) for i in eval_indices[start:end].tolist()],
-                **ctx,
-            })
-            if m.group("key") != expected:
-                leftovers.append(str(path))
-    return leftovers
 
 
 def recognized_legacy_leftovers(project: Path) -> list[str]:
@@ -1468,6 +1406,9 @@ def recognized_legacy_leftovers(project: Path) -> list[str]:
         except Exception:
             pass
     for path in project.rglob("group_eval_cache/batch_*.pkl"):
+        if LEGACY_HASH_GROUP_FILENAME_RE.fullmatch(path.name):
+            leftovers.append(str(path))
+            continue
         try:
             with path.open("rb") as f:
                 payload = pickle.load(f)
@@ -1475,17 +1416,9 @@ def recognized_legacy_leftovers(project: Path) -> list[str]:
                 leftovers.append(str(path))
         except Exception:
             pass
-    for path in project.rglob("threshold_spiking_experiment.json"):
-        try:
-            method = json.loads(path.read_text(encoding="utf-8")).get("scientific_method") or {}
-        except Exception:
-            continue
-        if THRESHOLD_RUNTIME_KEYS.intersection(method) or "candidate_flip_stats_path" in method or "materialized_stage7_scores_path" in method:
-            leftovers.append(str(path))
     for path in project.rglob("07_poisoning_example_detection/*/detection_summary.json"):
         if not (path.parent / "stage07_resume_configuration.json").is_file():
             leftovers.append(str(path.parent))
-    leftovers.extend(noncanonical_high_n_leftovers(project))
     return sorted(set(leftovers))
 
 
@@ -1516,16 +1449,12 @@ def main() -> None:
     counts["normal_task_cache"] = migrate_normal_task_cache(
         project, apply=args.apply, purge_unverifiable=purge_unverifiable, unresolved=unresolved
     )
-    counts["group_cache_v1"] = migrate_group_caches(
+    group_v1, group_hash_promoted, group_hash_removed = migrate_group_caches(
         project, apply=args.apply, purge_unverifiable=purge_unverifiable, unresolved=unresolved
     )
-    # High-N keys must be migrated BEFORE threshold manifests are canonicalized,
-    # because old manifests still contain the historical runtime batch_size that
-    # participated in the legacy key hash.
-    counts["high_n_cache"] = migrate_high_n_caches(
-        project, apply=args.apply, purge_unverifiable=purge_unverifiable, unresolved=unresolved
-    )
-    counts["threshold_manifest_or_csv"] = migrate_threshold_manifests_and_empty_csvs(project, apply=args.apply)
+    counts["group_cache_v1"] = group_v1
+    counts["group_cache_hash_promoted"] = group_hash_promoted
+    counts["group_cache_hash_removed"] = group_hash_removed
     counts["directional_singleton_v2"] = migrate_directional_singletons(
         project, apply=args.apply, python_bin=args.python_bin, unresolved=unresolved
     )

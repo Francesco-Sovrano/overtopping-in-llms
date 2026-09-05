@@ -38,7 +38,7 @@ Interpretation of the sign:
 - `Delta_comp = 0`: the simultaneous effect equals singleton-union reach;
 - `Delta_comp > 0`: the simultaneous intervention reaches examples not accounted for by the singleton-union mask, consistent with coalition-dependent effects.
 
-The sign alone does not identify the mechanism producing the gap. Overlap, saturation, preemption, masking, cancellation, and coalition effects require additional example-level analysis to distinguish.
+The sign alone does not identify the mechanism producing the gap. Overlap, saturation, masking, cancellation, and coalition effects are not separated by this statistic.
 
 ## Structural context
 
@@ -118,6 +118,6 @@ results/analysis/figure_data/03_rq2_composition/
 
 ## Relation to RQ3
 
-RQ2 establishes set-level composition. It does not by itself establish a threshold mechanism or preemption. RQ3 separately tests endogenous threshold visibility and conditional marginal effects.
+RQ2 establishes set-level composition. It does not by itself establish a causal threshold crossing. RQ3 separately tests the graded causal transition of agonists on examples they are already known to flip.
 
 See [RQ3 — threshold-event analysis](rq3-threshold-event.md).

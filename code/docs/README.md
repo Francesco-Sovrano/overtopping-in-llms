@@ -1,68 +1,87 @@
 # Documentation
 
-This directory is the documentation entry point for the repository.
+This documentation describes the repository from experiment configuration through manuscript output generation. It is organized for readers who have not worked with the code before.
 
-## Start here
+## Reading order
 
-For a first reading, use this order:
+1. [Getting started](getting-started/README.md) — environment, runtime roots, experiment launchers, and result generation.
+2. [Architecture](methods/architecture.md) — ownership of code packages and artifact roots.
+3. [Core concepts](methods/concepts.md) — behavioral endpoints, directional causal effects, union reach, composition, threshold-event metrics, and graded interventions.
+4. [Pipeline](methods/pipeline.md) — numbered model-backed execution stages and their persistent outputs.
+5. [Experiments](experiments/README.md) — overtopping and controlled-poisoning study designs.
+6. [Research questions](research-questions/README.md) — scientific populations, estimands, and manuscript outputs for RQ1–RQ4.
+7. [Reporting](reporting/README.md) — aggregation, audits, figures, and result-tree conventions.
+8. [Operations](operations/README.md) — targeted regeneration and troubleshooting without unnecessary cache deletion.
 
-1. [Getting started](getting-started/) — install the environment, understand the repository roots, inspect the experiment catalogues, run experiments, and generate results.
-2. [Methods](methods/) — learn the intervention model, directional causal quantities, discovery/evaluation split, pipeline stages, and attribution machinery.
-3. [Experiments](experiments/) — see the exact overtopping catalogue and the poisoning study design.
-4. [Research questions](research-questions/) — read the scientific analyses for RQ1, RQ2, RQ3, and RQ4 in parallel form.
-5. [Reporting](reporting/) — understand how completed experiments become tables, figures, audits, and manuscript-facing outputs.
-6. [Operations and troubleshooting](operations/) — recover incomplete analyses, inspect missing populations, and decide which derived files can be regenerated without deleting reusable caches.
+## Repository model
+
+```text
+repository/
+├── code/       source packages and this documentation
+├── data/       persistent scientific outputs
+├── cache/      reusable computation caches
+└── results/    derived analyses and manuscript products
+```
+
+Within `code/`:
+
+```text
+core/           shared task, model, intervention, attribution, and statistics code
+pipeline/       numbered causal-intervention stages
+studies/        study-specific experiment and analysis packages
+reporting/      final aggregation, audits, and manuscript-output generation
+docs/           documentation
+```
 
 ## Documentation map
 
 ```text
-code/docs/
-├── README.md                         documentation entry point
+docs/
+├── README.md
 ├── getting-started/
-│   ├── README.md                     installation and first run
-│   └── credentials.md                provider credentials and secrets
+│   ├── README.md
+│   └── credentials.md
 ├── methods/
-│   ├── README.md                     methods map
-│   ├── architecture.md               package and artifact ownership
-│   ├── concepts.md                   causal definitions and metrics
-│   ├── pipeline.md                   numbered causal pipeline
-│   └── eap.md                        EAP / EAP-IG implementation
+│   ├── README.md
+│   ├── architecture.md
+│   ├── concepts.md
+│   ├── pipeline.md
+│   └── eap.md
 ├── experiments/
-│   ├── README.md                     experiment-family map
-│   ├── overtopping.md                exact overtopping catalogue
+│   ├── README.md
+│   ├── overtopping.md
 │   └── poisoning/
-│       ├── README.md                 poisoning protocol
-│       ├── configuration.md          launcher configuration
-│       └── outputs.md                poisoning artifact tree
+│       ├── README.md
+│       ├── configuration.md
+│       └── outputs.md
 ├── research-questions/
-│   ├── README.md                     RQ map and populations
-│   ├── rq1-prevalence.md             prevalence and competence
-│   ├── rq2-composition.md            joint composition and specificity
-│   ├── rq3-threshold-event.md        causal threshold-event analysis
-│   └── rq4-learning.md               learning trajectories and poisoning
+│   ├── README.md
+│   ├── rq1-prevalence.md
+│   ├── rq2-composition.md
+│   ├── rq3-threshold-event.md
+│   └── rq4-learning.md
 ├── reporting/
-│   ├── README.md                     reporting entry point
-│   ├── analysis-pipeline.md          analysis stages and result tree
-│   ├── figures.md                    manuscript figure ownership
-│   └── interpretation.md             metric scope and limitations
+│   ├── README.md
+│   ├── analysis-pipeline.md
+│   ├── figures.md
+│   └── interpretation.md
 └── operations/
-    └── README.md                     troubleshooting and regeneration
+    └── README.md
 ```
 
-## Choose a path by task
+## Common tasks
 
-| Goal | Read |
+| Task | Reference |
 |---|---|
-| Install and run the repository | [Getting started](getting-started/) |
-| Understand what `data/`, `cache/`, and `results/` contain | [Architecture](methods/architecture.md) |
-| Understand `U(J)`, directional reach, `E(J)`, graded agonist crossings, or preemption | [Core concepts](methods/concepts.md) |
-| Understand the execution stages | [Numbered pipeline](methods/pipeline.md) |
-| See which overtopping experiments are part of the paper | [Overtopping catalogue](experiments/overtopping.md) |
+| Install and execute the code | [Getting started](getting-started/README.md) |
+| Understand `data/`, `cache/`, and `results/` | [Architecture](methods/architecture.md) |
+| Understand `U(J)`, `E(J)`, directional effects, threshold MCC, TECS, or graded crossings | [Core concepts](methods/concepts.md) |
+| Trace pipeline execution | [Pipeline](methods/pipeline.md) |
+| Inspect the exact overtopping catalogue | [Overtopping catalogue](experiments/overtopping.md) |
 | Understand RQ1 | [RQ1 — prevalence](research-questions/rq1-prevalence.md) |
 | Understand RQ2 | [RQ2 — composition](research-questions/rq2-composition.md) |
 | Understand RQ3 | [RQ3 — threshold events](research-questions/rq3-threshold-event.md) |
 | Understand RQ4 | [RQ4 — learning](research-questions/rq4-learning.md) |
-| Understand poisoning experiments | [Poisoning protocol](experiments/poisoning/) |
-| Trace a manuscript figure to its source data | [Figure map](reporting/figures.md) |
-| Interpret a metric or limitation | [Interpretation](reporting/interpretation.md) |
-| Recover or regenerate derived outputs | [Operations](operations/) |
+| Understand poisoning | [Poisoning protocol](experiments/poisoning/README.md) |
+| Trace a figure to source data | [Figure map](reporting/figures.md) |
+| Regenerate derived outputs | [Operations](operations/README.md) |

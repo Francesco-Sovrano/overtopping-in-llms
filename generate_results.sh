@@ -33,7 +33,6 @@ printf 'Reading poisoning runs from: %s\n' "$POISONING_ROOT"
 
 ALLOW_INCOMPLETE_METRICS="${ALLOW_INCOMPLETE_METRICS:-false}"
 REQUIRE_CMC="${REQUIRE_CMC:-false}"
-SPIKING_SOURCE="${SPIKING_SOURCE:-}"
 
 ARGS=(
   --data-root "$DATA_ROOT"
@@ -46,11 +45,6 @@ if [[ "$ALLOW_INCOMPLETE_METRICS" != "true" && "$ALLOW_INCOMPLETE_METRICS" != "1
   ARGS+=(--require-complete-metrics)
 else
   echo "WARNING: incomplete metrics are allowed; inspect results/analysis/reproducibility/metric_completeness_audit/."
-fi
-
-if [[ -n "$SPIKING_SOURCE" ]]; then
-  ARGS+=(--spiking-source "$SPIKING_SOURCE")
-  echo "Using explicit RQ3 threshold/spiking diagnostics source: $SPIKING_SOURCE"
 fi
 
 # CMC is an optional interaction diagnostic, not part of the directional-singleton

@@ -1,61 +1,90 @@
-# Numbered causal-intervention pipeline
+# Causal-intervention pipeline
 
-The shared pipeline is implemented in `code/pipeline/`. Study-specific launchers configure it for overtopping and poisoning experiments.
+The shared execution pipeline is implemented in `code/pipeline/`. Study-specific launchers provide task/model configurations and invoke these stages.
 
-## Configuration
-
-A pipeline run is determined by task specification, analyzed model, intervention phase, replacement baseline, sampling configuration, discovery settings, evaluation split, and stage-specific thresholds. These values are encoded in configuration metadata and, where necessary, output paths.
+A run is identified by its task specification, model, intervention phase, replacement baseline, sampling configuration, discovery configuration, evaluation split, and stage-specific settings.
 
 ## Stage 01 — prompts and answers
 
-`stage01_generate_prompts_and_answers.py`
+Module:
 
-Creates task prompts, obtains model outputs or loads cached generations, computes task-level behavioral labels, and writes the score population used by later stages.
+```text
+pipeline.stage01_generate_prompts_and_answers
+```
+
+Responsibilities:
+
+- construct or load task prompts;
+- obtain model outputs or reuse generation caches;
+- compute task-level behavioral labels;
+- persist the population consumed by later stages.
 
 ## Stage 02 — feature export
 
-`stage02_generate_features.py`
+Module:
 
-Computes feature representations used for rule extraction and discovery. Feature generation can use local or provider-backed language models according to the configured task and feature model.
+```text
+pipeline.stage02_generate_features
+```
+
+Computes the feature table used for rule extraction and discovery. Feature proposal can use the configured local or provider-backed model.
 
 ## Stage 03 — rule extraction
 
-`stage03_extract_rules.py`
+Module:
 
-Fits and exports interpretable rule structures over the generated feature table.
+```text
+pipeline.stage03_extract_rules
+```
+
+Fits and exports interpretable rule structures over the feature table.
 
 ## Stage 04 — spectral sampling plan
 
-`stage04_spectral_sample_datapoints.py`
+Module:
 
-Constructs a bounded sampling plan for expensive causal evaluation. Sampling metadata records the population and method used to choose rows.
+```text
+pipeline.stage04_spectral_sample_datapoints
+```
+
+Constructs a bounded, reproducible sampling plan for expensive causal evaluation and records the selected population.
 
 ## Stage 05 — circuit discovery
 
-`stage05_discover_circuits.py`
+Module:
 
-Runs attribution/circuit discovery over the selected population. EAP/EAP-IG implementation details are documented in [EAP / EAP-IG](eap.md).
+```text
+pipeline.stage05_discover_circuits
+```
+
+Runs attribution-based circuit discovery on the selected rows. The EAP/EAP-IG implementation is documented in [EAP / EAP-IG](eap.md).
 
 ## Stage 06 — candidate and rule analysis
 
-`stage06_analyze_bag_of_rules.py`
-
-Builds candidate/rule summaries and the directional agonist buckets used by downstream singleton evaluation. Candidate membership records the source baseline subset:
+Module:
 
 ```text
-positive  -> 1→0 discovery population
-negative  -> 0→1 discovery population
+pipeline.stage06_analyze_bag_of_rules
+```
+
+Builds candidate/rule summaries and directional candidate buckets. Discovery baseline is retained as candidate provenance:
+
+```text
+positive baseline -> 1→0 discovery direction
+negative baseline -> 0→1 discovery direction
 ```
 
 ## Stage 07 — held-out singleton causal evaluation
 
-`stage07_singleton_causal_evaluation.py`
+Module:
+
+```text
+pipeline.stage07_singleton_causal_evaluation
+```
 
 Evaluates frozen candidates on the declared evaluation split and materializes row-level singleton intervention outcomes.
 
-The historical module name `stage07_refine_neuron_anchored_rules.py` remains as a compatibility implementation only; Stage 7 does not perform rule extraction unless the optional legacy `REFINE_EXTRACT_RULES=true` add-on is explicitly enabled.
-
-Important artifacts include:
+Core Stage-7 artifacts include:
 
 ```text
 scores.csv
@@ -64,90 +93,142 @@ flip_stats_by_neuron.csv
 flip_stats_global.json
 ```
 
-The frozen ranking and per-neuron statistics carry discovery-direction provenance. A candidate discovered in only one baseline subset remains restricted to that directional population in RQ3.
+Stage 7 owns the row identities on which singleton outcomes are evaluated. Downstream directional and threshold analyses intersect their source-state populations with this materialized evaluation universe.
 
-### Evaluation universe
+When row-level intervention columns already exist, statistics-only utilities can rebuild summary files without rerunning the model interventions.
 
-Stage 7 owns the row identities on which candidate singleton outcomes are materialized. Downstream threshold analysis intersects its requested split and source-state subset with this Stage-7 universe rather than constructing a separate candidate evaluation population.
+## Stage 07b — graded agonist intervention
 
-### Statistics-only regeneration
-
-When row-level intervention columns already exist and only summary statistics are missing, the analysis utilities can rebuild statistics from the persisted Stage-7 score materialization without repeating model interventions.
-
-## Stage 7b — RQ3 threshold-event diagnostics
-
-Implemented in `studies/overtopping/analysis/threshold_event_diagnostics.py` and orchestrated across the manuscript population by `rebuild_spiking_diagnostics.py`.
-
-For each configured RQ3 run and directional baseline subset, Stage 7b:
-
-1. loads the frozen Stage-7 candidate ranking and direction membership;
-2. includes only candidates discovered for that baseline subset;
-3. reuses candidate singleton outcomes from the Stage-7 row universe;
-4. samples same-layer/head non-candidate controls independently of intervention outcomes;
-5. evaluates control interventions with the same replacement protocol;
-6. records endogenous scalar features and intervention-defined flip labels;
-7. performs repeated threshold diagnostics;
-8. writes per-unit, population, binned-response, and raw activation/flip tables.
-
-The experiment-level threshold-event schema is:
+Module:
 
 ```text
-threshold-event-v4-discovery-direction-aware
+studies.overtopping.analysis.graded_agonist_intervention
 ```
 
-The principal per-baseline derived files include:
+Default control:
 
 ```text
-threshold_spiking_experiment.json
-high_n_scores_with_flips.csv
-high_n_flip_stats_by_unit.csv
-threshold_unit_tests.csv
-threshold_population_summary.csv
-threshold_binned_flip_curves.csv
-threshold_activation_flip_rows.csv.gz
-same_layer_nonagonist_control_pool.csv
-same_layer_nonagonist_control_selection.csv
+RUN_GRADED_AGONIST_INTERVENTION=true
 ```
 
-High-N model evaluations are cached separately from these derived tables.
-
-## RQ3 graded agonist intervention
-
-`studies/overtopping/analysis/graded_agonist_intervention.py`
-
-This model-backed experiment starts from each frozen agonist's own held-out directional flip support and sweeps the strength of the same singleton intervention from 0 (natural activation) to 1 (the historical full replacement). It reports per-example crossing dose, persistence, reversal count, and single-crossing status. Optional same-agonist negative support uses source-state examples that the same agonist did not flip at full dose.
-
-`studies/overtopping/analysis/stage08_graded_agonist_report.py` aggregates agonists within run/baseline/direction conditions for Figure 4. Nested held-out threshold `|MCC|` is no longer a primary RQ3 endpoint.
-
-## Stage 08 — interaction validation
-
-`stage08_validate_interactions.py`
-
-Evaluates the full candidate set and matched non-candidate sets, computes simultaneous-set and conditional interaction quantities, and can run dominant-secondary preemption experiments.
-
-The interaction stage uses its own group-evaluation cache because the expensive object is a multi-channel intervention rather than an individual singleton evaluation.
-
-### Preemption experiment
-
-Preemption candidate pools are restricted to the candidate's frozen discovery direction. The dominant threshold event is fitted on a threshold-training split; signed training MCC determines whether the raw threshold predicate must be inverted before evaluating event-present versus event-absent subsets.
-
-The direction-aware interaction schema is:
+Prerequisites in the Stage-7 statistics directory:
 
 ```text
-conditional-marginal-validation-v2-direction-aware-preemption
+flip_stats_by_neuron.csv
+scores.csv
+frozen_candidate_ranking.csv
 ```
 
-`stage09_preemption_report.py` aggregates pair-level results to run × baseline × direction conditions.
+For selected frozen agonists, the experiment evaluates the same singleton intervention at doses from 0 to 1 on held-out source-state examples. The primary population is each agonist's full-dose flip support. Optional same-agonist non-flip support is controlled by `GRADED_AGONIST_NEGATIVE_SUPPORT`.
+
+Per-run outputs are written to:
+
+```text
+<stage7 stats dir>/graded_agonist_intervention/
+```
+
+Important files:
+
+```text
+graded_agonist_intervention.json
+graded_agonist_plan.csv
+graded_agonist_dose_rows.csv.gz
+graded_agonist_example_summary.csv
+graded_agonist_unit_summary.csv
+```
+
+## Stage 07c — threshold-event diagnostics
+
+Module:
+
+```text
+studies.overtopping.analysis.threshold_event_diagnostics
+```
+
+Default control:
+
+```text
+RUN_THRESHOLD_EVENT_POSTHOC=true
+```
+
+The diagnostic evaluates candidate and structural-control units using observed singleton flip/non-flip outcomes and endogenous scalar features. It records per-baseline unit tests, activation/flip rows, testability summaries, and binned response curves.
+
+Aggregate files include:
+
+```text
+aggregate_flip_stats.csv
+aggregate_unit_tests.csv
+aggregate_population_summary.csv
+aggregate_binned_curves.csv
+aggregate_activation_flip_rows.csv
+threshold_spiking_experiment_aggregate.json
+```
+
+These files are persistent RQ3 analysis inputs used by the reporting pipeline.
+
+Principal runtime controls are:
+
+```text
+THRESHOLD_EVENT_TARGET
+THRESHOLD_EVENT_MAX_POINTS
+THRESHOLD_EVENT_MIN_POINTS
+THRESHOLD_EVENT_REPEATS
+THRESHOLD_EVENT_HOLDOUT_FRACTION
+THRESHOLD_EVENT_N_BINS
+THRESHOLD_EVENT_SEED
+FORCE_THRESHOLD_EVENT_POSTHOC
+```
+
+## Stage 08 — simultaneous-set and conditional interaction validation
+
+Module:
+
+```text
+pipeline.stage08_validate_interactions
+```
+
+Default controls:
+
+```text
+RUN_INTERACTION_VALIDATION=true
+RUN_CMC=true
+```
+
+This stage evaluates:
+
+1. the simultaneous effect `E(J)` of the complete frozen candidate set;
+2. structurally matched non-candidate sets;
+3. conditional marginal contribution when CMC is enabled.
+
+Candidate, null, and background groups are evaluated with genuine simultaneous interventions. The interaction stage uses a group-evaluation cache distinct from singleton-evaluation caches.
+
+## Reporting after model-backed execution
+
+The numbered pipeline writes persistent experiment artifacts under `data/`. Manuscript aggregation is performed separately by:
+
+```text
+reporting.generate_final_results
+```
+
+RQ3 reporting uses three modules:
+
+```text
+studies.overtopping.analysis.stage07_overtopping_spiking_report
+studies.overtopping.analysis.stage08_threshold_shape_validation
+studies.overtopping.analysis.stage08_graded_agonist_report
+```
+
+The first two consume aggregate threshold-event diagnostics. The third consumes the per-run `graded_agonist_intervention/` outputs resolved from the RQ3 run manifest.
 
 ## Cache and path rules
 
 - Persistent scientific outputs belong under `data/`.
-- Regenerable reporting products belong under `results/`.
-- Expensive reusable computations belong in cache directories.
-- Cache lookup occurs after the scientific population and method configuration are determined.
-- Distinct evaluation splits and non-default point caps must resolve to distinct derived paths.
-- A schema mismatch requires regeneration of the derived products governed by that schema; it does not automatically require deletion of model-backed caches.
+- Reusable computation caches belong under `cache/` or declared experiment cache directories.
+- Derived reporting products belong under `results/`.
+- Cache lookup occurs after scientific configuration and population are determined.
+- Evaluation split and non-default population caps must resolve to distinct scientific/derived identities where they change the computation.
+- Regenerating reports does not require deletion of valid model-backed caches.
 
 ## Batch size
 
-Batch-size controls change execution throughput and memory use but should not alter the selected scientific population. When reducing batch sizes to handle accelerator memory pressure, keep row caps, splits, candidate definitions, and intervention settings unchanged.
+Batch-size controls affect execution throughput and memory use. They should not change the selected scientific population. When reducing batch size for memory reasons, keep splits, row caps, candidate definitions, and intervention settings fixed.

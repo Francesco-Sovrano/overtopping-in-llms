@@ -18,7 +18,7 @@ from studies.overtopping.analysis import primary_holdout_analysis as primary_hel
 from studies.overtopping.experiments.run_experiments import paper_auxiliary_experiments
 
 
-import argparse, glob, io, json, math, os, textwrap, zipfile
+import argparse, io, json, math, textwrap, zipfile
 from dataclasses import replace
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -82,57 +82,8 @@ def normalize_member_name(name: str) -> str:
     return name.lstrip("./")
 
 
-def meta_for(rel: str) -> Dict[str, object]:
-    rel = normalize_member_name(rel)
-    parts = rel.split("/")
-    m = dict(rel=rel, task="unknown", model="unknown", setting="unknown", decode_only=False, run_id="unknown")
-    # Archives are sometimes wrapped in a top-level folder. Anchor metadata at
-    # the first `data/` component instead of requiring it to be zip-member root.
-    if "data" in parts:
-        parts = parts[parts.index("data"): ]
-    # Expected after normalization: data/<task>/<org>/<model>/.../eap_ig_inputs/<setting>/spiking_diagnostics/<file>
-    if len(parts) >= 4 and parts[0] == "data":
-        task, org, model = parts[1], parts[2], parts[3]
-        setting = "unknown"
-        if "eap_ig_inputs" in parts:
-            i = parts.index("eap_ig_inputs")
-            if i + 1 < len(parts): setting = parts[i+1]
-        m.update(task=task, model=f"{org}/{model}", setting=setting, decode_only=("decode_only" in setting), run_id=f"{task}__{org}_{model}__{setting}")
-    return m
 
 
-def concat_from_zip(zip_path: Path, suffix: str) -> pd.DataFrame:
-    rows=[]
-    with zipfile.ZipFile(zip_path) as zf:
-        for name in zf.namelist():
-            rel = normalize_member_name(name)
-            if not rel.endswith(suffix):
-                continue
-            try:
-                with zf.open(name) as fh:
-                    data = fh.read()
-                df = pd.read_csv(io.BytesIO(data))
-            except Exception:
-                continue
-            for k,v in meta_for(rel).items(): df[k]=v
-            rows.append(df)
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
-
-def concat_from_root(root: Path, suffix: str) -> pd.DataFrame:
-    rows=[]
-    for f in glob.glob(str(root / "**" / suffix), recursive=True):
-        try: df = pd.read_csv(f)
-        except Exception: continue
-        rel = os.path.relpath(f, root).replace(os.sep, "/")
-        meta_rel = rel if rel.startswith("data/") else f"data/{rel}"
-        for k,v in meta_for(meta_rel).items(): df[k]=v
-        rows.append(df)
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
-
-def concat(source_kind: str, source_path: Path, suffix: str) -> pd.DataFrame:
-    return concat_from_zip(source_path, suffix) if source_kind == "zip" else concat_from_root(source_path, suffix)
 
 def _spiking_label(setting: dict, evaluation_split: str, spiking_max_points: int) -> str:
     label = f"spiking_diagnostics-{setting['bag_label']}"
@@ -519,10 +470,6 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
     return fs, ut, b
 
 
-def load_exact_primary_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Backward-compatible alias; honors args.population_scope when present."""
-    return load_exact_rq3_population(args, out)
-
 
 def rankdata_abs(vals: np.ndarray) -> np.ndarray:
     order = np.argsort(vals)
@@ -888,7 +835,7 @@ def plot_manuscript_spiking_cut(
 
     # Stage 7 reports endpoints that do not require nested feature selection.
     # Stage 8 writes the complete structural-control phenotype analysis
-    # Legacy scalar/threshold diagnostics only; manuscript RQ3 uses graded agonist intervention.
+    # (strength, testability, nested MCC, and nested TECS).
     panels = [
         ("Singleton causal effect", float(ctrl_flip.get("median_flip_any", math.nan)), float(cand_flip.get("median_flip_any", math.nan)), float(adj.get("strength_flip_rate", math.nan))),
         ("Threshold-testable fraction", float(test_eff.get("control_median", math.nan)), float(test_eff.get("candidate_median", math.nan)), float(adj.get("threshold_testability", math.nan))),
@@ -973,15 +920,13 @@ Stage 8 provides the primary nested held-out analysis:
 
 - singleton causal strength;
 - threshold-testable fraction;
-- legacy scalar/flip predictability diagnostics for inspection only.
-
-The manuscript RQ3 endpoint is the graded agonist intervention, not a nested threshold-MCC comparison.
+- nested held-out threshold |MCC| among testable units;
+- nested TECS lower bound over all evaluated units.
 
 The primary comparison preserves same-layer/head structural controls and does not condition on causal strength. Causal-strength matching is a supplementary same-layer/head sensitivity analysis. Scalar selection, threshold fitting, and event orientation occur on training folds; held-out folds are used only for evaluation.
 
 `threshold_testability_audit.csv` records how many model-evaluated units in each run/baseline/population have enough flip and non-flip events for threshold fitting. An undefined threshold test is not treated as a missing intervention.
 
-`stage09_preemption_report` aggregates dominant-secondary pair-intervention outputs to run/baseline/direction conditions. The current interaction-stage pair selection and event-orientation contract makes this branch exploratory rather than a standalone confirmatory test.
 """
     (paper_dir / "README.md").write_text(status, encoding="utf-8")
 
@@ -1018,13 +963,11 @@ Threshold fitting is possible for a much larger or smaller fraction of one popul
 
 `aggregate_unit_tests.csv` contains held-out results for multiple scalar features. Choosing a feature by its held-out MCC and reporting that same maximum reuses held-out outcomes for selection. Thresholdability is also defined only for units with enough flip and non-flip events. Max-feature `best_mcc` and non-nested TECS tables are therefore descriptive diagnostics rather than primary inferential endpoints.
 
-These scalar-to-flip diagnostics are legacy descriptive analyses. They are not used to establish the manuscript RQ3 spiking phenotype. The primary RQ3 experiment is `graded_agonist_intervention.py`, which sweeps the same validated agonist intervention over its known held-out directional flip support.
+The inferential threshold-shape analysis is produced by Stage 8. It selects the scalar inside each training fold and evaluates the selected scalar on untouched held-out data. The primary RQ3 comparison preserves the independently sampled same-layer/head non-candidate controls and does not condition on causal strength; it reports causal strength, threshold testability, nested held-out threshold MCC, and nested TECS. Causal-strength matching is retained only as a supplementary sensitivity analysis and is constrained to the same layer/head.
 
-### Supported Stage-7 claim
+### Stage-7 scope
 
-> These scalar-to-flip summaries are legacy diagnostics only. They are not used to establish RQ3's spiking phenotype.
-
-Use the graded agonist intervention outputs for manuscript-facing RQ3 claims.
+Stage-7 aggregate reporting estimates candidate/control causal strength and threshold testability. Candidate/control differences in nested held-out threshold MCC and nested TECS are estimated by `threshold_shape_validation/threshold_shape_statistical_results.json`.
 '''
     if base_md and base_md.exists():
         base=base_md.read_text()

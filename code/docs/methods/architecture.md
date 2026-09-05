@@ -14,7 +14,7 @@ Study-independent implementation:
 - activation and gradient extraction;
 - EAP/EAP-IG graph attribution;
 - singleton, set-level, binomial, and interaction statistics;
-- high-N evaluation and threshold-event utilities.
+- activation/saliency diagnostics and graded-intervention helpers.
 
 `core/` does not define manuscript experiment populations.
 
@@ -29,6 +29,8 @@ Reusable causal-intervention workflow:
 5. circuit discovery;
 6. candidate and rule analysis;
 7. held-out singleton causal evaluation;
+7b. graded agonist intervention;
+7c. threshold-event diagnostics;
 8. simultaneous-set, matched-null, and conditional interaction validation.
 
 The pipeline writes persistent experiment artifacts under `data/`.
@@ -42,7 +44,7 @@ Study-specific ownership for:
 - primary-matrix construction;
 - RQ1 prevalence and competence analyses;
 - RQ2 composition analyses;
-- RQ3 threshold-event diagnostics, structural controls, and preemption reports;
+- RQ3 threshold-event diagnostics, nested threshold-shape validation, and graded agonist analysis;
 - RQ4 checkpoint trajectories.
 
 ### `studies/poisoning/`
@@ -76,7 +78,7 @@ Persistent scientific outputs. Examples include:
 - frozen candidate rankings;
 - Stage-7 singleton intervention outcomes;
 - interaction-validation outputs;
-- RQ3 per-experiment threshold-event diagnostics;
+- RQ3 per-experiment threshold-event diagnostics and graded agonist intervention outputs;
 - poisoning checkpoints and checkpoint-level causal outputs.
 
 ### `cache/`
@@ -112,7 +114,7 @@ Population membership is defined before aggregation:
 - Stage 7 defines the held-out row universe used for singleton causal evaluation.
 - RQ1 Figure 2 resolves the exact 39 catalogue settings.
 - RQ2 uses the 28-setting primary profile.
-- RQ3 uses the exact primary manifest plus auxiliary runs with complete configured diagnostics; candidate membership is further restricted by frozen discovery direction.
+- RQ3 reporting uses the exact 28-setting primary manifest and can include the 11 auxiliary settings as supplementary inputs. Threshold diagnostics are filtered against this manifest, graded outputs are resolved from the corresponding Stage-7 statistics directories, and candidate membership is restricted by frozen discovery direction.
 - Poisoning defines separate normal-task, trigger-test, attack-cohort, and training-exposure populations.
 
 Directory scans and cache presence are not valid substitutes for these population definitions.

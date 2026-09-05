@@ -283,7 +283,7 @@ def run_holdout(setting: dict[str, Any], args: argparse.Namespace, repo_dir: Pat
         args.python_bin, "-m", "pipeline.stage07_singleton_causal_evaluation",
         "--task_module", str(setting["task_module"]),
         "--ai_model", str(setting["model_id"]),
-        "--rules_dir", str(setting["model_root"] / "rule_extraction_results" / "neuron_flip_rules"),
+        "--output_dir", str(setting["model_root"] / "rule_extraction_results" / "neuron_flip_rules"),
         "--features_scores_dir", str(setting["model_root"] / "feature_report"),
         "--circuit_agonists_path", str(setting["circuit_agonists_path"]),
         "--search_epsilon", str(setting["search_epsilon"]),
