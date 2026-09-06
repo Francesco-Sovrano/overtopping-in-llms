@@ -427,6 +427,10 @@ def _summarize_examples(dose_rows: pd.DataFrame) -> pd.DataFrame:
         single_crossing = bool(first_idx is not None and n_state_changes == 1 and persistent_after_first)
         natural_state_matches_stage7 = bool(len(changed) and not changed[0])
         endpoint_flip = bool(changed[-1]) if len(changed) else False
+        any_flip = bool(changed.any()) if len(changed) else False
+        any_intermediate_flip = bool(changed[:-1].any()) if len(changed) > 1 else False
+        stable_all_doses = bool(not any_flip)
+        transient_flip = bool(any_flip and not endpoint_flip)
         endpoint_expected = str(values[5]) == "known_flip"
         output.append({
             **dict(zip(keys, values)),
@@ -437,6 +441,10 @@ def _summarize_examples(dose_rows: pd.DataFrame) -> pd.DataFrame:
             "single_crossing": single_crossing,
             "natural_state_matches_stage7_baseline": natural_state_matches_stage7,
             "full_dose_flipped": endpoint_flip,
+            "ever_flipped_at_any_dose": any_flip,
+            "ever_flipped_before_full_dose": any_intermediate_flip,
+            "stable_at_baseline_all_doses": stable_all_doses,
+            "transient_flip": transient_flip,
             "full_dose_matches_stage7_support": bool(endpoint_flip == endpoint_expected),
         })
     return pd.DataFrame(output)
@@ -455,6 +463,10 @@ def _summarize_units(example_summary: pd.DataFrame) -> pd.DataFrame:
             "natural_state_reproduction_rate": float(group["natural_state_matches_stage7_baseline"].mean()),
             "full_dose_support_reproduction_rate": float(group["full_dose_matches_stage7_support"].mean()),
             "full_dose_flip_rate": float(group["full_dose_flipped"].mean()),
+            "any_dose_flip_rate": float(group["ever_flipped_at_any_dose"].mean()),
+            "intermediate_flip_rate": float(group["ever_flipped_before_full_dose"].mean()),
+            "stable_all_doses_rate": float(group["stable_at_baseline_all_doses"].mean()),
+            "transient_flip_rate": float(group["transient_flip"].mean()),
             "single_crossing_rate": float(group["single_crossing"].mean()),
             "median_first_flip_dose": float(first.median()) if first.notna().any() else math.nan,
             "mean_first_flip_dose": float(first.mean()) if first.notna().any() else math.nan,
@@ -491,6 +503,33 @@ def _plot(dose_rows: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _requested_run_config(args: argparse.Namespace, doses: tuple[float, ...]) -> dict:
+    return {
+        "evaluation_split": str(args.evaluation_split),
+        "intervention": str(args.intervention),
+        "decode_only": bool(args.decode_only),
+        "doses": [float(x) for x in doses],
+        "same_agonist_negative_support": bool(args.same_agonist_negative_support),
+        "negative_support_ratio": float(args.negative_support_ratio),
+        "max_agonists_per_direction": int(args.max_agonists_per_direction),
+        "max_positive_support_per_agonist": int(args.max_positive_support_per_agonist),
+        "max_negative_support_per_agonist": int(args.max_negative_support_per_agonist),
+        "points_to_use_for_mean_ablation": int(args.points_to_use_for_mean_ablation),
+        "seed": int(args.seed),
+    }
+
+
+def _manifest_matches_request(existing: dict, requested: dict) -> bool:
+    if existing.get("status") != "ok" or existing.get("schema") != SCHEMA:
+        return False
+    cfg = existing.get("run_config")
+    # Legacy manifests did not fingerprint all scientifically relevant support
+    # and sampling parameters.  Treat them as stale rather than guessing that
+    # they match the current request.  This does not delete the old artifacts;
+    # it only prevents a false cache hit when Stage 7b is explicitly rerun.
+    return isinstance(cfg, dict) and cfg == requested
+
+
 def main() -> None:
     args = parse_args()
     doses = _parse_doses(args.doses)
@@ -510,14 +549,35 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_path = out_dir / "graded_agonist_intervention.json"
+    requested_config = _requested_run_config(args, doses)
     if manifest_path.is_file() and not args.force:
         try:
             existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if existing.get("status") == "ok" and existing.get("schema") == SCHEMA:
-                print(f"{LOG_PREFIX} existing completed output found: {out_dir}")
+            if _manifest_matches_request(existing, requested_config):
+                print(f"{LOG_PREFIX} existing completed output matches requested configuration: {out_dir}")
                 return
+            print(f"{LOG_PREFIX} existing output configuration differs; recomputing {out_dir}")
         except Exception:
             pass
+
+    # Mark the directory incomplete *before* changing any per-run artifacts.
+    # A recomputation may reuse the same output directory as an older completed
+    # run.  Without this marker, an interruption after writing the new plan but
+    # before writing new dose rows leaves a hybrid directory that looks
+    # completed to downstream reporting.  Existing scientific outputs remain on
+    # disk and are replaced only as their refreshed versions are written.
+    manifest_path.write_text(
+        json.dumps({
+            "schema": SCHEMA,
+            "status": "running",
+            "scientific_target": "graded causal transition with same-agonist held-out flip and non-flip support",
+            "run_config": requested_config,
+            "same_agonist_negative_support": bool(args.same_agonist_negative_support),
+            "negative_support_ratio": float(args.negative_support_ratio),
+            "doses": list(doses),
+        }, indent=2),
+        encoding="utf-8",
+    )
 
     dataset_info = load_dataset_info(input_data_dir)
     task = resolve_task_spec(args.task_module)
@@ -598,7 +658,15 @@ def main() -> None:
     plan_df = pd.DataFrame(plan_rows)
     plan_df.to_csv(out_dir / "graded_agonist_plan.csv", index=False)
     if not selection:
-        payload = {"schema": SCHEMA, "status": "no_eligible_agonists", "n_planned": int(len(plan_df)), "doses": list(doses)}
+        payload = {
+            "schema": SCHEMA,
+            "status": "no_eligible_agonists",
+            "run_config": requested_config,
+            "same_agonist_negative_support": bool(args.same_agonist_negative_support),
+            "negative_support_ratio": float(args.negative_support_ratio),
+            "n_planned": int(len(plan_df)),
+            "doses": list(doses),
+        }
         manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"{LOG_PREFIX} no agonists have known held-out directional flip support")
         return
@@ -670,10 +738,12 @@ def main() -> None:
         _plot(dose_df, out_dir)
 
     positive_summary = unit_summary.loc[unit_summary.get("support_kind", pd.Series(dtype=str)).astype(str) == "known_flip"] if not unit_summary.empty else pd.DataFrame()
+    negative_summary = unit_summary.loc[unit_summary.get("support_kind", pd.Series(dtype=str)).astype(str) == "same_agonist_nonflip"] if not unit_summary.empty else pd.DataFrame()
     payload = {
         "schema": SCHEMA,
         "status": "ok",
-        "scientific_target": "graded causal transition on the agonist's known held-out directional flip support",
+        "scientific_target": "graded causal transition with same-agonist held-out flip and non-flip support",
+        "run_config": requested_config,
         "evaluation_split": str(args.evaluation_split),
         "intervention": str(args.intervention),
         "decode_only": bool(args.decode_only),
@@ -689,6 +759,8 @@ def main() -> None:
         "n_same_agonist_negative_examples_evaluated": int((dose_df["support_kind"] == "same_agonist_nonflip").sum() / max(len(doses), 1)) if not dose_df.empty else 0,
         "median_unit_single_crossing_rate_known_flip": float(pd.to_numeric(positive_summary.get("single_crossing_rate"), errors="coerce").median()) if not positive_summary.empty else math.nan,
         "median_unit_first_flip_dose_known_flip": float(pd.to_numeric(positive_summary.get("median_first_flip_dose"), errors="coerce").median()) if not positive_summary.empty else math.nan,
+        "median_unit_stable_all_doses_rate_same_agonist_nonflip": float(pd.to_numeric(negative_summary.get("stable_all_doses_rate"), errors="coerce").median()) if not negative_summary.empty else math.nan,
+        "median_unit_transient_flip_rate_same_agonist_nonflip": float(pd.to_numeric(negative_summary.get("transient_flip_rate"), errors="coerce").median()) if not negative_summary.empty else math.nan,
         "files": {
             "plan": "graded_agonist_plan.csv",
             "dose_rows": "graded_agonist_dose_rows.csv.gz",

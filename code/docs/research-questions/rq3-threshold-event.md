@@ -204,7 +204,7 @@ Direction-specific Stage-7 columns identify this support:
 
 Only rows on which the singleton outcome was actually evaluated are eligible.
 
-### Optional same-agonist reference
+### Same-agonist non-flip reference
 
 The experiment can also evaluate source-state rows where the same agonist was evaluated but did not flip the endpoint at full dose:
 
@@ -219,6 +219,8 @@ GRADED_AGONIST_NEGATIVE_SUPPORT=true
 ```
 
 This reference holds agonist identity, layer, intervention baseline, replacement rule, and discovery direction fixed.
+
+For non-flip support, the primary trajectory endpoint is **stability at the baseline state across the full dose sweep**. A persistent-crossing rate is not used as the negative-support endpoint because full-dose non-flip membership makes a persistent terminal crossing nearly tautologically absent. The reporter also records transient intermediate flips.
 
 ### Selection and sampling defaults
 
@@ -337,7 +339,10 @@ results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/
 ├── graded_agonist_all_units.csv
 ├── graded_agonist_by_condition.csv
 ├── graded_agonist_dose_by_condition.csv
+├── graded_agonist_support_contrast_by_condition.csv
+├── graded_agonist_dose_support_contrast.csv
 ├── graded_agonist_dose_response.pdf
+graded_agonist_support_consistency.pdf
 ├── graded_agonist_single_crossing.pdf
 └── graded_agonist_report_status.json
 ```

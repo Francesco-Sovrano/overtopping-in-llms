@@ -948,6 +948,7 @@ def main() -> None:
             "--primary-table", str(paper_tables / "primary_table.csv"),
             "--population-scope", "primary+supplementary",
             "--evaluation-split", "test",
+            "--require-negative-support",
         ])
 
         # Aggregate the threshold-conditioned preemption assay as analysis-only
@@ -967,12 +968,12 @@ def main() -> None:
             "\n\n## Figure 4 layout\n\n"
             "- `fig4a_candidate_control_spiking_cut_summary.pdf` - candidate/control phenotype endpoints.\n"
             "- `fig4b_threshold_shape_model_comparison_by_direction.pdf` - aggregate held-out threshold/logistic/isotonic comparison by discovery direction.\n"
-            "- `fig4c_graded_agonist_dose_response.pdf` - graded intervention dose response.\n"
+            "- `fig4c_graded_agonist_dose_response.pdf` - graded dose response for known-flip and same-channel non-flip support.\n"
             "- `fig4s1_threshold_testability_by_condition.pdf` - condition-level testability.\n"
             "- `fig4s2_strength_matched_thresholdability.pdf` - strength-matched sensitivity.\n"
             "- `fig4s3_nested_tecs_lower_bound_ecdf.pdf` - nested TECS lower bound.\n"
             "- `fig4s4_threshold_tail_response_by_direction.pdf` - descriptive endogenous-proxy tail response.\n"
-            "- `fig4s5_graded_agonist_single_crossing.pdf` - graded single-persistent-crossing summary.\n"
+            "- `fig4s5_graded_agonist_single_crossing.pdf` - support-consistent graded trajectories: known-flip single crossing and non-flip stability.\n"
             "\nPreemption is aggregated under `analysis/rq3_threshold_event/spiking_diagnostics/preemption/`; "
             "representative response curves remain analysis diagnostics rather than paper figures.\n"
         )

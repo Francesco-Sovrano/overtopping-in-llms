@@ -218,6 +218,8 @@ graded_agonist_population_audit.csv
 graded_agonist_all_units.csv
 graded_agonist_by_condition.csv
 graded_agonist_dose_by_condition.csv
+graded_agonist_support_contrast_by_condition.csv
+graded_agonist_dose_support_contrast.csv
 graded_agonist_report_status.json
 ```
 
@@ -236,6 +238,7 @@ results/paper/figures/04_rq3_spiking_cut/
 ├── fig4a_candidate_control_spiking_cut_summary.pdf
 ├── fig4b_threshold_shape_model_comparison_by_direction.pdf
 ├── fig4c_graded_agonist_dose_response.pdf
+graded_agonist_support_consistency.pdf
 ├── fig4s1_threshold_testability_by_condition.pdf
 ├── fig4s2_strength_matched_thresholdability.pdf
 ├── fig4s3_nested_tecs_lower_bound_ecdf.pdf

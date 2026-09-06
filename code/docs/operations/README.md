@@ -143,7 +143,9 @@ Graded report status and audit:
 ```text
 results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/
 ├── graded_agonist_report_status.json
-└── graded_agonist_population_audit.csv
+├── graded_agonist_population_audit.csv
+├── graded_agonist_support_contrast_by_condition.csv
+└── graded_agonist_dose_support_contrast.csv
 ```
 
 ## RQ3 graded experiment is missing
