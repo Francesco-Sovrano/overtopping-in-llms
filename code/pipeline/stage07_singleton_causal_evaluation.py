@@ -875,10 +875,17 @@ def write_flip_stats(
 		if any_eval_col is None:
 			any_eval_col = col_any
 
-		n_eval = int(scores_df[col_any].notna().sum())
+		eval_mask = scores_df[col_any].notna().to_numpy(dtype=bool)
+		n_eval = int(eval_mask.sum())
 		c2i = int(scores_df[col_c2i].fillna(False).astype(int).sum()) if col_c2i in scores_df.columns else 0
 		i2c = int(scores_df[col_i2c].fillna(False).astype(int).sum()) if col_i2c in scores_df.columns else 0
 		total = int(scores_df[col_any].fillna(False).astype(int).sum())
+		base = pd.to_numeric(scores_df[baseline_metric_col], errors="coerce").to_numpy(float) if baseline_metric_col in scores_df.columns else np.full(len(scores_df), np.nan)
+		valid_base = np.isfinite(base)
+		positive_source = eval_mask & valid_base & (base > 0.5)
+		negative_source = eval_mask & valid_base & (base <= 0.5)
+		n_source_c2i = int(positive_source.sum())
+		n_source_i2c = int(negative_source.sum())
 		semantic_wrong = int(scores_df[col_semantic_wrong].fillna(False).astype(int).sum()) if col_semantic_wrong in scores_df.columns else 0
 		flip_semantic_wrong = int(scores_df[col_flip_semantic_wrong].fillna(False).astype(int).sum()) if col_flip_semantic_wrong in scores_df.columns else 0
 		flip_empty = int(scores_df[col_flip_empty].fillna(False).astype(int).sum()) if col_flip_empty in scores_df.columns else 0
@@ -900,8 +907,14 @@ def write_flip_stats(
 			"c2i_count": c2i,
 			"i2c_count": i2c,
 			"flip_any_count": total,
+			# Legacy unconditional directional-flip rates are retained for compatibility.
 			"c2i_rate": (c2i / n_eval) if n_eval else float("nan"),
 			"i2c_rate": (i2c / n_eval) if n_eval else float("nan"),
+			# Source-conditioned directional effects used by directional analyses/preemption.
+			"c2i_rate_conditional": (c2i / n_source_c2i) if n_source_c2i else float("nan"),
+			"i2c_rate_conditional": (i2c / n_source_i2c) if n_source_i2c else float("nan"),
+			"n_source_c2i": n_source_c2i,
+			"n_source_i2c": n_source_i2c,
 			"flip_any_rate": (total / n_eval) if n_eval else float("nan"),
 			"flip_any_ci_low": flip_ci_low,
 			"flip_any_ci_high": flip_ci_high,

@@ -102,6 +102,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--null_draws", type=int, default=100)
     parser.add_argument(
+        "--skip_preemption",
+        action="store_true",
+        help="Skip dominant-secondary pair interventions and example-level preemption outputs.",
+    )
+    parser.add_argument(
+        "--preemption_min_discovery_score", "--preemption_min_singleton_rate",
+        dest="preemption_min_discovery_score",
+        type=float,
+        default=0.05,
+        help=(
+            "Minimum frozen Stage-6 discovery |max_effect| score for dominant/secondary pair selection. "
+            "The legacy --preemption_min_singleton_rate spelling is accepted as an alias. Default: 0.05."
+        ),
+    )
+    parser.add_argument(
+        "--preemption_max_secondaries",
+        type=int,
+        default=8,
+        help="Maximum secondary candidates evaluated per direction. Default: 8; 0 means all eligible.",
+    )
+    parser.add_argument(
+        "--threshold_diagnostics_dir",
+        default=None,
+        help=(
+            "Stage-7c threshold-diagnostics directory required for preemption. The assay conditions "
+            "secondary marginal effects on an internally held-out endogenous threshold event T_j*."
+        ),
+    )
+    parser.add_argument("--preemption_threshold_holdout_fraction", type=float, default=0.25)
+    parser.add_argument("--preemption_threshold_min_class", type=int, default=8)
+    parser.add_argument(
         "--skip_cmc",
         action="store_true",
         help=(
@@ -302,12 +333,472 @@ def _union_group(*groups: GroupSpec, label: str) -> GroupSpec:
     return _group((unit for group in groups for unit in group.units), label)
 
 
+def _candidate_stat_frame(
+    path: Path,
+    candidates: list[UnitSpec],
+    *,
+    scores_df: pd.DataFrame | None = None,
+    baseline: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Load candidate singleton statistics and attach source-conditioned rates.
+
+    Historical c2i_rate/i2c_rate fields divide directional flips by all
+    evaluated examples. Preemption eligibility instead requires
+    P(flip | eligible source state), so those rates are reconstructed from the
+    materialized Stage-7 flip columns whenever scores_df is available.
+    """
+    frame = pd.read_csv(path)
+    if "unit_key" not in frame.columns:
+        layer_col = "layer_label" if "layer_label" in frame.columns else "layer_key"
+        if layer_col not in frame.columns or "neuron_id" not in frame.columns:
+            return pd.DataFrame()
+        frame["unit_key"] = [f"{layer}:{int(neuron)}" for layer, neuron in zip(frame[layer_col], frame["neuron_id"])]
+    keys = {u.unit_key for u in candidates}
+    frame = frame.loc[frame["unit_key"].astype(str).isin(keys)].copy()
+    if scores_df is None or baseline is None or len(scores_df) != len(baseline):
+        return frame
+
+    baseline = np.asarray(baseline, dtype=bool)
+    by_key = {u.unit_key: u for u in candidates}
+    rows = []
+    for key in frame["unit_key"].astype(str):
+        unit = by_key.get(key)
+        rec = {
+            "unit_key": key,
+            "c2i_rate_conditional": math.nan,
+            "i2c_rate_conditional": math.nan,
+            "n_source_c2i": 0,
+            "n_source_i2c": 0,
+            "n_flip_c2i_conditional": 0,
+            "n_flip_i2c_conditional": 0,
+        }
+        if unit is not None:
+            for direction, source_mask in (("c2i", baseline), ("i2c", ~baseline)):
+                col = _directional_flip_column(unit, direction)
+                if col not in scores_df.columns:
+                    continue
+                vals = pd.to_numeric(scores_df[col], errors="coerce").to_numpy(float)
+                evaluated = np.isfinite(vals)
+                eligible = evaluated & source_mask
+                flips = eligible & (vals > 0.5)
+                n_source = int(eligible.sum())
+                n_flip = int(flips.sum())
+                rec[f"n_source_{direction}"] = n_source
+                rec[f"n_flip_{direction}_conditional"] = n_flip
+                rec[f"{direction}_rate_conditional"] = float(n_flip / n_source) if n_source else math.nan
+        rows.append(rec)
+    directional = pd.DataFrame(rows)
+    return frame.drop(columns=[c for c in directional.columns if c != "unit_key" and c in frame.columns], errors="ignore").merge(
+        directional, on="unit_key", how="left", validate="one_to_one"
+    )
+
+def _ranking_direction_keys(ranking: pd.DataFrame, baseline_subset: str) -> set[str]:
+    baseline = str(baseline_subset).strip().lower()
+    if baseline not in {"positive", "negative"}:
+        raise ValueError(f"Unsupported discovery baseline: {baseline_subset!r}")
+    if "unit_key" not in ranking.columns:
+        raise ValueError("Frozen ranking lacks unit_key for directional preemption selection")
+    if "discovery_baseline_subsets" in ranking.columns:
+        def eligible(value):
+            tokens={x.strip().lower() for x in str(value).replace(",","|").replace(";","|").split("|")}
+            return baseline in tokens
+        mask=ranking["discovery_baseline_subsets"].map(eligible)
+    elif "discovery_baseline_subset" in ranking.columns:
+        mask=ranking["discovery_baseline_subset"].astype(str).str.strip().str.lower().eq(baseline)
+    else:
+        raise RuntimeError(
+            "Frozen ranking lacks discovery_baseline_subset provenance; refusing direction-agnostic preemption selection."
+        )
+    return set(ranking.loc[mask,"unit_key"].astype(str))
+
+
+def _preemption_pair_plan(
+    *,
+    candidates: list[UnitSpec],
+    candidate_stats: pd.DataFrame,
+    ranking: pd.DataFrame,
+    min_discovery_score: float,
+    max_secondaries: int,
+) -> tuple[list[dict], dict[str, GroupSpec]]:
+    """Freeze dominant-secondary pair identity from discovery data only.
+
+    Pair selection uses the frozen Stage-6 discovery score and discovery
+    direction. Held-out source-conditioned singleton effects are attached only
+    as descriptive measurements and never determine pair membership or order.
+    """
+    unit_by_key = {u.unit_key: u for u in candidates}
+    if "unit_key" not in ranking.columns or "discovery_score" not in ranking.columns:
+        raise RuntimeError(
+            "Frozen ranking must contain unit_key and discovery_score for held-out preemption pair selection."
+        )
+    stats_by_key = candidate_stats.set_index(candidate_stats["unit_key"].astype(str), drop=False) if not candidate_stats.empty else pd.DataFrame()
+    plans: list[dict] = []
+    groups: dict[str, GroupSpec] = {}
+    for direction in ("c2i", "i2c"):
+        discovery_baseline = "positive" if direction == "c2i" else "negative"
+        directional_keys = _ranking_direction_keys(ranking, discovery_baseline)
+        cols = ["unit_key", "discovery_score"]
+        if "discovery_rank_global" in ranking.columns:
+            cols.append("discovery_rank_global")
+        work = ranking[cols].copy()
+        work["unit_key"] = work["unit_key"].astype(str)
+        work["discovery_score"] = pd.to_numeric(work["discovery_score"], errors="coerce")
+        work = work.loc[work["unit_key"].isin(directional_keys & set(unit_by_key))]
+        work = work.loc[np.isfinite(work["discovery_score"]) & (work["discovery_score"] >= float(min_discovery_score))]
+        sort_cols = ["discovery_score"]
+        ascending = [False]
+        if "discovery_rank_global" in work.columns:
+            work["discovery_rank_global"] = pd.to_numeric(work["discovery_rank_global"], errors="coerce")
+            sort_cols.append("discovery_rank_global"); ascending.append(True)
+        sort_cols.append("unit_key"); ascending.append(True)
+        work = work.sort_values(sort_cols, ascending=ascending, kind="mergesort")
+        if len(work) < 2:
+            continue
+        dominant = work.iloc[0]
+        dominant_key = str(dominant["unit_key"])
+        secondary_rows = work.iloc[1:]
+        if int(max_secondaries) > 0:
+            secondary_rows = secondary_rows.head(int(max_secondaries))
+
+        rate_col = f"{direction}_rate_conditional"
+        source_col = f"n_source_{direction}"
+        def heldout(key: str, column: str):
+            if isinstance(stats_by_key, pd.DataFrame) and not stats_by_key.empty and key in stats_by_key.index and column in stats_by_key.columns:
+                value = stats_by_key.loc[key, column]
+                if isinstance(value, pd.Series):
+                    value = value.iloc[0]
+                return value
+            return math.nan
+
+        for rank, row in enumerate(secondary_rows.itertuples(index=False), start=1):
+            secondary_key = str(row.unit_key)
+            pair = _group([unit_by_key[dominant_key], unit_by_key[secondary_key]], f"preemption_{direction}_{rank}")
+            groups[pair.key] = pair
+            dom_rate = heldout(dominant_key, rate_col)
+            sec_rate = heldout(secondary_key, rate_col)
+            dom_n = heldout(dominant_key, source_col)
+            sec_n = heldout(secondary_key, source_col)
+            plans.append({
+                "direction": direction,
+                "discovery_baseline_subset": discovery_baseline,
+                "candidate_direction_policy": "discovery_baseline_only",
+                "pair_selection_policy": "frozen_stage6_discovery_score_only",
+                "dominant_unit": dominant_key,
+                "secondary_unit": secondary_key,
+                "dominant_discovery_score": float(dominant["discovery_score"]),
+                "secondary_discovery_score": float(getattr(row, "discovery_score")),
+                "discovery_score_semantics": "Stage-6 abs(max_effect); evaluation rows are not used for pair selection",
+                "directional_rate_semantics": "P(flip | eligible source state); descriptive only",
+                "dominant_singleton_rate": float(dom_rate) if np.isfinite(dom_rate) else math.nan,
+                "secondary_singleton_rate": float(sec_rate) if np.isfinite(sec_rate) else math.nan,
+                "dominant_source_denominator": int(dom_n) if np.isfinite(dom_n) else None,
+                "secondary_source_denominator": int(sec_n) if np.isfinite(sec_n) else None,
+                "secondary_rank": int(rank),
+                "pair_key": pair.key,
+            })
+    return plans, groups
+
+def _directional_flip_column(unit: UnitSpec, direction: str) -> str:
+    prefix = "flip_c2i" if direction == "c2i" else "flip_i2c"
+    return f"{prefix}_{unit.layer_key}_{int(unit.neuron_id)}"
+
+
+def _mean_or_nan(values: np.ndarray) -> float:
+    return float(np.mean(values)) if len(values) else math.nan
+
+
+def _mcc_binary(y: np.ndarray, pred: np.ndarray) -> float:
+    y=np.asarray(y,dtype=bool); pred=np.asarray(pred,dtype=bool)
+    tp=float(np.sum(y & pred)); fp=float(np.sum(~y & pred)); tn=float(np.sum(~y & ~pred)); fn=float(np.sum(y & ~pred))
+    denom=math.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
+    return ((tp*tn)-(fp*fn))/denom if denom>0 else math.nan
+
+
+def _fit_preemption_threshold(x: np.ndarray, y: np.ndarray, min_class: int) -> dict | None:
+    x=np.asarray(x,dtype=float); y=np.asarray(y,dtype=bool)
+    mask=np.isfinite(x); x=x[mask]; y=y[mask]
+    if min(int(y.sum()),int((~y).sum())) < int(min_class): return None
+    vals=np.unique(np.sort(x))
+    if len(vals)<2: return None
+    if len(vals)>256: vals=np.unique(np.quantile(vals,np.linspace(0,1,257)))
+    thresholds=np.unique(np.concatenate([vals,(vals[:-1]+vals[1:])/2]))
+    best=None
+    for direction in (">=","<="):
+        for threshold in thresholds:
+            pred=x>=threshold if direction==">=" else x<=threshold
+            mcc=_mcc_binary(y,pred)
+            if not np.isfinite(mcc): continue
+            candidate=(abs(float(mcc)),float(threshold),direction,float(mcc))
+            if best is None or candidate[0]>best[0]: best=candidate
+    if best is None: return None
+    return {
+        "abs_mcc":best[0],"threshold":best[1],"direction":best[2],"mcc":best[3],
+        "prediction_inverted":bool(best[3] < 0.0),
+    }
+
+
+PREEMPTION_PROXY_FEATURES = (
+    "activation_value", "abs_activation_value",
+    "gradient_value", "abs_gradient_value",
+    "activation_x_gradient", "abs_activation_x_gradient",
+    "wanda_value", "predicted_margin_drop", "abs_predicted_margin_drop",
+    "learned_direction_score", "abs_learned_direction_score",
+    "activation_percentile_rank", "activation_layer_zscore",
+    "abs_activation_percentile_rank", "abs_activation_layer_zscore",
+    "gradient_percentile_rank", "gradient_layer_zscore",
+    "abs_gradient_percentile_rank", "abs_gradient_layer_zscore",
+    "activation_x_gradient_percentile_rank", "activation_x_gradient_layer_zscore",
+    "abs_activation_x_gradient_percentile_rank", "abs_activation_x_gradient_layer_zscore",
+    "wanda_percentile_rank", "wanda_layer_zscore",
+    "layer_percentile_rank", "layer_zscore",
+    "baseline_value", "delta_to_baseline",
+)
+
+def _threshold_event_indicator(
+    *, threshold_dir: Path | None, dominant_unit: str, direction: str, seed: int,
+    holdout_fraction: float, min_class: int,
+) -> tuple[dict[object,bool], dict]:
+    """Fit T_j* on one internal train fold and return predictions only on its held-out fold."""
+    if threshold_dir is None:
+        return {}, {"status":"threshold_diagnostics_not_provided"}
+    baseline_name="positive_baseline" if direction=="c2i" else "negative_baseline"
+    base=Path(threshold_dir)/baseline_name
+    raw_path=base/"threshold_activation_flip_rows.csv.gz"
+    scores_path=base/"high_n_scores_with_flips.csv"
+    tests_path=base/"threshold_unit_tests.csv"
+    missing = [str(path.name) for path in (raw_path, scores_path) if not path.is_file()]
+    if missing:
+        return {}, {"status":"threshold_diagnostics_missing_files","baseline":baseline_name,"missing_files":missing}
+    try:
+        raw=pd.read_csv(raw_path); high=pd.read_csv(scores_path)
+    except Exception as exc:
+        return {}, {"status":"threshold_diagnostics_read_error","error":str(exc)}
+    target="flip_c2i" if direction=="c2i" else "flip_i2c"
+    if "unit_key" not in raw.columns:
+        return {}, {"status":"threshold_raw_missing_unit_key","target":target}
+    raw=raw.loc[raw["unit_key"].astype(str)==str(dominant_unit)].copy()
+    if raw.empty:
+        return {}, {"status":"dominant_unit_raw_rows_unavailable","target":target,"dominant_unit":str(dominant_unit)}
+    if target not in raw.columns:
+        return {}, {"status":"threshold_target_unavailable","target":target}
+    if "example_local_index" not in raw.columns:
+        return {}, {"status":"threshold_row_identity_unavailable","target":target}
+
+    # Use a prespecified proxy set from the raw diagnostic rows. The general
+    # threshold-unit test table is optional metadata, not an eligibility gate.
+    preferred=[]
+    if tests_path.is_file():
+        try:
+            tests=pd.read_csv(tests_path)
+            if {"unit_key","target","feature"}.issubset(tests.columns):
+                unit_tests=tests.loc[(tests["unit_key"].astype(str)==str(dominant_unit)) & (tests["target"].astype(str)==target)]
+                preferred=[str(v) for v in unit_tests["feature"].dropna().unique() if str(v) in PREEMPTION_PROXY_FEATURES and str(v) in raw.columns]
+        except Exception:
+            preferred=[]
+    features=preferred + [f for f in PREEMPTION_PROXY_FEATURES if f in raw.columns and f not in preferred]
+    if not features:
+        return {}, {"status":"threshold_features_unavailable","target":target,"available_columns":sorted(map(str,raw.columns))}
+    y=pd.to_numeric(raw[target],errors="coerce").to_numpy(float); valid=np.isfinite(y)
+    raw=raw.loc[valid].reset_index(drop=True); y=(y[valid]>.5)
+    if min(int(y.sum()),int((~y).sum())) < 2*int(min_class):
+        return {}, {"status":"insufficient_threshold_classes","n_pos":int(y.sum()),"n_neg":int((~y).sum())}
+    rng=np.random.default_rng(np.random.SeedSequence([int(seed), 8675309, 1 if direction=="c2i" else 2]))
+    train=[]; test=[]
+    for cls in (False,True):
+        idx=np.flatnonzero(y==cls); rng.shuffle(idx)
+        n_test=max(int(min_class),min(len(idx)-int(min_class),int(round(float(holdout_fraction)*len(idx)))))
+        test.extend(idx[:n_test].tolist()); train.extend(idx[n_test:].tolist())
+    train=np.asarray(train,dtype=int); test=np.asarray(test,dtype=int)
+    best=None
+    for feature in features:
+        x=pd.to_numeric(raw[feature],errors="coerce").to_numpy(float)
+        finite=np.isfinite(x[train])
+        fit=_fit_preemption_threshold(x[train][finite],y[train][finite],max(1,int(min_class)//2))
+        if fit is None: continue
+        candidate=(float(fit["abs_mcc"]),feature,fit,x)
+        if best is None or candidate[0]>best[0] or (math.isclose(candidate[0],best[0]) and feature<best[1]): best=candidate
+    if best is None: return {}, {"status":"threshold_fit_failed"}
+    _,feature,fit,x=best
+    finite=np.isfinite(x[test]); test=test[finite]
+    pred=x[test]>=fit["threshold"] if fit["direction"]==">=" else x[test]<=fit["threshold"]
+    if bool(fit.get("prediction_inverted", False)):
+        pred = ~pred
+    ytest=y[test]
+    local=pd.to_numeric(raw.iloc[test]["example_local_index"],errors="coerce").to_numpy()
+    id_col="original_idx" if "original_idx" in high.columns else ("_orig_row" if "_orig_row" in high.columns else None)
+    if id_col is None: return {}, {"status":"threshold_scores_missing_row_identity"}
+    mapping={}
+    for li,event in zip(local,pred):
+        if not np.isfinite(li): continue
+        pos=int(li)
+        if 0<=pos<len(high): mapping[high.iloc[pos][id_col]]=bool(event)
+    return mapping, {
+        "status":"ok","feature":feature,"threshold":float(fit["threshold"]),"direction":str(fit["direction"]),
+        "prediction_inverted":bool(fit.get("prediction_inverted", False)),
+        "event_direction":("<=" if str(fit["direction"]) == ">=" else ">=") if bool(fit.get("prediction_inverted", False)) else str(fit["direction"]),
+        "train_abs_mcc":float(fit["abs_mcc"]),"heldout_abs_mcc":abs(float(_mcc_binary(ytest,pred))),
+        "n_threshold_holdout":int(len(test)),"n_threshold_event_present":int(np.sum(pred)),"target":target,"row_id_column":id_col,
+    }
+
+
+def _analyze_preemption(
+    *,
+    plans: list[dict],
+    pair_groups: dict[str, GroupSpec],
+    candidates: list[UnitSpec],
+    candidate_full: GroupSpec,
+    scores_df: pd.DataFrame,
+    baseline: np.ndarray,
+    post_by_key: dict[str, np.ndarray],
+    out_dir: Path,
+    threshold_events: dict[str, dict[object, bool]],
+    threshold_meta: dict[str, dict],
+) -> dict:
+    """Write Example masks and endogenous-event conditional marginals for the preemption assay.
+
+    T_j* is predicted from a one-dimensional endogenous scalar using a disjoint
+    internal threshold holdout created from Stage-7c diagnostics.  The pair
+    intervention is then evaluated on those same held-out examples, making
+    Delta_k^+ versus Delta_k^- a non-tautological preemption test.
+    """
+    unit_by_key = {u.unit_key: u for u in candidates}
+    summary_rows: list[dict] = []
+    mask_rows: list[dict] = []
+    if not plans:
+        payload = {"status": "insufficient_nontrivial_candidates", "n_pairs": 0}
+        pd.DataFrame(columns=["direction","dominant_unit","secondary_unit","n_source","n_threshold_event_defined","delta_secondary_given_dominant_present","delta_secondary_given_dominant_absent","preemption_index_absent_minus_present"]).to_csv(out_dir / "preemption_pair_summary.csv", index=False)
+        (out_dir / "preemption_summary.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    full_post = np.asarray(post_by_key[candidate_full.key], dtype=bool)
+    full_flip = full_post != baseline
+    if "original_idx" in scores_df.columns:
+        orig = scores_df["original_idx"].to_numpy()
+    elif "_orig_row" in scores_df.columns:
+        orig = scores_df["_orig_row"].to_numpy()
+    else:
+        orig = np.arange(len(scores_df))
+
+    for plan in plans:
+        direction = str(plan["direction"])
+        dominant = unit_by_key[str(plan["dominant_unit"])]
+        secondary = unit_by_key[str(plan["secondary_unit"])]
+        pair = pair_groups[str(plan["pair_key"])]
+        dom_col = _directional_flip_column(dominant, direction)
+        sec_col = _directional_flip_column(secondary, direction)
+        if dom_col not in scores_df.columns or sec_col not in scores_df.columns:
+            continue
+        source = baseline if direction == "c2i" else ~baseline
+        f_dom = scores_df[dom_col].fillna(False).astype(bool).to_numpy() & source
+        f_sec = scores_df[sec_col].fillna(False).astype(bool).to_numpy() & source
+        f_pair = (np.asarray(post_by_key[pair.key], dtype=bool) != baseline) & source
+        f_full = full_flip & source
+        reachable = f_dom | f_sec
+        indicator = threshold_events.get(direction, {})
+        t_defined = np.asarray([key in indicator for key in orig], dtype=bool) & source
+        t_event = np.asarray([bool(indicator.get(key, False)) for key in orig], dtype=bool)
+        dom_present = t_defined & t_event
+        dom_absent = t_defined & ~t_event
+        increment = f_pair.astype(float) - f_dom.astype(float)
+        delta_plus = _mean_or_nan(increment[dom_present])
+        delta_minus = _mean_or_nan(increment[dom_absent])
+        preemption_index = delta_minus - delta_plus if np.isfinite(delta_plus) and np.isfinite(delta_minus) else math.nan
+        n_source = int(source.sum())
+        row = {
+            **plan,
+            "n_source": n_source,
+            "n_threshold_event_defined": int(t_defined.sum()),
+            "n_threshold_event_present": int(dom_present.sum()),
+            "n_threshold_event_absent": int(dom_absent.sum()),
+            "interaction_validation_schema": SCHEMA,
+            "threshold_event_status": str(threshold_meta.get(direction, {}).get("status", "unavailable")),
+            "threshold_event_feature": threshold_meta.get(direction, {}).get("feature"),
+            "threshold_event_heldout_abs_mcc": threshold_meta.get(direction, {}).get("heldout_abs_mcc"),
+            "threshold_event_prediction_inverted": threshold_meta.get(direction, {}).get("prediction_inverted"),
+            "threshold_event_raw_direction": threshold_meta.get(direction, {}).get("direction"),
+            "threshold_event_effective_direction": threshold_meta.get(direction, {}).get("event_direction"),
+            "dominant_rate_observed": _mean_or_nan(f_dom[source].astype(float)),
+            "secondary_rate_observed": _mean_or_nan(f_sec[source].astype(float)),
+            "pair_rate": _mean_or_nan(f_pair[source].astype(float)),
+            "full_set_rate": _mean_or_nan(f_full[source].astype(float)),
+            "delta_secondary_given_dominant_present": delta_plus,
+            "delta_secondary_given_dominant_absent": delta_minus,
+            "preemption_index_absent_minus_present": preemption_index,
+            "singleton_reachable_fraction": _mean_or_nan(reachable[source].astype(float)),
+            "singleton_and_joint_fraction": _mean_or_nan((reachable & f_pair)[source].astype(float)),
+            "singleton_reachable_not_joint_fraction": _mean_or_nan((reachable & ~f_pair)[source].astype(float)),
+            "joint_only_fraction": _mean_or_nan((~reachable & f_pair & source)[source].astype(float)),
+            "multi_singleton_covered_fraction": _mean_or_nan((f_dom & f_sec)[source].astype(float)),
+            "evaluation_population_n": int(len(scores_df)),
+        }
+        summary_rows.append(row)
+        for i in np.flatnonzero(source):
+            mask_rows.append({
+                "evaluation_row": int(i),
+                "_orig_row": orig[i],
+                "direction": direction,
+                "dominant_unit": dominant.unit_key,
+                "secondary_unit": secondary.unit_key,
+                "dominant_singleton_event": bool(f_dom[i]),
+                "threshold_event_defined": bool(t_defined[i]),
+                "dominant_threshold_event": bool(t_event[i]) if t_defined[i] else None,
+                "secondary_singleton_event": bool(f_sec[i]),
+                "pair_event": bool(f_pair[i]),
+                "full_set_event": bool(f_full[i]),
+                "singleton_reachable": bool(reachable[i]),
+                "singleton_reachable_not_joint": bool(reachable[i] and not f_pair[i]),
+                "joint_only": bool((not reachable[i]) and f_pair[i]),
+                "multi_singleton_covered": bool(f_dom[i] and f_sec[i]),
+            })
+
+    summary_df = pd.DataFrame(summary_rows)
+    if summary_df.empty:
+        summary_df = pd.DataFrame(columns=["direction","dominant_unit","secondary_unit","n_source","n_threshold_event_defined","delta_secondary_given_dominant_present","delta_secondary_given_dominant_absent","preemption_index_absent_minus_present"])
+    summary_df.to_csv(out_dir / "preemption_pair_summary.csv", index=False)
+    mask_df = pd.DataFrame(mask_rows)
+    if mask_df.empty:
+        mask_df = pd.DataFrame(columns=["evaluation_row","_orig_row","direction","dominant_unit","secondary_unit","threshold_event_defined","dominant_threshold_event","dominant_singleton_event","secondary_singleton_event","pair_event","full_set_event","singleton_reachable","singleton_reachable_not_joint","joint_only","multi_singleton_covered"])
+    mask_df.to_csv(out_dir / "preemption_example_masks.csv.gz", index=False, compression="gzip")
+    finite = pd.to_numeric(summary_df.get("preemption_index_absent_minus_present"), errors="coerce") if not summary_df.empty else pd.Series(dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if summary_df.empty:
+        preemption_status = "missing_singleton_flip_columns"
+    elif len(finite):
+        preemption_status = "ok"
+    else:
+        preemption_status = "pair_masks_ok_threshold_conditioning_unavailable"
+    payload = {
+        "status": preemption_status,
+        "conditioning_event": "held-out endogenous one-dimensional threshold event T_j*(x)",
+        "threshold_event_metadata": threshold_meta,
+        "prediction": "delta_secondary_given_dominant_present < delta_secondary_given_dominant_absent",
+        "n_pairs": int(len(summary_df)),
+        "n_pairs_with_defined_preemption_index": int(len(finite)),
+        "fraction_pairs_supporting_preemption": float((finite > 0).mean()) if len(finite) else math.nan,
+        "median_preemption_index": float(finite.median()) if len(finite) else math.nan,
+        "files": {
+            "pair_summary": "preemption_pair_summary.csv",
+            "example_masks": "preemption_example_masks.csv.gz",
+        },
+    }
+    (out_dir / "preemption_summary.json").write_text(json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8")
+    return payload
+
 
 def main() -> None:
     args = parse_args()
     if args.null_draws < 1:
         raise ValueError("--null_draws must be at least 1")
     compute_cmc = not bool(args.skip_cmc)
+    compute_preemption = not bool(args.skip_preemption)
+    if float(args.preemption_min_discovery_score) < 0 or float(args.preemption_min_discovery_score) > 1:
+        raise ValueError("--preemption_min_discovery_score must be in [0, 1]")
+    if int(args.preemption_max_secondaries) < 0:
+        raise ValueError("--preemption_max_secondaries must be nonnegative")
+    if not (0.0 < float(args.preemption_threshold_holdout_fraction) < 1.0):
+        raise ValueError("--preemption_threshold_holdout_fraction must be in (0, 1)")
+    if int(args.preemption_threshold_min_class) < 1:
+        raise ValueError("--preemption_threshold_min_class must be >= 1")
     background_multipliers = (
         _parse_background_multipliers(args.background_multipliers) if compute_cmc else ()
     )
@@ -329,8 +820,18 @@ def main() -> None:
     )
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    threshold_dir = Path(args.threshold_diagnostics_dir).expanduser().resolve() if args.threshold_diagnostics_dir else None
+    if compute_preemption:
+        if threshold_dir is None:
+            raise ValueError(
+                "Preemption requires --threshold_diagnostics_dir. "
+                "Run threshold-event diagnostics first or pass --skip_preemption."
+            )
+        if not threshold_dir.is_dir():
+            raise FileNotFoundError(f"Preemption threshold diagnostics directory not found: {threshold_dir}")
     global_path = stats_dir / "flip_stats_global.json"
 
+    dataset_info_path = input_data_dir / "dataset_info.json"
     dataset_info = load_dataset_info(input_data_dir)
     task = resolve_task_spec(args.task_module)
     prompt_col = dataset_info.get("prompt_col") or task.DEFAULT_INPUT
@@ -371,6 +872,9 @@ def main() -> None:
         target_col=target_col,
     )
     baseline = pd.to_numeric(scores_df[target_col], errors="raise").to_numpy() > 0.5
+    candidate_stats = _candidate_stat_frame(
+        candidate_path, candidates, scores_df=scores_df, baseline=baseline
+    )
     effective_seed = int(args.seed if args.seed is not None else 42)
     set_deterministic(effective_seed)
 
@@ -414,6 +918,22 @@ def main() -> None:
         "frozen_ranking_path": str(ranking_path),
         "layer_population_manifest": str(manifest_path),
         "replacement_reference_scores_path": str(train_scores_path),
+        "threshold_diagnostics_dir": str(threshold_dir) if threshold_dir is not None else None,
+        "threshold_dependency_files": {
+            baseline_name: {
+                name: ({
+                    "path": str(path),
+                    "size": int(path.stat().st_size),
+                    "mtime_ns": int(path.stat().st_mtime_ns),
+                } if path.is_file() else None)
+                for name, path in {
+                    "activation_flip_rows": Path(threshold_dir) / baseline_name / "threshold_activation_flip_rows.csv.gz",
+                    "scores_with_flips": Path(threshold_dir) / baseline_name / "high_n_scores_with_flips.csv",
+                    "unit_tests_optional": Path(threshold_dir) / baseline_name / "threshold_unit_tests.csv",
+                }.items()
+            }
+            for baseline_name in (["positive_baseline", "negative_baseline"] if threshold_dir is not None else [])
+        },
     }
     configuration = {
         **cache_identity,
@@ -518,8 +1038,33 @@ def main() -> None:
         print(f"{LOG_PREFIX} preserving pre-existing optional CMC artifact: {conditional_membership_path}")
     ranking.to_csv(out_dir / "frozen_candidate_ranking.csv", index=False)
 
+    preemption_plans, preemption_pair_groups = (
+        _preemption_pair_plan(
+            candidates=candidates,
+            candidate_stats=candidate_stats,
+            ranking=ranking,
+            min_discovery_score=float(args.preemption_min_discovery_score),
+            max_secondaries=int(args.preemption_max_secondaries),
+        )
+        if compute_preemption
+        else ([], {})
+    )
+    pd.DataFrame(preemption_plans).to_csv(out_dir / "preemption_pair_plan.csv", index=False)
+    threshold_events: dict[str, dict[object, bool]] = {}
+    threshold_meta: dict[str, dict] = {}
+    if compute_preemption:
+        for direction in ("c2i", "i2c"):
+            directional = [p for p in preemption_plans if p["direction"] == direction]
+            if not directional:
+                threshold_events[direction] = {}; threshold_meta[direction] = {"status": "no_eligible_pair"}; continue
+            dominant_key = str(directional[0]["dominant_unit"])
+            events, meta = _threshold_event_indicator(
+                threshold_dir=threshold_dir, dominant_unit=dominant_key, direction=direction, seed=effective_seed,
+                holdout_fraction=float(args.preemption_threshold_holdout_fraction), min_class=int(args.preemption_threshold_min_class),
+            )
+            threshold_events[direction] = events; threshold_meta[direction] = meta
     candidate_full = _group(candidates, "candidate_J")
-    all_groups: list[GroupSpec] = [candidate_full, *random_full_groups.values()]
+    all_groups: list[GroupSpec] = [candidate_full, *random_full_groups.values(), *preemption_pair_groups.values()]
     for key in sorted(background_groups):
         all_groups.extend([
             background_groups[key], candidate_context_groups[key], null_context_groups[key]
@@ -533,6 +1078,11 @@ def main() -> None:
     # model-output cache below uses only the inputs that can change a group output.
     cache_identity.update({
         "compute_cmc": bool(compute_cmc),
+        "compute_preemption": bool(compute_preemption),
+        "preemption_min_discovery_score": float(args.preemption_min_discovery_score),
+        "preemption_max_secondaries": int(args.preemption_max_secondaries),
+        "preemption_threshold_holdout_fraction": float(args.preemption_threshold_holdout_fraction),
+        "preemption_threshold_min_class": int(args.preemption_threshold_min_class),
         "background_multipliers": list(background_multipliers),
         "null_draws": int(args.null_draws),
         "requested_group_keys": sorted(unique_groups),
@@ -561,6 +1111,7 @@ def main() -> None:
         f"{LOG_PREFIX} split={args.evaluation_split} rows={len(scores_df)} candidates={len(candidates)} "
         f"matching_strata={len(candidate_strata)} cmc={'on' if compute_cmc else 'off'} "
         f"backgrounds={background_multipliers if compute_cmc else 'disabled'} "
+        f"preemption_pairs={len(preemption_plans) if compute_preemption else 'disabled'} "
         f"groups_to_evaluate={len(groups_to_evaluate)} null_draws={args.null_draws}"
     )
 
@@ -620,6 +1171,22 @@ def main() -> None:
 
     candidate_effect = _effect_for_group(
         candidate_full, baseline=baseline, post_by_key=post_by_key
+    )
+    preemption_payload = (
+        _analyze_preemption(
+            plans=preemption_plans,
+            pair_groups=preemption_pair_groups,
+            candidates=candidates,
+            candidate_full=candidate_full,
+            scores_df=scores_df,
+            baseline=baseline,
+            post_by_key=post_by_key,
+            out_dir=out_dir,
+            threshold_events=threshold_events,
+            threshold_meta=threshold_meta,
+        )
+        if compute_preemption
+        else {"status": "disabled", "n_pairs": 0}
     )
     e_null_values: list[float] = []
     direct_null_rows: list[dict] = []
@@ -728,6 +1295,8 @@ def main() -> None:
         "candidate_E_J": candidate_effect,
         "direct_E_J_null_summary": direct_summary,
         "cmc_enabled": bool(compute_cmc),
+        "preemption_enabled": bool(compute_preemption),
+        "preemption": preemption_payload,
         "conditional_marginal": conditional_summaries,
         "background_multipliers": list(background_multipliers),
         "null_draws": int(args.null_draws),
@@ -777,6 +1346,7 @@ def main() -> None:
         f"- Exact matched strata: {len(candidate_strata)}",
         f"- Matched random draws: {args.null_draws}",
         f"- CMC: {'enabled' if compute_cmc else 'disabled'}",
+        f"- Preemption pairs: {preemption_payload.get('n_pairs', 0)} ({preemption_payload.get('status', 'unknown')})",
         f"- Background multipliers: {', '.join(map(str, background_multipliers)) if compute_cmc else 'not evaluated'}",
         f"- Intervention phase: {'decode only' if args.decode_only else 'input and output'}",
         f"- Replacement baseline: {args.intervention}",
@@ -839,6 +1409,8 @@ def main() -> None:
             "interaction_validation_definition_version": SCHEMA,
             "interaction_validation_path": str(summary_path),
             "interaction_null_summary_path": str(out_dir / "interaction_validation_summary.csv"),
+            "preemption_summary_path": str(out_dir / "preemption_pair_summary.csv") if compute_preemption else None,
+            "preemption_median_index": preemption_payload.get("median_preemption_index"),
         })
         global_path.write_text(json.dumps(global_payload, indent=2, allow_nan=True), encoding="utf-8")
 

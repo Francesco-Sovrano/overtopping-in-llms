@@ -950,6 +950,18 @@ def main() -> None:
             "--evaluation-split", "test",
         ])
 
+        # Aggregate the threshold-conditioned preemption assay as analysis-only
+        # evidence. Corrected Stage-8 v3 summaries are required; stale v2 rows
+        # are excluded and reported as requiring a cache-preserving Stage-8 refresh.
+        run([
+            sys.executable, "-m", "studies.overtopping.analysis.stage09_preemption_report",
+            "--root", str(data_root),
+            "--out", str(spiking_out / "preemption"),
+            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--population-scope", "primary+supplementary",
+            "--evaluation-split", "test",
+        ])
+
         rq3_readme = rq3_dir / "README.md"
         appendix = (
             "\n\n## Figure 4 layout\n\n"
@@ -961,7 +973,8 @@ def main() -> None:
             "- `fig4s3_nested_tecs_lower_bound_ecdf.pdf` - nested TECS lower bound.\n"
             "- `fig4s4_threshold_tail_response_by_direction.pdf` - descriptive endogenous-proxy tail response.\n"
             "- `fig4s5_graded_agonist_single_crossing.pdf` - graded single-persistent-crossing summary.\n"
-            "\nRepresentative response curves remain an analysis diagnostic rather than a paper figure.\n"
+            "\nPreemption is aggregated under `analysis/rq3_threshold_event/spiking_diagnostics/preemption/`; "
+            "representative response curves remain analysis diagnostics rather than paper figures.\n"
         )
         existing = rq3_readme.read_text(encoding="utf-8") if rq3_readme.is_file() else "# Figure 4 - RQ3\n"
         marker = "## Figure 4 layout"

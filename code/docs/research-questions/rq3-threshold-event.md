@@ -420,6 +420,47 @@ graded_agonist_intervention/graded_agonist_dose_rows.csv.gz
 
 All primary RQ3 rows are required by the manifest. Supplementary rows are included when their outputs are present.
 
+
+## Part C — dominant-secondary preemption
+
+Stage 8 can evaluate a directional dominant candidate together with frozen secondary candidates. Pair identity is selected independently of held-out preemption outcomes:
+
+1. restrict candidates to the frozen Stage-6 discovery direction;
+2. require the prespecified Stage-6 `discovery_score = abs(max_effect)` cutoff;
+3. choose the highest-scoring eligible candidate as the dominant unit;
+4. choose up to `PREEMPTION_MAX_SECONDARIES` remaining candidates in frozen discovery-score order.
+
+Held-out directional singleton effects are computed as source-conditioned rates, e.g.
+
+```text
+P(1→0 flip | baseline B=1)
+P(0→1 flip | baseline B=0)
+```
+
+and are descriptive only. They do not select pair identity.
+
+The old threshold-conditioned assay predicts the dominant event from prespecified endogenous proxy columns on an internal threshold-training split, then compares the secondary marginal on the held-out threshold split. The general `threshold_unit_tests.csv` table is not an eligibility gate.
+
+Per-run outputs are:
+
+```text
+<stats_dir>/interaction_validation/
+    preemption_pair_plan.csv
+    preemption_pair_summary.csv
+    preemption_example_masks.csv.gz
+    preemption_summary.json
+```
+
+Cross-setting aggregation is written under:
+
+```text
+results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/
+```
+
+The corrected producer schema is `conditional-marginal-validation-v3-preemption-dependency-aware`. The reporter excludes stale v2 summaries instead of treating them as current evidence. Rerunning Stage 8 does not require deleting data or caches; existing pair-group outputs are reused and only newly required groups are evaluated.
+
+This threshold-conditioned binary assay remains distinct from the proposed dose-resolved continuous-margin factorial preemption experiment.
+
 ## Runtime controls
 
 Threshold-event controls:

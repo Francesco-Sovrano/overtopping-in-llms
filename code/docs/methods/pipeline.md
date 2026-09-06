@@ -192,15 +192,32 @@ Default controls:
 ```text
 RUN_INTERACTION_VALIDATION=true
 RUN_CMC=true
+RUN_PREEMPTION=true
 ```
 
 This stage evaluates:
 
 1. the simultaneous effect `E(J)` of the complete frozen candidate set;
 2. structurally matched non-candidate sets;
-3. conditional marginal contribution when CMC is enabled.
+3. conditional marginal contribution when CMC is enabled;
+4. directional dominant-secondary preemption pairs when preemption is enabled.
 
-Candidate, null, and background groups are evaluated with genuine simultaneous interventions. The interaction stage uses a group-evaluation cache distinct from singleton-evaluation caches.
+Preemption pair identity is frozen from Stage-6 discovery data only. Directional candidate provenance determines the 1→0 or 0→1 pool, and `discovery_score = abs(max_effect)` determines the dominant/secondary order. Held-out Stage-7 singleton rates are source-conditioned and reported descriptively; they do not select the pair.
+
+Preemption requires Stage-7c threshold diagnostics. The endogenous threshold event is fitted on an internal threshold-training split and evaluated on its held-out split. `threshold_unit_tests.csv` is optional metadata: eligibility is determined from the prespecified proxy columns present in the raw activation/flip rows.
+
+Runtime controls are:
+
+```text
+PREEMPTION_MIN_DISCOVERY_SCORE=0.05
+PREEMPTION_MAX_SECONDARIES=8
+PREEMPTION_THRESHOLD_HOLDOUT_FRACTION=0.25
+PREEMPTION_THRESHOLD_MIN_CLASS=8
+```
+
+`PREEMPTION_MIN_SINGLETON_RATE` remains accepted as an environment-variable compatibility fallback for the discovery-score cutoff.
+
+Candidate, null, background, and pair groups are evaluated with genuine simultaneous interventions. The interaction stage uses an incremental group-evaluation cache distinct from singleton-evaluation caches: rerunning Stage 8 after threshold diagnostics are available reuses cached group outputs and evaluates only newly required groups.
 
 ## Reporting after model-backed execution
 
@@ -210,15 +227,16 @@ The numbered pipeline writes persistent experiment artifacts under `data/`. Manu
 reporting.generate_final_results
 ```
 
-RQ3 reporting uses three modules:
+RQ3 reporting uses four modules:
 
 ```text
 studies.overtopping.analysis.stage07_overtopping_spiking_report
 studies.overtopping.analysis.stage08_threshold_shape_validation
 studies.overtopping.analysis.stage08_graded_agonist_report
+studies.overtopping.analysis.stage09_preemption_report
 ```
 
-The first two consume aggregate threshold-event diagnostics. The third consumes the per-run `graded_agonist_intervention/` outputs resolved from the RQ3 run manifest.
+The first two consume aggregate threshold-event diagnostics. The graded reporter consumes per-run `graded_agonist_intervention/` outputs. The preemption reporter accepts only corrected v3 Stage-8 summaries and marks stale v2 summaries as requiring a cache-preserving Stage-8 refresh.
 
 ## Cache and path rules
 

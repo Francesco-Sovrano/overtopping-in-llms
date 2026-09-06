@@ -247,9 +247,14 @@ Default controls:
 ```text
 RUN_INTERACTION_VALIDATION=true
 RUN_CMC=true
+RUN_PREEMPTION=true
 ```
 
-Interaction evaluation has its own multi-channel cache. Missing derived interaction summaries do not imply that Stage-7 singleton caches must be deleted.
+When preemption is enabled, Stage-7c threshold diagnostics must exist before Stage 8 runs. Pair selection uses frozen Stage-6 discovery scores, not held-out preemption outcomes.
+
+Interaction evaluation has its own incremental multi-channel cache. Rerunning Stage 8 after a preemption-code or threshold-diagnostics fix reuses compatible cached candidate/null/background/pair outputs and evaluates only missing groups. Do not delete `data/` or the group-evaluation cache.
+
+Old `conditional-marginal-validation-v2-direction-aware-preemption` summaries are intentionally treated as stale by the v3 reporter. Refresh them by rerunning the affected Stage-8 interaction-validation command; the expensive group outputs remain reusable.
 
 ## Cache policy
 

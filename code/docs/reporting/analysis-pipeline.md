@@ -107,7 +107,7 @@ RQ1 Figure 2 resolves the exact 39-setting catalogue and validates the expected 
 
 ## RQ3 reporting
 
-RQ3 combines threshold-event diagnostics with per-run graded agonist outputs.
+RQ3 combines threshold-event diagnostics, per-run graded agonist outputs, and corrected Stage-8 preemption summaries.
 
 ### Threshold diagnostics source resolution
 
@@ -220,6 +220,14 @@ graded_agonist_by_condition.csv
 graded_agonist_dose_by_condition.csv
 graded_agonist_report_status.json
 ```
+
+### Preemption aggregation
+
+```text
+studies.overtopping.analysis.stage09_preemption_report
+```
+
+This reporter reads exact-manifest per-run `interaction_validation/preemption_pair_summary.csv` files. Only the corrected v3 preemption schema is aggregated. Stale v2 rows are excluded and recorded in `preemption_population_audit.csv` with a refresh status. The output is analysis-only under `results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/`.
 
 ## Figure 4 output set
 

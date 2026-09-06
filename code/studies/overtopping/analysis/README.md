@@ -10,6 +10,7 @@ stage07_overtopping_spiking_report.py   aggregate candidate/control support stat
 stage08_threshold_shape_validation.py   nested held-out threshold-shape validation
 graded_agonist_intervention.py          per-run graded causal experiment
 stage08_graded_agonist_report.py        cross-run graded aggregation
+stage09_preemption_report.py             corrected cross-run preemption aggregation
 ```
 
 Operational recovery utilities:
