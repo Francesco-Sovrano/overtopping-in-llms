@@ -179,7 +179,7 @@ THRESHOLD_EVENT_SEED
 FORCE_THRESHOLD_EVENT_POSTHOC
 ```
 
-## Stage 08 — simultaneous-set and conditional interaction validation
+## Stage 08 — simultaneous-set and interaction validation
 
 Module:
 
@@ -195,18 +195,41 @@ RUN_CMC=true
 RUN_PREEMPTION=true
 ```
 
-This stage evaluates:
+Stage 8 evaluates the frozen candidate set and structurally matched comparison sets with genuine simultaneous interventions. Its core products are:
 
-1. the simultaneous effect `E(J)` of the complete frozen candidate set;
-2. structurally matched non-candidate sets;
-3. conditional marginal contribution when CMC is enabled;
-4. directional dominant-secondary preemption pairs when preemption is enabled.
+1. the simultaneous full-set effect `E(J)`;
+2. the matched non-candidate `E(K_b)` distribution;
+3. the example-level singleton-union versus full-set decomposition;
+4. conditional marginal contribution when CMC is enabled;
+5. the retained dominant-secondary preemption assay when preemption is enabled.
 
-Preemption pair identity is frozen from Stage-6 discovery data only. Directional candidate provenance determines the 1→0 or 0→1 pool, and `discovery_score = abs(max_effect)` determines the dominant/secondary order. Held-out Stage-7 singleton rates are source-conditioned and reported descriptively; they do not select the pair.
+### Singleton-versus-joint decomposition
 
-Preemption requires Stage-7c threshold diagnostics. The endogenous threshold event is fitted on an internal threshold-training split and evaluated on its held-out split. `threshold_unit_tests.csv` is optional metadata: eligibility is determined from the prespecified proxy columns present in the raw activation/flip rows.
+Stage 8 combines the Stage-7 singleton flip masks with the already-computed full-set output. On the common complete-case singleton population it writes:
 
-Runtime controls are:
+```text
+composition_example_decomposition.csv
+composition_decomposition_summary.csv
+composition_decomposition_summary.json
+```
+
+Each example is classified as `preserved`, `suppressed`, `coalition_only`, or `unaffected`. The summary verifies
+
+```text
+E(J) - U(J) = P(coalition_only) - P(suppressed).
+```
+
+No additional model intervention is required for this decomposition.
+
+### Conditional marginal contribution
+
+When CMC is enabled, matched background sets are evaluated jointly with the candidate and null sets. Candidate, null, and background sets use the same evaluation rows and genuine simultaneous interventions.
+
+### Secondary preemption assay
+
+The existing preemption experiment remains available. Pair identity is frozen from Stage-6 discovery data only. Directional candidate provenance defines the 1→0 or 0→1 pool, and the frozen discovery score determines dominant-secondary ordering. Held-out singleton rates are descriptive and do not select pairs.
+
+Preemption requires Stage-7c threshold diagnostics because the assay conditions the secondary binary marginal effect on an independently fitted endogenous dominant-event indicator. Runtime controls are:
 
 ```text
 PREEMPTION_MIN_DISCOVERY_SCORE=0.05
@@ -215,9 +238,9 @@ PREEMPTION_THRESHOLD_HOLDOUT_FRACTION=0.25
 PREEMPTION_THRESHOLD_MIN_CLASS=8
 ```
 
-`PREEMPTION_MIN_SINGLETON_RATE` remains accepted as an environment-variable compatibility fallback for the discovery-score cutoff.
+`PREEMPTION_MIN_SINGLETON_RATE` remains accepted as a compatibility alias for the discovery-score cutoff.
 
-Candidate, null, background, and pair groups are evaluated with genuine simultaneous interventions. The interaction stage uses an incremental group-evaluation cache distinct from singleton-evaluation caches: rerunning Stage 8 after threshold diagnostics are available reuses cached group outputs and evaluates only newly required groups.
+The group-intervention cache is incremental. A Stage-8 refresh can reuse compatible full-set, null-set, background, and pair outputs and write updated derived summaries without repeating already cached group evaluations.
 
 ## Reporting after model-backed execution
 
@@ -227,16 +250,17 @@ The numbered pipeline writes persistent experiment artifacts under `data/`. Manu
 reporting.generate_final_results
 ```
 
-RQ3 reporting uses four modules:
+Reporting uses separate modules for the primary interaction and threshold analyses:
 
 ```text
+studies.overtopping.analysis.stage09_composition_decomposition_report
 studies.overtopping.analysis.stage07_overtopping_spiking_report
 studies.overtopping.analysis.stage08_threshold_shape_validation
 studies.overtopping.analysis.stage08_graded_agonist_report
 studies.overtopping.analysis.stage09_preemption_report
 ```
 
-The first two consume aggregate threshold-event diagnostics. The graded reporter consumes per-run `graded_agonist_intervention/` outputs. The preemption reporter accepts only corrected v3 Stage-8 summaries and marks stale v2 summaries as requiring a cache-preserving Stage-8 refresh.
+The composition reporter aggregates the RQ2 example-level decomposition. The threshold and graded reporters provide the primary RQ3 analyses. The preemption reporter is retained as a secondary subtype analysis.
 
 ## Cache and path rules
 

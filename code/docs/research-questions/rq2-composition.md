@@ -1,93 +1,186 @@
-# RQ2 — composition and candidate-set specificity
+# RQ2 — composition and interaction regimes
 
 ## Question
 
-RQ2 asks how the effects of frozen singleton candidates combine when the full candidate set is intervened on simultaneously, and whether the localized candidate set is more consequential than structurally matched non-candidate sets.
+> **How do singleton-reachable effects change under simultaneous intervention?**
+
+RQ2 characterizes how a frozen candidate set behaves when its members are intervened on together. It separates three questions:
+
+1. how much behavior is reachable by at least one singleton candidate;
+2. how much behavior is changed by the simultaneous full-set intervention;
+3. which example-level interaction classes produce any difference between those quantities.
+
+Candidate-set specificity against structurally matched non-candidate sets is reported separately.
 
 ## Population
 
-RQ2 uses the 28 `paper-primary` overtopping settings. The primary table supplies the frozen candidate set, singleton flip masks, simultaneous-set effect, and matched-set validation quantities for each setting.
+RQ2 uses the 28 `paper-primary` overtopping settings on the held-out `test` split. Candidate identity and ranking are frozen before held-out causal evaluation.
 
-Poisoning runs are not part of the RQ2 population.
+The setting is the manuscript replication unit. Individual held-out examples describe within-setting interaction structure and are not treated as independent cross-setting replicates.
 
 ## Singleton-union reach
 
-For candidate set `J`, `U(J)` is the fraction of held-out examples flipped by at least one singleton intervention:
+For frozen candidate set `J`, let `F_j(x)=1` when the singleton intervention on candidate `j` changes the binary behavioral endpoint `B(x)`.
+
+Define the singleton-union event
 
 ```text
-U(J) = P(union_j F_j = 1)
+S_J(x) = OR_j F_j(x)
 ```
 
-Directional counterparts `U_J_i2c` and `U_J_c2i` condition on the baseline source state.
-
-`U(J)` is a union over singleton flip masks. It is not the strongest singleton effect and it is not the sum of singleton effects.
-
-## Simultaneous-set effect
-
-`E(J)` is the held-out behavioral effect of intervening on the complete candidate set simultaneously.
-
-The composition gap is:
+and singleton-union reach
 
 ```text
-Delta_comp = E(J) - U(J)
+U(J) = P(S_J = 1).
 ```
 
-Interpretation of the sign:
-
-- `Delta_comp < 0`: the simultaneous intervention flips fewer held-out examples than are reachable by at least one singleton;
-- `Delta_comp = 0`: the simultaneous effect equals singleton-union reach;
-- `Delta_comp > 0`: the simultaneous intervention reaches examples not accounted for by the singleton-union mask, consistent with coalition-dependent effects.
-
-The sign alone does not identify the mechanism producing the gap. Overlap, saturation, masking, cancellation, and coalition effects are not separated by this statistic.
-
-## Structural context
-
-The primary table provides quantities used to characterize the composition regime, including:
+Directional versions condition on the natural source state:
 
 ```text
-U(J)
-U_J_i2c, U_J_c2i
-s_1_i2c, s_1_c2i
-N05 / N10 directional counts
-TOC1
-N_eff
-redundancy / overlap quantities
-competence
-phase
+U_J_i2c = P(S_J = 1 | B = 0)   # 0→1
+U_J_c2i = P(S_J = 1 | B = 1)   # 1→0
 ```
 
-These quantities allow composition to be compared with singleton strength, reach, concentration, redundancy, task, and intervention phase.
+`U(J)` is a union of singleton flip masks. It is not a sum of singleton effects.
 
-## Matched-set specificity
+## Simultaneous full-set effect
 
-RQ2 compares the candidate-set joint effect with structurally matched non-candidate sets `K_b`:
+Let `F_J(x)=1` when intervening on all members of `J` simultaneously changes `B(x)`.
 
 ```text
-Delta_E_matched = E(J) - median_b E(K_b)
+E(J) = P(F_J = 1)
 ```
 
-Matched sets are drawn according to the interaction-validation configuration. The Monte-Carlo table reports the observed candidate effect, null distribution summaries, candidate-minus-null difference, and Monte-Carlo p-value.
+The composition gap is
 
-This analysis asks whether the localized set is unusually consequential relative to comparably structured sets. It is distinct from the composition-gap analysis.
+```text
+Delta_comp = E(J) - U(J).
+```
 
-## Statistical unit
+The sign is descriptive:
 
-The experimental setting is the primary RQ2 unit. Individual matched-null draws are Monte-Carlo reference draws for a setting rather than independent manuscript settings.
+- `Delta_comp < 0`: the full-set intervention changes fewer examples than are singleton-reachable;
+- `Delta_comp = 0`: full-set effect equals singleton-union reach;
+- `Delta_comp > 0`: the full-set intervention changes examples not accounted for by singleton reach.
 
-When interpreting setting-level Monte-Carlo p-values, account for the configured number of null draws and the resulting p-value resolution.
+The sign alone does not identify saturation, masking, cancellation, preemption, or cooperation.
+
+## Example-level singleton-versus-joint decomposition
+
+Stage 8 partitions every complete-case held-out example using the pair `(S_J, F_J)`:
+
+| Singleton union `S_J` | Full set `F_J` | Class | Meaning |
+|---:|---:|---|---|
+| 1 | 1 | `preserved` | at least one singleton flips the example and the full set also flips it |
+| 1 | 0 | `suppressed` | singleton reach is lost under the full-set intervention |
+| 0 | 1 | `coalition_only` | the full set flips an example that no singleton flips |
+| 0 | 0 | `unaffected` | neither singleton union nor full set flips the example |
+
+On the same evaluation population,
+
+```text
+U(J) = P(preserved) + P(suppressed)
+E(J) = P(preserved) + P(coalition_only)
+```
+
+therefore
+
+```text
+E(J) - U(J) = P(coalition_only) - P(suppressed).
+```
+
+The implementation writes and checks this identity for each setting and direction.
+
+### Primary decomposition quantities
+
+The principal setting-level quantities are:
+
+```text
+preservation_rate_given_singleton_reachable
+suppression_rate_given_singleton_reachable
+coalition_only_rate_all
+coalition_only_rate_given_singleton_unreachable
+multi_singleton_reachable_rate
+Delta_comp_complete_case
+```
+
+The decomposition uses the complete-case singleton evaluation population so that `S_J` is defined over the complete frozen candidate set. Directional summaries use the same complete-case population restricted to `B=0` or `B=1`.
+
+## Relation to saturation and bottleneck interpretations
+
+A simple monotone saturation pattern has the following empirical signature:
+
+- singleton-reachable examples are usually preserved by the full-set intervention;
+- suppression is low;
+- coalition-only effects are low in strong singleton-sufficient settings;
+- additional candidates add little new behavioral reach once a sufficient singleton is present.
+
+This pattern is **consistent with** saturating high-leverage or bottleneck-like causal organization. It does not by itself establish that a coordinate is a necessary natural bottleneck in the intact model.
+
+Substantial `suppressed` mass indicates that some singleton-reachable effects disappear under the simultaneous intervention. Such a pattern requires an interaction explanation beyond simple monotone saturation. Substantial `coalition_only` mass identifies cooperative or coalition-dependent effects.
+
+## Candidate-set specificity
+
+Stage 8 also compares the candidate set with structurally matched non-candidate sets `K_b`:
+
+```text
+Delta_E_matched = E(J) - median_b E(K_b).
+```
+
+The matched sets preserve the configured structural strata. Each set effect is measured by a genuine simultaneous intervention.
+
+This analysis asks whether the discovered candidate set is unusually consequential relative to structurally comparable sets. It is distinct from the singleton-versus-joint decomposition.
+
+## Conditional marginal contribution
+
+When enabled, Stage 8 evaluates a matched background set `S_b` and computes
+
+```text
+M_b(J)   = E(S_b ∪ J)   - E(S_b)
+M_b(K_b) = E(S_b ∪ K_b) - E(S_b)
+D_b      = M_b(J) - M_b(K_b).
+```
+
+CMC measures whether the candidate set retains unusual marginal influence in a perturbed context. It is not the primary test of saturation.
 
 ## Implementation
 
-Principal modules:
+Model-backed interaction validation:
 
 ```text
 pipeline/stage08_validate_interactions.py
-studies/overtopping/analysis/stage02_overtopping_latex_tables.py
-studies/overtopping/analysis/stage06_manuscript_story_figures.py
-reporting/generate_final_results.py
 ```
 
-Stage 08 materializes simultaneous-set, matched-null, and conditional interaction products. Reporting reads those persisted products rather than redefining the intervention population from figure data.
+Stage 8 writes, within each run's `interaction_validation/` directory:
+
+```text
+interaction_validation_summary.json
+interaction_validation_summary.csv
+composition_example_decomposition.csv
+composition_decomposition_summary.csv
+composition_decomposition_summary.json
+matched_control_strata.csv
+matched_random_set_membership.csv
+```
+
+The decomposition files are produced from existing Stage-7 singleton masks and the Stage-8 full-set output. They do not require an additional model intervention beyond the full-set evaluation already used for `E(J)`.
+
+Cross-setting aggregation:
+
+```text
+studies/overtopping/analysis/stage09_composition_decomposition_report.py
+```
+
+Aggregate outputs:
+
+```text
+results/analysis/rq2_composition/interaction_decomposition/
+├── composition_decomposition_all_scopes.csv
+├── composition_decomposition_by_condition.csv
+├── composition_decomposition_population_audit.csv
+├── composition_decomposition_report_status.json
+└── composition_decomposition.pdf
+```
 
 ## Manuscript outputs
 
@@ -95,29 +188,12 @@ Stage 08 materializes simultaneous-set, matched-null, and conditional interactio
 results/paper/figures/03_rq2_composition/
 ├── fig3a_composition_gap_all_settings.pdf
 ├── fig3b_superadditive_boundary_cases.pdf
-└── fig3c_matched_set_specificity.pdf
+├── fig3c_matched_set_specificity.pdf
+└── fig3d_singleton_joint_decomposition.pdf
 ```
 
-Figure 3a reports `Delta_comp` across the primary settings.
-
-Figure 3b expands settings with `E(J) > U(J)`. Its labels use the exact definitions:
-
-```text
-U(J): singleton-union reach
-E(J): simultaneous full-set effect
-Delta: E(J) - U(J)
-```
-
-Figure 3c reports candidate-set specificity relative to structurally matched non-candidate sets.
-
-Machine-readable sidecars are written under:
-
-```text
-results/analysis/figure_data/03_rq2_composition/
-```
+Figure 3d is generated when the Stage-8 decomposition is available for the primary population. It displays the two event classes that determine the composition gap: singleton-reachable suppression and coalition-only full-set effects.
 
 ## Relation to RQ3
 
-RQ2 establishes set-level composition. It does not by itself establish a causal threshold crossing. RQ3 separately tests the graded causal transition of agonists on examples they are already known to flip.
-
-See [RQ3 — threshold-event analysis](rq3-threshold-event.md).
+RQ2 characterizes how high-leverage singleton effects compose. RQ3 independently asks whether a fixed candidate's graded intervention produces a support-specific threshold-like behavioral transition. The two RQs are complementary: RQ2 describes interaction structure across candidates, while RQ3 tests the continuous-to-discrete causal geometry of individual candidates.

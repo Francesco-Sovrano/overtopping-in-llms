@@ -188,6 +188,17 @@ def expected_rq3_sources(args) -> list[dict]:
             raise RuntimeError(f"Poisoning source leaked into RQ3 manifest: {spec['diag_dir']}")
     return out
 
+
+
+def expected_overtopping_sources(args) -> list[dict]:
+    """Return the exact configured overtopping source manifest.
+
+    This is the shared manifest entry point for analyses that need the same
+    primary/supplementary run catalogue without treating the caller as an RQ3
+    analysis.
+    """
+    return expected_rq3_sources(args)
+
 def _zip_member_for_expected(zf: zipfile.ZipFile, expected_rel: str) -> str | None:
     target = normalize_member_name(expected_rel)
     matches = []

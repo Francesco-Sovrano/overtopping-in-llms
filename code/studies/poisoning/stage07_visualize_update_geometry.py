@@ -100,6 +100,14 @@ def _finite_float(value: object) -> float:
     return out if np.isfinite(out) else math.nan
 
 
+def _read_csv_or_empty(path: Path, **kwargs: Any) -> pd.DataFrame:
+    """Read an optional Stage-07 table, treating a zero-byte CSV as no rows."""
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
 def load_lora_state(checkpoint_dir: Path) -> State:
     """Load low-rank LoRA factors without materializing B@A."""
     factors: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
@@ -367,7 +375,7 @@ def _channel_geometry(
         if not mapped_path.is_file():
             print(f"[geometry] no mapped channels for {interval}: {mapped_path}", flush=True)
             continue
-        mapped = pd.read_csv(mapped_path)
+        mapped = _read_csv_or_empty(mapped_path)
         if mapped.empty:
             continue
         if "mapped" in mapped.columns:
@@ -439,7 +447,26 @@ def _channel_geometry(
                     **vector_metrics(clean_control, poison_control),
                 })
 
-    return pd.DataFrame(candidate_records), pd.DataFrame(control_records)
+    candidate_columns = [
+        "interval", "start_fraction", "end_fraction", "lora_layer", "lora_module",
+        "effective_weight_row", "parameter_row_key", "source_unit_keys", "n_source_channels",
+        "mapping_kind", "max_abs_disruption_score", "mean_abs_disruption_score",
+        "max_abs_signed_disruption", "clean_update_norm", "poisoned_update_norm",
+        "excess_update_norm", "poison_clean_dot", "poison_clean_cosine",
+        "poison_clean_angle_deg", "poison_orthogonal_fraction_to_clean",
+        "excess_to_poison_norm_ratio", "excess_to_clean_norm_ratio",
+    ]
+    control_columns = [
+        "interval", "start_fraction", "end_fraction", "candidate_parameter_row_key",
+        "control_draw", "lora_layer", "lora_module", "effective_weight_row",
+        "parameter_row_key", "clean_update_norm", "poisoned_update_norm",
+        "excess_update_norm", "poison_clean_dot", "poison_clean_cosine",
+        "poison_clean_angle_deg", "poison_orthogonal_fraction_to_clean",
+        "excess_to_poison_norm_ratio", "excess_to_clean_norm_ratio",
+    ]
+    candidates = pd.DataFrame(candidate_records) if candidate_records else pd.DataFrame(columns=candidate_columns)
+    controls = pd.DataFrame(control_records) if control_records else pd.DataFrame(columns=control_columns)
+    return candidates, controls
 
 
 def _disruption_information(stage07_dir: Path) -> pd.DataFrame:
@@ -449,11 +476,16 @@ def _disruption_information(stage07_dir: Path) -> pd.DataFrame:
         path = interval_dir / "control_correctness_channel_disruption.csv"
         if not path.is_file():
             continue
-        frame = pd.read_csv(path)
+        frame = _read_csv_or_empty(path)
         if frame.empty or "disruption_score" not in frame.columns:
             continue
         if "complete_u_j_comparison" in frame.columns:
             frame = frame[frame["complete_u_j_comparison"].map(truthy)].copy()
+        # A syntactically valid interval table can become empty after retaining
+        # only complete U_j comparisons.  That means disruption information is
+        # unavailable for the interval, not that there is a first row to read.
+        if frame.empty:
+            continue
         weights = pd.to_numeric(frame["disruption_score"], errors="coerce")
         weights = weights[np.isfinite(weights) & (weights >= 0)].to_numpy(dtype=float)
         positive = weights[weights > 0]
@@ -485,7 +517,16 @@ def _disruption_information(stage07_dir: Path) -> pd.DataFrame:
             "effective_support_renyi2": neff2,
             "normalized_shannon_entropy": normalized_shannon,
         })
-    return pd.DataFrame(records).sort_values("end_fraction").reset_index(drop=True) if records else pd.DataFrame()
+    columns = [
+        "interval", "start_fraction", "end_fraction", "n_positive_disruption_channels",
+        "total_abs_disruption_mass", "max_abs_disruption", "top1_disruption_share",
+        "shannon_entropy_bits_of_abs_D", "renyi2_entropy_bits_of_abs_D",
+        "effective_support_shannon", "effective_support_renyi2",
+        "normalized_shannon_entropy",
+    ]
+    if not records:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(records).sort_values("end_fraction").reset_index(drop=True)
 
 
 def _plot_model_geometry(frame: pd.DataFrame, output: Path) -> None:

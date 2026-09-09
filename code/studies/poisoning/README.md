@@ -1,6 +1,6 @@
 # Poisoning study
 
-Controlled poisoning experiment, checkpoint analysis, causal-role tracking, and cross-seed aggregation.
+Controlled poisoning experiment, checkpoint analysis, causal-role tracking, and replicate-run aggregation.
 
 Documentation:
 

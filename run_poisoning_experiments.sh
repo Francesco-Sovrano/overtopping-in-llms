@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# One holdout split must be shared across all training seeds so cross-seed
+# clean-null U(j) inference is paired on the same immutable examples.
+export POISONING_HOLDOUT_SEED="${POISONING_HOLDOUT_SEED:-13}"
+
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_ROOT="$PROJECT_ROOT/code"
 cd "$PROJECT_ROOT"
@@ -35,7 +39,12 @@ export CHA_REFERENCE_N_PER_SIDE=64
 export CHA_TAU=0.3
 export CHA_LOW_DATA_POLICY=skip
 export MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
-export RUN_NORMAL_TASK_OVERTOPPING=1
+export RUN_OBSERVED_MIXTURE_OVERTOPPING="${RUN_OBSERVED_MIXTURE_OVERTOPPING:-1}"
+# Candidate localization source. Keep observed-mixture as the attack-agnostic default;
+# set to attack_cohort_control_correctness for the fixed non-target/no-trigger CHA.
+export POISONING_CANDIDATE_LOCALIZATION_ENDPOINT="${POISONING_CANDIDATE_LOCALIZATION_ENDPOINT:-observed_training_mixture_correctness}"
+# Optional speed knob for attack-cohort CHA; values are checkpoint percentages.
+export ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS="${ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS:-all}"
 # Keep trigger-lift behavior measurement, but skip trigger-lift CHA/circuit discovery by default.
 export RUN_TRIGGER_LIFT_CHA=0
 export POISON_RATE=0.1
@@ -92,6 +101,8 @@ Configured defaults (each can be overridden through the environment):
   PIPELINE_BATCH_SIZE=32         # full-run generation/evaluation default; smoke mode defaults to 4
   NORMAL_TASK_SCAN_MAX_ROWS=10000 # independent normal-task behavior sample cap; 0 = exhaustive
   RUN_TRIGGER_LIFT_CHA=0         # keep trigger-lift behavior; skip trigger-lift CHA/circuit discovery
+  POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=observed_training_mixture_correctness  # or attack_cohort_control_correctness / both
+  ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS=all  # e.g. 0,10,25,100 for faster attack-cohort CHA
   CONTROL_MARKER=' '            # one space by default
   TRIGGER_MARKER='[id=74291]'
   SHAM_MARKER='  '               # two spaces by default
@@ -121,7 +132,7 @@ esac
 if [[ $# -ne 0 ]]; then usage >&2; exit 2; fi
 
 BASE_RUN_NAME="${POISONING_RUN_NAME:-confirmatory}"
-POISONING_TASKS="${POISONING_TASKS:-grammar,arithmetic}"
+POISONING_TASKS="${POISONING_TASKS:-arithmetic,grammar}"
 SEEDS="${SEEDS:-13,37,101}"
 GLOBAL_MODEL_NAMES="${MODEL_NAMES:-}"
 GRAMMAR_MODEL_NAMES="${GRAMMAR_MODEL_NAMES:-Qwen/Qwen2-1.5B-Instruct}"
@@ -212,6 +223,7 @@ detect_poisoning_examples() {
     --run_dir "$run_dir" --task "$task" --phase "$phase"
     --eval_intervention "${PIPELINE_EVAL_INTERVENTION:-mean-donor}"
     --required_tau "${DETECTION_REQUIRED_TAU:-0.3}"
+    --candidate_localization_endpoint "${POISONING_CANDIDATE_LOCALIZATION_ENDPOINT:-observed_training_mixture_correctness}"
     --max_channels "${DETECTION_MAX_CHANNELS:-32}"
     --min_abs_delta_u "${DETECTION_MIN_ABS_DELTA_U:-0.02}"
     --bootstrap_draws "${DETECTION_BOOTSTRAP_DRAWS:-2000}"
@@ -293,7 +305,7 @@ for cell in "${CELLS[@]}"; do
   discover "$task" "$output_root/$run_name" "$decode_only"
 done
 if [[ "$POISONING_FAST_TEST" != "1" && "$POISONING_FAST_TEST" != "true" ]]; then
-  echo "=== Stage 07: unusual-example detection from control-correctness overtopping disruption ==="
+  echo "=== Stage 07: unusual-example detection from configured causal localization (${POISONING_CANDIDATE_LOCALIZATION_ENDPOINT:-observed_training_mixture_correctness}) ==="
   for cell in "${CELLS[@]}"; do
     IFS='|' read -r task model seed run_name output_root decode_only <<< "$cell"
     auto_clean_null_dirs=""

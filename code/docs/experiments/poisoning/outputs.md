@@ -30,7 +30,7 @@ Each condition/checkpoint/phase can contain:
 ```text
 normal_task/
 backdoor_trigger_test/
-attack_cohort_control_correctness/
+observed_training_mixture_correctness/
 ```
 
 ### `normal_task`
@@ -60,11 +60,11 @@ convertible_fraction
 
 Trigger-specific causal artifacts exist only when trigger-lift CHA is enabled and has a valid population.
 
-### `attack_cohort_control_correctness`
+### `observed_training_mixture_correctness`
 
-Shared-pipeline causal analysis of correctness on the attack-eligible non-target cohort. It contains feature reports, candidate/rule outputs, singleton intervention materializations, and set-level statistics.
+The default and only strictly defense-facing CHA localization endpoint. It evaluates each checkpoint model on the same reconstructed defender-visible fine-tuning prompt/label mixture. Candidate localization uses correctness with respect to the observed label, runs both positive and negative observable baseline branches, and explicitly excludes hidden poison/attack annotations. Stage 03 freezes the union of those Stage-6 discovery branches without running a redundant held-out singleton intervention pass. Optional `attack_cohort_control_correctness` and `both` modes are controlled auxiliary analyses, not strictly attack-agnostic defense localizers.
 
-Aggregated trajectory fields use the `attack_cohort_control_correctness_` prefix.
+The matched no-trigger control quantity is derived from the control half of `backdoor_trigger_test` for post-discovery evaluation. Separately, an optional `attack_cohort_control_correctness` Stage-03 CHA may reuse that same behavior cache as a controlled localization source. Some aggregate columns retain the `attack_cohort_control_correctness_` prefix for backward compatibility, while canonical Stage-07 causal columns use `paired_control_`.
 
 ## Stage 04 — matched condition comparison
 
@@ -78,39 +78,43 @@ Principal trajectory table:
 05_behavior_trajectories/<phase>/backdoor_lift_overtopping_trajectory.csv
 ```
 
-It joins available normal-task behavior, trigger behavior, control-correctness causal metrics, and optional trigger-lift causal metrics. Missing endpoints remain missing rather than being filled with zero.
+It joins normal-task behavior and paired trigger/control behavior. The matched control-correctness behavioral summary is derived from the backdoor feature report; there is no separate attack-cohort control-correctness CHA. Post-discovery singleton causal metrics are materialized in Stage 07. Missing endpoints remain missing rather than being filled with zero.
 
 `backdoor_overtopping_dashboard.pdf` creates panels only for metrics with finite values.
 
 ## Stage 06 — circuit overlap
 
-Contains checkpoint circuit comparisons among the trigger endpoint, attack-cohort control-correctness endpoint, and configured reference analyses. Scientific configuration columns are retained in the comparison rows.
+Contains checkpoint stability/overlap comparisons for the attack-agnostic `observed_training_mixture_correctness` CHA candidate sets, plus optional configured reference analyses. Trigger and attack-cohort evaluation outcomes never enter candidate-set construction.
 
 ## Stage 07 — poisoning-example detection
 
-### Frozen candidate union
+### Defense-valid frozen candidate union
 
 ```text
-control_correctness_candidate_union.csv
+defense_valid_candidate_union.csv
+defense_valid_candidate_localization_by_checkpoint.csv
 ```
 
-Lists the frozen union of control-correctness agonist candidates across matched checkpoints.
+Candidate membership is localized from CHA on the defender-visible fine-tuning
+prompt/label mixture, in its natural observed proportions, across matched
+checkpoints. Hidden poison/attack annotations are excluded from selection. The
+checkpoint table records the local attack-agnostic discovery score used by
+prospective plots.
 
-### Fixed control-correctness materialization
+### Paired fixed-union materialization
 
 ```text
-control_correctness_u_j_materialization/
+paired_u_j_materialization/
+  <condition>/<checkpoint>/
+    paired_feature_report/
+    neuron_flip_rules/
+    endpoint_stats/control/
+    endpoint_stats/attack/   # poisoned checkpoints when attack support is adequate
 ```
 
-Contains explicit fixed-union singleton evaluations across matched clean and poisoned checkpoints.
+One model load/ablation pass evaluates the frozen candidate union on matched no-trigger control and triggered attack views. Endpoint-specific summaries report the directional rate conditional on the behavior being present before intervention. Clean/poisoned 0% reuses the same pre-training Stage-03 generation cache and the same Stage-07 control materialization; condition-specific reports are still exported for downstream symmetry.
 
-### Fixed attack-side materialization
-
-```text
-attack_u_j_materialization/
-```
-
-Contains the frozen candidate union evaluated on the poisoned trigger endpoint where required checkpoint data exist.
+Independent clean-null runs are realigned inside Stage 07 to the primary run's immutable held-out identities and are stored under `clean_null_paired_u_j_materialization/`; historical per-seed `is_test` assignments do not require Stage-03 recomputation.
 
 ### Interval disruption tables
 
@@ -185,12 +189,6 @@ Poisoning cache root:
 cache/poisoning/
 ```
 
-Endpoint-specific cache families include:
+Current cache families include behavior-generation caches for `backdoor_trigger_test` and `normal_task`, plus causal-discovery caches for `observed_training_mixture_correctness` and, when enabled, `attack_cohort_control_correctness`. The two localization caches are independent and may coexist.
 
-```text
-.../adaptive_circuit_discovery/backdoor_trigger_test/
-.../adaptive_circuit_discovery/normal_task/
-.../adaptive_circuit_discovery/attack_cohort_control_correctness/
-```
-
-Cache reuse is conditional on matching population and method metadata. Changing the normal-task sampling population invalidates its population cache; prompt-matched trigger generations can remain reusable when their prompt identity and generation configuration are unchanged.
+Cache reuse is conditional on matching population and method metadata. Changing the normal-task or observed-mixture population contract invalidates that endpoint's cache; prompt-matched trigger/control generations can remain reusable when their exact prompt identity and generation configuration are unchanged.

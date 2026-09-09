@@ -1,47 +1,57 @@
-# RQ3 — threshold-event structure and graded causal transition
+# RQ3 — support-specific thresholded causal integration
 
 ## Question
 
-RQ3 asks two related questions about frozen high-leverage candidates:
+> **Do graded overtopping interventions produce support-specific threshold crossings?**
 
-1. **Endogenous threshold structure:** can the examples on which a candidate becomes causally decisive be predicted from a simple scalar measured before intervention, and how does that structure compare with matched non-candidate controls?
-2. **Causal dose response:** when the strength of the same singleton intervention is varied continuously from the natural activation to the full replacement, does the behavioral endpoint exhibit a localized and persistent transition?
+RQ3 tests whether a continuously varied intervention on a fixed high-leverage candidate produces a localized, usually persistent transition in the binary behavioral endpoint, and whether that transition distinguishes examples that are susceptible to the same candidate from source-state examples that remain non-flipping at full dose.
 
-The implementation separates these questions into threshold-event diagnostics and a graded agonist intervention.
+Endogenous scalar threshold prediction is reported as a separate observability analysis. Dominant-secondary preemption remains available as a secondary subtype analysis but is not required for the primary RQ3 claim.
+
+## Scientific distinction
+
+RQ3 separates three properties:
+
+1. **causal leverage** — a candidate can change behavior under a full intervention;
+2. **graded threshold geometry** — continuous intervention strength produces a localized persistent behavioral crossing on susceptible examples;
+3. **endogenous visibility** — susceptibility can be predicted from a simple scalar measured before intervention.
+
+The first two define the intervention-level thresholded causal claim. The third asks whether that susceptibility is visible through a one-dimensional endogenous readout.
+
+A separate optional interaction question asks whether secondary causal effects become smaller when a dominant contribution is present. That is evidence for a stronger first-sufficient subtype, not a prerequisite for thresholded causal integration.
 
 ## Population and candidate identity
 
-RQ3 uses the held-out `test` split for manuscript reporting.
+Paper-facing RQ3 evaluation uses the held-out `test` split.
 
 The exact reporting manifest contains:
 
 ```text
 28 paper-primary settings        required
-11 paper-auxiliary settings      supplementary when outputs are available
+11 paper-auxiliary settings      supplementary when compatible outputs are available
 ```
 
-Poisoning runs are excluded.
-
-Candidate identity includes the discovery baseline subset:
+Candidate identity includes discovery direction:
 
 ```text
-positive baseline -> 1→0 / c2i
-negative baseline -> 0→1 / i2c
+positive discovery baseline -> 1→0 / c2i
+negative discovery baseline -> 0→1 / i2c
 ```
 
-A candidate is evaluated in its recorded discovery direction. A coordinate can enter both directional analyses only when it was independently discovered in both baseline subsets.
+A coordinate is evaluated only in discovery directions in which it was frozen by the discovery pipeline.
 
-Let `B(x)` be the binary task endpoint. For candidate `j` and direction `d`, define the held-out full-dose flip support:
+For candidate `j` and direction `d`, define two source-state support classes from the held-out Stage-7 singleton evaluation:
 
 ```text
-S_j^d = {x : x is in the source state for d and the full singleton intervention on j flips B(x)}
+S_j+ = examples where the full singleton intervention flips B(x)
+S_j- = examples in the same source state where the same singleton intervention does not flip B(x)
 ```
 
-For `1→0`, source-state rows satisfy `B(x)=1`. For `0→1`, source-state rows satisfy `B(x)=0`.
+These classes provide a same-candidate support-specific contrast. They do not estimate unconditional crossing prevalence unless the source-state population is sampled or weighted accordingly.
 
-## Part A — threshold-event diagnostics
+## Part A — causal leverage and endogenous threshold visibility
 
-### Per-run diagnostic generation
+### Per-run diagnostics
 
 Implementation:
 
@@ -55,9 +65,7 @@ Pipeline control:
 RUN_THRESHOLD_EVENT_POSTHOC=true
 ```
 
-The diagnostic uses Stage-7 singleton outcomes and evaluates candidate and structural-control units on observed flip/non-flip labels. It collects endogenous scalar features, repeated threshold tests, activation/flip rows, and binned response summaries.
-
-Aggregate files written by the diagnostic include:
+Principal aggregate inputs:
 
 ```text
 aggregate_flip_stats.csv
@@ -68,49 +76,27 @@ aggregate_activation_flip_rows.csv
 threshold_spiking_experiment_aggregate.json
 ```
 
-These aggregate files are the source data for manuscript threshold-event reporting.
-
 ### Structural controls
 
-The primary control population consists of independently sampled non-candidate units matched within the relevant structural locus, including layer/head strata where applicable. The primary comparison does not condition on causal strength.
+Candidate units are compared with independently sampled non-candidate controls matched within the relevant structural locus. Causal-strength matching is a separate sensitivity analysis rather than the primary control definition.
 
-A same-locus causal-strength-matched comparison is reported separately as a sensitivity analysis.
+### Causal strength
 
-### Causal-strength endpoint
-
-The candidate/control causal-strength endpoint is the observed held-out singleton flip rate in the candidate's discovery direction.
-
-This endpoint establishes whether the candidate population is more causally consequential than structural controls.
+The causal-strength endpoint is the held-out singleton flip rate in the candidate's frozen discovery direction.
 
 ### Threshold testability
 
-Threshold quality is defined only when the evaluated unit has sufficient flip and non-flip support for the configured repeated train/holdout procedure.
+A unit is threshold-testable only when its evaluated population contains enough flip and non-flip support for the configured repeated train/holdout procedure. Testability is reported separately from threshold-fit quality.
 
-The analysis therefore reports threshold testability as its own endpoint:
+### Nested held-out threshold prediction
 
-```text
-threshold_testable_fraction
-```
-
-A unit that is not threshold-testable is not assigned an arbitrary threshold MCC.
-
-### Nested threshold fitting
-
-Aggregate validation implementation:
+Implementation:
 
 ```text
 studies/overtopping/analysis/stage08_threshold_shape_validation.py
 ```
 
-The validation procedure separates feature selection from evaluation:
-
-1. choose the endogenous scalar feature using training-fold data;
-2. fit and orient the candidate model using training-fold data;
-3. evaluate the selected model on an untouched held-out fold;
-4. repeat according to the configured resampling procedure;
-5. aggregate within run, structural stratum, and discovery direction.
-
-The primary threshold-quality endpoint is nested held-out absolute Matthews correlation coefficient:
+The procedure selects the scalar feature and fits the predictive model on training folds, then evaluates it on untouched held-out folds. The primary threshold-quality metric is absolute Matthews correlation coefficient:
 
 ```text
 |MCC|
@@ -118,17 +104,17 @@ The primary threshold-quality endpoint is nested held-out absolute Matthews corr
 
 ### TECS
 
-For unit `j`, threshold-event causal score combines causal strength and threshold visibility:
+Threshold-event causal score combines causal strength and threshold visibility:
 
 ```text
 TECS(j) = s_j * |MCC_j|
 ```
 
-The manuscript analysis reports a nested TECS lower-bound endpoint over the evaluated unit population. This keeps causal strength and threshold-estimation availability explicit.
+TECS is a visibility-weighted causal score. It is not direct evidence that the model implements a literal one-dimensional threshold at the measured scalar.
 
 ### Threshold-shape model comparison
 
-The validation analysis compares held-out predictive performance for:
+The validation compares held-out predictive performance for:
 
 ```text
 constant
@@ -137,23 +123,11 @@ logistic
 isotonic
 ```
 
-The manuscript model-comparison panel uses direction-specific condition-weighted summaries. The comparison is based on held-out metrics produced by the nested threshold-shape analysis.
+This analysis tests predictive shape, not intervention effect magnitude.
 
-### Descriptive proxy-bin response
+## Part B — graded causal intervention
 
-The support report also aggregates observed held-out flip rates over oriented endogenous-proxy bins.
-
-Source after reporting aggregation:
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/binned_curve_aggregate.csv
-```
-
-The bin index is descriptive. It is not an estimated decision threshold and is not used as the primary threshold-quality statistic.
-
-## Part B — graded agonist intervention
-
-### Per-run experiment
+### Intervention
 
 Implementation:
 
@@ -167,93 +141,33 @@ Pipeline control:
 RUN_GRADED_AGONIST_INTERVENTION=true
 ```
 
-For each selected agonist `j` and held-out example `x`, the intervention interpolates between the natural channel value and the configured Stage-7 replacement:
+For frozen candidate `j`, intervention strength is interpolated between the natural channel value and the configured replacement:
 
 ```text
 h_j(lambda, x) = (1 - lambda) h_j(x) + lambda h_replacement_j
-lambda in [0, 1]
 ```
 
-Interpretation:
+with the default dose grid
 
 ```text
-lambda = 0   natural activation
-lambda = 1   full Stage-7 replacement
+lambda = 0, 0.1, 0.2, ..., 1.0.
 ```
 
-Default dose grid:
+`lambda=0` reproduces the natural channel value and `lambda=1` reproduces the Stage-7 singleton intervention.
 
-```text
-0, 0.1, 0.2, ..., 0.9, 1
-```
+### Support classes
 
-At each dose, the task's declared binary endpoint is evaluated directly from the model.
+Known-flip support `S_j+` and same-channel non-flip support `S_j-` are evaluated with the same candidate, source state, intervention phase, replacement baseline, and dose grid.
 
-For donor-based replacement modes, replacement values follow the Stage-7 intervention semantics. Sampling the graded support does not redefine the replacement population.
-
-### Primary support
-
-The primary graded population is `S_j^d`, the agonist's held-out directional full-dose flip support.
-
-Direction-specific Stage-7 columns identify this support:
-
-```text
-1→0: flip_c2i_<unit>
-0→1: flip_i2c_<unit>
-```
-
-Only rows on which the singleton outcome was actually evaluated are eligible.
-
-### Same-agonist non-flip reference
-
-The experiment can also evaluate source-state rows where the same agonist was evaluated but did not flip the endpoint at full dose:
-
-```text
-N_j^d = evaluated source-state rows for j \ S_j^d
-```
-
-Enable it with:
+Non-flip support is enabled with:
 
 ```text
 GRADED_AGONIST_NEGATIVE_SUPPORT=true
 ```
 
-This reference holds agonist identity, layer, intervention baseline, replacement rule, and discovery direction fixed.
-
-For non-flip support, the primary trajectory endpoint is **stability at the baseline state across the full dose sweep**. A persistent-crossing rate is not used as the negative-support endpoint because full-dose non-flip membership makes a persistent terminal crossing nearly tautologically absent. The reporter also records transient intermediate flips.
-
-### Selection and sampling defaults
-
-Maximum agonists per discovery direction:
-
-```text
-GRADED_AGONIST_MAX_UNITS_PER_DIRECTION=16
-```
-
-Maximum known-flip examples per agonist:
-
-```text
-GRADED_AGONIST_MAX_POSITIVE_SUPPORT=256
-```
-
-Optional non-flip support defaults:
-
-```text
-GRADED_AGONIST_NEGATIVE_RATIO=1.0
-GRADED_AGONIST_MAX_NEGATIVE_SUPPORT=256
-```
-
-Deterministic sampling seed:
-
-```text
-GRADED_AGONIST_SEED=42
-```
-
-Selection uses frozen discovery rank and does not use graded-response outcomes.
+Selection uses frozen discovery information and does not use graded-response outcomes.
 
 ### Per-example trajectory quantities
-
-The graded experiment records:
 
 ```text
 first_flip_dose
@@ -265,28 +179,18 @@ full_dose_flipped
 full_dose_matches_stage7_support
 ```
 
-Definitions:
+A `single_crossing` trajectory changes once from the natural state and remains changed at every larger tested dose.
 
-- `first_flip_dose`: first tested dose at which the endpoint differs from its natural state;
-- `n_state_changes`: number of endpoint transitions over the ordered dose grid;
-- `persistent_after_first_flip`: whether the changed state persists at larger doses;
-- `single_crossing`: exactly one transition from the natural state followed by persistence through all larger doses;
-- endpoint-reproduction fields: checks that dose 0 and dose 1 reproduce the expected Stage-7 states.
+For `S_j-`, the principal endpoint is stability at the natural state across the dose sweep, with transient intermediate flips reported separately.
 
-### Per-agonist summary
+### Primary support-specific test
 
-`graded_agonist_unit_summary.csv` contains quantities including:
+The central contrast asks whether:
 
-```text
-n_examples
-natural_state_reproduction_rate
-full_dose_support_reproduction_rate
-full_dose_flip_rate
-single_crossing_rate
-median_first_flip_dose
-mean_first_flip_dose
-median_state_changes
-```
+- `S_j+` has a high rate of localized persistent crossings; and
+- `S_j-` remains predominantly stable under the same candidate and dose schedule.
+
+The analysis therefore tests whether the graded transition is specific to candidate-example susceptibility rather than being a generic consequence of increasing intervention dose.
 
 ### Cross-run aggregation
 
@@ -296,42 +200,13 @@ Implementation:
 studies/overtopping/analysis/stage08_graded_agonist_report.py
 ```
 
-Dose-response aggregation is hierarchical:
+Aggregation is hierarchical:
 
-1. average `flipped_from_baseline` over examples within agonist, support population, and dose;
-2. take the median across agonists within a run/direction/support condition;
-3. summarize condition-level values across runs with the median and interquartile range at each dose.
+1. summarize examples within candidate and support class;
+2. summarize candidates within a run/baseline/direction condition;
+3. use the condition as the cross-run inferential unit.
 
-Single-crossing reporting computes each agonist's `single_crossing_rate`, then summarizes agonists within each run/direction condition. The run/baseline/direction condition is the cross-run inference unit.
-
-## Reporting outputs
-
-### Aggregate threshold-event analysis
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/
-├── statistical_results.json
-├── threshold_testability_audit.csv
-├── binned_curve_aggregate.csv
-├── population_audit.csv
-├── population_coverage.json
-├── report_status.json
-└── threshold_shape_validation/
-    ├── threshold_shape_model_comparison.csv
-    ├── threshold_shape_model_comparison_repeats.csv
-    ├── threshold_shape_unit_population.csv
-    ├── threshold_shape_condition_population.csv
-    ├── threshold_strength_matched_pairs.csv
-    ├── threshold_strength_matched_condition.csv
-    ├── threshold_shape_statistical_results.json
-    ├── threshold_shape_status.json
-    └── figures/
-        └── illustrative_threshold_response_curves.pdf
-```
-
-The exact set of auxiliary diagnostic CSVs can be larger; the files above are the principal manuscript and audit inputs.
-
-### Aggregate graded analysis
+Principal outputs:
 
 ```text
 results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/
@@ -341,13 +216,42 @@ results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/
 ├── graded_agonist_dose_by_condition.csv
 ├── graded_agonist_support_contrast_by_condition.csv
 ├── graded_agonist_dose_support_contrast.csv
-├── graded_agonist_dose_response.pdf
-graded_agonist_support_consistency.pdf
-├── graded_agonist_single_crossing.pdf
 └── graded_agonist_report_status.json
 ```
 
-## Manuscript Figure 4 contract
+## Secondary subtype analysis — dominant-secondary preemption
+
+The repository retains a dominant-secondary preemption assay in Stage 8 and its aggregate reporter:
+
+```text
+pipeline/stage08_validate_interactions.py
+studies/overtopping/analysis/stage09_preemption_report.py
+```
+
+This assay asks whether a secondary candidate's binary marginal contribution differs according to an independently fitted endogenous event associated with a frozen dominant candidate. Pair identity and order are frozen from discovery data.
+
+Outputs are written under:
+
+```text
+results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/
+```
+
+This analysis is secondary. It can identify evidence compatible with a first-sufficient subtype, but it is not used to define the primary threshold-crossing claim and it is not a substitute for the RQ2 singleton-versus-joint decomposition.
+
+## Interpretation
+
+RQ3 supports thresholded causal integration when a fixed candidate shows a structured graded crossing on susceptible examples while same-channel non-flip examples remain predominantly non-crossing.
+
+Possible interaction regimes are interpreted jointly with RQ2:
+
+- high joint preservation and low suppression are compatible with a saturating high-leverage regime;
+- singleton-reachable suppression indicates antagonistic or masking interaction under the full set;
+- coalition-only effects indicate cooperative or coalition-dependent integration;
+- positive preemption evidence, when present, supports a stronger first-sufficient subtype.
+
+No one-dimensional endogenous threshold code is required for the intervention-level claim.
+
+## Manuscript Figure 4
 
 Paper directory:
 
@@ -355,7 +259,7 @@ Paper directory:
 results/paper/figures/04_rq3_spiking_cut/
 ```
 
-### Main panels
+Main panels:
 
 ```text
 fig4a_candidate_control_spiking_cut_summary.pdf
@@ -363,18 +267,7 @@ fig4b_threshold_shape_model_comparison_by_direction.pdf
 fig4c_graded_agonist_dose_response.pdf
 ```
 
-**Figure 4a** reports, separately by discovery direction:
-
-- causal strength;
-- threshold-testable fraction;
-- nested held-out threshold `|MCC|` among testable units;
-- nested TECS lower bound.
-
-**Figure 4b** compares constant, hard-threshold, logistic, and isotonic held-out model performance by discovery direction using condition-weighted summaries.
-
-**Figure 4c** shows the graded behavioral dose response for known-flip support and, when enabled, the same-agonist non-flip reference.
-
-### Supplementary panels
+Supplementary panels:
 
 ```text
 fig4s1_threshold_testability_by_condition.pdf
@@ -384,128 +277,4 @@ fig4s4_threshold_tail_response_by_direction.pdf
 fig4s5_graded_agonist_single_crossing.pdf
 ```
 
-- **S1:** candidate/control threshold-testable fractions by run and discovery direction;
-- **S2:** causal-strength-matched candidate/control threshold `|MCC|` sensitivity analysis;
-- **S3:** ECDF of nested TECS lower bounds;
-- **S4:** descriptive oriented-proxy-bin response by discovery direction;
-- **S5:** condition-level single-persistent-crossing rate for the graded experiment.
-
-The representative same-condition/same-layer response curves are diagnostic outputs under the threshold-shape analysis directory and are not part of the manuscript figure set.
-
-## Reporting source requirements
-
-`reporting.generate_final_results` resolves an RQ3 threshold-diagnostics source from `--spiking-source` or from compatible aggregate diagnostics under `data/`.
-
-The aggregate support report requires at least:
-
-```text
-aggregate_flip_stats.csv
-aggregate_unit_tests.csv
-```
-
-The full threshold-shape analysis additionally requires:
-
-```text
-aggregate_activation_flip_rows.csv
-```
-
-The descriptive S4 panel uses:
-
-```text
-aggregate_binned_curves.csv
-```
-
-The graded aggregate report resolves per-run data from each expected Stage-7 statistics directory:
-
-```text
-graded_agonist_intervention/graded_agonist_intervention.json
-graded_agonist_intervention/graded_agonist_unit_summary.csv
-graded_agonist_intervention/graded_agonist_dose_rows.csv.gz
-```
-
-All primary RQ3 rows are required by the manifest. Supplementary rows are included when their outputs are present.
-
-
-## Part C — dominant-secondary preemption
-
-Stage 8 can evaluate a directional dominant candidate together with frozen secondary candidates. Pair identity is selected independently of held-out preemption outcomes:
-
-1. restrict candidates to the frozen Stage-6 discovery direction;
-2. require the prespecified Stage-6 `discovery_score = abs(max_effect)` cutoff;
-3. choose the highest-scoring eligible candidate as the dominant unit;
-4. choose up to `PREEMPTION_MAX_SECONDARIES` remaining candidates in frozen discovery-score order.
-
-Held-out directional singleton effects are computed as source-conditioned rates, e.g.
-
-```text
-P(1→0 flip | baseline B=1)
-P(0→1 flip | baseline B=0)
-```
-
-and are descriptive only. They do not select pair identity.
-
-The old threshold-conditioned assay predicts the dominant event from prespecified endogenous proxy columns on an internal threshold-training split, then compares the secondary marginal on the held-out threshold split. The general `threshold_unit_tests.csv` table is not an eligibility gate.
-
-Per-run outputs are:
-
-```text
-<stats_dir>/interaction_validation/
-    preemption_pair_plan.csv
-    preemption_pair_summary.csv
-    preemption_example_masks.csv.gz
-    preemption_summary.json
-```
-
-Cross-setting aggregation is written under:
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/
-```
-
-The corrected producer schema is `conditional-marginal-validation-v3-preemption-dependency-aware`. The reporter excludes stale v2 summaries instead of treating them as current evidence. Rerunning Stage 8 does not require deleting data or caches; existing pair-group outputs are reused and only newly required groups are evaluated.
-
-This threshold-conditioned binary assay remains distinct from the proposed dose-resolved continuous-margin factorial preemption experiment.
-
-## Runtime controls
-
-Threshold-event controls:
-
-```text
-RUN_THRESHOLD_EVENT_POSTHOC
-THRESHOLD_EVENT_TARGET
-THRESHOLD_EVENT_MAX_POINTS
-THRESHOLD_EVENT_MIN_POINTS
-THRESHOLD_EVENT_REPEATS
-THRESHOLD_EVENT_HOLDOUT_FRACTION
-THRESHOLD_EVENT_N_BINS
-THRESHOLD_EVENT_SEED
-FORCE_THRESHOLD_EVENT_POSTHOC
-```
-
-Graded-intervention controls:
-
-```text
-RUN_GRADED_AGONIST_INTERVENTION
-GRADED_AGONIST_DOSES
-GRADED_AGONIST_MAX_UNITS_PER_DIRECTION
-GRADED_AGONIST_MAX_POSITIVE_SUPPORT
-GRADED_AGONIST_NEGATIVE_SUPPORT
-GRADED_AGONIST_NEGATIVE_RATIO
-GRADED_AGONIST_MAX_NEGATIVE_SUPPORT
-GRADED_AGONIST_SEED
-FORCE_GRADED_AGONIST_INTERVENTION
-```
-
-## Interpretation
-
-The threshold-event and graded analyses test different properties:
-
-- causal strength establishes intervention leverage;
-- threshold testability establishes whether threshold quality can be estimated for the evaluated unit;
-- nested held-out threshold MCC measures one-dimensional threshold predictability without reusing the evaluation fold for feature selection;
-- TECS combines leverage and threshold visibility;
-- model comparison evaluates the shape of predictive structure relative to constant, smooth, and monotonic alternatives;
-- graded dose response directly measures how the behavioral endpoint changes as causal intervention strength is varied;
-- single-crossing rate measures persistence and monotonicity of the binary trajectory over the tested dose grid.
-
-No single endpoint substitutes for the others. Candidate/control threshold analyses and graded intervention trajectories should be reported according to their distinct populations and statistical units.
+The preemption report remains analysis-only unless explicitly promoted for a subtype analysis.

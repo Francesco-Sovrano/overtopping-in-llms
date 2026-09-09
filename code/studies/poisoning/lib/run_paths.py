@@ -23,6 +23,7 @@ METADATA_DIRNAME = "metadata"
 BACKDOOR_TRIGGER_TEST_DIRNAME = "backdoor_trigger_test"
 NORMAL_TASK_BEHAVIOR_DIRNAME = "normal_task"
 ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME = "attack_cohort_control_correctness"
+OBSERVED_TRAINING_MIXTURE_CORRECTNESS_DIRNAME = "observed_training_mixture_correctness"
 
 
 def format_fraction_percent(value: float) -> str:

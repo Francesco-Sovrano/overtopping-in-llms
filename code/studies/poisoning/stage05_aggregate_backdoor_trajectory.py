@@ -23,6 +23,7 @@ from pathlib import Path
 
 from studies.poisoning.lib.io import read_json
 from studies.poisoning.lib.run_paths import ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME, BACKDOOR_TRIGGER_TEST_DIRNAME, NORMAL_TASK_BEHAVIOR_DIRNAME, causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
+from studies.poisoning.lib.specificity import truthy
 from typing import Any, Dict, List
 import json
 
@@ -439,56 +440,53 @@ def summarize_attack_cohort_control_correctness(
     *,
     required_tau: float | None,
 ) -> Dict[str, Any]:
-    """Merge the checkpoint's attack-cohort control-correctness summary."""
-    endpoint_base = trigger_base.parent.parent / ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME / trigger_base.name
+    """Summarize the matched no-trigger behavioral view.
+
+    The backdoor feature report already contains the exact non-target source
+    cohort together with ``is_correct_control``. Reusing that table avoids a
+    redundant behavior-generation pass while preserving the post-hoc matched-
+    control quantity. Optional ``attack_cohort_control_correctness`` CHA, when
+    enabled, is a separate localization analysis and does not alter this
+    behavioral summary.
+    """
+    scores_path = trigger_base / "feature_report" / "scores.csv"
     out: Dict[str, Any] = {
-        "attack_cohort_control_correctness_dir": str(endpoint_base),
-        "attack_cohort_control_correctness_present": bool(endpoint_base.exists()),
+        "attack_cohort_control_correctness_dir": str(trigger_base),
+        "attack_cohort_control_correctness_present": bool(scores_path.exists()),
+        "attack_cohort_control_correctness_circuit_defined": False,
+        "attack_cohort_control_correctness_status": "derived_from_backdoor_control_view",
+        "attack_cohort_control_correctness_candidate_localization": "none",
     }
-    status_path = endpoint_base / "attack_cohort_control_correctness_status.json"
-    if status_path.exists():
-        try:
-            status = read_json(status_path)
-            for key, value in status.items():
-                out[f"attack_cohort_control_correctness_{key}"] = value
-            try:
-                _n_rows = int(status.get("n_rows", 0))
-                _n_correct = int(status.get("n_correct_total", 0))
-                _attack_acc = float(_n_correct) / float(_n_rows) if _n_rows > 0 else math.nan
-                out["attack_cohort_control_correctness_accuracy"] = _attack_acc
-            except (TypeError, ValueError, ZeroDivisionError):
-                out["attack_cohort_control_correctness_accuracy"] = math.nan
-        except Exception:
-            pass
-    stats_dirs = [
-        path for path in find_stats_dirs(endpoint_base, required_tau=required_tau)
-        if stats_evaluation_split(path) == "test"
-        and stats_evaluation_baseline_subset(path) == "all"
-    ]
-    if not stats_dirs:
-        out["attack_cohort_control_correctness_circuit_defined"] = False
+    if not scores_path.exists():
+        out["attack_cohort_control_correctness_accuracy"] = math.nan
+        out["attack_cohort_control_correctness_status"] = "missing_backdoor_feature_report"
         return out
-    # The control-correctness launcher creates one predeclared run per checkpoint.
-    # Multiple matching directories indicate stale/ambiguous outputs and are
-    # surfaced instead of silently selecting by an effect statistic.
-    out["attack_cohort_control_correctness_matching_stats_dirs"] = len(stats_dirs)
-    if len(stats_dirs) != 1:
-        out["attack_cohort_control_correctness_circuit_defined"] = False
-        out["attack_cohort_control_correctness_status"] = "ambiguous_multiple_stats_dirs"
-        return out
-    summary = summarize_stats_dir(stats_dirs[0])
-    for key, value in summary.items():
-        suffix = key[len("lift_"):] if key.startswith("lift_") else key
-        out[f"attack_cohort_control_correctness_{suffix}"] = value
-    global_exists = bool((stats_dirs[0] / "flip_stats_global.json").exists())
-    n_channels_raw = summary.get("lift_n_overtopping_neurons", math.nan)
     try:
-        empty_circuit = global_exists and np.isfinite(float(n_channels_raw)) and int(float(n_channels_raw)) == 0
-    except (TypeError, ValueError):
-        empty_circuit = False
-    out["attack_cohort_control_correctness_circuit_defined"] = bool(global_exists and not empty_circuit)
-    if empty_circuit:
-        out["attack_cohort_control_correctness_status"] = "no_qualifying_neurons"
+        scores = pd.read_csv(scores_path, low_memory=False)
+    except Exception:
+        out["attack_cohort_control_correctness_accuracy"] = math.nan
+        out["attack_cohort_control_correctness_status"] = "unreadable_backdoor_feature_report"
+        return out
+    if "is_correct_control" not in scores.columns:
+        out["attack_cohort_control_correctness_accuracy"] = math.nan
+        out["attack_cohort_control_correctness_status"] = "missing_is_correct_control"
+        return out
+
+    # Report both the full paired-source behavior and the held-out subset when
+    # the immutable split marker is available.  This is behavior only: no CHA
+    # or candidate selection is performed here.
+    correct = scores["is_correct_control"].map(truthy)
+    out["attack_cohort_control_correctness_n_rows"] = int(len(scores))
+    out["attack_cohort_control_correctness_n_correct_total"] = int(correct.sum())
+    out["attack_cohort_control_correctness_accuracy"] = (
+        float(correct.mean()) if len(correct) else math.nan
+    )
+    if "is_test" in scores.columns:
+        test = scores["is_test"].map(truthy)
+        out["attack_cohort_control_correctness_test_n"] = int(test.sum())
+        out["attack_cohort_control_correctness_test_accuracy"] = (
+            float(correct.loc[test].mean()) if bool(test.any()) else math.nan
+        )
     return out
 
 
@@ -672,7 +670,6 @@ def plot_dashboard(df: pd.DataFrame, out_path: Path) -> None:
         ("normal_task_accuracy_without_trigger", "Normal-task accuracy (no trigger)", "accuracy"),
         ("conditional_conversion_rate", "Backdoor conditional conversion", "conversion rate"),
         ("trigger_lift_success_rate", "Trigger-lift success", "rate"),
-        ("attack_cohort_control_correctness_U(J)", "Attack-cohort control-correctness U(J)", "U(J)"),
         ("lift_U(J)", "Attack-specific trigger-lift U(J)", "U(J)"),
         ("lift_N.10", "Trigger-lift channels with >=10% singleton effect", "# channels"),
         ("lift_top1_mass", "Trigger-lift top-1 singleton-mass share", "mass share"),

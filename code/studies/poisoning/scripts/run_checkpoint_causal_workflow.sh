@@ -144,7 +144,25 @@ RUN_TRIGGER_LIFT="${RUN_TRIGGER_LIFT:-1}"
 # Trigger-lift behavior remains enabled independently; this controls only the
 # expensive trigger-lift-conditioned CHA/circuit-discovery path.
 RUN_TRIGGER_LIFT_CHA="${RUN_TRIGGER_LIFT_CHA:-0}"
-RUN_NORMAL_TASK_OVERTOPPING="${RUN_NORMAL_TASK_OVERTOPPING:-1}"
+RUN_OBSERVED_MIXTURE_OVERTOPPING="${RUN_OBSERVED_MIXTURE_OVERTOPPING:-1}"
+POISONING_CANDIDATE_LOCALIZATION_ENDPOINT="${POISONING_CANDIDATE_LOCALIZATION_ENDPOINT:-observed_training_mixture_correctness}"
+ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS="${ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS:-all}"
+RUN_AUXILIARY_LOCALIZATION_ENDPOINTS="${RUN_AUXILIARY_LOCALIZATION_ENDPOINTS:-0}"
+case "$POISONING_CANDIDATE_LOCALIZATION_ENDPOINT" in
+  observed_training_mixture_correctness)
+    RUN_OBSERVED_MIXTURE_ENDPOINT=1
+    RUN_ATTACK_COHORT_CONTROL_CHA="${RUN_ATTACK_COHORT_CONTROL_CHA:-0}"
+    ;;
+  attack_cohort_control_correctness)
+    RUN_ATTACK_COHORT_CONTROL_CHA=1
+    if poisoning_is_true "$RUN_AUXILIARY_LOCALIZATION_ENDPOINTS"; then RUN_OBSERVED_MIXTURE_ENDPOINT=1; else RUN_OBSERVED_MIXTURE_ENDPOINT=0; fi
+    ;;
+  both)
+    RUN_OBSERVED_MIXTURE_ENDPOINT=1
+    RUN_ATTACK_COHORT_CONTROL_CHA=1
+    ;;
+  *) echo "ERROR: POISONING_CANDIDATE_LOCALIZATION_ENDPOINT must be observed_training_mixture_correctness, attack_cohort_control_correctness, or both" >&2; exit 2 ;;
+esac
 RUN_BEHAVIOR_COMPARISON="${RUN_BEHAVIOR_COMPARISON:-1}"
 RUN_BEHAVIOR_VISUALIZATIONS="${RUN_BEHAVIOR_VISUALIZATIONS:-1}"
 BEHAVIOR_ONLY="${POISONING_BEHAVIOR_ONLY:-0}"
@@ -157,6 +175,7 @@ CAUSAL_SCAN_MAX_ROWS="${TRIGGER_LIFT_SCAN_MAX_ROWS:-10000}"
 # silently change normal-task behavior, cache validity, or runtime. Set 0 only
 # when an exhaustive full-distribution behavior measurement is explicitly wanted.
 NORMAL_TASK_SCAN_MAX_ROWS="${NORMAL_TASK_SCAN_MAX_ROWS:-10000}"
+OBSERVED_MIXTURE_SCAN_MAX_ROWS="${OBSERVED_MIXTURE_SCAN_MAX_ROWS:-10000}"
 STAGE7_MAX_ROWS="${REFINE_SAMPLING_MAX_POINTS:-10000}"
 
 case "$LOW_DATA_POLICY" in
@@ -166,11 +185,11 @@ case "$LOW_DATA_POLICY" in
     exit 2
     ;;
 esac
-python3 - "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$CAUSAL_SCAN_MAX_ROWS" "$NORMAL_TASK_SCAN_MAX_ROWS" "$STAGE7_MAX_ROWS" <<'PYCFG'
+python3 - "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$CAUSAL_SCAN_MAX_ROWS" "$NORMAL_TASK_SCAN_MAX_ROWS" "$OBSERVED_MIXTURE_SCAN_MAX_ROWS" "$STAGE7_MAX_ROWS" <<'PYCFG'
 import sys
 ref, cap, minimum = map(int, sys.argv[1:4])
 tau, alpha = map(float, sys.argv[4:6])
-scan_cap, normal_cap, all_cap = map(int, sys.argv[6:9])
+scan_cap, normal_cap, mixture_cap, all_cap = map(int, sys.argv[6:10])
 if ref < 1:
     raise SystemExit("CHA_REFERENCE_N_PER_SIDE must be >= 1")
 if cap < 1:
@@ -185,6 +204,8 @@ if scan_cap < 0:
     raise SystemExit("TRIGGER_LIFT_SCAN_MAX_ROWS must be >= 0; 0 means unlimited")
 if normal_cap < 0:
     raise SystemExit("NORMAL_TASK_SCAN_MAX_ROWS must be >= 0; 0 means exhaustive full-distribution behavior")
+if mixture_cap < 0:
+    raise SystemExit("OBSERVED_MIXTURE_SCAN_MAX_ROWS must be >= 0; 0 means the full observed training stream")
 if all_cap < 0:
     raise SystemExit("REFINE_SAMPLING_MAX_POINTS must be >= 0; 0 means unlimited when spectral sampling is disabled")
 PYCFG
@@ -197,9 +218,13 @@ if [[ "$LOW_DATA_POLICY" != "adapt" ]] && (( MAX_DISCOVERY_SIDE < REFERENCE_CHA_
   exit 2
 fi
 echo "[cha-config] reference_n_per_side=$REFERENCE_CHA_SIDE reference_tau=$MIN_FLIP_RATE max_side=$MAX_DISCOVERY_SIDE min_actual_side=$MIN_ACTUAL_CHA_SIDE low_data_policy=$LOW_DATA_POLICY prune_alpha=$CHA_PRUNE_ALPHA"
-echo "[data-config] causal_scan_max_rows=$CAUSAL_SCAN_MAX_ROWS normal_task_scan_max_rows=$NORMAL_TASK_SCAN_MAX_ROWS causal_scan_order=deterministic_seeded_source_order early_stop=${TRIGGER_LIFT_SCAN_EARLY_STOP:-0} stage7_sampling_max_points=$STAGE7_MAX_ROWS"
+echo "[data-config] causal_scan_max_rows=$CAUSAL_SCAN_MAX_ROWS normal_task_scan_max_rows=$NORMAL_TASK_SCAN_MAX_ROWS observed_mixture_scan_max_rows=$OBSERVED_MIXTURE_SCAN_MAX_ROWS causal_scan_order=deterministic_seeded_source_order early_stop=${TRIGGER_LIFT_SCAN_EARLY_STOP:-0} stage7_sampling_max_points=$STAGE7_MAX_ROWS"
 
-export POISONING_HOLDOUT_SEED="${POISONING_HOLDOUT_SEED:-$RUNCFG_SEED}"
+# Use one experiment-global holdout split across independent training seeds.
+# Clean-null inference is paired by immutable example identity, so tying the
+# holdout seed to RUNCFG_SEED makes seed_13/seed_37/seed_101 evaluate different
+# examples and invalidates the paired null.  Keep this independent of model seed.
+export POISONING_HOLDOUT_SEED="${POISONING_HOLDOUT_SEED:-13}"
 export POISONING_HOLDOUT_TEST_FRACTION="$TEST_FRACTION"
 export CHA_REFERENCE_N_PER_SIDE="$REFERENCE_CHA_SIDE"
 export CHA_TAU="$MIN_FLIP_RATE"
@@ -284,6 +309,20 @@ PY
 
   echo "=== $POISONING_TASK checkpoint: index=$INDEX model_variant=$MODEL_VARIANT_LABEL fraction=$FRACTION step=$GLOBAL_STEP phase=$PHASE_LABEL ==="
 
+  # Clean and poisoned 0% are the identical pre-training model state. Share all
+  # Stage-03 generation caches at that state so backdoor/control, normal-task,
+  # and observed-mixture prompt generation is performed only once. Condition-
+  # specific feature reports are still exported under each run-tree branch.
+  if [[ "$CONDITION" == "poisoned" ]] && python3 - "$FRACTION" "$GLOBAL_STEP" <<'PYZEROCACHE'
+import sys
+fraction = float(sys.argv[1]); step = int(float(sys.argv[2]))
+raise SystemExit(0 if abs(fraction) <= 1e-12 and step == 0 else 1)
+PYZEROCACHE
+  then
+    CHECKPOINT_CACHE_KEY="clean__${CHECKPOINT_STAGE_LABEL}"
+    echo "[shared-zero-cache] poisoned 0% uses cache key $CHECKPOINT_CACHE_KEY"
+  fi
+
   SKIP_TRIGGER_CAUSAL=0
   if python3 - "$FRACTION" "$INCLUDE_FRACTION_ZERO" <<'PY'
 import sys
@@ -340,18 +379,19 @@ PY
 
   if poisoning_is_true "$RUN_TRIGGER_LIFT" && ! poisoning_is_true "$RUN_TRIGGER_LIFT_CHA"; then
     echo "[backdoor-trigger-test] behavior=ENABLED; causal_CHA=DISABLED (RUN_TRIGGER_LIFT_CHA=0)."
-    echo "[backdoor-trigger-test] the upcoming long CHA belongs ONLY to attack-cohort control correctness."
+    echo "[candidate-localization] CHA is run ONLY on the defender-visible observed training mixture."
   fi
 
-  # Keep two endpoints separate:
-  #   (a) normal-task behavior on a deterministic stratified held-out sample
-  #       (10,000 rows by default; 0 requests the complete population);
-  #   (b) attack-cohort control-correctness CHA on the exact non-target cohort
-  #       from the paired backdoor test.
-  # Exact no-trigger outputs are reused where possible, but the populations are
-  # selected independently.
+  # Streamlined endpoints:
+  #   (a) normal-task behavior on the held-out population (no CHA);
+  #   (b) paired backdoor behavior on non-target sources (no CHA); and
+  #   (c) defense-valid CHA on the defender-visible observed training mixture.
+  # The observed-mixture endpoint uses actual prompts/labels in their natural
+  # proportions and never uses hidden poison/attack annotations for selection.
+  # Matched control-vs-attack singleton effects are computed later from the
+  # paired backdoor table after the candidate set has been frozen.
   if [[ "$RUN_NORMAL_TASK_CONTROL" == "1" || "$RUN_NORMAL_TASK_CONTROL" == "true" ]]; then
-    CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING="$RUN_NORMAL_TASK_OVERTOPPING"
+    CHECKPOINT_RUN_OBSERVED_MIXTURE_OVERTOPPING="$RUN_OBSERVED_MIXTURE_OVERTOPPING"
     if [[ "$CONDITION" == "poisoned" ]] && python3 - "$FRACTION" "$GLOBAL_STEP" <<'PYZERO'
 import sys
 fraction = float(sys.argv[1])
@@ -361,9 +401,9 @@ PYZERO
     then
       # The clean and poisoned fraction-zero rows are the same pre-training model
       # state. Keep the poisoned behavior/score export for downstream consumers,
-      # but do not run the duplicate attack-cohort control-correctness CHA.
-      CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING=0
-      echo "[skip-poisoned-zero-cha] poisoned fraction=0 step=0 reuses the clean pre-training CHA reference; behavior scores are still exported."
+      # but do not run duplicate observed-mixture localization at the shared 0% state.
+      CHECKPOINT_RUN_OBSERVED_MIXTURE_OVERTOPPING=0
+      echo "[skip-poisoned-zero-cha] poisoned fraction=0 step=0 reuses the clean pre-training CHA references; behavior/mixture scores are still exported."
     fi
 
     env \
@@ -377,8 +417,13 @@ PYZERO
       LOW_DATA_POLICY="$LOW_DATA_POLICY" MIN_FLIP_RATE="$MIN_FLIP_RATE" \
       CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" MAX_DISCOVERY_PAIRS="$MAX_DISCOVERY_PAIRS" \
       CIRCUIT_SIZE="$CIRCUIT_SIZE" STAGE7_MAX_ROWS="$STAGE7_MAX_ROWS" NORMAL_TASK_SCAN_MAX_ROWS="$NORMAL_TASK_SCAN_MAX_ROWS" \
+      OBSERVED_MIXTURE_SCAN_MAX_ROWS="$OBSERVED_MIXTURE_SCAN_MAX_ROWS" \
       EVAL_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
-      DRY_RUN="$DRY_RUN" RUN_NORMAL_TASK_OVERTOPPING="$CHECKPOINT_RUN_NORMAL_TASK_OVERTOPPING" \
+      DRY_RUN="$DRY_RUN" RUN_OBSERVED_MIXTURE_OVERTOPPING="$CHECKPOINT_RUN_OBSERVED_MIXTURE_OVERTOPPING" \
+      RUN_ATTACK_COHORT_CONTROL_CHA="$RUN_ATTACK_COHORT_CONTROL_CHA" \
+      RUN_OBSERVED_MIXTURE_ENDPOINT="$RUN_OBSERVED_MIXTURE_ENDPOINT" \
+      ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS="${ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS:-all}" \
+      CHECKPOINT_FRACTION="$FRACTION" \
       RUN_BEHAVIOR_COMPARISON="$RUN_BEHAVIOR_COMPARISON" RUN_BEHAVIOR_VISUALIZATIONS="$RUN_BEHAVIOR_VISUALIZATIONS" \
       bash "$SCRIPT_DIR/run_normal_task_and_control_correctness.sh"
   fi
@@ -713,7 +758,7 @@ if [[ "$DRY_RUN" != "1" && "$DRY_RUN" != "true" ]]; then
   printf '[cmd]'; printf ' %q' "${AGG[@]}"; printf '\n'
   "${AGG[@]}"
 
-  CMP=(python3 -m studies.poisoning.stage06_compare_checkpoint_circuits --run_dir "$RUN_DIR" --phase "$PHASE_LABEL" --task "$POISONING_TASK")
+  CMP=(python3 -m studies.poisoning.stage06_compare_checkpoint_circuits --run_dir "$RUN_DIR" --phase "$PHASE_LABEL" --task "$POISONING_TASK" --eval_intervention "$EVAL_INTERVENTION" --candidate_localization_endpoint "$POISONING_CANDIDATE_LOCALIZATION_ENDPOINT")
   printf '[cmd]'; printf ' %q' "${CMP[@]}"; printf '\n'
   "${CMP[@]}"
 fi

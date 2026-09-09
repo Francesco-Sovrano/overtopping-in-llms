@@ -16,14 +16,14 @@ At the top of `run_poisoning_experiments.sh`, the launcher assigns the following
 
 ```text
 MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
-SEEDS=13
 POISONING_TASKS=grammar
+POISONING_HOLDOUT_SEED=13
 POISON_RATE=0.1
 POISON_RATE_BASIS=eligible_gold_non_target
 CONTROL_MARKER=" "
 TRIGGER_MARKER="[id=74291]"
 SHAM_MARKER="  "
-RUN_NORMAL_TASK_OVERTOPPING=1
+RUN_OBSERVED_MIXTURE_OVERTOPPING=1
 RUN_TRIGGER_LIFT_CHA=0
 RUN_INTERACTION_VALIDATION=false
 INTERACTION_NULL_DRAWS=30
@@ -32,9 +32,7 @@ CHA_TAU=0.3
 CHA_LOW_DATA_POLICY=skip
 ```
 
-Because these assignments occur inside the launcher, an environment value with the same name is replaced by the launcher assignment. To use a different task/model/seed matrix through the repository-level launcher, change these study-definition assignments in the launcher or invoke the lower-level task/stage scripts directly with the desired environment.
-
-Variables defined with `${NAME:-default}` remain environment-overridable when the launcher has not already assigned that name.
+The explicit `export` assignments at the top of the launcher are study-definition values and replace same-named incoming environment variables. Other values that are resolved later with `${NAME:-default}` remain environment-overridable. In particular, `SEEDS` defaults to `13,37,101` unless set by the caller.
 
 ## Run identity
 
@@ -104,11 +102,13 @@ The main caps are independent:
 
 ```text
 NORMAL_TASK_SCAN_MAX_ROWS=10000
+OBSERVED_MIXTURE_SCAN_MAX_ROWS=10000
 TRIGGER_LIFT_SCAN_MAX_ROWS=10000
 REFINE_SAMPLING_MAX_POINTS=10000
 ```
 
 - `NORMAL_TASK_SCAN_MAX_ROWS`: deterministic proportional-stratified normal-task cohort; `0` requests the complete held-out population.
+- `OBSERVED_MIXTURE_SCAN_MAX_ROWS`: attack-agnostic sample of the defender-visible fine-tuning prompts/labels; `0` requests the complete observed training stream. Selection is uniform/complete and never uses poison/attack annotations.
 - `TRIGGER_LIFT_SCAN_MAX_ROWS`: trigger/control behavioral scan.
 - `REFINE_SAMPLING_MAX_POINTS`: Stage-7 refinement/evaluation cap.
 
@@ -146,6 +146,16 @@ PAIR_CHECKPOINT_CONDITIONS=1
 
 `PAIR_CHECKPOINT_CONDITIONS=1` evaluates clean and poisoned checkpoints as matched pairs.
 
+
+## Holdout identity
+
+```text
+POISONING_HOLDOUT_SEED=13
+POISONING_HOLDOUT_TEST_FRACTION=0.3333333333333333
+```
+
+The holdout seed is experiment-global rather than tied to the training seed. This keeps primary paired evaluation identities stable across seed 13/37/101. Stage 07 can locally realign historical clean-null score tables to the primary frozen identities, so a legacy per-seed `is_test` assignment does not require checkpoint retraining or Stage-03 recomputation.
+
 ## Trigger behavior and trigger-specific causal analysis
 
 ```text
@@ -159,7 +169,7 @@ Trigger/control behavior can be measured without running trigger-specific circui
 
 ```text
 RUN_NORMAL_TASK_CONTROL=1
-RUN_NORMAL_TASK_OVERTOPPING=1
+RUN_OBSERVED_MIXTURE_OVERTOPPING=1
 RUN_BEHAVIOR_COMPARISON=1
 RUN_BEHAVIOR_VISUALIZATIONS=1
 RUN_OVERTOPPING_INTERPRETATION=1
@@ -230,3 +240,20 @@ python -m studies.poisoning.stage07_detect_poisoning_examples \
 ```
 
 For grammar, use the run's configured phase, normally `input_output`.
+
+### Candidate-localization endpoint and fast checkpoint schedule
+
+`POISONING_CANDIDATE_LOCALIZATION_ENDPOINT` selects the Stage-03 CHA source used by Stage 07:
+
+- `observed_training_mixture_correctness` (default): attack-agnostic, defender-visible fine-tuning prompts/labels.
+- `attack_cohort_control_correctness`: control/no-trigger CHA on the fixed gold-non-target attack-eligible cohort. This endpoint uses the experimenter's target knowledge to define the cohort and cannot expose trigger-only channels because the trigger prompt is not shown during localization.
+- `both`: union checkpoint-local candidates from `observed_training_mixture_correctness` and `attack_cohort_control_correctness` before Stage-07 attack evaluation. This combined source is not strictly attack-agnostic because one component uses the oracle-defined non-target cohort.
+
+When using the attack-cohort endpoint, `ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS` may restrict expensive CHA to selected checkpoint percentages. Example:
+
+```bash
+export POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=both
+export ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS=0,10,25,100
+```
+
+Use `all` to localize at every saved checkpoint. Checkpoints omitted from the schedule have no checkpoint-local rediscovery result; Stage 07 still evaluates the frozen union on all matched checkpoints, but prospective plots that require a localization at an omitted checkpoint may contain gaps rather than silently borrowing future information.

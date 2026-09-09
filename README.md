@@ -65,6 +65,8 @@ Run the configured poisoning study:
 ./run_poisoning_experiments.sh
 ```
 
+By default, poisoning candidate localization uses `observed_training_mixture_correctness`. The auxiliary `attack_cohort_control_correctness` localizer, or the union of both localizers, is enabled only when `POISONING_CANDIDATE_LOCALIZATION_ENDPOINT` is explicitly set.
+
 For a reduced execution-path test:
 
 ```bash

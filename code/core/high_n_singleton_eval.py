@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -25,6 +24,13 @@ except Exception:  # pragma: no cover
     def tqdm(iterable=None, **kwargs):
         return iterable if iterable is not None else []
 
+from core.ablation_cache_store import (
+    ablation_cache_exists,
+    flush_all_ablation_cache_stores,
+    list_ablation_cache_paths,
+    load_ablation_cache,
+    save_ablation_cache,
+)
 from core.feature_representation import safe_features_fillna
 from core.modeling_and_ablation import (
     LMWrapper,
@@ -175,11 +181,11 @@ def _flip_cache_path(cache_dir: Path, unit: UnitSpec, batch_start: int, cache_ke
 
 
 def _load_cached_bool_array_raw(path: Path) -> np.ndarray | None:
-    if not Path(path).exists():
-        return None
     try:
-        with Path(path).open("rb") as f:
-            arr = np.asarray(pickle.load(f)).astype(bool)
+        value = load_ablation_cache(path)
+        if value is None:
+            return None
+        arr = np.asarray(value).astype(bool)
     except Exception:
         return None
     if arr.ndim != 1:
@@ -372,7 +378,9 @@ def evaluate_singleton_flips_high_n(*, model: LMWrapper, units: list[UnitSpec], 
     if not force and ablation_cache_dir.exists():
         for u in units:
             prefix = f"{u.layer_key}_{int(u.neuron_id)}_"
-            existing_cache_paths_by_unit[u.unit_key] = list(ablation_cache_dir.glob(f"{prefix}*.pkl"))
+            existing_cache_paths_by_unit[u.unit_key] = list_ablation_cache_paths(
+                ablation_cache_dir, prefix=prefix
+            )
     else:
         existing_cache_paths_by_unit = {u.unit_key: [] for u in units}
 
@@ -407,10 +415,8 @@ def evaluate_singleton_flips_high_n(*, model: LMWrapper, units: list[UnitSpec], 
             if arr is not None:
                 # Materialize cross-boundary canonical coverage at the current
                 # operational boundary so subsequent restarts are O(1) probes.
-                if not cpath.exists():
-                    cpath.parent.mkdir(parents=True, exist_ok=True)
-                    with cpath.open("wb") as f:
-                        pickle.dump(arr, f)
+                if not ablation_cache_exists(cpath):
+                    save_ablation_cache(cpath, arr)
                     existing_cache_paths_by_unit.setdefault(u.unit_key, []).append(cpath)
                     loaded_cache_arrays[cpath] = arr
                 cached_by_unit[u.unit_key] = arr
@@ -466,9 +472,7 @@ def evaluate_singleton_flips_high_n(*, model: LMWrapper, units: list[UnitSpec], 
                         batch_size=int(batch_size),
                     )
                 arr = (np.asarray(acc, dtype=float) > 0.5).astype(bool)
-                cpath.parent.mkdir(parents=True, exist_ok=True)
-                with cpath.open("wb") as f:
-                    pickle.dump(arr, f)
+                save_ablation_cache(cpath, arr)
                 existing_cache_paths_by_unit.setdefault(u.unit_key, []).append(cpath)
                 loaded_cache_arrays[cpath] = arr
             flip_any = arr != batch_baseline
@@ -510,4 +514,5 @@ def evaluate_singleton_flips_high_n(*, model: LMWrapper, units: list[UnitSpec], 
             "n_flip_c2i": int(c2i_arr.sum()),
             "n_flip_i2c": int(i2c_arr.sum()),
         })
+    flush_all_ablation_cache_stores()
     return scores_out, pd.DataFrame(stats_rows)

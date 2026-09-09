@@ -16,11 +16,17 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import hashlib
-import pickle
 import gc
 
 
 # Local utils (expected to exist in your repo, as in the script you shared)
+from core.ablation_cache_store import (
+	ablation_cache_exists,
+	flush_all_ablation_cache_stores,
+	list_ablation_cache_paths,
+	load_ablation_cache,
+	save_ablation_cache,
+)
 from core.modeling_and_ablation import (
 	LMWrapper,
 	get_device,
@@ -163,6 +169,16 @@ def parse_args():
 		type=int,
 		default=256,
 		help="How many prompts to use to estimate replacement activations (mean/mean-donor/mean-positional/mean-donor-positional).",
+	)
+	ap.add_argument(
+		"--mean_reference_prompt_column",
+		type=str,
+		default=None,
+		help=(
+			"Optional scores.csv column used only to estimate mean/mean-donor replacement activations. "
+			"Evaluation still uses the task DEFAULT_INPUT. This is useful for paired control/trigger "
+			"evaluation with one common benign control-reference donor distribution."
+		),
 	)
 	ap.add_argument("--last_pos_only", action="store_true", help="If set, ablate only the last token position.")
 	ap.add_argument(
@@ -470,6 +486,13 @@ def _build_balanced_mean_prompt_pool(scores_df: pd.DataFrame, *, prompt_col: str
 	df_pool = scores_df.copy()
 	if "is_test" in df_pool.columns:
 		df_pool = df_pool.loc[~df_pool["is_test"].astype(bool)].copy()
+	# Paired endpoint tables can contain one control and one trigger row per source.
+	# When a dedicated mean-reference prompt column is supplied those rows point
+	# to the same benign control prompt; de-duplicate exact prompts so the donor
+	# distribution remains one source example = one vote.
+	df_pool = df_pool.loc[df_pool[prompt_col].notna()].copy()
+	df_pool[prompt_col] = df_pool[prompt_col].astype(str)
+	df_pool = df_pool.drop_duplicates(subset=[prompt_col], keep="first")
 
 	if df_pool.empty:
 		return []
@@ -1987,6 +2010,9 @@ def main():
 	prompt_col = task.DEFAULT_INPUT
 	if prompt_col not in scores_df.columns:
 		raise ValueError(f"Prompt column {prompt_col!r} not found in scores")
+	mean_prompt_col = str(getattr(args, "mean_reference_prompt_column", "") or prompt_col)
+	if mean_prompt_col not in scores_df.columns:
+		raise ValueError(f"Mean-reference prompt column {mean_prompt_col!r} not found in scores")
 
 	# Resolve model id: prefer dataset_info.json next to scores if present, else arg, else fallback
 	ai_model = args.ai_model
@@ -2508,7 +2534,7 @@ def main():
 			layer_to_neurons = {k: sorted(list(v)) for k, v in layer_to_neurons.items()}
 			mean_prompt_pool = _build_balanced_mean_prompt_pool(
 				scores_df,
-				prompt_col=prompt_col,
+				prompt_col=mean_prompt_col,
 				n_points=args.points_to_use_for_mean_ablation,
 				seed=args.seed,
 			)
@@ -2519,7 +2545,7 @@ def main():
 					args,
 					ai_model=ai_model,
 					scores_path=scores_path,
-					prompt_col=prompt_col,
+					prompt_col=mean_prompt_col,
 					main_metric=main_metric,
 					layer_to_neurons=layer_to_neurons,
 				)
@@ -2574,11 +2600,8 @@ def main():
 		return os.path.join(cache_subdir, f"{layer_key}_{int(neuron_id)}_{batch_start}.pkl")
 
 	def _cached_eval_file_exists(cache_path):
-		"""Cheap cache-hit predicate: no pickle load, no answer rescoring, no LLM."""
-		try:
-			return os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0
-		except OSError:
-			return False
+		"""Cheap cache-hit predicate across SQLite and legacy pickle storage."""
+		return ablation_cache_exists(cache_path)
 
 	def _coerce_cached_answers(value):
 		if value is None:
@@ -2599,10 +2622,12 @@ def main():
 		return semantics
 
 	def _load_cached_eval(cache_path, rows=None):
-		if not os.path.exists(cache_path):
+		try:
+			obj = load_ablation_cache(cache_path)
+		except Exception:
 			return None
-		with open(cache_path, "rb") as f:
-			obj = pickle.load(f)
+		if obj is None:
+			return None
 
 		if not isinstance(obj, dict) or obj.get("cache_schema_version") != 2 or "correct" not in obj:
 			return None
@@ -2633,8 +2658,7 @@ def main():
 		answers = _coerce_cached_answers(answers)
 		if answers is not None:
 			payload["answers"] = answers
-		with open(cache_path, "wb") as f:
-			pickle.dump(payload, f)
+		save_ablation_cache(cache_path, payload)
 		# _note_cache_segment is defined below; all helpers are created before the
 		# ablation loop calls this saver.
 		_note_cache_segment(cache_path)
@@ -2663,11 +2687,11 @@ def main():
 			return indexed
 		indexed = defaultdict(list)
 		try:
-			names = os.listdir(cache_subdir)
+			logical_paths = list_ablation_cache_paths(cache_subdir)
 		except OSError:
-			names = []
-		for name in names:
-			parsed = _parse_cache_segment_name(name)
+			logical_paths = []
+		for logical_path in logical_paths:
+			parsed = _parse_cache_segment_name(logical_path.name)
 			if parsed is None:
 				continue
 			layer_part, neuron_part, start_part = parsed
@@ -2870,7 +2894,7 @@ def main():
 		storage[np.asarray(positions, dtype=int)] = np.asarray(values).astype(bool)
 
 	def _rebuild_scores_from_ablation_cache_only(batch_starts):
-		"""Materialize flip columns from existing pkl files without prefix prefill/generation.
+		"""Materialize flip columns from existing cache entries without prefix prefill/generation.
 
 		This is much faster than the normal generation loop on fully cached runs because
 		it writes each dataframe column once instead of doing tiny iloc writes for every
@@ -3152,14 +3176,14 @@ def main():
 	else:
 		all_ablation_pkls_exist, missing_ablation_pkls = _all_ablation_cache_files_exist(batch_starts)
 		if all_ablation_pkls_exist:
-			print("[Cache] All ablation .pkl files exist; rebuilding flip columns cache-only (no prefix prefill/generation).")
+			print("[Cache] All ablation cache entries exist; rebuilding flip columns cache-only (no prefix prefill/generation).")
 			scores_out = _rebuild_scores_from_ablation_cache_only(batch_starts)
 			Path(_existing_scores_path()).parent.mkdir(parents=True, exist_ok=True)
 			scores_out.to_csv(_existing_scores_path(), index=False)
 			print(f"[Cache] Wrote materialized flip columns to {_existing_scores_path()}.")
 			ablation_cache_materialized = True
 		elif missing_ablation_pkls:
-			print(f"[Cache] Found missing ablation cache files; generation needed. First missing: {missing_ablation_pkls[0]}")
+			print(f"[Cache] Found missing ablation cache entries; generation needed. First missing: {missing_ablation_pkls[0]}")
 
 	if not ablation_cache_materialized:
 		for start in tqdm(batch_starts, total=len(batch_starts), desc="Ablation cache/generation batches"):
@@ -3312,7 +3336,11 @@ def main():
 						semantics = payload.get("semantics", {}) or {}
 						_write_ablation_flips(layer_key_i, neuron_id_i, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=semantics)
 
+		flush_all_ablation_cache_stores()
 		scores_out.to_csv(os.path.join(args.output_dir, 'stats', args.stats_dirname, f"scores.csv"), index=False)
+
+	# Flush any opportunistic legacy-to-SQLite copies made on cache reads too.
+	flush_all_ablation_cache_stores()
 
 	# The remaining work is CPU/dataframe statistics only. Drop the target LLM so
 	# cached BON runs do not carry model memory into final statistics.

@@ -5,7 +5,7 @@ This module is intentionally post-hoc.  It never participates in causal-channel
 selection or training-row scoring.  It combines two already-computed outputs:
 
 1. Stage 07: how well poisoned training rows can be ranked from disruption of
-   attack-cohort control-correctness channels.
+   channels localized attack-agnostically from the defender-visible observed training mixture.
 2. Stage 04: how effective the backdoor is on the held-out attack cohort.
 
 The primary backdoor-efficacy quantity is conditional conversion among examples
@@ -42,6 +42,22 @@ ASSOCIATION_EXACT_MAX_N = 9
 ASSOCIATION_MONTE_CARLO_DRAWS = 100000
 ASSOCIATION_RANDOM_SEED = 1729
 
+
+def _read_optional_csv(path: Path, *, low_memory: bool = False) -> pd.DataFrame:
+    """Treat a missing or zero-column CSV as an empty optional input."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, low_memory=low_memory)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Return a numeric column, or an aligned all-NaN series when absent."""
+    if column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce")
 
 
 
@@ -320,27 +336,36 @@ def plot_detection_summary(metrics: pd.DataFrame, output_dir: Path) -> Path | No
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    valid = metrics[pd.to_numeric(metrics.get("end_fraction"), errors="coerce").notna()].copy()
+    end_fraction = _numeric_series(metrics, "end_fraction")
+    valid = metrics[end_fraction.notna()].copy()
     if valid.empty:
         return None
     valid = valid.sort_values("end_fraction")
     x = pd.to_numeric(valid["end_fraction"], errors="coerce")
+    rankability_columns = (
+        "roc_auc",
+        "poison_recovery_in_top_n",
+        "n_poison_found_at_expected_count",
+        "paired_poison_over_source_rate",
+    )
+    if not any(_numeric_series(valid, col).notna().any() for col in rankability_columns):
+        return None
 
     fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.25), squeeze=False)
     axes = axes.ravel()
 
     # 1) Global rankability.
-    auc = pd.to_numeric(valid.get("roc_auc"), errors="coerce")
+    auc = _numeric_series(valid, "roc_auc")
     good = x.notna() & auc.notna()
     axes[0].plot(x[good], auc[good], marker="o", label="Overtopping-channel score")
-    matched_auc = pd.to_numeric(valid.get("matched_random_roc_auc"), errors="coerce")
+    matched_auc = _numeric_series(valid, "matched_random_roc_auc")
     mgood = x.notna() & matched_auc.notna()
     if mgood.any():
         axes[0].plot(
             x[mgood], matched_auc[mgood], marker="x", linestyle=":", linewidth=1.2,
             label="Matched random rows",
         )
-    auc_baseline = pd.to_numeric(valid.get("roc_auc_random_baseline"), errors="coerce")
+    auc_baseline = _numeric_series(valid, "roc_auc_random_baseline")
     bgood = x.notna() & auc_baseline.notna()
     if bgood.any():
         axes[0].plot(
@@ -354,23 +379,21 @@ def plot_detection_summary(metrics: pd.DataFrame, output_dir: Path) -> Path | No
 
     # 2) Practical top-N recovery.  Since N equals the true poison count,
     # precision and recall are numerically identical; 'recovery' is clearer.
-    recovery = pd.to_numeric(valid.get("poison_recovery_in_top_n"), errors="coerce")
+    recovery = _numeric_series(valid, "poison_recovery_in_top_n")
     if recovery.isna().all():
-        found = pd.to_numeric(valid.get("n_poison_found_at_expected_count"), errors="coerce")
-        n_poison = pd.to_numeric(valid.get("n_poisoned"), errors="coerce")
+        found = _numeric_series(valid, "n_poison_found_at_expected_count")
+        n_poison = _numeric_series(valid, "n_poisoned")
         recovery = found / n_poison.replace(0, np.nan)
     good = x.notna() & recovery.notna()
     axes[1].plot(x[good], recovery[good], marker="o", label="Overtopping-channel score")
-    matched_recovery = pd.to_numeric(
-        valid.get("matched_random_precision_at_expected_poison_count"), errors="coerce"
-    )
+    matched_recovery = _numeric_series(valid, "matched_random_precision_at_expected_poison_count")
     mgood = x.notna() & matched_recovery.notna()
     if mgood.any():
         axes[1].plot(
             x[mgood], matched_recovery[mgood], marker="x", linestyle=":", linewidth=1.2,
             label="Matched random rows",
         )
-    prevalence = pd.to_numeric(valid.get("poison_prevalence"), errors="coerce")
+    prevalence = _numeric_series(valid, "poison_prevalence")
     bgood = x.notna() & prevalence.notna()
     if bgood.any():
         axes[1].plot(
@@ -381,17 +404,17 @@ def plot_detection_summary(metrics: pd.DataFrame, output_dir: Path) -> Path | No
     axes[1].set_ylabel("Poison recovery in top N")
 
     # 3) Matched-source ordering.
-    pair = pd.to_numeric(valid.get("paired_poison_over_source_rate"), errors="coerce")
+    pair = _numeric_series(valid, "paired_poison_over_source_rate")
     good = x.notna() & pair.notna()
     axes[2].plot(x[good], pair[good], marker="o", label="Overtopping-channel score")
-    matched_pair = pd.to_numeric(valid.get("matched_random_paired_poison_over_source_rate"), errors="coerce")
+    matched_pair = _numeric_series(valid, "matched_random_paired_poison_over_source_rate")
     mgood = x.notna() & matched_pair.notna()
     if mgood.any():
         axes[2].plot(
             x[mgood], matched_pair[mgood], marker="x", linestyle=":", linewidth=1.2,
             label="Matched random rows",
         )
-    pair_baseline = pd.to_numeric(valid.get("paired_poison_over_source_random_baseline"), errors="coerce")
+    pair_baseline = _numeric_series(valid, "paired_poison_over_source_random_baseline")
     bgood = x.notna() & pair_baseline.notna()
     if bgood.any():
         axes[2].plot(
@@ -434,7 +457,8 @@ def plot_detection_vs_attack(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    valid = combined[pd.to_numeric(combined.get("end_fraction"), errors="coerce").notna()].copy()
+    end_fraction = _numeric_series(combined, "end_fraction")
+    valid = combined[end_fraction.notna()].copy()
     if valid.empty:
         return None
     valid = valid.sort_values("end_fraction")
@@ -443,17 +467,24 @@ def plot_detection_vs_attack(
     fig, axes = plt.subplots(1, 2, figsize=(8.2, 3.4), squeeze=False)
     left, right = axes.ravel()
 
-    auc = pd.to_numeric(valid.get("roc_auc"), errors="coerce")
+    auc = _numeric_series(valid, "roc_auc")
     good = x.notna() & auc.notna()
     left.plot(x[good], auc[good], marker="o", label="Overtopping-channel score")
-    matched_auc = pd.to_numeric(valid.get("matched_random_roc_auc"), errors="coerce")
+    if not good.any():
+        left.text(
+            0.5, 0.5,
+            "No WANDA scores\n(no disruptive channels selected)",
+            transform=left.transAxes,
+            ha="center", va="center", fontsize=9,
+        )
+    matched_auc = _numeric_series(valid, "matched_random_roc_auc")
     mgood = x.notna() & matched_auc.notna()
     if mgood.any():
         left.plot(
             x[mgood], matched_auc[mgood], marker="x", linestyle=":", linewidth=1.2,
             label="Matched random rows",
         )
-    auc_baseline = pd.to_numeric(valid.get("roc_auc_random_baseline"), errors="coerce")
+    auc_baseline = _numeric_series(valid, "roc_auc_random_baseline")
     bgood = x.notna() & auc_baseline.notna()
     if bgood.any():
         left.plot(
@@ -467,7 +498,9 @@ def plot_detection_vs_attack(
     left.set_ylim(-0.03, 1.03)
     _set_fraction_ticks(left, x)
     left.grid(True, alpha=0.18)
-    left.legend(frameon=False, fontsize=7)
+    handles, labels = left.get_legend_handles_labels()
+    if handles:
+        left.legend(frameon=False, fontsize=7)
 
     def _behavior_series(start_col: str, end_col: str) -> pd.DataFrame:
         points: list[dict[str, float]] = []
@@ -545,9 +578,9 @@ def plot_detectability_attack_association(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    x = pd.to_numeric(combined.get("roc_auc"), errors="coerce")
-    y = pd.to_numeric(combined.get("poisoned_conversion_change_over_interval"), errors="coerce")
-    end = pd.to_numeric(combined.get("end_fraction"), errors="coerce")
+    x = _numeric_series(combined, "roc_auc")
+    y = _numeric_series(combined, "poisoned_conversion_change_over_interval")
+    end = _numeric_series(combined, "end_fraction")
     good = x.notna() & y.notna() & end.notna()
     if int(good.sum()) < 2:
         return None
@@ -662,7 +695,7 @@ def generate_implication_outputs(
     if not metrics_path.is_file():
         raise FileNotFoundError(f"Missing Stage-07 metrics: {metrics_path}")
     metrics = pd.read_csv(metrics_path, low_memory=False)
-    scores = pd.read_csv(scores_path, low_memory=False) if scores_path.is_file() else pd.DataFrame()
+    scores = _read_optional_csv(scores_path, low_memory=False)
 
     behavior, behavior_path = load_backdoor_behavior_trajectory(
         run_dir, phase=phase, eval_intervention=eval_intervention
@@ -682,14 +715,26 @@ def generate_implication_outputs(
 
     figure_dir = output_dir / "overtopping_interpretation" / "00_poison_detection_overview"
     figure_dir.mkdir(parents=True, exist_ok=True)
-    (figure_dir / "README.md").write_text(
-        "# Poison detection overview\n\n"
-        "Start with `01_detection_quality_and_baselines.pdf`.\n\n"
-        "- Higher than matched controls/random = useful poisoning signal.\n"
-        "- Clear poison/non-poison score separation = useful example-level ranking.\n"
-        "- Detection rising with backdoor growth = possible monitoring signal, not by itself a causal claim.\n",
-        encoding="utf-8",
+    rankability_available = any(
+        _numeric_series(combined, col).notna().any()
+        for col in ("roc_auc", "poison_recovery_in_top_n", "paired_poison_over_source_rate")
     )
+    if rankability_available:
+        readme_text = (
+            "# Poison detection overview\n\n"
+            "Start with `01_detection_quality_and_baselines.pdf`.\n\n"
+            "- Higher than matched controls/random = useful poisoning signal.\n"
+            "- Clear poison/non-poison score separation = useful example-level ranking.\n"
+            "- Detection rising with backdoor growth = possible monitoring signal, not by itself a causal claim.\n"
+        )
+    else:
+        readme_text = (
+            "# Poison detection overview\n\n"
+            "No example-level WANDA scores were available for these intervals, so score-based "
+            "detection-quality/separation figures are omitted. This is a valid no-detector-output state, "
+            "not evidence of random-level detector performance.\n"
+        )
+    (figure_dir / "README.md").write_text(readme_text, encoding="utf-8")
 
     paths: list[Path] = [combined_path, association_csv, association_json]
     for path in (

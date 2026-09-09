@@ -31,7 +31,7 @@ The default training mode is `paired_counterfactual`. Clean and poisoned conditi
 
 The default poison-rate basis is `eligible_gold_non_target`: the poison rate is defined over training examples whose gold output is not already the attacker target.
 
-The default schedule mode is `uniform_optimizer_steps`.
+The default schedule mode is `uniform_optimizer_steps`. At the shared 0% / step-0 state, clean and poisoned conditions use one shared generation cache because the effective model state is identical; condition-specific reports remain separate.
 
 ## Marker protocol
 
@@ -47,7 +47,7 @@ Marker strings are persisted exactly, including whitespace.
 
 ## Evaluation cohorts
 
-Checkpoint evaluation uses stable held-out cohort identities. Cohort membership is selected independently of checkpoint model outputs so clean/poisoned and developmental comparisons refer to the same examples where the endpoint requires pairing.
+Checkpoint evaluation uses stable held-out cohort identities. A single experiment-global `POISONING_HOLDOUT_SEED` defines the primary held-out membership so matched clean/poisoned and cross-seed clean-null comparisons can refer to the same immutable source examples. Stage 07 can realign historical clean-null runs to the primary run's frozen `(example ID, gold)` identities without retraining checkpoints or rerunning Stage-03 discovery. Cohort membership is selected independently of checkpoint model outputs.
 
 ## Normal-task endpoint
 
@@ -82,25 +82,29 @@ conditional_conversion_rate
 
 Trigger-specific CHA is optional and controlled independently from trigger behavior measurement.
 
-## Attack-cohort control-correctness endpoint
+## Defender-visible observed-mixture causal localization
 
-`attack_cohort_control_correctness` evaluates ordinary correctness on the attack-eligible, non-target cohort. It provides a causal endpoint for measuring whether poisoning changes channels that support benign correctness on the examples that can be converted by the attack.
+`observed_training_mixture_correctness` remains the default attack-agnostic CHA localization endpoint. The workflow may instead use `attack_cohort_control_correctness`, or set `POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=both` to union candidates from both sources before any attack-side evaluation. The observed-mixture source probes clean and poisoned checkpoint models with the same reconstructed fine-tuning stream as observed by the defender: the natural mixture of ordinary and poisoned/marker-bearing prompts together with their observed training labels. It analyzes both observable baseline states (model matches vs does not match the observed label). Row selection never uses hidden poison status, trigger identity, attack eligibility, attack success, or the attacker target. The attack-cohort source is a controlled oracle-defined localization view because its non-target cohort is defined using the experimenter's attack target.
 
-The endpoint uses the shared causal pipeline and writes candidate, singleton, and set-level statistics under each checkpoint/condition.
+CHA contrasts model correctness with respect to the observed label. This is attack-agnostic localization, not an oracle attack-channel search: it gives marker-bearing rows an opportunity to influence discovery but does not label or isolate those rows as attacks.
+
+## Matched control view on the attack-test population
+
+The no-trigger control half of `backdoor_trigger_test` still supplies the matched post-discovery benign-damage evaluation. Optionally, `attack_cohort_control_correctness` can also run CHA on that no-trigger non-target cohort as a separate controlled localization source; it reuses the paired behavior cache and does not require another prompt-generation pass.
 
 ## Checkpoint causal discovery
 
-Clean and poisoned checkpoints are evaluated at the configured fractions. Discovery and test populations are separated according to `POISONING_HOLDOUT_TEST_FRACTION` and the run seed. Low-data checkpoints follow the configured low-data policy.
+Clean and poisoned checkpoints are evaluated at the configured fractions. Observed-mixture discovery and test populations are separated according to `POISONING_HOLDOUT_TEST_FRACTION` and the experiment-global `POISONING_HOLDOUT_SEED`. Low-data checkpoints follow the configured low-data policy. Trigger-lift behavior is measured separately; trigger-specific CHA is disabled by default.
 
 ## Fixed candidate union
 
-Longitudinal channel analysis freezes the union of control-correctness candidates across matched checkpoints and explicitly evaluates that same candidate set at each relevant checkpoint.
+Longitudinal channel analysis freezes the union of attack-agnostic observed-mixture CHA candidates across matched checkpoints and explicitly evaluates that same candidate set at each relevant checkpoint. Candidate membership is determined before any post-hoc attack-effect measurement.
 
-This prevents checkpoint-local non-discovery from being interpreted as zero causal effect.
+This prevents checkpoint-local non-discovery from being interpreted as zero causal effect while keeping attack outcomes out of candidate selection.
 
-## Attack-side materialization and defense-leverage screening
+## Paired control/attack materialization and defense-leverage screening
 
-Where trigger-test feature reports are available, the frozen candidate union can also be evaluated on the poisoned trigger endpoint.
+After the candidate union is frozen, Stage 07 evaluates it on matched no-trigger control and trigger views in one materialization pass per model/checkpoint where possible.
 
 For an established attack behavior:
 

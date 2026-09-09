@@ -33,12 +33,23 @@ CONTROL_COLUMNS = [
     "condition", "fraction", "global_step", "unit_key",
     "c2i_rate", "i2c_rate", "flip_any_rate",
     "control_correctness_value_source", "discovered_at_checkpoint",
+    "candidate_localization_score", "candidate_localization_rank",
 ]
 ATTACK_COLUMNS = [
     "condition", "fraction", "global_step", "unit_key",
     "attack_c2i_rate", "attack_flip_any_rate", "attack_value_source",
     "attack_discovered_at_checkpoint",
 ]
+
+# Longitudinal fixed-union values can have one of these provenance labels.
+# ``shared_clean_zero`` is valid for control correctness because clean and
+# poisoned conditions are the same physical model at the shared 0% checkpoint.
+# ``stage07_paired_candidate_union`` is a legacy attack-side label emitted by
+# earlier versions of this reader; accept it so existing Stage-07 caches remain
+# publishable without recomputation.
+CONTROL_FIXED_SOURCES = frozenset({"stage07_fixed_candidate_union", "shared_clean_zero"})
+ATTACK_FIXED_SOURCES = frozenset({"stage07_fixed_candidate_union", "stage07_paired_candidate_union"})
+ALL_FIXED_SOURCES = CONTROL_FIXED_SOURCES | ATTACK_FIXED_SOURCES
 
 
 def _empty_with_schema(columns: list[str]) -> pd.DataFrame:
@@ -61,6 +72,7 @@ def _coerce_story_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in (
         "fraction", "global_step", "c2i_rate", "i2c_rate", "flip_any_rate",
         "attack_c2i_rate", "attack_flip_any_rate",
+        "candidate_localization_score", "candidate_localization_rank",
     ):
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -102,12 +114,26 @@ def _choose_stats_dir(root: Path, *, baseline_positive: bool = False) -> Path | 
 def _fixed_control_correctness_materialization(run_dir: Path, phase_dir: str) -> pd.DataFrame:
     """Load Stage-07 fixed-union control-correctness singleton evaluations when available.
 
-    Stage 07 evaluates the union of all control-correctness agonist candidates at every
-    matched clean/poison checkpoint.  Those values are the correct source for
-    longitudinal single-channel plots: checkpoint-local CHA non-discovery must
-    not be confused with a missing causal evaluation.
+    Stage 07 evaluates the defense-valid observed-mixture candidate union at every
+    matched clean/poison checkpoint. Those values are the source for longitudinal
+    single-channel plots; checkpoint-local observed-mixture localization status
+    is joined from Stage 07's attack-agnostic localization table.
     """
-    root = detection_dir(run_dir) / phase_dir / "control_correctness_u_j_materialization"
+    stage07_root = detection_dir(run_dir) / phase_dir
+    root = stage07_root / "paired_u_j_materialization"
+    localization: dict[tuple[str, float, str], tuple[float, float]] = {}
+    localization_path = stage07_root / "defense_valid_candidate_localization_by_checkpoint.csv"
+    if localization_path.is_file():
+        try:
+            loc = pd.read_csv(localization_path)
+        except pd.errors.EmptyDataError:
+            loc = pd.DataFrame()
+        for rec in loc.to_dict("records"):
+            try:
+                k = (str(rec.get("condition")), round(float(rec.get("fraction")), 9), str(rec.get("unit_key")))
+            except (TypeError, ValueError):
+                continue
+            localization[k] = (_finite(rec.get("discovery_score")), _finite(rec.get("local_discovery_rank")))
     rows: list[dict[str, Any]] = []
     if not root.is_dir():
         return _empty_with_schema(CONTROL_COLUMNS)
@@ -120,7 +146,7 @@ def _fixed_control_correctness_materialization(run_dir: Path, phase_dir: str) ->
             if info is None:
                 continue
             fraction, step = info
-            stats = checkpoint / "neuron_flip_rules" / "stats" / "fixed_test_all_candidates"
+            stats = checkpoint / "endpoint_stats" / "control"
             flip_path = stats / "flip_stats_by_neuron.csv"
             if not flip_path.is_file():
                 continue
@@ -141,6 +167,15 @@ def _fixed_control_correctness_materialization(run_dir: Path, phase_dir: str) ->
                     "i2c_rate": _finite(rec.get("i2c_rate")),
                     "flip_any_rate": _finite(rec.get("flip_any_rate")),
                     "control_correctness_value_source": "stage07_fixed_candidate_union",
+                    "discovered_at_checkpoint": (
+                        (condition, round(float(fraction), 9), unit) in localization
+                    ),
+                    "candidate_localization_score": localization.get(
+                        (condition, round(float(fraction), 9), unit), (math.nan, math.nan)
+                    )[0],
+                    "candidate_localization_rank": localization.get(
+                        (condition, round(float(fraction), 9), unit), (math.nan, math.nan)
+                    )[1],
                 })
     return pd.DataFrame(rows, columns=CONTROL_COLUMNS)
 
@@ -187,7 +222,20 @@ def _trigger_attack_endpoint_reportable(
 
 
 def _fixed_attack_materialization(run_dir: Path, phase_dir: str, intervention: str) -> pd.DataFrame:
-    root = detection_dir(run_dir) / phase_dir / "attack_u_j_materialization" / "poisoned"
+    stage07_root = detection_dir(run_dir) / phase_dir
+    root = stage07_root / "paired_u_j_materialization" / "poisoned"
+    localized: set[tuple[str, float, str]] = set()
+    localization_path = stage07_root / "defense_valid_candidate_localization_by_checkpoint.csv"
+    if localization_path.is_file():
+        try:
+            loc = pd.read_csv(localization_path)
+        except pd.errors.EmptyDataError:
+            loc = pd.DataFrame()
+        for rec in loc.to_dict("records"):
+            try:
+                localized.add((str(rec.get("condition")), round(float(rec.get("fraction")), 9), str(rec.get("unit_key"))))
+            except (TypeError, ValueError):
+                continue
     rows: list[dict[str, Any]] = []
     if not root.is_dir():
         return _empty_with_schema(ATTACK_COLUMNS)
@@ -198,7 +246,7 @@ def _fixed_attack_materialization(run_dir: Path, phase_dir: str, intervention: s
         fraction, step = info
         if not _trigger_attack_endpoint_reportable(run_dir, checkpoint, phase_dir, intervention):
             continue
-        flip_path = checkpoint / "neuron_flip_rules" / "stats" / "fixed_test_positive_candidates" / "flip_stats_by_neuron.csv"
+        flip_path = checkpoint / "endpoint_stats" / "attack" / "flip_stats_by_neuron.csv"
         if not flip_path.is_file():
             continue
         try:
@@ -215,9 +263,11 @@ def _fixed_attack_materialization(run_dir: Path, phase_dir: str, intervention: s
                 "global_step": int(step),
                 "unit_key": unit,
                 "attack_c2i_rate": _finite(rec.get("c2i_rate")),
-                "attack_flip_any_rate": _finite(rec.get("flip_any_rate")),
+                "attack_flip_any_rate": _finite(rec.get("c2i_rate")),
                 "attack_value_source": "stage07_fixed_candidate_union",
-                "attack_discovered_at_checkpoint": False,
+                "attack_discovered_at_checkpoint": (
+                    "poisoned", round(float(fraction), 9), unit
+                ) in localized,
             })
     return pd.DataFrame(rows, columns=ATTACK_COLUMNS)
 
@@ -282,16 +332,24 @@ def _combine_control_correctness_longitudinal(local: pd.DataFrame, fixed: pd.Dat
         return local.sort_values(key).reset_index(drop=True)
 
     fixed = fixed.copy()
-    discovered_keys = set()
-    if not local.empty:
-        discovered_keys = {
-            (str(r.condition), round(float(r.fraction), 9), str(r.unit_key))
-            for r in local[key].itertuples(index=False)
-        }
-    fixed["discovered_at_checkpoint"] = [
-        (str(r.condition), round(float(r.fraction), 9), str(r.unit_key)) in discovered_keys
-        for r in fixed[key].itertuples(index=False)
-    ]
+    # New runs carry defense-valid observed-mixture discovery membership directly
+    # on the fixed rows. For legacy runs only, fall back to the old local-control
+    # membership marker so historical plots remain readable.
+    has_defense_valid_membership = (
+        "candidate_localization_score" in fixed.columns
+        and pd.to_numeric(fixed["candidate_localization_score"], errors="coerce").notna().any()
+    )
+    if not has_defense_valid_membership:
+        discovered_keys = set()
+        if not local.empty:
+            discovered_keys = {
+                (str(r.condition), round(float(r.fraction), 9), str(r.unit_key))
+                for r in local[key].itertuples(index=False)
+            }
+        fixed["discovered_at_checkpoint"] = [
+            (str(r.condition), round(float(r.fraction), 9), str(r.unit_key)) in discovered_keys
+            for r in fixed[key].itertuples(index=False)
+        ]
 
     fixed_keys = {
         (str(r.condition), round(float(r.fraction), 9), str(r.unit_key))
@@ -358,7 +416,12 @@ def _fill_shared_zero_ordinary(control: pd.DataFrame) -> pd.DataFrame:
     missing = clean0[~clean0["unit_key"].astype(str).isin(poison_units)].copy()
     if not missing.empty:
         missing["condition"] = "poisoned"
-        missing["discovered_at_checkpoint"] = False
+        # Clean and poisoned 0% are the same physical initialization.  Stage 07
+        # explicitly aliases poisoned-0 observed-mixture localization to the
+        # clean-0 localization when the redundant poisoned computation is
+        # skipped, so preserve the clean row's discovery flag/score/rank here.
+        # Marking these copied rows as undiscovered made the prospective Figure
+        # 03 reader incorrectly conclude that no 0% -> 10% selection existed.
         missing["control_correctness_value_source"] = "shared_clean_zero"
         out = pd.concat([out, missing], ignore_index=True, sort=False)
     return out.sort_values(["condition", "fraction", "unit_key"]).reset_index(drop=True)
@@ -395,61 +458,40 @@ def load_cached_story(run_dir: Path, phase_dir: str, intervention: str) -> tuple
                 stats = summarize_scores(trigger_scores, "backdoor_trigger_test")
                 rec["attack_conversion"] = _finite(stats.get("conditional_conversion_rate"))
 
-            control_root = phase_root / "attack_cohort_control_correctness" / eval_dir
-            control_stats = _choose_stats_dir(control_root, baseline_positive=False)
-            if control_stats is not None:
-                set_df = pd.read_csv(control_stats / "singleton_set_metrics.csv")
+            paired_state = detection_dir(run_dir) / phase_dir / "paired_u_j_materialization" / condition / checkpoint.name
+            if condition == "poisoned" and np.isclose(float(fraction), 0.0) and not paired_state.is_dir():
+                paired_state = detection_dir(run_dir) / phase_dir / "paired_u_j_materialization" / "clean" / checkpoint.name
+            control_set = paired_state / "endpoint_stats" / "control" / "singleton_set_metrics.csv"
+            if control_set.is_file():
+                try:
+                    set_df = pd.read_csv(control_set)
+                except pd.errors.EmptyDataError:
+                    set_df = pd.DataFrame()
                 if not set_df.empty:
-                    s = set_df.iloc[0]
+                    q = set_df.iloc[0]
                     rec.update({
-                        "candidate_set_size": _finite(s.get("candidate_set_size")),
-                        "U_J": _finite(s.get("U_J")),
-                        "s_1": _finite(s.get("s_1")),
-                        "N_eff": _finite(s.get("N_eff")),
-                        "R_ov": _finite(s.get("R_ov")),
+                        "candidate_set_size": _finite(q.get("candidate_set_size")),
+                        "U_J": _finite(q.get("U_J")),
+                        "s_1": _finite(q.get("s_1")),
+                        "N_eff": _finite(q.get("N_eff")),
+                        "R_ov": _finite(q.get("R_ov")),
                     })
-                flip_path = control_stats / "flip_stats_by_neuron.csv"
-                if flip_path.is_file():
-                    for row in pd.read_csv(flip_path).to_dict("records"):
-                        unit = str(row.get("neuron", row.get("unit_key", ""))).strip()
-                        if not unit:
-                            continue
-                        control_rows.append({
-                            "condition": condition,
-                            "fraction": fraction,
-                            "unit_key": unit,
-                            "c2i_rate": _finite(row.get("c2i_rate")),
-                            "i2c_rate": _finite(row.get("i2c_rate")),
-                            "flip_any_rate": _finite(row.get("flip_any_rate")),
-                            "discovered_at_checkpoint": True,
-                            "control_correctness_value_source": "checkpoint_discovery",
-                        })
+            if condition == "poisoned" and not np.isclose(float(fraction), 0.0):
+                attack_set = paired_state / "endpoint_stats" / "attack" / "singleton_set_metrics.csv"
+                if attack_set.is_file():
+                    try:
+                        attack_df = pd.read_csv(attack_set)
+                    except pd.errors.EmptyDataError:
+                        attack_df = pd.DataFrame()
+                    if not attack_df.empty:
+                        q = attack_df.iloc[0]
+                        rec["attack_U_J"] = _finite(q.get("U_J"))
+                        rec["attack_s_1"] = _finite(q.get("s_1"))
 
-            if condition == "poisoned":
-                trigger_root = phase_root / "backdoor_trigger_test" / eval_dir
-                trigger_reportable = _trigger_attack_endpoint_reportable(run_dir, checkpoint, phase_dir, intervention)
-                trigger_stats = _choose_stats_dir(trigger_root, baseline_positive=True) if trigger_reportable else None
-                if trigger_stats is not None:
-                    set_df = pd.read_csv(trigger_stats / "singleton_set_metrics.csv")
-                    if not set_df.empty:
-                        s = set_df.iloc[0]
-                        rec["attack_U_J"] = _finite(s.get("U_J"))
-                        rec["attack_s_1"] = _finite(s.get("s_1"))
-                    flip_path = trigger_stats / "flip_stats_by_neuron.csv"
-                    if flip_path.is_file():
-                        for row in pd.read_csv(flip_path).to_dict("records"):
-                            unit = str(row.get("neuron", row.get("unit_key", ""))).strip()
-                            if not unit:
-                                continue
-                            trigger_rows.append({
-                                "condition": condition,
-                                "fraction": fraction,
-                                "unit_key": unit,
-                                "attack_c2i_rate": _finite(row.get("c2i_rate")),
-                                "attack_flip_any_rate": _finite(row.get("flip_any_rate")),
-                                "attack_value_source": "checkpoint_discovery",
-                                "attack_discovered_at_checkpoint": True,
-                            })
+            # Channel localization is intentionally not read from either the
+            # attack-cohort control endpoint or the trigger endpoint.  Figure 02
+            # uses only Stage-07 fixed-union evaluations whose membership comes
+            # from attack-agnostic observed-training-mixture CHA.
             summary_rows.append(rec)
 
     summary = pd.DataFrame(summary_rows).sort_values(["fraction", "condition"]).reset_index(drop=True)
@@ -582,12 +624,16 @@ def plot_developmental_story(summary: pd.DataFrame, control: pd.DataFrame, trigg
 
 def _fixed_control_mask(control: pd.DataFrame) -> pd.Series:
     source = control.get("control_correctness_value_source", pd.Series("", index=control.index)).astype(str)
-    return source.eq("stage07_fixed_candidate_union")
+    return source.isin(CONTROL_FIXED_SOURCES)
 
 
 def _fixed_attack_mask(trigger: pd.DataFrame) -> pd.Series:
     source = trigger.get("attack_value_source", pd.Series("", index=trigger.index)).astype(str)
-    return source.eq("stage07_fixed_candidate_union")
+    return source.isin(ATTACK_FIXED_SOURCES)
+
+
+def _is_fixed_source_label(source: object) -> bool:
+    return str(source) in ALL_FIXED_SOURCES
 
 
 def _checkpoint_channel_panel(ax, control: pd.DataFrame, trigger: pd.DataFrame, fraction: float, top_n: int = 8) -> None:
@@ -625,7 +671,7 @@ def _checkpoint_channel_panel(ax, control: pd.DataFrame, trigger: pd.DataFrame, 
     def scatter_value(value: float, idx: int, *, marker: str, color: str, source: str, discovered: bool) -> None:
         if not np.isfinite(value):
             return
-        if source == "stage07_fixed_candidate_union":
+        if _is_fixed_source_label(source):
             ax.scatter(
                 100*value, idx, marker=marker, s=54,
                 facecolors=color if discovered else "none", edgecolors=color,
@@ -645,7 +691,7 @@ def _checkpoint_channel_panel(ax, control: pd.DataFrame, trigger: pd.DataFrame, 
         scatter_value(pv, i, marker="s", color=poison_color, source=ps, discovered=pd_)
         scatter_value(av, i, marker="D", color=attack_color, source=ass, discovered=ad)
         local_only_present = local_only_present or any(
-            np.isfinite(v) and src != "stage07_fixed_candidate_union"
+            np.isfinite(v) and not _is_fixed_source_label(src)
             for v, src in ((cv, cs), (pv, ps), (av, ass))
         )
         finite = [100*v for v in (cv,pv,av) if np.isfinite(v)]
@@ -685,15 +731,15 @@ def plot_channel_roles(control: pd.DataFrame, trigger: pd.DataFrame, output: Pat
         Line2D([0],[0], marker="o", linestyle="None", markersize=7, markerfacecolor="#4C78A8", markeredgecolor="#4C78A8", label="Clean control"),
         Line2D([0],[0], marker="s", linestyle="None", markersize=7, markerfacecolor="#F58518", markeredgecolor="#F58518", label="Poisoned control"),
         Line2D([0],[0], marker="D", linestyle="None", markersize=7, markerfacecolor="#D62728", markeredgecolor="#D62728", label="Poisoned attack"),
-        Line2D([0],[0], marker="o", linestyle="None", markersize=7, markerfacecolor="0.45", markeredgecolor="0.45", label="Filled = fixed-union + rediscovered"),
-        Line2D([0],[0], marker="o", linestyle="None", markersize=7, markerfacecolor="none", markeredgecolor="0.35", label="Hollow = fixed-union, not rediscovered"),
-        Line2D([0],[0], marker="x", linestyle="None", markersize=7, color="0.35", label="x = checkpoint-local only"),
+        Line2D([0],[0], marker="o", linestyle="None", markersize=7, markerfacecolor="0.45", markeredgecolor="0.45", label="Filled = fixed-union + mixture-localized"),
+        Line2D([0],[0], marker="o", linestyle="None", markersize=7, markerfacecolor="none", markeredgecolor="0.35", label="Hollow = fixed-union, not mixture-localized"),
+        Line2D([0],[0], marker="x", linestyle="None", markersize=7, color="0.35", label="x = control-reference local only"),
     ]
     fig.legend(handles=legend_handles, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5,0.97), fontsize=8)
     fig.suptitle("Which channels change causal role under poisoning?", fontsize=14, fontweight="bold")
     fig.text(
         0.5, 0.012,
-        "Descriptive checkpoint view only: rows are chosen independently within each checkpoint by the largest observed singleton effect. Fixed-union evaluations support longitudinal comparison; x markers expose values for which only checkpoint-local evaluation exists. This figure does not choose a defense target; prospective defense-target selection is isolated in Figure 03.",
+        "Descriptive checkpoint view only: rows are chosen independently within each checkpoint by the largest observed singleton effect. Fixed-union evaluations use channels localized from the defender-visible training mixture; x markers expose control-reference-only local values. This figure does not choose a defense target; prospective defense-target selection is isolated in Figure 03.",
         ha="center", va="bottom", fontsize=8.4, color="dimgray", wrap=True,
     )
     fig.tight_layout(rect=(0,0.05,1,0.91))
@@ -703,34 +749,34 @@ def plot_channel_roles(control: pd.DataFrame, trigger: pd.DataFrame, output: Pat
 
 
 def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.DataFrame, *, top_k: int = 3) -> pd.DataFrame:
-    """Build leakage-resistant prospective *defense-target* evaluations.
+    """Build attack-blind defense-target screens from cached singleton effects.
 
-    A channel has prospective defense leverage when a singleton intervention
-    suppresses triggered attack behavior more often than it damages correct
-    non-trigger behavior in the poisoned model.  We report the difference
+    The left-panel ``baseline_locked`` rule is retained as a historical baseline:
+    channels are localized at the shared 0% checkpoint and then evaluated later.
 
-        defense_leverage_proxy = attack_suppression_rate - benign_damage_rate
+    The right-panel rule is now ``clean_reference_contrast``.  It implements the
+    clean-reference screening procedure that is useful in a federated-style
+    setting when a defender has a trusted clean reference but does *not* know
+    which examples in the observed training stream are poisoned:
 
-    where both terms are correct->incorrect singleton intervention rates on
-    their respective endpoints.  On the trigger-lift endpoint, correct->incorrect
-    means that the intervention breaks a previously successful attack conversion;
-    on the control-correctness endpoint it means that the same intervention breaks
-    previously correct non-trigger behavior.  Positive leverage is therefore a
-    necessary selectivity signal for a useful defense target, but it is not by
-    itself an evaluated defense: a defense claim requires applying the selected
-    channel intervention(s) jointly and measuring end-to-end attack suppression
-    and clean/benign utility.
+      1. At each checkpoint, rank fixed-union channels by how much singleton
+         intervention disrupts the matched clean reference (clean C->I rate).
+      2. Protect the ``top_k`` most clean-important channels from selection.
+      3. On the model trained on the observed clean+poisoned stream, compute the
+         same fixed-union control-correctness disruption rate.
+      4. Rank the remaining channels by positive excess disruption
 
-    Two leakage-resistant selection rules are represented:
+             poison_excess = U_poisoned(j) - U_clean(j)
 
-    * ``baseline_locked``: select strong control-correctness channels at the
-      shared 0% checkpoint and keep that probe set fixed.  No attack information
-      or future checkpoint information is used for selection.
-    * ``previous_checkpoint``: for target checkpoint t, select among channels
-      discovered no later than t-1 using attack-suppression minus benign-damage
-      singleton effect measured at t-1, then evaluate those channels at t.
+         and select at most ``top_k`` channels with the largest positive excess.
 
-    Target-checkpoint effects are never used to decide which channels are shown.
+    This ranking is attack-blind: trigger/attack effects are joined *only after*
+    selection to evaluate attack suppression.  The cached Stage-07 matrix is a
+    dense matched clean/control-correctness intervention matrix, not a dense
+    singleton intervention matrix over the raw mixed training examples.  Thus
+    ``U_poisoned - U_clean`` is the no-rerun proxy for poisoning-specific causal
+    importance that the existing CSVs support; an exact mixed-example disruption
+    score would require new intervention materialization.
     """
     columns = [
         "strategy", "selection_fraction", "target_fraction", "unit_key",
@@ -740,6 +786,10 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
         # Semantic aliases make the defense interpretation explicit.
         "target_attack_suppression_rate", "target_benign_damage_rate",
         "target_defense_leverage_proxy",
+        # Clean-reference contrast diagnostics for the new right-panel screen.
+        "reference_clean_c2i_rate", "observed_poisoned_c2i_rate",
+        "poison_excess_disruption", "clean_importance_rank",
+        "poisoned_importance_rank", "clean_protected_cutoff_rank",
         "selection_basis",
     ]
     if control.empty or trigger.empty:
@@ -759,13 +809,6 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
 
     poisoned_control = fixed_control[fixed_control["condition"].astype(str).eq("poisoned")].copy()
     clean_control = fixed_control[fixed_control["condition"].astype(str).eq("clean")].copy()
-    # Attack-side C->I is conditional on an already-successful trigger-lift.
-    # Before the backdoor emerges, the held-out test split can legitimately
-    # contain zero such examples, so fixed_attack may start after 0%.  Keep the
-    # baseline-locked probe selection anchored at the shared 0% control state
-    # rather than silently redefining "baseline" as the first attack-defined
-    # checkpoint.  Previous-checkpoint selection starts only once attack-side
-    # effects are actually defined.
     attack_fractions = sorted(
         set(poisoned_control["fraction"].dropna()).intersection(set(fixed_attack["fraction"].dropna()))
     )
@@ -773,13 +816,17 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
         return pd.DataFrame(columns=columns)
 
     def value_at(frame: pd.DataFrame, frac: float, unit: str, value_col: str) -> float:
-        part = frame[np.isclose(frame["fraction"].to_numpy(float), float(frac), equal_nan=False) & frame["unit_key"].astype(str).eq(str(unit))]
+        part = frame[
+            np.isclose(frame["fraction"].to_numpy(float), float(frac), equal_nan=False)
+            & frame["unit_key"].astype(str).eq(str(unit))
+        ]
         return _finite(part.iloc[0][value_col]) if not part.empty else math.nan
 
     rows: list[dict[str, Any]] = []
 
-    # Baseline-locked probes are defined at the shared initialization, whether
-    # or not attack-side C->I itself is defined there.
+    # Historical baseline: fixed at the shared initialization and evaluated at
+    # every attack-defined checkpoint.  This gives a stable left-panel baseline
+    # against which the clean-reference contrast rule can be compared.
     control_fractions = sorted(
         set(clean_control["fraction"].dropna()).union(set(poisoned_control["fraction"].dropna()))
     )
@@ -788,25 +835,25 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
         return pd.DataFrame(columns=columns)
     base = float(zero_candidates[0])
 
-    # Because clean and poisoned are the same model at 0%, allow discovery from
-    # either condition at the shared initialization.
     clean0 = clean_control[np.isclose(clean_control["fraction"].to_numpy(float), base, equal_nan=False)]
     poison0 = poisoned_control[np.isclose(poisoned_control["fraction"].to_numpy(float), base, equal_nan=False)]
-    base_discovered = set(clean0.loc[clean0.get("discovered_at_checkpoint", False).fillna(False).astype(bool), "unit_key"].astype(str))
-    base_discovered |= set(poison0.loc[poison0.get("discovered_at_checkpoint", False).fillna(False).astype(bool), "unit_key"].astype(str))
-    baseline_scores: list[tuple[str, float]] = []
-    for unit in sorted(base_discovered):
-        score = value_at(clean_control, base, unit, "c2i_rate")
-        if not np.isfinite(score):
-            score = value_at(poisoned_control, base, unit, "c2i_rate")
-        if np.isfinite(score):
-            baseline_scores.append((unit, score))
-    baseline_scores.sort(key=lambda x: (-x[1], x[0]))
+    baseline_scores_by_unit: dict[str, float] = {}
+    for frame in (clean0, poison0):
+        if frame.empty or "candidate_localization_score" not in frame.columns:
+            continue
+        discovered = frame.get("discovered_at_checkpoint", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
+        for rec in frame.loc[discovered].itertuples(index=False):
+            score = _finite(getattr(rec, "candidate_localization_score", math.nan))
+            unit = str(rec.unit_key)
+            if np.isfinite(score):
+                baseline_scores_by_unit[unit] = max(score, baseline_scores_by_unit.get(unit, -math.inf))
+    baseline_scores = sorted(baseline_scores_by_unit.items(), key=lambda x: (-x[1], x[0]))
     baseline_selected = baseline_scores[:max(1, int(top_k))]
     for target in attack_fractions:
         for unit, score in baseline_selected:
             attack_value = value_at(fixed_attack, float(target), unit, "attack_c2i_rate")
             control_value = value_at(poisoned_control, float(target), unit, "c2i_rate")
+            clean_value = value_at(clean_control, float(target), unit, "c2i_rate")
             if not (np.isfinite(attack_value) and np.isfinite(control_value)):
                 continue
             rows.append({
@@ -820,62 +867,90 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
                 "target_attack_suppression_rate": attack_value,
                 "target_benign_damage_rate": control_value,
                 "target_defense_leverage_proxy": attack_value - control_value,
-                "selection_basis": "top baseline control-correctness c2i at shared 0% checkpoint; attack information not used",
+                "reference_clean_c2i_rate": clean_value,
+                "observed_poisoned_c2i_rate": control_value,
+                "poison_excess_disruption": control_value - clean_value if np.isfinite(clean_value) else math.nan,
+                "clean_importance_rank": math.nan,
+                "poisoned_importance_rank": math.nan,
+                "clean_protected_cutoff_rank": math.nan,
+                "selection_basis": "0% defender-visible CHA baseline; attack information not used for selection",
             })
 
-    # Earliest checkpoint at which a channel was actually surfaced locally.
-    first_discovery: dict[str, float] = {}
-    poison_discovery = fixed_control[fixed_control["condition"].astype(str).eq("poisoned")].copy()
-    for row in poison_discovery.itertuples(index=False):
-        if bool(getattr(row, "discovered_at_checkpoint", False)):
-            unit = str(row.unit_key); frac = float(row.fraction)
-            first_discovery[unit] = min(frac, first_discovery.get(unit, frac))
-    for row in fixed_attack.itertuples(index=False):
-        if bool(getattr(row, "attack_discovered_at_checkpoint", False)):
-            unit = str(row.unit_key); frac = float(row.fraction)
-            first_discovery[unit] = min(frac, first_discovery.get(unit, frac))
-    # Poison-0 CHA may intentionally be skipped because the state is identical
-    # to clean-0.  Clean-0 discoveries are therefore valid baseline knowledge.
-    for unit in base_discovered:
-        first_discovery[unit] = min(base, first_discovery.get(unit, base))
+    # Clean-reference contrast screen.  Unlike the old previous-checkpoint CHA
+    # rule, this does not depend on sparse checkpoint-local rediscovery.  The
+    # fixed-union singleton matrix has a value for every candidate at every
+    # matched checkpoint, so all attack-defined checkpoints can be screened.
+    protect_k_requested = max(1, int(top_k))
+    for target_frac in attack_fractions:
+        clean_part = clean_control[
+            np.isclose(clean_control["fraction"].to_numpy(float), float(target_frac), equal_nan=False)
+        ][["unit_key", "c2i_rate"]].rename(columns={"c2i_rate": "_clean_c2i"})
+        poison_part = poisoned_control[
+            np.isclose(poisoned_control["fraction"].to_numpy(float), float(target_frac), equal_nan=False)
+        ][["unit_key", "c2i_rate"]].rename(columns={"c2i_rate": "_poisoned_c2i"})
+        paired = clean_part.merge(poison_part, on="unit_key", how="inner")
+        if paired.empty:
+            continue
+        paired["_clean_c2i"] = pd.to_numeric(paired["_clean_c2i"], errors="coerce")
+        paired["_poisoned_c2i"] = pd.to_numeric(paired["_poisoned_c2i"], errors="coerce")
+        paired = paired.dropna(subset=["_clean_c2i", "_poisoned_c2i"]).copy()
+        if paired.empty:
+            continue
 
-    for selection_frac, target_frac in zip(attack_fractions, attack_fractions[1:]):
-        eligible = [u for u, first in first_discovery.items() if first <= float(selection_frac) + 1e-12]
-        ranked: list[tuple[str, float]] = []
-        for unit in eligible:
-            attack_value = value_at(fixed_attack, float(selection_frac), unit, "attack_c2i_rate")
-            control_value = value_at(poisoned_control, float(selection_frac), unit, "c2i_rate")
-            if not (np.isfinite(attack_value) and np.isfinite(control_value)):
-                continue
-            gap = attack_value - control_value
-            # Rank the finite prospective screen; do not condition inclusion on
-            # the sign of the screening statistic.  Requiring gap > 0 makes
-            # negative prospective results disappear entirely (the arithmetic
-            # trajectory), whereas the scientific question is whether the
-            # *best available* prior-checkpoint screen generalizes one step
-            # ahead.  A negative score is an informative failed screen.
-            ranked.append((unit, gap))
-        ranked.sort(key=lambda x: (-x[1], x[0]))
-        for unit, score in ranked[:max(1, int(top_k))]:
+        # Rank by direct disruption on the trusted clean reference.  Protecting
+        # these channels makes the screen explicitly conservative about clean
+        # utility rather than merely hoping the final attack-vs-benign contrast
+        # will penalize them after selection.
+        paired["_clean_rank"] = paired["_clean_c2i"].rank(method="min", ascending=False)
+        paired["_poisoned_rank"] = paired["_poisoned_c2i"].rank(method="min", ascending=False)
+        paired["_poison_excess"] = paired["_poisoned_c2i"] - paired["_clean_c2i"]
+        protect_k = min(protect_k_requested, int(len(paired)))
+        paired["_clean_protected"] = paired["_clean_rank"] <= float(protect_k)
+
+        # This is the requested difference-set logic in a stable numeric form:
+        # remove clean-essential channels, then rank the remaining channels by
+        # how much more disruptive they became under poisoned/mixed training.
+        pool = paired.loc[(~paired["_clean_protected"]) & (paired["_poison_excess"] > 0.0)].copy()
+        pool = pool.sort_values(
+            ["_poison_excess", "_poisoned_c2i", "unit_key"],
+            ascending=[False, False, True],
+        ).head(protect_k_requested)
+
+        for rec in pool.to_dict("records"):
+            unit = str(rec["unit_key"])
             attack_value = value_at(fixed_attack, float(target_frac), unit, "attack_c2i_rate")
-            control_value = value_at(poisoned_control, float(target_frac), unit, "c2i_rate")
-            if not (np.isfinite(attack_value) and np.isfinite(control_value)):
+            if not np.isfinite(attack_value):
+                # Selection itself is still valid, but Figure 03 is an evaluated
+                # defense-leverage figure, so only plot rows with an attack-side
+                # post-selection outcome.
                 continue
+            clean_value = float(rec["_clean_c2i"])
+            poisoned_value = float(rec["_poisoned_c2i"])
+            excess = float(rec["_poison_excess"])
             rows.append({
-                "strategy": "previous_checkpoint",
-                "selection_fraction": float(selection_frac),
+                "strategy": "clean_reference_contrast",
+                "selection_fraction": float(target_frac),
                 "target_fraction": float(target_frac),
                 "unit_key": unit,
-                "selection_score": float(score),
+                "selection_score": excess,
                 "target_attack_c2i_rate": attack_value,
-                "target_control_c2i_rate": control_value,
+                "target_control_c2i_rate": poisoned_value,
                 "target_attack_suppression_rate": attack_value,
-                "target_benign_damage_rate": control_value,
-                "target_defense_leverage_proxy": attack_value - control_value,
-                "selection_basis": "top finite defense-leverage proxy (attack suppression minus benign damage) at previous checkpoint; eligible only if previously discovered; sign is reported, not used as an inclusion filter",
+                "target_benign_damage_rate": poisoned_value,
+                "target_defense_leverage_proxy": attack_value - poisoned_value,
+                "reference_clean_c2i_rate": clean_value,
+                "observed_poisoned_c2i_rate": poisoned_value,
+                "poison_excess_disruption": excess,
+                "clean_importance_rank": float(rec["_clean_rank"]),
+                "poisoned_importance_rank": float(rec["_poisoned_rank"]),
+                "clean_protected_cutoff_rank": float(protect_k),
+                "selection_basis": (
+                    f"same-checkpoint attack-blind clean-reference contrast: protect top {protect_k} "
+                    "clean-disruption channels, then rank remaining fixed-union channels by positive "
+                    "poisoned-trained minus clean-trained control-correctness C->I excess"
+                ),
             })
     return pd.DataFrame(rows, columns=columns)
-
 
 def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, top_k: int = 3) -> bool:
     if selection.empty:
@@ -898,10 +973,9 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
     )
     expected_targets = {
         "baseline_locked": baseline_targets,
-        # A one-checkpoint-ahead target cannot be the first attack-defined
-        # checkpoint because there is no preceding attack-defined checkpoint
-        # from which to select it.
-        "previous_checkpoint": baseline_targets[1:] if len(baseline_targets) > 1 else [],
+        # The clean-reference contrast uses the dense fixed-union matrix at the
+        # same checkpoint, so every attack-defined checkpoint is screenable.
+        "clean_reference_contrast": baseline_targets,
     }
 
     def _set_checkpoint_axis(ax: Any, fracs: list[float]) -> None:
@@ -918,10 +992,10 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
             pad = max(2.5, 0.05 * (hi - lo))
         ax.set_xlim(max(0.0, lo - pad), min(100.0, hi + pad))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.7), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.0), sharey=True)
     specs = [
         ("baseline_locked", "Pre-training-locked candidates (selected at 0%)"),
-        ("previous_checkpoint", "One-checkpoint-ahead defense targets"),
+        ("clean_reference_contrast", "Clean-reference contrast targets (attack-blind)"),
     ]
     any_panel = False
     for ax, (strategy, title) in zip(axes, specs):
@@ -929,24 +1003,32 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
         planned = expected_targets.get(strategy, [])
         _set_checkpoint_axis(ax, planned)
         if part.empty:
-            ax.text(0.5, 0.5, "No leakage-free selection available", ha="center", va="center", transform=ax.transAxes, color="0.35")
+            ax.text(0.5, 0.5, "No attack-agnostic selection available", ha="center", va="center", transform=ax.transAxes, color="0.35")
             ax.set_title(title, fontweight="bold")
             ax.set_xlabel("Target checkpoint (%)")
             ax.grid(True, alpha=0.15)
             continue
-        agg = part.groupby("target_fraction", as_index=False).agg(
-            attack_suppression=("target_attack_suppression_rate", "mean"),
-            benign_damage=("target_benign_damage_rate", "mean"),
-            defense_leverage=("target_defense_leverage_proxy", "mean"),
-            n_selected=("unit_key", "nunique"),
-            selection_fraction=("selection_fraction", "first"),
-        ).sort_values("target_fraction")
+        agg_spec: dict[str, tuple[str, str]] = {
+            "attack_suppression": ("target_attack_suppression_rate", "mean"),
+            "benign_damage": ("target_benign_damage_rate", "mean"),
+            "defense_leverage": ("target_defense_leverage_proxy", "mean"),
+            "n_selected": ("unit_key", "nunique"),
+            "selection_fraction": ("selection_fraction", "first"),
+        }
+        if "reference_clean_c2i_rate" in part.columns:
+            agg_spec["clean_reference_damage"] = ("reference_clean_c2i_rate", "mean")
+        if "poison_excess_disruption" in part.columns:
+            agg_spec["poison_excess_disruption"] = ("poison_excess_disruption", "mean")
+        agg = part.groupby("target_fraction", as_index=False).agg(**agg_spec).sort_values("target_fraction")
         x = 100 * agg["target_fraction"].to_numpy(float)
         attack = 100 * agg["attack_suppression"].to_numpy(float)
         benign = 100 * agg["benign_damage"].to_numpy(float)
         leverage = 100 * agg["defense_leverage"].to_numpy(float)
         ax.plot(x, attack, marker="D", linewidth=2.2, label="Attack suppression")
-        ax.plot(x, benign, marker="o", linewidth=2.2, label="Benign-correctness damage")
+        ax.plot(x, benign, marker="o", linewidth=2.2, label="Poison-trained benign damage")
+        if strategy == "clean_reference_contrast" and "clean_reference_damage" in agg.columns:
+            clean_ref = 100 * pd.to_numeric(agg["clean_reference_damage"], errors="coerce").to_numpy(float)
+            ax.plot(x, clean_ref, marker="s", linewidth=1.8, linestyle="--", label="Clean-reference disruption")
         # The vertical difference is the operational selectivity signal: how
         # much more the singleton intervention suppresses the attack than it
         # damages non-trigger correctness.
@@ -963,16 +1045,18 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
                 xytext=offset, textcoords="offset points", fontsize=7.0, ha="center",
             )
 
-        # Show that absent points are a selection outcome, not a truncated
-        # checkpoint series.  Do not fabricate rates for those checkpoints.
-        if strategy == "previous_checkpoint" and planned:
+        # Show any genuinely absent target checkpoints explicitly.  With the
+        # dense fixed-union clean-reference contrast this should normally be
+        # empty; keeping the check prevents a silently truncated series if an
+        # upstream cache is incomplete.
+        if strategy == "clean_reference_contrast" and planned:
             observed = set(np.round(pd.to_numeric(agg["target_fraction"], errors="coerce").dropna().to_numpy(float), 12))
             missing = [f for f in planned if round(float(f), 12) not in observed]
             if missing:
                 labels = ", ".join(f"{100*float(f):g}%" for f in missing)
                 ax.text(
                     0.98, 0.97,
-                    f"No finite prior-checkpoint screen at: {labels}",
+                    f"Missing fixed-union contrast data at: {labels}",
                     transform=ax.transAxes, ha="right", va="top", fontsize=7.0, color="0.4",
                 )
 
@@ -982,18 +1066,24 @@ def plot_prospective_defense_leverage(selection: pd.DataFrame, output: Path, *, 
         any_panel = True
     axes[0].set_ylabel("Singleton intervention rate (%)")
     axes[0].set_ylim(0, 105)
-    handles, _ = axes[0].get_legend_handles_labels()
-    if not handles:
-        handles, _ = axes[1].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles=handles, labels=[h.get_label() for h in handles], loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5,0.96))
-    fig.suptitle("Prospective defense leverage from attack-selective channels", fontsize=14, fontweight="bold")
+    legend_by_label: dict[str, Any] = {}
+    for axis in axes:
+        hs, labels = axis.get_legend_handles_labels()
+        for h, label in zip(hs, labels):
+            legend_by_label.setdefault(label, h)
+    if legend_by_label:
+        fig.legend(
+            handles=list(legend_by_label.values()),
+            labels=list(legend_by_label.keys()),
+            loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.5, 0.955), fontsize=8.5,
+        )
+    fig.suptitle("Defense leverage from clean-reference channel contrast", fontsize=14, fontweight="bold")
     fig.text(
-        0.5, 0.015,
-        f"At most {int(top_k)} channels are selected prospectively. Attack suppression = trigger-lift correct->incorrect under singleton intervention; benign damage = non-trigger control-correctness correct->incorrect in the poisoned model; Δdef = attack suppression - benign damage.\nPositive Δdef is the attack-selectivity signal for a plausible defense target. The left panel asks whether pre-training-locked probes later acquire defense leverage; the right panel selects targets one checkpoint ahead using only the previous checkpoint. This is target screening, not defense efficacy: efficacy requires applying the selected intervention set and measuring end-to-end attack suppression and benign utility.",
-        ha="center", va="bottom", fontsize=8.3, color="dimgray", wrap=True,
+        0.5, 0.012,
+        f"Right panel: protect the top {int(top_k)} clean-essential channels at each checkpoint, then select up to {int(top_k)} remaining fixed-union channels with the largest positive poisoned-trained minus clean-trained C->I excess. Attack effects are used only after selection; Δdef = attack suppression - poisoned-model benign damage.\nThe existing caches contain dense clean-vs-poisoned control-correctness singleton effects, not dense singleton effects on the raw mixed training examples, so this is an attack-blind mixed-training-effect contrast that requires no new inference.",
+        ha="center", va="bottom", fontsize=8.0, color="dimgray", wrap=True,
     )
-    fig.tight_layout(rect=(0,0.08,1,0.89))
+    fig.tight_layout(rect=(0,0.095,1,0.885))
     if any_panel:
         fig.savefig(output, bbox_inches="tight")
         plt.close(fig)
@@ -1199,12 +1289,12 @@ def _story_coverage(summary: pd.DataFrame, control: pd.DataFrame, trigger: pd.Da
             "summary_row_present": bool(not s.empty),
             "control_correctness_channel_rows": int(len(o)),
             "control_correctness_locally_discovered_rows": int(discovered.sum()) if len(discovered) else 0,
-            "control_correctness_fixed_union_rows": int(source.eq("stage07_fixed_candidate_union").sum()) if len(source) else 0,
+            "control_correctness_fixed_union_rows": int(source.isin(CONTROL_FIXED_SOURCES).sum()) if len(source) else 0,
             "control_correctness_checkpoint_local_only_rows": int(source.eq("checkpoint_discovery").sum()) if len(source) else 0,
             "control_correctness_shared_zero_rows": int(source.eq("shared_clean_zero").sum()) if len(source) else 0,
             "attack_channel_rows": int(len(t)),
             "attack_locally_discovered_rows": int(attack_discovered.sum()) if len(attack_discovered) else 0,
-            "attack_fixed_union_rows": int(attack_source.eq("stage07_fixed_candidate_union").sum()) if len(attack_source) else 0,
+            "attack_fixed_union_rows": int(attack_source.isin(ATTACK_FIXED_SOURCES).sum()) if len(attack_source) else 0,
             "attack_checkpoint_local_only_rows": int(attack_source.eq("checkpoint_discovery").sum()) if len(attack_source) else 0,
         })
     return pd.DataFrame(rows)
@@ -1242,6 +1332,10 @@ def main() -> None:
 
     prospective = _prospective_defense_target_selection(control, trigger, top_k=int(args.prospective_top_k))
     prospective.to_csv(output / "prospective_defense_leverage.csv", index=False)
+    clean_reference_screen = prospective[
+        prospective.get("strategy", pd.Series(dtype=str)).astype(str).eq("clean_reference_contrast")
+    ].copy()
+    clean_reference_screen.to_csv(output / "clean_reference_defense_screen.csv", index=False)
 
     fig1_ok = plot_developmental_story(summary, control, trigger, output / "01_clean_vs_poisoned_overtopping_development.pdf")
     fig2_ok = plot_channel_roles(control, trigger, output / "02_channel_role_reassignment.pdf")

@@ -25,9 +25,9 @@ Reporting does not replace missing model-backed causal measurements with derived
 |---|---|
 | Primary matrix | 28 `paper-primary` settings |
 | RQ1 Figure 2 | 28 primary + 11 auxiliary settings |
-| RQ2 composition | 28 primary settings |
+| RQ2 composition and singleton-versus-joint decomposition | 28 primary settings |
 | RQ3 threshold-event reporting | 28 primary settings required; 11 auxiliary settings supplementary when compatible inputs are present |
-| RQ3 graded report | 28 primary settings required; auxiliary settings supplementary when graded outputs are present |
+| RQ3 graded support-specific report | 28 primary settings required; auxiliary settings supplementary when compatible graded outputs are present |
 | RQ4 Pythia | configured checkpoint runs |
 | Poisoning | configured task/model/seed runs under `data/poisoning/` |
 
@@ -70,7 +70,7 @@ Directional fields retain their own eligible denominators.
 studies.overtopping.analysis.stage03_audit_required_metrics
 ```
 
-Checks required fields, evaluation variants, and interaction products for the configured primary profile.
+Checks required fields, evaluation variants, simultaneous-set products, and the singleton-union/full-set composition decomposition for the configured primary profile.
 
 ### 4. Primary statistics
 
@@ -100,14 +100,14 @@ studies.overtopping.analysis.stage06_manuscript_story_figures
 These modules generate:
 
 - RQ1 competence versus directional reach/high-effect-count figures;
-- RQ2 composition and matched-set figures;
+- RQ2 composition, matched-set, and singleton-versus-joint decomposition figures;
 - Pythia checkpoint trajectories used by RQ4.
 
 RQ1 Figure 2 resolves the exact 39-setting catalogue and validates the expected 17 input+output / 22 decode-only phase split.
 
 ## RQ3 reporting
 
-RQ3 combines threshold-event diagnostics, per-run graded agonist outputs, and corrected Stage-8 preemption summaries.
+RQ3 combines threshold-event diagnostics with per-run same-candidate graded positive/non-flip support. The retained Stage-8 preemption summary is aggregated separately as a secondary subtype analysis.
 
 ### Threshold diagnostics source resolution
 
@@ -223,13 +223,13 @@ graded_agonist_dose_support_contrast.csv
 graded_agonist_report_status.json
 ```
 
-### Preemption aggregation
+### Secondary preemption aggregation
 
 ```text
 studies.overtopping.analysis.stage09_preemption_report
 ```
 
-This reporter reads exact-manifest per-run `interaction_validation/preemption_pair_summary.csv` files. Only the corrected v3 preemption schema is aggregated. Stale v2 rows are excluded and recorded in `preemption_population_audit.csv` with a refresh status. The output is analysis-only under `results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/`.
+This reporter reads exact-manifest per-run `interaction_validation/preemption_pair_summary.csv` files. Only the corrected schema is aggregated. Incompatible rows are excluded through the population audit. The output is analysis-only under `results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/` and is not required for the primary RQ3 claim.
 
 ## Figure 4 output set
 
@@ -238,7 +238,6 @@ results/paper/figures/04_rq3_spiking_cut/
 ├── fig4a_candidate_control_spiking_cut_summary.pdf
 ├── fig4b_threshold_shape_model_comparison_by_direction.pdf
 ├── fig4c_graded_agonist_dose_response.pdf
-graded_agonist_support_consistency.pdf
 ├── fig4s1_threshold_testability_by_condition.pdf
 ├── fig4s2_strength_matched_thresholdability.pdf
 ├── fig4s3_nested_tecs_lower_bound_ecdf.pdf
@@ -259,7 +258,7 @@ studies.poisoning.stage08_aggregate_cross_seed
 studies.poisoning.stage08_plot_cross_seed
 ```
 
-and publishes configured per-run poisoning visuals. Training seed is the cross-run replication unit.
+and publishes configured per-run poisoning visuals. Training seed is the trajectory-level replication unit.
 
 ## Result tree
 

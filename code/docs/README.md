@@ -79,8 +79,8 @@ docs/
 | Trace pipeline execution | [Pipeline](methods/pipeline.md) |
 | Inspect the exact overtopping catalogue | [Overtopping catalogue](experiments/overtopping.md) |
 | Understand RQ1 | [RQ1 — prevalence](research-questions/rq1-prevalence.md) |
-| Understand RQ2 | [RQ2 — composition](research-questions/rq2-composition.md) |
-| Understand RQ3 | [RQ3 — threshold events](research-questions/rq3-threshold-event.md) |
+| Understand RQ2 | [RQ2 — composition and interaction regimes](research-questions/rq2-composition.md) |
+| Understand RQ3 | [RQ3 — support-specific thresholded integration](research-questions/rq3-threshold-event.md) |
 | Understand RQ4 | [RQ4 — learning](research-questions/rq4-learning.md) |
 | Understand poisoning | [Poisoning protocol](experiments/poisoning/README.md) |
 | Trace a figure to source data | [Figure map](reporting/figures.md) |

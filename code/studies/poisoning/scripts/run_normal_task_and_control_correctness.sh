@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Two deliberately separate endpoints:
-#   1) normal_task: configured held-out sample, no-trigger BEHAVIOR reporting only;
-#   2) attack_cohort_control_correctness: CHA on the exact attack-eligible
-#      non-target cohort used by the paired backdoor-trigger test.
+# Behavior plus configurable CHA localization endpoints:
+#   1) normal_task: held-out no-trigger BEHAVIOR reporting only;
+#   2) attack_cohort_control_correctness: OPTIONAL no-trigger CHA on the fixed
+#      non-target attack-eligible cohort (uses oracle target knowledge to define
+#      the cohort, therefore suitable for controlled/post-hoc localization, not
+#      a strictly deployable attack-agnostic defense);
+#   3) observed_training_mixture_correctness: OPTIONAL attack-agnostic CHA on
+#      defender-visible fine-tuning prompts/labels.
 #
-# Do not merge these populations. The Aug-26 validated CHA used endpoint (2).
+# Stage 07 chooses exactly one localization endpoint through
+# POISONING_CANDIDATE_LOCALIZATION_ENDPOINT. The matched control-vs-trigger
+# causal evaluation remains paired and post-discovery.
+
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/bash_compat.sh
@@ -41,10 +48,17 @@ STAGE7_MAX_ROWS="${STAGE7_MAX_ROWS:-10000}"
 # Exact prompt reuse from the paired trigger cache still occurs opportunistically.
 # Set to 0 explicitly for an exhaustive full-distribution behavior measurement.
 NORMAL_TASK_SCAN_MAX_ROWS="${NORMAL_TASK_SCAN_MAX_ROWS:-10000}"
+OBSERVED_MIXTURE_SCAN_MAX_ROWS="${OBSERVED_MIXTURE_SCAN_MAX_ROWS:-10000}"
+OBSERVED_MIXTURE_CANDIDATE_SEED="${OBSERVED_MIXTURE_CANDIDATE_SEED:-${POISONING_HOLDOUT_SEED:-13}}"
 EVAL_CONFIDENCE_ALPHA="${EVAL_CONFIDENCE_ALPHA:-0.05}"
 HF_MODEL_CACHE_DIR="${HF_MODEL_CACHE_DIR:-}"
 DRY_RUN="${DRY_RUN:-0}"
-RUN_NORMAL_TASK_OVERTOPPING="${RUN_NORMAL_TASK_OVERTOPPING:-1}"
+RUN_OBSERVED_MIXTURE_OVERTOPPING="${RUN_OBSERVED_MIXTURE_OVERTOPPING:-1}"
+RUN_OBSERVED_MIXTURE_ENDPOINT="${RUN_OBSERVED_MIXTURE_ENDPOINT:-1}"
+RUN_ATTACK_COHORT_CONTROL_CHA="${RUN_ATTACK_COHORT_CONTROL_CHA:-0}"
+# Comma-separated checkpoint percentages, e.g. 0,10,25,100. "all" runs every checkpoint.
+ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS="${ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS:-all}"
+CHECKPOINT_FRACTION="${CHECKPOINT_FRACTION:-}"
 RUN_BEHAVIOR_COMPARISON="${RUN_BEHAVIOR_COMPARISON:-1}"
 RUN_BEHAVIOR_VISUALIZATIONS="${RUN_BEHAVIOR_VISUALIZATIONS:-1}"
 BACKDOOR_LLM_IO="${REUSE_CONTROL_CACHE:?REUSE_CONTROL_CACHE must point to the paired backdoor-test llm_io_data.pkl}"
@@ -52,12 +66,14 @@ BACKDOOR_LLM_IO="${REUSE_CONTROL_CACHE:?REUSE_CONTROL_CACHE must point to the pa
 case "$POISONING_TASK" in
   grammar)
     NORMAL_BEHAVIOR_TASK_MODULE="studies.poisoning.tasks.grammar:NORMAL_TASK_SPEC"
-    ATTACK_CAUSAL_TASK_MODULE="studies.poisoning.tasks.grammar:ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC"
+    OBSERVED_MIXTURE_TASK_MODULE="studies.poisoning.tasks.grammar:OBSERVED_TRAINING_MIXTURE_CORRECTNESS_SPEC"
+    ATTACK_CONTROL_TASK_MODULE="studies.poisoning.tasks.grammar:ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC"
     FULL_FILTER_NAME="GRAMMAR_BACKDOOR_SOURCE_FILTER"
     ;;
   arithmetic)
     NORMAL_BEHAVIOR_TASK_MODULE="studies.poisoning.tasks.arithmetic:NORMAL_TASK_SPEC"
-    ATTACK_CAUSAL_TASK_MODULE="studies.poisoning.tasks.arithmetic:ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC"
+    OBSERVED_MIXTURE_TASK_MODULE="studies.poisoning.tasks.arithmetic:OBSERVED_TRAINING_MIXTURE_CORRECTNESS_SPEC"
+    ATTACK_CONTROL_TASK_MODULE="studies.poisoning.tasks.arithmetic:ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC"
     FULL_FILTER_NAME="ARITHMETIC_BACKDOOR_SOURCE_FILTER"
     ;;
   *) echo "POISONING_TASK must be grammar or arithmetic" >&2; exit 2 ;;
@@ -70,18 +86,25 @@ PHASE_ENDPOINT_ROOT="$(dirname "$(dirname "$BACKDOOR_OUTPUT_DATA_DIR")")"
 NORMAL_BEHAVIOR_OUTPUT_DATA_DIR="$PHASE_ENDPOINT_ROOT/normal_task/eval_${SAFE_INTERVENTION}"
 NORMAL_BEHAVIOR_CACHE_DIR="$DISCOVERY_CACHE_ROOT/normal_task/$CHECKPOINT_CACHE_KEY"
 NORMAL_BEHAVIOR_LLM_IO="$NORMAL_BEHAVIOR_CACHE_DIR/llm_io_data.pkl"
-# Causal control endpoint on the fixed attack-eligible non-target cohort.
-ATTACK_CAUSAL_OUTPUT_DATA_DIR="$PHASE_ENDPOINT_ROOT/attack_cohort_control_correctness/eval_${SAFE_INTERVENTION}"
-ATTACK_CAUSAL_CACHE_DIR="$DISCOVERY_CACHE_ROOT/attack_cohort_control_correctness/$CHECKPOINT_CACHE_KEY"
-ATTACK_CAUSAL_LLM_IO="$ATTACK_CAUSAL_CACHE_DIR/llm_io_data.pkl"
+# Optional control-only CHA endpoint on the fixed attack-eligible non-target cohort.
+ATTACK_CONTROL_OUTPUT_DATA_DIR="$PHASE_ENDPOINT_ROOT/attack_cohort_control_correctness/eval_${SAFE_INTERVENTION}"
+ATTACK_CONTROL_CACHE_DIR="$DISCOVERY_CACHE_ROOT/attack_cohort_control_correctness/$CHECKPOINT_CACHE_KEY"
+
+# Causal endpoint on the defender-visible suspicious training stream. Both
+# clean and poisoned checkpoints are evaluated on this same prompt/label set.
+OBSERVED_MIXTURE_OUTPUT_DATA_DIR="$PHASE_ENDPOINT_ROOT/observed_training_mixture_correctness/eval_${SAFE_INTERVENTION}"
+OBSERVED_MIXTURE_CACHE_DIR="$DISCOVERY_CACHE_ROOT/observed_training_mixture_correctness/$CHECKPOINT_CACHE_KEY"
+OBSERVED_MIXTURE_LLM_IO="$OBSERVED_MIXTURE_CACHE_DIR/llm_io_data.pkl"
 
 mkdir -p \
   "$NORMAL_BEHAVIOR_CACHE_DIR" "$NORMAL_BEHAVIOR_OUTPUT_DATA_DIR/feature_report" \
-  "$ATTACK_CAUSAL_CACHE_DIR" "$ATTACK_CAUSAL_OUTPUT_DATA_DIR/feature_report"
+  "$ATTACK_CONTROL_CACHE_DIR" "$ATTACK_CONTROL_OUTPUT_DATA_DIR/feature_report" \
+  "$OBSERVED_MIXTURE_CACHE_DIR" "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR/feature_report"
 
 if [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" ]]; then
   echo "[dry-run] NORMAL TASK BEHAVIOR: configured held-out sample, no trigger -> $NORMAL_BEHAVIOR_OUTPUT_DATA_DIR"
-  echo "[dry-run] ATTACK-COHORT CONTROL-CORRECTNESS CHA: attack-eligible non-target rows only -> $ATTACK_CAUSAL_OUTPUT_DATA_DIR"
+  echo "[dry-run] ATTACK-COHORT CONTROL-CORRECTNESS CHA: enabled=$RUN_ATTACK_COHORT_CONTROL_CHA checkpoints=$ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS -> $ATTACK_CONTROL_OUTPUT_DATA_DIR"
+  echo "[dry-run] OBSERVED-TRAINING-MIXTURE CORRECTNESS CHA: defender-visible prompts/labels, no oracle attack labels -> $OBSERVED_MIXTURE_OUTPUT_DATA_DIR"
   exit 0
 fi
 
@@ -135,187 +158,57 @@ if poisoning_is_true "$RUN_BEHAVIOR_COMPARISON"; then
 fi
 
 # ---------------------------------------------------------------------------
-# B. Attack-cohort no-trigger correctness CHA.
-# Re-export scores from the *same paired backdoor cache* used by the trigger
-# behavior test. No full-cohort rows are allowed into this endpoint.
+# B. Optional attack-cohort control-correctness CHA.
+#
+# This reuses the already-generated paired backdoor cache, so enabling it does
+# NOT regenerate prompts or model outputs.  It intentionally evaluates only the
+# control/no-trigger view of the fixed non-target attack-eligible cohort.
 # ---------------------------------------------------------------------------
-echo "============================================================"
-echo "ATTACK-COHORT CONTROL-CORRECTNESS CAUSAL CHA"
-echo "model_variant=$CONDITION checkpoint=$CHECKPOINT_STAGE_LABEL"
-echo "cohort=ATTACK-ELIGIBLE NON-TARGET EXAMPLES ONLY"
-echo "target=is_correct_control (1=RIGHT, 0=WRONG)"
-echo "positive baseline=correct; negative baseline=incorrect"
-echo "trigger-conditioned CHA=NO"
-echo "============================================================"
-
-# Validate the paired cache *before* Stage 1 can decide to regenerate it. This
-# prevents a misconfigured full-cohort backdoor cache from being silently
-# overwritten or accepted as the causal population.
-python3 - "$BACKDOOR_LLM_IO" <<'PYCACHEGUARD'
-import pickle, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-with p.open("rb") as f:
-    obj = pickle.load(f)
-if not isinstance(obj, list) or not obj or not all(isinstance(r, dict) for r in obj):
-    raise SystemExit("SCIENTIFIC GUARD FAILED: paired backdoor cache has an unsupported shape")
-def b(v): return str(v).strip().lower() in {"1", "true", "t", "yes", "y"}
-if not all("is_attack_example" in r for r in obj):
-    raise SystemExit("SCIENTIFIC GUARD FAILED: paired backdoor cache lacks is_attack_example")
-non_attack = sum(not b(r.get("is_attack_example")) for r in obj)
-if non_attack:
-    raise SystemExit(
-        f"SCIENTIFIC GUARD FAILED: paired backdoor cache contains {non_attack}/{len(obj)} non-attack rows. "
-        "Do not run attack-cohort CHA from a full/mixed cohort cache."
-    )
-print(f"[scientific-cache-guard] PASS paired_backdoor_rows={len(obj)} all_attack_eligible=true")
-PYCACHEGUARD
-
-ATTACK_STAGE1=(python3 -m pipeline.stage01_generate_prompts_and_answers
-  --ai_model "$CHECKPOINT_DIR"
-  --task_module "$ATTACK_CAUSAL_TASK_MODULE"
-  --prompts_answers_pkl_file "$BACKDOOR_LLM_IO"
-  --batch_size "$BATCH_SIZE"
-  --stats_json_out "$ATTACK_CAUSAL_OUTPUT_DATA_DIR/feature_report"
-  --export_dataset_scores_dir "$ATTACK_CAUSAL_OUTPUT_DATA_DIR/feature_report")
-if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then ATTACK_STAGE1+=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR"); fi
-
-env "$FULL_FILTER_NAME=non_target" "${ATTACK_STAGE1[@]}"
-
-# Hard scientific guard: refuse to run CHA if the cohort or correctness
-# semantics differ from the validated attack-eligible control endpoint.
-python3 - \
-  "$POISONING_TASK" \
-  "$ATTACK_CAUSAL_OUTPUT_DATA_DIR/feature_report/scores.csv" \
-  "$BACKDOOR_OUTPUT_DATA_DIR/feature_report/scores.csv" <<'PYGUARD'
-import math
-import pathlib
-import sys
-import pandas as pd
-
-kind, causal_path, backdoor_path = sys.argv[1:]
-
-# Correctness and paired-cache identity depend on the exact model text.  Force
-# numeric-looking generations/prompts to remain text across CSV round-trips;
-# otherwise pandas may turn an output such as "12" into the float 12.0.
-_SCORE_TEXT_COLUMNS = ("prompt_control", "raw_output_control", "original_prompt")
-
-def read_scores_csv(path):
-    # Converters preserve the exact CSV cell text, including numeric-looking
-    # generations and literal strings such as "NA", while leaving non-text
-    # columns under pandas' normal type/NA inference.
-    return pd.read_csv(path, converters={col: str for col in _SCORE_TEXT_COLUMNS})
-
-causal = read_scores_csv(causal_path)
-
-def as_bool(v):
-    return str(v).strip().lower() in {"1", "true", "t", "yes", "y"}
-
-required = {"is_attack_example", "is_correct_control", "prompt_control", "raw_output_control"}
-missing = sorted(required.difference(causal.columns))
-if missing:
-    raise SystemExit(f"SCIENTIFIC GUARD FAILED: causal scores missing columns: {missing}")
-if causal.empty:
-    raise SystemExit("SCIENTIFIC GUARD FAILED: attack-cohort causal dataset is empty")
-attack = causal["is_attack_example"].map(as_bool)
-if not bool(attack.all()):
-    bad = int((~attack).sum())
-    raise SystemExit(
-        f"SCIENTIFIC GUARD FAILED: {bad}/{len(causal)} causal rows are not attack-eligible. "
-        "Full-cohort rows must never enter attack-cohort control-correctness CHA."
-    )
-
-correct = causal["is_correct_control"].map(as_bool)
-if kind == "grammar":
-    needed = {"predicted_label_control", "original_is_acceptable", "backdoor_target_label"}
-    missing = sorted(needed.difference(causal.columns))
-    if missing:
-        raise SystemExit(f"SCIENTIFIC GUARD FAILED: grammar causal scores missing {missing}")
-    pred = causal["predicted_label_control"].map(lambda v: None if pd.isna(v) else as_bool(v))
-    gold = causal["original_is_acceptable"].map(as_bool)
-    recomputed = pd.Series(
-        [p is not None and bool(p) == bool(g) for p, g in zip(pred, gold)],
-        index=causal.index,
-    )
-    mismatch = int((recomputed != correct).sum())
-    if mismatch:
-        raise SystemExit(
-            f"SCIENTIFIC GUARD FAILED: is_correct_control is inverted/inconsistent on {mismatch} rows. "
-            "Required semantics are 1=right output, 0=wrong output."
-        )
-    # With source_filter=non_target, gold must be opposite the configured target.
-    def target_is_true(v):
-        return str(v).strip().lower() in {"yes", "acceptable", "grammatical", "correct", "true", "1"}
-    target = causal["backdoor_target_label"].map(target_is_true)
-    same_side = int((gold == target).sum())
-    if same_side:
-        raise SystemExit(
-            f"SCIENTIFIC GUARD FAILED: {same_side} target-gold rows entered attack-cohort CHA."
-        )
-elif kind == "arithmetic":
-    from studies.poisoning.tasks.arithmetic import _is_answer_correct
-    needed = {"original_prompt", "correct_answer_numeric", "backdoor_target_answer_numeric"}
-    missing = sorted(needed.difference(causal.columns))
-    if missing:
-        raise SystemExit(f"SCIENTIFIC GUARD FAILED: arithmetic causal scores missing {missing}")
-    recomputed = pd.Series(
-        [_is_answer_correct(str(p), str(o)) for p, o in zip(causal["original_prompt"], causal["raw_output_control"])],
-        index=causal.index,
-    ).map(bool)
-    mismatch = int((recomputed != correct).sum())
-    if mismatch:
-        raise SystemExit(
-            f"SCIENTIFIC GUARD FAILED: is_correct_control is inconsistent on {mismatch} rows."
-        )
-    gold = pd.to_numeric(causal["correct_answer_numeric"], errors="coerce")
-    target = pd.to_numeric(causal["backdoor_target_answer_numeric"], errors="coerce")
-    same_side = int(((gold - target).abs() <= 1e-9).fillna(False).sum())
-    if same_side:
-        raise SystemExit(
-            f"SCIENTIFIC GUARD FAILED: {same_side} target-answer rows entered attack-cohort CHA."
-        )
+attack_control_checkpoint_selected() {
+  if ! poisoning_is_true "$RUN_ATTACK_COHORT_CONTROL_CHA"; then return 1; fi
+  case "$ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS" in
+    [Aa][Ll][Ll]) return 0 ;;
+  esac
+  python3 - "$ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS" "$CHECKPOINT_FRACTION" "$CHECKPOINT_STAGE_LABEL" <<'PYSEL'
+import math, re, sys
+spec, frac, label = sys.argv[1:]
+if frac.strip():
+    pct = 100.0 * float(frac)
 else:
-    raise SystemExit(f"Unknown task: {kind}")
+    m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*%', label)
+    if not m:
+        raise SystemExit(2)
+    pct = float(m.group(1))
+selected=[]
+for tok in spec.split(','):
+    tok=tok.strip().rstrip('%')
+    if tok:
+        selected.append(float(tok))
+raise SystemExit(0 if any(math.isclose(pct, x, abs_tol=1e-9) for x in selected) else 1)
+PYSEL
+}
 
-# The causal control scores must be an exact row-for-row view of the paired
-# backdoor-test cache on prompt_control/raw_output_control.
-bp = pathlib.Path(backdoor_path)
-if bp.exists():
-    backdoor = read_scores_csv(bp)
-    if len(backdoor) != len(causal):
-        raise SystemExit(
-            f"SCIENTIFIC GUARD FAILED: causal rows={len(causal)} but paired backdoor rows={len(backdoor)}"
-        )
-    for col in ("prompt_control", "raw_output_control"):
-        if col not in backdoor.columns:
-            raise SystemExit(f"SCIENTIFIC GUARD FAILED: paired backdoor scores missing {col}")
-        a = causal[col].fillna("").astype(str).tolist()
-        b = backdoor[col].fillna("").astype(str).tolist()
-        if a != b:
-            raise SystemExit(
-                f"SCIENTIFIC GUARD FAILED: {col} differs between causal control and paired backdoor cache"
-            )
+if attack_control_checkpoint_selected; then
+  echo "============================================================"
+  echo "ATTACK-COHORT CONTROL-CORRECTNESS CAUSAL CHA"
+  echo "model_variant=$CONDITION checkpoint=$CHECKPOINT_STAGE_LABEL"
+  echo "cohort=ATTACK-ELIGIBLE GOLD NON-TARGET EXAMPLES (CONTROL/NO-TRIGGER VIEW)"
+  echo "target=is_correct_control"
+  echo "checkpoint schedule=$ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS"
+  echo "============================================================"
 
-print(
-    f"[scientific-guard] PASS rows={len(causal)} "
-    f"baseline_correct={int(correct.sum())} baseline_incorrect={int((~correct).sum())} "
-    "cohort=attack_eligible_non_target positive=correct negative=incorrect"
-)
-PYGUARD
+  # Re-export the same cached paired rows through the control-correctness task
+  # adapter. Because BACKDOOR_LLM_IO already exists, Stage 1 performs no model
+  # generation here.
+  python3 -m pipeline.stage01_generate_prompts_and_answers \
+    --ai_model "$CHECKPOINT_DIR" \
+    --task_module "$ATTACK_CONTROL_TASK_MODULE" \
+    --prompts_answers_pkl_file "$BACKDOOR_LLM_IO" \
+    --batch_size "$BATCH_SIZE" \
+    --stats_json_out "$ATTACK_CONTROL_OUTPUT_DATA_DIR/feature_report" \
+    --export_dataset_scores_dir "$ATTACK_CONTROL_OUTPUT_DATA_DIR/feature_report"
 
-# Make run_pipeline's model-cache Stage-1 pointer resolve to the exact same
-# paired cache without duplicating model inference. A symlink is scientifically
-# identity-preserving; if a real file already exists, keep it only if identical.
-if [[ -e "$ATTACK_CAUSAL_LLM_IO" || -L "$ATTACK_CAUSAL_LLM_IO" ]]; then
-  if ! cmp -s "$ATTACK_CAUSAL_LLM_IO" "$BACKDOOR_LLM_IO"; then
-    echo "Refusing to reuse non-identical attack-cohort cache: $ATTACK_CAUSAL_LLM_IO" >&2
-    echo "Move/quarantine it first; the causal endpoint must use the paired backdoor cache exactly." >&2
-    exit 1
-  fi
-else
-  ln -s "$BACKDOOR_LLM_IO" "$ATTACK_CAUSAL_LLM_IO"
-fi
-
-PLAN="$(python3 - "$ATTACK_CAUSAL_OUTPUT_DATA_DIR/feature_report/scores.csv" "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$LOW_DATA_POLICY" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$MAX_DISCOVERY_PAIRS" <<'PYPLAN'
+  ATTACK_PLAN="$(python3 - "$ATTACK_CONTROL_OUTPUT_DATA_DIR/feature_report/scores.csv" "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$LOW_DATA_POLICY" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$MAX_DISCOVERY_PAIRS" <<'PYACPLAN'
 import pandas as pd, shlex, sys
 from studies.poisoning.lib.cha import plan_cha
 p, ref, cap, minimum, policy, tau, alpha, max_pairs = sys.argv[1:]
@@ -324,106 +217,256 @@ tau, alpha = map(float, (tau, alpha))
 df = pd.read_csv(p)
 def b(v): return str(v).strip().lower() in {'1','true','t','yes','y'}
 is_test = df['is_test'].map(b) if 'is_test' in df else pd.Series(False, index=df.index)
-positive = df['is_correct_control'].map(b)
-train = int((positive & ~is_test).sum()); test = int((positive & is_test).sum())
+pos = df['is_correct_control'].map(b)
+train = int((pos & ~is_test).sum()); test = int((pos & is_test).sum())
 plan = plan_cha(train, reference_side=ref, reference_tau=tau, max_side=cap,
                 min_actual_side=minimum, low_data_policy=policy,
                 prune_alpha=alpha, max_pairs=max_pairs)
+for k,v in {
+ 'AC_ROWS':len(df),'AC_TRAIN_CORRECT':train,'AC_TEST_CORRECT':test,
+ 'AC_N_SIDE':plan['n_side'],'AC_N_PAIRS':plan['n_pairs'],
+ 'AC_EFFECTIVE_TAU':plan['effective_tau'],'AC_DECISION':plan['analysis_decision'],
+ 'AC_LOW_DATA_REASON':plan['low_data_reason'],
+}.items(): print(f"{k}={shlex.quote(str(v))}")
+PYACPLAN
+)"
+  eval "$ATTACK_PLAN"
+  echo "[attack-control-cha] rows=$AC_ROWS discovery_correct=$AC_TRAIN_CORRECT heldout_correct=$AC_TEST_CORRECT decision=$AC_DECISION"
+
+  if [[ "$AC_DECISION" == run_reference || "$AC_DECISION" == run_adaptive ]]; then
+    AC_CMD=(bash pipeline/run_pipeline.sh
+      "${POISONING_TASK}_attack_cohort_control_correctness"
+      "$CHECKPOINT_DIR"
+      --task_module "$ATTACK_CONTROL_TASK_MODULE"
+      --output_data_dir "$ATTACK_CONTROL_OUTPUT_DATA_DIR"
+      --pipeline_cache_root "$DISCOVERY_CACHE_ROOT"
+      --pipeline_model_cache_dir "$ATTACK_CONTROL_CACHE_DIR"
+      --model_label "${CHECKPOINT_CACHE_KEY}__attack_cohort_control_correctness"
+      --spectral_splits --fast_anchoring --z_thresh -1
+      --batch_size "$BATCH_SIZE" --circuit_level neuron --circuit_size "$CIRCUIT_SIZE"
+      --eval_intervention "$EVAL_INTERVENTION" --min_flip_rate "$MIN_FLIP_RATE"
+      --max_number_of_circuits_to_analyze 1 --evaluation_split test
+      --no_llm_feature_generation --skip_stage1 --evaluation_baseline_subset all)
+    if [[ "$PHASE_LABEL" == "output_only" ]]; then AC_CMD+=(--decode_only); fi
+    printf '[cmd-attack-control-cha]'; printf ' %q' "${AC_CMD[@]}"; printf '\n'
+    env \
+      MAX_POINTS_PER_ABLATION="$AC_N_SIDE" MAX_POINTS_PER_CIRCUIT="$AC_N_PAIRS" \
+      SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" \
+      EVALUATION_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" REFINE_SAMPLING_MAX_POINTS=0 \
+      ANALYZE_BASELINE_SUBSETS=positive SPECTRAL_CLUSTER_BASE_SUBSET=positive \
+      EVALUATION_BASELINE_SUBSET=all PIPELINE_EVALUATION_BASELINE_SUBSET=all \
+      RUN_SINGLETON_CAUSAL_EVALUATION=false RUN_GRADED_AGONIST_INTERVENTION=false \
+      RUN_THRESHOLD_EVENT_POSTHOC=false RUN_PREEMPTION=false REFINE_USE_SPECTRAL_SAMPLING=false \
+      REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=false RUN_INTERACTION_VALIDATION=false \
+      RUN_CMC=false SKIP_AGONIST_METRIC_STATS=true HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
+      "${AC_CMD[@]}"
+
+    python3 -m studies.poisoning.stage03_freeze_observed_mixture_candidates \
+      --endpoint_dir "$ATTACK_CONTROL_OUTPUT_DATA_DIR" \
+      --search_epsilon "$MIN_FLIP_RATE" \
+      --source_label attack_cohort_control_correctness \
+      --oracle_cohort_definition_used
+  else
+    echo "[attack-control-cha] CHA not run: $AC_LOW_DATA_REASON"
+  fi
+else
+  echo "[attack-control-cha] skipped at checkpoint=$CHECKPOINT_STAGE_LABEL; enabled=$RUN_ATTACK_COHORT_CONTROL_CHA schedule=$ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS"
+fi
+
+# ---------------------------------------------------------------------------
+# C. Defense-valid CHA on the actually observed fine-tuning mixture.
+#
+# The source is the reconstructed suspicious/poisoned-condition training stream,
+# including clean and poisoned rows in their naturally observed proportions and
+# exact prompt forms.  Row selection is uniform/complete and DOES NOT inspect
+# poison status, trigger identity, attack eligibility, attack success, or the
+# attacker target.  Clean and poisoned model checkpoints are probed with the
+# same observable prompt/label population.
+# ---------------------------------------------------------------------------
+if poisoning_is_true "$RUN_OBSERVED_MIXTURE_ENDPOINT"; then
+echo "============================================================"
+echo "OBSERVED-TRAINING-MIXTURE CORRECTNESS CAUSAL CHA"
+echo "model_variant=$CONDITION checkpoint=$CHECKPOINT_STAGE_LABEL"
+echo "cohort=DEFENDER-VISIBLE FINE-TUNING PROMPTS + OBSERVED LABELS"
+echo "target=is_correct_observed_label (1=matches observed label, 0=does not)"
+echo "oracle poison/attack annotations used=NO"
+echo "============================================================"
+
+OBSERVED_STAGE1=(python3 -m pipeline.stage01_generate_prompts_and_answers
+  --ai_model "$CHECKPOINT_DIR"
+  --task_module "$OBSERVED_MIXTURE_TASK_MODULE"
+  --prompts_answers_pkl_file "$OBSERVED_MIXTURE_LLM_IO"
+  --batch_size "$BATCH_SIZE"
+  --stats_json_out "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR/feature_report"
+  --export_dataset_scores_dir "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR/feature_report")
+if [[ -n "$HF_MODEL_CACHE_DIR" ]]; then OBSERVED_STAGE1+=(--ai_model_cache_dir "$HF_MODEL_CACHE_DIR"); fi
+
+env \
+  POISONING_RUN_DIR="$RUN_DIR" \
+  OBSERVED_MIXTURE_SCAN_MAX_ROWS="$OBSERVED_MIXTURE_SCAN_MAX_ROWS" \
+  OBSERVED_MIXTURE_CANDIDATE_SEED="$OBSERVED_MIXTURE_CANDIDATE_SEED" \
+  "${OBSERVED_STAGE1[@]}"
+
+# Guard the exported causal table itself: no hidden poison/attack annotation may
+# enter candidate localization, even accidentally through a task-adapter change.
+python3 - "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR/feature_report/scores.csv" <<'PYMIXGUARD'
+import pathlib, sys
+import pandas as pd
+p = pathlib.Path(sys.argv[1])
+df = pd.read_csv(p)
+required = {
+    'training_slot_index', 'observed_prompt', 'observed_label',
+    'is_correct_observed_label', 'is_test',
+    'oracle_attack_annotations_used_for_selection',
+}
+missing = sorted(required - set(df.columns))
+if missing:
+    raise SystemExit(f"SCIENTIFIC GUARD FAILED: observed-mixture scores missing {missing}")
+forbidden = {'is_poisoned', 'is_attack_example', 'is_trigger_lift_success'}
+present = sorted(forbidden & set(df.columns))
+if present:
+    raise SystemExit(
+        "SCIENTIFIC GUARD FAILED: oracle attack/poison columns leaked into observed-mixture CHA: "
+        + ', '.join(present)
+    )
+def b(v): return str(v).strip().lower() in {'1','true','t','yes','y'}
+if df['oracle_attack_annotations_used_for_selection'].map(b).any():
+    raise SystemExit("SCIENTIFIC GUARD FAILED: observed-mixture row selection reports oracle annotation use")
+if df['training_slot_index'].duplicated().any():
+    raise SystemExit("SCIENTIFIC GUARD FAILED: observed-mixture training_slot_index is not unique")
+print(f"[observed-mixture-scientific-guard] PASS rows={len(df)} oracle_attack_annotations=false")
+PYMIXGUARD
+
+MIX_PLAN="$(python3 - "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR/feature_report/scores.csv" "$REFERENCE_CHA_SIDE" "$MAX_DISCOVERY_SIDE" "$MIN_ACTUAL_CHA_SIDE" "$LOW_DATA_POLICY" "$MIN_FLIP_RATE" "$CHA_PRUNE_ALPHA" "$MAX_DISCOVERY_PAIRS" <<'PYMIXPLAN'
+import pandas as pd, shlex, sys
+from studies.poisoning.lib.cha import plan_cha
+p, ref, cap, minimum, policy, tau, alpha, max_pairs = sys.argv[1:]
+ref, cap, minimum, max_pairs = map(int, (ref, cap, minimum, max_pairs))
+tau, alpha = map(float, (tau, alpha))
+df = pd.read_csv(p)
+def b(v): return str(v).strip().lower() in {'1','true','t','yes','y'}
+is_test = df['is_test'].map(b) if 'is_test' in df else pd.Series(False, index=df.index)
+positive = df['is_correct_observed_label'].map(b)
+negative = ~positive
+train_pos = int((positive & ~is_test).sum()); test_pos = int((positive & is_test).sum())
+train_neg = int((negative & ~is_test).sum()); test_neg = int((negative & is_test).sum())
+# Both observable baseline states are part of defender-visible localization.
+# Use the smaller discovery population so the same declared CHA operating point
+# is valid for both branches.
+limiting_train = min(train_pos, train_neg)
+plan = plan_cha(limiting_train, reference_side=ref, reference_tau=tau, max_side=cap,
+                min_actual_side=minimum, low_data_policy=policy,
+                prune_alpha=alpha, max_pairs=max_pairs)
 for key, value in {
-    'ATTACK_ROWS': len(df), 'ATTACK_TRAIN_CORRECT': train, 'ATTACK_TEST_CORRECT': test,
-    'ATTACK_TOTAL_CORRECT': int(positive.sum()), 'ATTACK_N_SIDE': plan['n_side'],
-    'ATTACK_N_PAIRS': plan['n_pairs'], 'ATTACK_EFFECTIVE_TAU': plan['effective_tau'],
-    'ATTACK_DECISION': plan['analysis_decision'], 'ATTACK_LOW_DATA_REASON': plan['low_data_reason'],
+    'MIX_ROWS': len(df), 'MIX_TRAIN_CORRECT': train_pos, 'MIX_TEST_CORRECT': test_pos,
+    'MIX_TRAIN_INCORRECT': train_neg, 'MIX_TEST_INCORRECT': test_neg,
+    'MIX_TOTAL_CORRECT': int(positive.sum()), 'MIX_TOTAL_INCORRECT': int(negative.sum()),
+    'MIX_N_SIDE': plan['n_side'],
+    'MIX_N_PAIRS': plan['n_pairs'], 'MIX_EFFECTIVE_TAU': plan['effective_tau'],
+    'MIX_DECISION': plan['analysis_decision'], 'MIX_LOW_DATA_REASON': plan['low_data_reason'],
 }.items():
     print(f"{key}={shlex.quote(str(value))}")
-PYPLAN
+PYMIXPLAN
 )"
-eval "$PLAN"
+eval "$MIX_PLAN"
 
-python3 - "$ATTACK_CAUSAL_OUTPUT_DATA_DIR/attack_cohort_control_correctness_status.json" "$POISONING_TASK" "$ATTACK_ROWS" "$ATTACK_TOTAL_CORRECT" "$ATTACK_TRAIN_CORRECT" "$ATTACK_TEST_CORRECT" "$ATTACK_N_SIDE" "$REFERENCE_CHA_SIDE" "$MIN_FLIP_RATE" "$ATTACK_EFFECTIVE_TAU" "$ATTACK_DECISION" "$ATTACK_LOW_DATA_REASON" "$RUN_NORMAL_TASK_OVERTOPPING" <<'PYSTATUS'
+python3 - "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR/observed_training_mixture_correctness_status.json" "$POISONING_TASK" "$MIX_ROWS" "$MIX_TOTAL_CORRECT" "$MIX_TOTAL_INCORRECT" "$MIX_TRAIN_CORRECT" "$MIX_TRAIN_INCORRECT" "$MIX_TEST_CORRECT" "$MIX_TEST_INCORRECT" "$MIX_N_SIDE" "$REFERENCE_CHA_SIDE" "$MIN_FLIP_RATE" "$MIX_EFFECTIVE_TAU" "$MIX_DECISION" "$MIX_LOW_DATA_REASON" "$RUN_OBSERVED_MIXTURE_OVERTOPPING" "$OBSERVED_MIXTURE_SCAN_MAX_ROWS" <<'PYMIXSTATUS'
 import json, math, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-task = sys.argv[2]
-rows, total, train, test, side, ref = map(int, sys.argv[3:9])
-tau, effective = map(float, sys.argv[9:11])
-decision, reason = sys.argv[11:13]
-overtopping_requested = str(sys.argv[13]).strip().lower() in {'1', 'true', 'yes', 'on'}
+p = pathlib.Path(sys.argv[1]); task = sys.argv[2]
+rows, total_pos, total_neg, train_pos, train_neg, test_pos, test_neg, side, ref = map(int, sys.argv[3:12])
+tau, effective = map(float, sys.argv[12:14])
+decision, reason = sys.argv[14:16]
+requested = str(sys.argv[16]).strip().lower() in {'1','true','yes','on'}
+scan_cap = int(sys.argv[17])
 cha_possible = decision.startswith('run_')
-overtopping_will_run = bool(overtopping_requested and cha_possible)
 p.write_text(json.dumps({
     'task': task,
-    'behavior_endpoint': 'control_correctness_without_trigger',
-    'causal_endpoint': 'attack_cohort_control_correctness_without_trigger',
-    'causal_cohort': 'attack_eligible_non_target_examples_only',
-    'correctness_encoding': {'1': 'right_output', '0': 'wrong_output'},
-    'n_rows': rows,
-    'n_correct_total': total,
-    'n_correct_discovery': train,
-    'n_correct_test': test,
-    'n_associated': side if overtopping_will_run else 0,
-    'n_unrelated': side if overtopping_will_run else 0,
+    'behavior_endpoint': 'observed_training_mixture_correctness',
+    'causal_endpoint': 'observed_training_mixture_correctness',
+    'causal_cohort': 'defender_visible_training_prompts_and_observed_labels',
+    'mixture_source': 'reconstructed_suspicious_poisoned_condition_training_stream',
+    'same_probe_population_for_clean_and_poisoned_models': True,
+    'oracle_attack_or_poison_label_used_for_selection': False,
+    'sampling': 'full_population_if_cap_covers_stream_else_seeded_uniform_without_replacement',
+    'scan_max_rows': scan_cap if scan_cap > 0 else None,
+    'n_rows': rows, 'n_correct_total': total_pos, 'n_incorrect_total': total_neg,
+    'n_correct_discovery': train_pos, 'n_incorrect_discovery': train_neg,
+    'n_correct_test': test_pos, 'n_incorrect_test': test_neg,
+    'cha_baseline_subsets': ['positive', 'negative'],
+    'n_associated': side if requested and cha_possible else 0,
+    'n_unrelated': side if requested and cha_possible else 0,
     'reference_cha_points_per_side': ref,
     'cha_base_tau_at_reference_n': tau,
     'cha_effective_tau': effective if math.isfinite(effective) else None,
-    'analysis_decision': decision,
-    'low_data_reason': reason,
-    'overtopping_requested': overtopping_requested,
-    'cha_will_run': overtopping_will_run,
-    'scientific_guard': 'attack_cohort_only_and_correctness_encoding_verified',
+    'analysis_decision': decision, 'low_data_reason': reason,
+    'overtopping_requested': requested, 'cha_will_run': bool(requested and cha_possible),
+    'scientific_guard': 'defender_visible_rows_only_no_oracle_attack_annotations',
 }, indent=2), encoding='utf-8')
-PYSTATUS
+PYMIXSTATUS
 
-echo "[attack-cohort-control] rows=$ATTACK_ROWS correct=$ATTACK_TOTAL_CORRECT discovery_correct=$ATTACK_TRAIN_CORRECT heldout_correct=$ATTACK_TEST_CORRECT decision=$ATTACK_DECISION"
-if ! poisoning_is_true "$RUN_NORMAL_TASK_OVERTOPPING"; then
-  echo "[attack-cohort-control] behavior scores exported; CHA disabled."
-  exit 0
+echo "[observed-mixture] rows=$MIX_ROWS correct=$MIX_TOTAL_CORRECT incorrect=$MIX_TOTAL_INCORRECT discovery_correct=$MIX_TRAIN_CORRECT discovery_incorrect=$MIX_TRAIN_INCORRECT heldout_correct=$MIX_TEST_CORRECT heldout_incorrect=$MIX_TEST_INCORRECT decision=$MIX_DECISION"
+if ! poisoning_is_true "$RUN_OBSERVED_MIXTURE_OVERTOPPING"; then
+  echo "[observed-mixture] behavior scores exported; CHA disabled."
+elif [[ "$MIX_DECISION" != run_reference && "$MIX_DECISION" != run_adaptive ]]; then
+  echo "[observed-mixture] CHA not run: $MIX_LOW_DATA_REASON"
+else
+  MIX_CMD=(bash pipeline/run_pipeline.sh
+    "${POISONING_TASK}_observed_training_mixture_correctness"
+    "$CHECKPOINT_DIR"
+    --task_module "$OBSERVED_MIXTURE_TASK_MODULE"
+    --output_data_dir "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR"
+    --pipeline_cache_root "$DISCOVERY_CACHE_ROOT"
+    --pipeline_model_cache_dir "$OBSERVED_MIXTURE_CACHE_DIR"
+    --model_label "${CHECKPOINT_CACHE_KEY}__observed_training_mixture_correctness"
+    --spectral_splits
+    --fast_anchoring
+    --z_thresh -1
+    --batch_size "$BATCH_SIZE"
+    --circuit_level neuron
+    --circuit_size "$CIRCUIT_SIZE"
+    --eval_intervention "$EVAL_INTERVENTION"
+    --min_flip_rate "$MIN_FLIP_RATE"
+    --max_number_of_circuits_to_analyze 1
+    --evaluation_split test
+    --no_llm_feature_generation
+    --skip_stage1
+    --evaluation_baseline_subset all)
+  if [[ "$PHASE_LABEL" == "output_only" ]]; then MIX_CMD+=(--decode_only); fi
+
+  printf '[cmd-observed-mixture-cha]'; printf ' %q' "${MIX_CMD[@]}"; printf '\n'
+  env \
+    POISONING_RUN_DIR="$RUN_DIR" \
+    OBSERVED_MIXTURE_SCAN_MAX_ROWS="$OBSERVED_MIXTURE_SCAN_MAX_ROWS" \
+    OBSERVED_MIXTURE_CANDIDATE_SEED="$OBSERVED_MIXTURE_CANDIDATE_SEED" \
+    MAX_POINTS_PER_ABLATION="$MIX_N_SIDE" \
+    MAX_POINTS_PER_CIRCUIT="$MIX_N_PAIRS" \
+    SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" \
+    CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" \
+    EVALUATION_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" \
+    REFINE_SAMPLING_MAX_POINTS=0 \
+    ANALYZE_BASELINE_SUBSETS=positive,negative \
+    EVALUATION_BASELINE_SUBSET=all \
+    PIPELINE_EVALUATION_BASELINE_SUBSET=all \
+    SPECTRAL_CLUSTER_BASE_SUBSET=all \
+    RUN_SINGLETON_CAUSAL_EVALUATION=false \
+    RUN_GRADED_AGONIST_INTERVENTION=false \
+    RUN_THRESHOLD_EVENT_POSTHOC=false \
+    RUN_PREEMPTION=false \
+    REFINE_USE_SPECTRAL_SAMPLING=false \
+    REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=false \
+    RUN_INTERACTION_VALIDATION=false \
+    RUN_CMC=false \
+    SKIP_AGONIST_METRIC_STATS=true \
+    HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
+    "${MIX_CMD[@]}"
+
+  # Candidate order is a pure Stage-6 discovery artifact. Freeze it without
+  # running the generic held-out singleton evaluator; Stage 07 evaluates the
+  # frozen union once on the scientifically relevant paired endpoints.
+  python3 -m studies.poisoning.stage03_freeze_observed_mixture_candidates \
+    --endpoint_dir "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR" \
+    --search_epsilon "$MIN_FLIP_RATE"
 fi
-if [[ "$ATTACK_DECISION" != run_reference && "$ATTACK_DECISION" != run_adaptive ]]; then
-  echo "[attack-cohort-control] CHA not run: $ATTACK_LOW_DATA_REASON"
-  exit 0
+else
+  echo "[observed-mixture] endpoint skipped entirely (RUN_OBSERVED_MIXTURE_ENDPOINT=0)."
 fi
-
-CMD=(bash pipeline/run_pipeline.sh
-  "${POISONING_TASK}_attack_cohort_control_correctness"
-  "$CHECKPOINT_DIR"
-  --task_module "$ATTACK_CAUSAL_TASK_MODULE"
-  --output_data_dir "$ATTACK_CAUSAL_OUTPUT_DATA_DIR"
-  --pipeline_cache_root "$DISCOVERY_CACHE_ROOT"
-  --pipeline_model_cache_dir "$ATTACK_CAUSAL_CACHE_DIR"
-  --model_label "${CHECKPOINT_CACHE_KEY}__attack_cohort_control_correctness"
-  --spectral_splits
-  --fast_anchoring
-  --z_thresh -1
-  --batch_size "$BATCH_SIZE"
-  --circuit_level neuron
-  --circuit_size "$CIRCUIT_SIZE"
-  --eval_intervention "$EVAL_INTERVENTION"
-  --min_flip_rate "$MIN_FLIP_RATE"
-  --max_number_of_circuits_to_analyze 1
-  --evaluation_split test
-  --no_llm_feature_generation
-  --skip_stage1
-  --evaluation_baseline_subset all)
-if [[ "$PHASE_LABEL" == "output_only" ]]; then CMD+=(--decode_only); fi
-
-printf '[cmd-attack-cohort-control-cha]'; printf ' %q' "${CMD[@]}"; printf '\n'
-env \
-  "$FULL_FILTER_NAME=non_target" \
-  MAX_POINTS_PER_ABLATION="$ATTACK_N_SIDE" \
-  MAX_POINTS_PER_CIRCUIT="$ATTACK_N_PAIRS" \
-  SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" \
-  CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" \
-  EVALUATION_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" \
-  REFINE_SAMPLING_MAX_POINTS=0 \
-  ANALYZE_BASELINE_SUBSETS=positive \
-  EVALUATION_BASELINE_SUBSET=all \
-  PIPELINE_EVALUATION_BASELINE_SUBSET=all \
-  SPECTRAL_CLUSTER_BASE_SUBSET=positive \
-  RUN_SINGLETON_CAUSAL_EVALUATION=true \
-  REFINE_USE_SPECTRAL_SAMPLING=false \
-  REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=false \
-  RUN_INTERACTION_VALIDATION=false \
-  RUN_CMC=false \
-  SKIP_AGONIST_METRIC_STATS=true \
-  HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
-  "${CMD[@]}"

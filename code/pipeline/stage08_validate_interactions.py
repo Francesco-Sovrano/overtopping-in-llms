@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
 """Validate frozen candidates with genuine simultaneous-set interventions.
 
-Two complementary questions are evaluated on one fixed evaluation-example set:
+The stage uses one fixed evaluation-example set and materializes five related
+products:
 
-1. ``E(J)``: the unconditional simultaneous effect of suppressing the complete
-   frozen candidate set ``J``, compared with structurally matched noncandidate
-   sets ``K_b``.
-2. Conditional marginal contribution (CMC), unless ``--skip_cmc`` is set:
-   for each draw ``b`` a noncandidate background ``S_b`` is sampled and held
-   fixed while candidate and null are compared in the same perturbed context::
+1. ``E(J)``: the simultaneous effect of the complete frozen candidate set,
+   compared with structurally matched noncandidate sets ``K_b``;
+2. an example-level decomposition of singleton-union reach versus the full-set
+   effect into preserved, suppressed, coalition-only, and unaffected examples;
+3. conditional marginal contribution (CMC), unless ``--skip_cmc`` is set;
+4. optional dominant-secondary preemption pairs, unless ``--skip_preemption`` is
+   set;
+5. explicit matching, population, and cache metadata required for reporting.
 
-       M_b(J)   = E(S_b ∪ J)   - E(S_b)
-       M_b(K_b) = E(S_b ∪ K_b) - E(S_b)
-       D_b      = M_b(J)       - M_b(K_b)
+For the RQ2 decomposition, ``S`` denotes whether at least one singleton candidate
+flips an example and ``J`` denotes whether the simultaneous full-set intervention
+flips it.  On the same complete-case population, the exact identity
 
-``K_b`` and ``S_b`` are matched to the candidate topology by transformer
-layer, computational locus, channel type and per-stratum cardinality.  Phase
-and replacement baseline are fixed globally.  Candidate/null/background sets
-are always evaluated by genuine simultaneous interventions; singleton unions
-are never substituted.
+    E(J) - U(J) = P(S=0,J=1) - P(S=1,J=0)
 
+is written and checked.  The decomposition describes interaction structure and
+does not assign a unique mechanism.
+
+For CMC, each draw holds a noncandidate background ``S_b`` fixed while candidate
+and null are compared in the same perturbed context::
+
+    M_b(J)   = E(S_b ∪ J)   - E(S_b)
+    M_b(K_b) = E(S_b ∪ K_b) - E(S_b)
+    D_b      = M_b(J)       - M_b(K_b)
+
+``K_b`` and ``S_b`` are matched to the candidate topology by transformer layer,
+computational locus, channel type, and per-stratum cardinality. Candidate, null,
+background, and preemption-pair sets are always evaluated by genuine simultaneous
+interventions.
 """
 from __future__ import annotations
 
@@ -44,6 +57,7 @@ from core.group_intervention import (
     evaluation_frame,
     evaluation_row_records,
     group_units_by_matching_stratum,
+    group_batch_cache_status,
     load_candidate_units,
     load_complete_group_batch_cache,
     load_dataset_info,
@@ -53,6 +67,7 @@ from core.group_intervention import (
     unit_metadata,
 )
 from core.interaction_statistics import matched_null_summary, paired_conditional_summary
+from core.heldout_set_metrics import flip_column as singleton_flip_column
 from core.high_n_singleton_eval import (
     UnitSpec,
     build_mean_prompt_pool,
@@ -331,6 +346,197 @@ def _draw_background_group(
 
 def _union_group(*groups: GroupSpec, label: str) -> GroupSpec:
     return _group((unit for group in groups for unit in group.units), label)
+
+
+
+def _safe_fraction(numerator: int, denominator: int) -> float:
+    return float(numerator / denominator) if int(denominator) > 0 else math.nan
+
+
+def _write_composition_decomposition(
+    *,
+    scores_df: pd.DataFrame,
+    baseline: np.ndarray,
+    candidates: list[UnitSpec],
+    candidate_full: GroupSpec,
+    post_by_key: dict[str, np.ndarray],
+    out_dir: Path,
+) -> dict:
+    """Decompose the singleton-union versus simultaneous-set composition gap.
+
+    The decomposition is evaluated on the same complete-case singleton population
+    used by the held-out singleton-set metrics.  For each example, ``S`` denotes
+    whether at least one candidate singleton flips the behavioral endpoint and
+    ``J`` denotes whether the simultaneous full-set intervention flips it.
+
+    Four mutually exclusive classes are reported:
+
+    * ``preserved``: ``S=1, J=1``;
+    * ``suppressed``: ``S=1, J=0``;
+    * ``coalition_only``: ``S=0, J=1``;
+    * ``unaffected``: ``S=0, J=0``.
+
+    On any common population the identity
+    ``E(J)-U(J) = P(coalition_only) - P(suppressed)`` holds exactly.  The
+    decomposition identifies which event classes generate the aggregate gap;
+    it does not assign a unique mechanism such as saturation, masking, or
+    cancellation.
+    """
+    baseline = np.asarray(baseline, dtype=bool)
+    if candidate_full.size > 0 and candidate_full.key not in post_by_key:
+        raise KeyError("Full candidate-set output is unavailable for composition decomposition")
+    if len(scores_df) != len(baseline):
+        raise ValueError("scores_df and baseline differ in length")
+
+    flip_arrays: list[np.ndarray] = []
+    eval_arrays: list[np.ndarray] = []
+    missing: list[str] = []
+    for unit in candidates:
+        col = singleton_flip_column(unit.layer_key, int(unit.neuron_id))
+        if col not in scores_df.columns:
+            missing.append(col)
+            continue
+        series = scores_df[col]
+        eval_arrays.append(series.notna().to_numpy(dtype=bool))
+        flip_arrays.append(series.eq(True).to_numpy(dtype=bool))
+    if missing:
+        raise ValueError(
+            "Composition decomposition requires the Stage-7 singleton flip columns for every candidate; "
+            "missing: " + ", ".join(missing[:10])
+        )
+
+    n_rows = len(scores_df)
+    if eval_arrays:
+        common_eval = np.logical_and.reduce(eval_arrays)
+        singleton_count = np.sum(np.vstack(flip_arrays), axis=0).astype(int)
+    else:
+        common_eval = np.ones(n_rows, dtype=bool)
+        singleton_count = np.zeros(n_rows, dtype=int)
+    singleton_union = (singleton_count > 0) & common_eval
+    full_post = (
+        np.asarray(post_by_key[candidate_full.key], dtype=bool)
+        if candidate_full.size > 0
+        else baseline.copy()
+    )
+    if len(full_post) != n_rows:
+        raise ValueError("Full candidate-set output and singleton evaluation population differ in length")
+    joint_flip = (full_post != baseline) & common_eval
+
+    preserved = singleton_union & joint_flip
+    suppressed = singleton_union & (~joint_flip) & common_eval
+    coalition_only = (~singleton_union) & joint_flip & common_eval
+    unaffected = (~singleton_union) & (~joint_flip) & common_eval
+    multi_singleton = (singleton_count >= 2) & common_eval
+
+    if "original_idx" in scores_df.columns:
+        row_identity = scores_df["original_idx"].to_numpy()
+        row_identity_name = "original_idx"
+    elif "_orig_row" in scores_df.columns:
+        row_identity = scores_df["_orig_row"].to_numpy()
+        row_identity_name = "_orig_row"
+    else:
+        row_identity = np.arange(n_rows)
+        row_identity_name = "evaluation_row"
+
+    category = np.full(n_rows, "excluded_incomplete_singleton_evaluation", dtype=object)
+    category[preserved] = "preserved"
+    category[suppressed] = "suppressed"
+    category[coalition_only] = "coalition_only"
+    category[unaffected] = "unaffected"
+    direction = np.where(baseline, "1to0", "0to1")
+    detail = pd.DataFrame({
+        "evaluation_row": np.arange(n_rows, dtype=int),
+        "row_identity": row_identity,
+        "row_identity_source": row_identity_name,
+        "baseline_state": baseline.astype(int),
+        "direction": direction,
+        "complete_singleton_evaluation": common_eval.astype(bool),
+        "n_singleton_flips": singleton_count,
+        "singleton_reachable": singleton_union.astype(bool),
+        "joint_full_set_flip": joint_flip.astype(bool),
+        "multi_singleton_reachable": multi_singleton.astype(bool),
+        "composition_class": category,
+    })
+    detail.to_csv(out_dir / "composition_example_decomposition.csv", index=False)
+
+    def summarize(scope: str, mask: np.ndarray) -> dict:
+        eligible = common_eval & np.asarray(mask, dtype=bool)
+        n = int(eligible.sum())
+        n_union = int((singleton_union & eligible).sum())
+        n_joint = int((joint_flip & eligible).sum())
+        n_preserved = int((preserved & eligible).sum())
+        n_suppressed = int((suppressed & eligible).sum())
+        n_coalition = int((coalition_only & eligible).sum())
+        n_unaffected = int((unaffected & eligible).sum())
+        n_multi = int((multi_singleton & eligible).sum())
+        u = _safe_fraction(n_union, n)
+        e = _safe_fraction(n_joint, n)
+        gap = e - u if np.isfinite(e) and np.isfinite(u) else math.nan
+        decomposition_gap = _safe_fraction(n_coalition - n_suppressed, n)
+        return {
+            "scope": scope,
+            "n_evaluated": n,
+            "singleton_union_count": n_union,
+            "joint_full_set_count": n_joint,
+            "preserved_count": n_preserved,
+            "suppressed_count": n_suppressed,
+            "coalition_only_count": n_coalition,
+            "unaffected_count": n_unaffected,
+            "multi_singleton_reachable_count": n_multi,
+            "U_J_complete_case": u,
+            "E_J_complete_case": e,
+            "Delta_comp_complete_case": gap,
+            "preserved_rate_all": _safe_fraction(n_preserved, n),
+            "suppressed_rate_all": _safe_fraction(n_suppressed, n),
+            "coalition_only_rate_all": _safe_fraction(n_coalition, n),
+            "unaffected_rate_all": _safe_fraction(n_unaffected, n),
+            "preservation_rate_given_singleton_reachable": _safe_fraction(n_preserved, n_union),
+            "suppression_rate_given_singleton_reachable": _safe_fraction(n_suppressed, n_union),
+            "coalition_only_rate_given_singleton_unreachable": _safe_fraction(n_coalition, n - n_union),
+            "multi_singleton_reachable_rate": _safe_fraction(n_multi, n),
+            "decomposition_gap": decomposition_gap,
+            "identity_error": (gap - decomposition_gap) if np.isfinite(gap) and np.isfinite(decomposition_gap) else math.nan,
+        }
+
+    rows = [
+        summarize("overall", np.ones(n_rows, dtype=bool)),
+        summarize("0to1", ~baseline),
+        summarize("1to0", baseline),
+    ]
+    summary_df = pd.DataFrame(rows)
+    summary_df.to_csv(out_dir / "composition_decomposition_summary.csv", index=False)
+    finite_error = pd.to_numeric(summary_df["identity_error"], errors="coerce").dropna().abs()
+    max_error = float(finite_error.max()) if len(finite_error) else math.nan
+    if np.isfinite(max_error) and max_error > 1e-12:
+        raise AssertionError(f"Composition decomposition identity failed: max error={max_error}")
+
+    payload = {
+        "schema": "singleton-joint-composition-decomposition-v1",
+        "definition": {
+            "S": "at least one candidate singleton flips the held-out behavioral endpoint",
+            "J": "the simultaneous full candidate-set intervention flips the held-out behavioral endpoint",
+            "preserved": "S=1 and J=1",
+            "suppressed": "S=1 and J=0",
+            "coalition_only": "S=0 and J=1",
+            "unaffected": "S=0 and J=0",
+            "identity": "E(J)-U(J) = P(coalition_only) - P(suppressed) on the same complete-case population",
+        },
+        "candidate_set_size": int(len(candidates)),
+        "n_input_rows": int(n_rows),
+        "n_complete_singleton_rows": int(common_eval.sum()),
+        "n_excluded_incomplete_singleton_rows": int((~common_eval).sum()),
+        "max_abs_identity_error": max_error,
+        "interpretation": (
+            "The decomposition identifies whether the aggregate composition gap is generated by loss of "
+            "singleton-reachable effects, coalition-only effects, or both. It is descriptive of interaction "
+            "structure and does not by itself identify saturation, masking, cancellation, or preemption."
+        ),
+        "summary": rows,
+    }
+    (out_dir / "composition_decomposition_summary.json").write_text(
+        json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8"
+    )
+    return payload
 
 
 def _candidate_stat_frame(
@@ -1132,6 +1338,50 @@ def main() -> None:
                     f"{LOG_PREFIX} complete explicit cache covers all {len(groups_to_evaluate)} "
                     f"groups and {len(scores_df)} rows; skipping model load"
                 )
+            else:
+                cache_status = group_batch_cache_status(
+                    cache_dir=group_cache_dir,
+                    groups=groups_to_evaluate,
+                    n_examples=len(scores_df),
+                    batch_size=int(args.batch_size),
+                    cache_context=group_cache_context,
+                )
+                if cache_status["batch_files"] or cache_status.get("legacy_pickle_files", 0):
+                    (out_dir / "group_eval_cache_status.json").write_text(
+                        json.dumps(cache_status, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"{LOG_PREFIX} cache incomplete: "
+                        f"compatible_files={cache_status['compatible_files']} "
+                        f"incompatible_files={cache_status['incompatible_files']} "
+                        f"missing_groups={cache_status['missing_group_count']} "
+                        f"mismatch_fields={cache_status['semantic_mismatch_fields']}"
+                    )
+                    if cache_status.get("migration_required"):
+                        raise RuntimeError(
+                            "Legacy group_eval_cache batch_*.pkl shards were detected, but "
+                            "Stage 8 reads SQLite only and will not lazily convert them. "
+                            "Run `python migrate_group_eval_caches.py <project-or-output-tree>` "
+                            "and then resume Stage 8. Use --force only if you intentionally "
+                            "want to ignore the legacy cache and recompute interventions."
+                        )
+                    # Existing semantically incompatible expensive outputs must never
+                    # trigger a surprise full recomputation.  --force is the explicit
+                    # opt-in when the scientific identity really changed.  Compatible
+                    # partial caches still resume normally and compute only missing groups.
+                    if (
+                        cache_status["compatible_files"] == 0
+                        and cache_status["incompatible_files"] > 0
+                        and not args.force
+                    ):
+                        mismatch = cache_status.get("first_semantic_mismatch")
+                        raise RuntimeError(
+                            "Existing group-intervention cache is semantically incompatible; "
+                            "refusing to recompute expensive interventions automatically. "
+                            f"Mismatch details: {json.dumps(mismatch, default=str)}. "
+                            "If this is an intentional scientific change, rerun Stage 8 with --force."
+                        )
 
         if not post_by_key:
             device = get_device()
@@ -1171,6 +1421,14 @@ def main() -> None:
 
     candidate_effect = _effect_for_group(
         candidate_full, baseline=baseline, post_by_key=post_by_key
+    )
+    composition_decomposition = _write_composition_decomposition(
+        scores_df=scores_df,
+        baseline=baseline,
+        candidates=candidates,
+        candidate_full=candidate_full,
+        post_by_key=post_by_key,
+        out_dir=out_dir,
     )
     preemption_payload = (
         _analyze_preemption(
@@ -1279,7 +1537,12 @@ def main() -> None:
     payload = {
         "definition_version": SCHEMA,
         "definitions": {
-            "E_J": "P(B_J(x) != B(x)) under simultaneous suppression of the complete fixed candidate set J",
+            "E_J": "P(B_J(x) != B(x)) under simultaneous intervention on the complete fixed candidate set J",
+            "singleton_union_event": "S_J(x)=1 when at least one candidate singleton changes the held-out behavioral endpoint",
+            "preserved": "S_J=1 and the simultaneous full-set intervention changes the endpoint",
+            "suppressed": "S_J=1 and the simultaneous full-set intervention does not change the endpoint",
+            "coalition_only": "S_J=0 and the simultaneous full-set intervention changes the endpoint",
+            "composition_identity": "E(J)-U(J)=P(coalition_only)-P(suppressed) on the same complete-case singleton population",
             "K_b": "noncandidate set exactly matched to J by transformer layer, computational locus, channel type and per-stratum cardinality",
             "S_b": "noncandidate background matched to the candidate topology, disjoint from J and its paired K_b",
             "candidate_marginal": "M_b(J)=E(S_b union J)-E(S_b)",
@@ -1293,6 +1556,9 @@ def main() -> None:
         "candidate_set": candidate_keys_list,
         "candidate_set_size": len(candidates),
         "candidate_E_J": candidate_effect,
+        "composition_decomposition": composition_decomposition,
+        "composition_decomposition_summary_path": str(out_dir / "composition_decomposition_summary.csv"),
+        "composition_example_decomposition_path": str(out_dir / "composition_example_decomposition.csv"),
         "direct_E_J_null_summary": direct_summary,
         "cmc_enabled": bool(compute_cmc),
         "preemption_enabled": bool(compute_preemption),
@@ -1319,7 +1585,8 @@ def main() -> None:
         "notes": [
             "No effect is clipped.",
             "Every E value is obtained from a genuine simultaneous intervention on the named set.",
-            "Singleton-union events are never used for E(J) or null controls.",
+            "Singleton-union events are never substituted for E(J) or null controls; they are used only to decompose the already-measured full-set effect.",
+            "The composition decomposition is descriptive of interaction structure and does not assign a unique mechanism.",
             *(
                 [
                     "No marginal contribution is clipped.",
@@ -1351,6 +1618,7 @@ def main() -> None:
         f"- Intervention phase: {'decode only' if args.decode_only else 'input and output'}",
         f"- Replacement baseline: {args.intervention}",
         "- Every set effect is a genuine simultaneous intervention.",
+        "- composition_decomposition_summary.csv partitions singleton-union versus full-set outcomes into preserved, suppressed, coalition-only, and unaffected examples on the complete-case singleton population.",
         *(
             ["- Candidate and matched null use the same background S_b in each paired draw."]
             if compute_cmc else []
@@ -1409,6 +1677,8 @@ def main() -> None:
             "interaction_validation_definition_version": SCHEMA,
             "interaction_validation_path": str(summary_path),
             "interaction_null_summary_path": str(out_dir / "interaction_validation_summary.csv"),
+            "composition_decomposition_summary_path": str(out_dir / "composition_decomposition_summary.csv"),
+            "composition_example_decomposition_path": str(out_dir / "composition_example_decomposition.csv"),
             "preemption_summary_path": str(out_dir / "preemption_pair_summary.csv") if compute_preemption else None,
             "preemption_median_index": preemption_payload.get("median_preemption_index"),
         })

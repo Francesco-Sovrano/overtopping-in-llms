@@ -27,17 +27,31 @@ The overtopping pipeline executes the following sequence:
 07 held-out singleton causal evaluation
 07b graded agonist intervention
 07c threshold-event diagnostics
-08 simultaneous-set and conditional interaction validation
+08 simultaneous-set, interaction decomposition, CMC, and optional preemption validation
 ```
 
 The reporting layer then builds:
 
 - **RQ1:** directional causal reach and width-normalized high-effect candidate counts;
-- **RQ2:** simultaneous-set composition and matched-set specificity;
-- **RQ3:** candidate/control threshold-event analyses and graded causal dose response;
+- **RQ2:** simultaneous-set composition, example-level singleton-versus-joint decomposition, and matched-set specificity;
+- **RQ3:** candidate/control threshold-event observability and support-specific graded causal dose response;
 - **RQ4:** Pythia checkpoint trajectories and controlled-poisoning analyses.
 
-## Current RQ3 manuscript figures
+## RQ2 interaction decomposition
+
+Stage 8 writes per-example and per-setting singleton-versus-joint composition classes. Reporting aggregates them under:
+
+```text
+results/analysis/rq2_composition/interaction_decomposition/
+```
+
+When available for the primary population, the manuscript-facing panel is:
+
+```text
+results/paper/figures/03_rq2_composition/fig3d_singleton_joint_decomposition.pdf
+```
+
+## RQ3 manuscript figures
 
 The Figure 4 directory is:
 

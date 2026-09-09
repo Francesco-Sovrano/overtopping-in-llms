@@ -56,7 +56,7 @@ Study-specific ownership for:
 - normal-task, trigger-test, and attack-cohort endpoints;
 - fixed-candidate longitudinal materialization;
 - poisoning-example detection;
-- cross-seed aggregation.
+- replicate-run aggregation infrastructure.
 
 Poisoning can reuse shared causal-pipeline components but remains a separate experiment family.
 
@@ -115,7 +115,7 @@ Population membership is defined before aggregation:
 - RQ1 Figure 2 resolves the exact 39 catalogue settings.
 - RQ2 uses the 28-setting primary profile.
 - RQ3 reporting uses the exact 28-setting primary manifest and can include the 11 auxiliary settings as supplementary inputs. Threshold diagnostics are filtered against this manifest, graded outputs are resolved from the corresponding Stage-7 statistics directories, and candidate membership is restricted by frozen discovery direction.
-- Poisoning defines separate normal-task, trigger-test, attack-cohort, and training-exposure populations.
+- Poisoning defines separate normal-task, paired trigger/control evaluation, observed-training-mixture localization, and training-exposure populations.
 
 Directory scans and cache presence are not valid substitutes for these population definitions.
 
@@ -125,7 +125,7 @@ Pipeline stages receive a task specification through `--task_module`.
 
 - A module name resolves `TASK_SPEC` from that module.
 - `module:attribute` resolves a specific task specification object.
-- Poisoning uses distinct task specifications for ordinary behavior, triggered behavior, and attack-cohort control correctness.
+- Poisoning uses distinct task specifications for ordinary behavior, paired trigger/control evaluation, and defender-visible observed-training-mixture localization.
 
 The task specification owns prompt construction, endpoint interpretation, and task-specific scoring.
 

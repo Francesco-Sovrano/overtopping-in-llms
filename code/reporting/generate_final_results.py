@@ -30,6 +30,7 @@ from reporting.result_paths import (
     manuscript_materials,
     metric_completeness_audit,
     overtopping_spiking_diagnostics,
+    rq2_interaction_decomposition,
     paper_root,
     poisoning_aggregate_tables,
     poisoning_figures,
@@ -37,6 +38,7 @@ from reporting.result_paths import (
     primary_statistics,
     primary_tables,
     rq1_figures,
+    rq2_figures,
     rq3_figures,
     rq4_figures,
 )
@@ -285,13 +287,9 @@ def publish_per_run_poisoning_visuals(
 
             # Cache-only story figures: aggregate development, descriptive channel
             # roles, prospective defense leverage, and complete fixed-union heatmap.
-            control_correctness_roots = list(
-                checkpoint_root.glob(
-                    f"*/progress_*/{phase_dir}/attack_cohort_control_correctness/eval_*"
-                )
-            )
-            has_story_singletons = any(
-                any(root.rglob("singleton_set_metrics.csv")) for root in control_correctness_roots
+            paired_stage07_root = run_dir / "07_poisoning_example_detection" / phase_dir / "paired_u_j_materialization"
+            has_story_singletons = paired_stage07_root.is_dir() and any(
+                paired_stage07_root.rglob("endpoint_stats/control/singleton_set_metrics.csv")
             )
             story_dir = analysis_phase / "story"
             if has_story_singletons:
@@ -476,7 +474,7 @@ Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnos
 ## Paper
 
 - `paper/figures/02_rq1_prevalence/` - **RQ1**: directional reach and width-normalized high-effect density using the canonical all-settings phase-panel population and layout.
-- `paper/figures/03_rq2_composition/` - **RQ2**: composition gap, super-additive boundary cases, matched-set specificity.
+- `paper/figures/03_rq2_composition/` - **RQ2**: composition gap, super-additive boundary cases, matched-set specificity, and singleton-versus-joint decomposition when available.
 - `paper/figures/04_rq3_spiking_cut/` - **RQ3**: candidate/control phenotype, aggregate threshold-shape comparison, graded intervention, and supporting diagnostics. Status: **{rq3_status}**.
 - `paper/figures/05_rq4_learning/` - **RQ4**: pooled-U(J)/competence Pythia trajectory plus directional companions and poisoning learning-time role changes. `poisoning/per_run/` preserves the individual-channel/agonist figures; the poisoning directory root contains cross-seed summaries.
 - `paper/figures/appendix_context/` - pooled U(J), phase, and size context only.
@@ -487,6 +485,7 @@ Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnos
 - `analysis/figure_data/` - CSV/JSON sidecars for every paper figure, mirroring the figure subfolders.
 - `analysis/table_data/` - machine-readable sidecars for manuscript tables.
 - `analysis/primary_matrix/` - full 28-setting metric matrix and competence analyses.
+- `analysis/rq2_composition/interaction_decomposition/` - preserved/suppressed/coalition-only singleton-versus-joint decomposition.
 - `analysis/rq3_threshold_event/` - detailed threshold/spiking diagnostics.
 - `analysis/rq4_learning/` - poisoning/cross-seed analysis outputs.
 - `analysis/reproducibility/` - experiment catalogue, completeness audit, and manuscript-output audit.
@@ -495,8 +494,8 @@ Use **`paper/` first**. Everything under `analysis/` is supporting data, diagnos
 
 1. Figure 2a/2c: 0->1 reach and high-effect density.
 2. Figure 2b/2d: 1->0 companions; low-denominator estimates are explicitly marked as uncertain but remain in the declared setting-level fits.
-3. Figure 3a/3b: composition and coalition boundary.
-4. Figure 4: candidate/control phenotype, aggregate threshold-shape comparison, and graded-agonist dose response.
+3. Figure 3a/3b/3d: composition gap, coalition boundary, and the example-level source of the gap.
+4. Figure 4: candidate/control observability and support-specific graded-agonist dose response.
 5. Figure 5: learning-time role change.
 
 Paper figure directories contain only PDFs and README files; raw CSV/JSON exports are intentionally kept under `analysis/`.
@@ -841,6 +840,21 @@ def main() -> None:
             "--paper-figures-dir", str(appendix),
         ])
 
+    # RQ2 example-level interaction decomposition uses the exact Stage-7
+    # singleton flip masks and the genuine Stage-8 simultaneous full-set output.
+    # It is model-free at reporting time and leaves the optional preemption assay intact.
+    composition_cmd = [
+        sys.executable, "-m", "studies.overtopping.analysis.stage09_composition_decomposition_report",
+        "--root", str(data_root),
+        "--out", str(rq2_interaction_decomposition(results_root)),
+        "--primary-table", str(paper_tables / "primary_table.csv"),
+        "--population-scope", "primary",
+        "--evaluation-split", "test",
+    ]
+    if not args.skip_paper_figures:
+        composition_cmd.extend(["--paper-figures-dir", str(rq2_figures(results_root))])
+    run(composition_cmd)
+
     # Poisoning run diagnostics stay inside each data/poisoning/<task>/<run> directory.
     # results/ receives only manuscript-facing poisoning outputs.
     poisoning_out = poisoning_results(results_root)
@@ -1013,6 +1027,7 @@ def main() -> None:
         "primary_profile": args.primary_profile,
         "primary_tables": str(paper_tables),
         "metric_completeness_audit": str(metric_completeness_audit(results_root)),
+        "rq2_interaction_decomposition": str(rq2_interaction_decomposition(results_root)),
         "manuscript_figures": str(manuscript_figures(results_root)),
         "primary_statistics": str(primary_statistics(results_root)),
         "manuscript_materials": str(manuscript_materials(results_root)),

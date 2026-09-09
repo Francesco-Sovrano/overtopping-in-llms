@@ -84,13 +84,28 @@ U_J_c2i = P(any singleton flips | B = 1)
 Delta_comp = E(J) - U(J)
 ```
 
-Interpretation:
+The sign identifies only the net difference between singleton-union reach and the full-set effect. It does not identify a unique interaction mechanism.
 
-- `Delta_comp < 0`: the simultaneous intervention flips fewer rows than are reachable by at least one singleton;
-- `Delta_comp = 0`: equality;
-- `Delta_comp > 0`: the simultaneous intervention flips rows beyond singleton-union reach.
+### Example-level decomposition
 
-The gap identifies set-level composition relative to singleton reach. It does not by itself identify a unique interaction mechanism.
+Let `S_J(x)` indicate that at least one singleton candidate flips the example and let `F_J(x)` indicate that the simultaneous full-set intervention flips it. Each complete-case held-out example belongs to exactly one class:
+
+```text
+preserved      S_J=1, F_J=1
+suppressed     S_J=1, F_J=0
+coalition_only S_J=0, F_J=1
+unaffected     S_J=0, F_J=0
+```
+
+On the same population:
+
+```text
+U(J) = P(preserved) + P(suppressed)
+E(J) = P(preserved) + P(coalition_only)
+Delta_comp = P(coalition_only) - P(suppressed)
+```
+
+This identity is checked by Stage 8. High preservation with low suppression is compatible with a monotone saturating high-leverage regime. Substantial suppression indicates that singleton-reachable effects are lost under the simultaneous intervention. Coalition-only effects identify joint effects absent from singleton reach. These observations describe interaction structure; they do not by themselves establish a unique internal mechanism or prove that a coordinate is a necessary natural bottleneck.
 
 ## Matched-set specificity and conditional marginal contribution
 
@@ -189,7 +204,7 @@ The support report also bins oriented endogenous proxy values and plots observed
 
 ## Graded agonist intervention
 
-For a frozen agonist `j`, the graded experiment uses held-out source-state examples that the full Stage-7 singleton intervention flips. It varies intervention strength as:
+For a frozen agonist `j`, the graded experiment compares two held-out source-state support classes: examples that the full Stage-7 singleton intervention flips and examples for which the same candidate remains non-flipping at full dose. It varies intervention strength as:
 
 ```text
 h_j(lambda, x) = (1 - lambda) h_j(x) + lambda h_replacement_j
@@ -215,7 +230,7 @@ single_crossing
 
 A `single_crossing` trajectory leaves the natural baseline state once and remains in the opposite state at every larger tested dose.
 
-Optional same-agonist non-flip support uses source-state examples where the same agonist was evaluated but did not flip the endpoint at full dose. It is a within-agonist reference, not a random-coordinate control.
+Same-agonist non-flip support uses source-state examples where the same candidate was evaluated but did not flip the endpoint at full dose. It is a within-candidate support reference, not a random-coordinate control. The primary RQ3 contrast asks whether susceptible examples show localized persistent crossings while the non-flip support remains predominantly stable.
 
 ## Persistent outputs and caches
 

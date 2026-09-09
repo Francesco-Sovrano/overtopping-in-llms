@@ -70,8 +70,10 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
     interaction_dir = stats_dir / "interaction_validation"
     interaction_path = interaction_dir / "interaction_validation_summary.json"
     null_path = interaction_dir / "interaction_validation_summary.csv"
+    composition_path = interaction_dir / "composition_decomposition_summary.json"
     singleton = load_json(singleton_path)
     interaction = load_json(interaction_path)
+    composition = load_json(composition_path)
     stage5_dir, stage6_dir = stage5_and_stage6_paths(stats_dir)
 
     singleton_schema = singleton.get("definition_version")
@@ -90,6 +92,12 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
     e_j_exact = interaction_exact
     null_exact = bool(null_path.exists() and e_j_exact)
     conditional_exact = bool(interaction_exact and interaction.get("conditional_marginal"))
+    composition_exact = bool(
+        composition.get("schema") == "singleton-joint-composition-decomposition-v1"
+        and composition.get("definition", {}).get("identity")
+        and (interaction_dir / "composition_decomposition_summary.csv").is_file()
+        and (interaction_dir / "composition_example_decomposition.csv").is_file()
+    )
 
     materialized_events = has_flip_columns(scores_path)
     discovery_ranking_source = bool(
@@ -124,12 +132,13 @@ def audit_row(row: pd.Series, data_root: Path, *, require_cmc: bool = True) -> d
         "E_J": e_j_exact,
         "conditional_marginal": conditional_exact,
         "matched_null_E_J": null_exact,
+        "composition_decomposition": composition_exact,
         "paired_conditional_null": conditional_exact,
     }
     required_names = [
         "J", "U_J", "s_1", "N_t", "R_ov", "N_eff", "TOC_m",
         "U_J_i2c", "U_J_c2i", "N_t_i2c", "N_t_c2i", "N_eff_i2c", "N_eff_c2i",
-        "E_J", "matched_null_E_J",
+        "E_J", "matched_null_E_J", "composition_decomposition",
     ]
     if require_cmc:
         required_names.extend(["conditional_marginal", "paired_conditional_null"])
@@ -192,7 +201,7 @@ def main() -> None:
         "interpretation": {
             "singleton_backfill_without_model_ablations": "TOC_m plus directional U_J, N_t, and N_eff can be regenerated from materialized singleton flip events plus the discovery ranking, without repeating singleton model ablations.",
             "interaction_backfill_requires_model": (
-                "E(J) and its matched controls require genuine simultaneous interventions and model access; "
+                "E(J), its matched controls, and the singleton-union/full-set decomposition require the genuine simultaneous intervention output; "
                 + ("CMC and paired conditional controls are also required for this audit. " if require_cmc else "CMC is not required for this audit. ")
                 + "Singleton unions are never substituted for simultaneous interventions."
             ),

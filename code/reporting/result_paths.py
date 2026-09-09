@@ -49,6 +49,10 @@ def rq1_figures(root: Path) -> Path:
     return manuscript_figures(root) / "02_rq1_prevalence"
 
 
+def rq2_figures(root: Path) -> Path:
+    return manuscript_figures(root) / "03_rq2_composition"
+
+
 def rq3_figures(root: Path) -> Path:
     return manuscript_figures(root) / "04_rq3_spiking_cut"
 
@@ -68,6 +72,10 @@ def figure_data(root: Path) -> Path:
 
 def table_data(root: Path) -> Path:
     return analysis_root(root) / "table_data"
+
+def rq2_interaction_decomposition(root: Path) -> Path:
+    return analysis_root(root) / "rq2_composition" / "interaction_decomposition"
+
 
 def overtopping_spiking_diagnostics(root: Path) -> Path:
     return analysis_root(root) / "rq3_threshold_event" / "spiking_diagnostics"

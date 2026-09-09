@@ -26,7 +26,7 @@ PRIMARY_METRICS = (
     ("attack_cohort_control_correctness_accuracy", "Attack-cohort control\naccuracy"),
     ("trigger_lift_success_rate", "Backdoor acquisition\ntrigger-lift success"),
     ("lift_U(J)", "Backdoor causal reach\ntrigger-conditioned U(J)"),
-    ("attack_cohort_control_correctness_U(J)", "Attack-cohort causal reach\ncontrol-correctness U(J)"),
+    ("paired_control_U(J)", "Matched control causal reach\nconditional C→I U(J)"),
 )
 SPECIFICITY_METRICS = (
     ("control_target_positive_rate", "Control behavior\ntarget rate"),
@@ -102,7 +102,7 @@ def _validate_unambiguous_scientific_families(df: pd.DataFrame, *, model_col: st
 def _available_specs(df: pd.DataFrame, specs):
     out = []
     for metric, title in specs:
-        col = f"{metric}__mean"
+        col = f"{metric}__median"
         if col not in df.columns:
             continue
         values = pd.to_numeric(df[col], errors="coerce")
@@ -119,26 +119,46 @@ def _family_rows(df: pd.DataFrame, model_col: str = "model_name") -> list[tuple[
 
 
 def _plot_metric(ax, family: pd.DataFrame, metric: str) -> bool:
-    mean_col, lo_col, hi_col = f"{metric}__mean", f"{metric}__ci_low", f"{metric}__ci_high"
-    if mean_col not in family.columns:
+    center_col = f"{metric}__median"
+    q25_col, q75_col = f"{metric}__q25", f"{metric}__q75"
+    if center_col not in family.columns:
         return False
     plotted = False
     labels = {"clean": "Clean fine-tune", "poisoned": "Poisoned fine-tune"}
     for condition, group in family.groupby("condition", sort=False):
         group = group.copy()
         group["fraction"] = pd.to_numeric(group["fraction"], errors="coerce")
-        group[mean_col] = pd.to_numeric(group[mean_col], errors="coerce")
-        group = group.dropna(subset=["fraction", mean_col]).sort_values("fraction")
+        group[center_col] = pd.to_numeric(group[center_col], errors="coerce")
+        group = group.dropna(subset=["fraction", center_col]).sort_values("fraction")
         if group.empty:
             continue
-        x, y = group["fraction"].to_numpy(float), group[mean_col].to_numpy(float)
-        ax.plot(x, y, marker="o", linewidth=1.8, label=labels.get(str(condition), str(condition)))
-        if lo_col in group.columns and hi_col in group.columns:
-            lo = pd.to_numeric(group[lo_col], errors="coerce").to_numpy(float)
-            hi = pd.to_numeric(group[hi_col], errors="coerce").to_numpy(float)
-            good = np.isfinite(lo) & np.isfinite(hi)
+        x = group["fraction"].to_numpy(float)
+        y = group[center_col].to_numpy(float)
+        line, = ax.plot(
+            x, y, marker="o", linewidth=1.8,
+            label=labels.get(str(condition), str(condition)),
+        )
+        if q25_col in group.columns and q75_col in group.columns:
+            q25 = pd.to_numeric(group[q25_col], errors="coerce").to_numpy(float)
+            q75 = pd.to_numeric(group[q75_col], errors="coerce").to_numpy(float)
+            good = np.isfinite(q25) & np.isfinite(q75) & (q25 <= y) & (y <= q75)
             if good.any():
-                ax.fill_between(x[good], lo[good], hi[good], alpha=0.15)
+                # Matplotlib accepts separate lower and upper y-errors.  Using
+                # Q1/median/Q3 makes the whiskers genuinely asymmetric whenever
+                # the across-seed distribution is asymmetric.
+                lower = y[good] - q25[good]
+                upper = q75[good] - y[good]
+                ax.errorbar(
+                    x[good],
+                    y[good],
+                    yerr=np.vstack([lower, upper]),
+                    fmt="none",
+                    ecolor=line.get_color(),
+                    elinewidth=1.2,
+                    capsize=3,
+                    capthick=1.0,
+                    alpha=0.9,
+                )
         plotted = True
     return plotted
 
@@ -276,12 +296,12 @@ def main() -> None:
         _plot_grid(
             df, PRIMARY_METRICS, output_dir / "poisoning_primary_trajectories.pdf",
             "Poisoning trajectories: behavior and causal organization",
-            note="Ordinary correctness and trigger lift are distinct endpoints. Gaps mean CHA was undefined/skipped. Shading is the across-seed Student-t interval when available.",
+            note="Ordinary correctness and trigger lift are distinct endpoints. Gaps mean CHA was undefined/skipped. Points/lines show the across-seed median; asymmetric error bars span Q1-Q3.",
         )
         _plot_grid(
             df, SPECIFICITY_METRICS, output_dir / "poisoning_specificity_checks.pdf",
             "Poisoning specificity and control diagnostics",
-            note="Control target rate diagnoses clean-path drift; trigger excess isolates marker-specific shift; conditional conversion conditions on control non-target rows; primary-sham contrast checks marker specificity.",
+            note="Control target rate diagnoses clean-path drift; trigger excess isolates marker-specific shift; conditional conversion conditions on control non-target rows; primary-sham contrast checks marker specificity. Points/lines show the across-seed median; asymmetric error bars span Q1-Q3.",
         )
     # Detector plotting is independent of the behavioral table and can still be
     # produced when every Stage-05 trajectory is unavailable.

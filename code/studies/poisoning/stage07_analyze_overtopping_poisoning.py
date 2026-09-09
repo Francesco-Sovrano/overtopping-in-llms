@@ -178,6 +178,14 @@ def _spearman(x: Iterable[float], y: Iterable[float]) -> tuple[int, float]:
     return int(ok.sum()), float(np.corrcoef(aa, bb)[0, 1])
 
 
+def _read_csv_or_empty(path: Path, **kwargs: Any) -> pd.DataFrame:
+    """Read an optional/intermediate CSV, treating a zero-byte file as empty."""
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
 def _pearson(x: Iterable[float], y: Iterable[float]) -> tuple[int, float]:
     a = pd.to_numeric(pd.Series(list(x)), errors="coerce")
     b = pd.to_numeric(pd.Series(list(y)), errors="coerce")
@@ -223,7 +231,7 @@ def _ensure_base_geometry(
 def _load_disruption_channels(stage07_dir: Path) -> pd.DataFrame:
     combined = stage07_dir / "control_correctness_channel_disruption_by_interval.csv"
     if combined.is_file():
-        frame = pd.read_csv(combined, low_memory=False)
+        frame = _read_csv_or_empty(combined, low_memory=False)
         if "interval" in frame.columns:
             return frame
 
@@ -232,7 +240,7 @@ def _load_disruption_channels(stage07_dir: Path) -> pd.DataFrame:
         path = interval_dir / "control_correctness_channel_disruption.csv"
         if not path.is_file():
             continue
-        df = pd.read_csv(path, low_memory=False)
+        df = _read_csv_or_empty(path, low_memory=False)
         if df.empty:
             continue
         if "interval" not in df.columns:
@@ -710,7 +718,7 @@ def wanda_weighting_comparison(stage07_dir: Path) -> pd.DataFrame:
     path = stage07_dir / "training_example_scores_all_intervals.csv"
     if not path.is_file():
         return pd.DataFrame()
-    scores = pd.read_csv(path, low_memory=False)
+    scores = _read_csv_or_empty(path, low_memory=False)
     if scores.empty or "interval" not in scores.columns:
         return pd.DataFrame()
     columns = [
@@ -885,7 +893,7 @@ def update_energy_enrichment(
         mapped_path = stage07_dir / interval / "mapped_disruptive_channels.csv"
         if not mapped_path.is_file():
             continue
-        mapped = pd.read_csv(mapped_path, low_memory=False)
+        mapped = _read_csv_or_empty(mapped_path, low_memory=False)
         if mapped.empty:
             continue
         if "mapped" in mapped.columns:
@@ -1104,9 +1112,9 @@ def complete_attack_detection_table(
             eval_intervention=eval_intervention,
             output_dir=stage07_dir,
         )
-    existing = pd.read_csv(combined_path) if combined_path.is_file() else pd.DataFrame()
+    existing = _read_csv_or_empty(combined_path) if combined_path.is_file() else pd.DataFrame()
     metrics_path = stage07_dir / "detection_metrics_by_interval.csv"
-    metrics = pd.read_csv(metrics_path) if metrics_path.is_file() else pd.DataFrame()
+    metrics = _read_csv_or_empty(metrics_path) if metrics_path.is_file() else pd.DataFrame()
     rebuilt_behavior = reconstruct_backdoor_behavior_from_cached_scores(
         run_dir=run_dir,
         phase=phase,
@@ -1328,10 +1336,10 @@ def main() -> None:
         max_control_draws=int(args.max_control_draws),
     )
 
-    geometry = pd.read_csv(geometry_dir / "update_geometry_by_interval.csv")
-    candidates = pd.read_csv(geometry_dir / "channel_update_geometry.csv")
-    controls = pd.read_csv(geometry_dir / "matched_control_update_geometry.csv")
-    disruption_info = pd.read_csv(geometry_dir / "disruption_information_by_interval.csv")
+    geometry = _read_csv_or_empty(geometry_dir / "update_geometry_by_interval.csv")
+    candidates = _read_csv_or_empty(geometry_dir / "channel_update_geometry.csv")
+    controls = _read_csv_or_empty(geometry_dir / "matched_control_update_geometry.csv")
+    disruption_info = _read_csv_or_empty(geometry_dir / "disruption_information_by_interval.csv")
 
     # 1) Additional causal-mechanism stories not present in the compact
     # checkpoint story: concentration relative to clean drift, channel/layer

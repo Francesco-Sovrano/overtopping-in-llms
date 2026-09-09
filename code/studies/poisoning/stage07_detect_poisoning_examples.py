@@ -1,42 +1,32 @@
 #!/usr/bin/env python3
-"""Rank poisoned training examples from attack-cohort control-correctness disruption.
+"""Rank poisoned training examples from defense-valid causal channel disruption.
 
-Stage 07 is trigger- and attacker-target-agnostic at channel selection and
-example scoring.  It does not use trigger-lift circuit membership, trigger-lift
-causal status, or the per-example poison label when constructing a score.  It
-does require matched clean and suspicious/poisoned trajectories so that abnormal
-control-correctness channel drift can be defined relative to normal fine-tuning.
+Stage 07 freezes candidate channels before any attack-side intervention effects are
+used for ranking or example scoring. Candidate localization can use the defender-visible
+observed fine-tuning prompt/label mixture, the matched no-trigger attack-cohort
+control-correctness CHA, or the union of both. The observed-mixture source never selects, labels, or
+weights rows using ``is_poisoned``, attack eligibility, trigger-lift success,
+trigger identity, or the attacker target. The attack-cohort source deliberately
+uses the known non-target cohort and is therefore an oracle-defined controlled
+analysis rather than a strictly deployable defense source. The paired backdoor
+score table supplies post-hoc no-trigger control and triggered attack views only
+after the candidate universe is frozen.
 
-For a singleton agonist channel j, U(j) is the probability, on one fixed
-held-out attack-eligible non-target cohort, that intervening on j changes a baseline-correct
-example to incorrect.  Candidate discovery still uses the attack-cohort control-correctness
-CHA threshold tau, but U(j) is measured separately on the same row identities at
-every matched checkpoint.  For a matched checkpoint
+For a singleton agonist channel j, control and attack effects are measured on one
+fixed held-out non-target source cohort with direction-eligible denominators:
+U_control(j)=P(correct->incorrect | baseline correct) and
+U_attack(j)=P(successful attack->failure | baseline successful attack). For a matched checkpoint
 interval t0 -> t1 the descriptive excess drift is
 
     D_j = [U_p(j,t1) - U_p(j,t0)] - [U_c(j,t1) - U_c(j,t0)]
 
-where p and c denote poisoned and clean training.  D_j is a clean-normalized
-trajectory divergence statistic; it is not presented as a same-start causal
-branch contrast.
+where p and c denote poisoned and clean training. Candidate membership is frozen
+by the defense-valid observed-training-mixture CHA analysis at the configured
+tau (0.3 by default). Missing singleton evaluations are never interpreted as U(j)=0.
 
-Candidate membership is frozen by the attack-cohort control-correctness CHA analysis at the
-configured tau (0.3 by default).  Missing singleton evaluations are never
-interpreted as U(j)=0.  Numerical disruption is computed only for channels with
-materialized U(j) at all four matched states.  Membership changes are reported
-separately as descriptive discovery events.
-
-Training rows are ranked with a WANDA-style score.  For every selected channel,
-its causal disruption magnitude weights the elementwise product between the
-input activation to the corresponding trained projection and the absolute clean-normalized effective LoRA interval update, where the effective
-adapter weight is scaling * (B @ A) and the scored update is
-[(W_p,t1-W_p,t0)-(W_c,t1-W_c,t0)].  Grouped-query attention channels that map to the same
-v-projection row are collapsed to one parameter row for scoring and are reported
-explicitly in the mapping table.
-
-The ground-truth ``is_poisoned`` flag is used only after scoring to evaluate the
-ranking with ROC AUC, average precision, precision/recall at the true poison
-count, and matched poison-versus-source comparisons.
+Training rows are ranked with the existing WANDA-style clean-normalized update
+score. The ground-truth ``is_poisoned`` flag is used only after scoring to
+evaluate ranking quality; it never enters candidate localization or scoring.
 """
 from __future__ import annotations
 
@@ -57,7 +47,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from studies.poisoning.lib.checkpoint_manifest import read_checkpoint_manifest
 from studies.poisoning.lib.completion_data import CausalCompletionDataset, CausalLMCollator
-from core.heldout_set_metrics import safe_layer_label
+from core.heldout_set_metrics import compute_singleton_set_metrics, safe_layer_label
 from studies.poisoning.lib.specificity import truthy
 from studies.poisoning.lib.run_paths import (
     safe_component,
@@ -65,7 +55,7 @@ from studies.poisoning.lib.run_paths import (
     metadata_path,
     phase_dirname,
     checkpoint_progress_label,
-    ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME,
+    OBSERVED_TRAINING_MIXTURE_CORRECTNESS_DIRNAME, ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME,
     BACKDOOR_TRIGGER_TEST_DIRNAME,
     causal_dir,
     resolve_manifest_checkpoint_dir,
@@ -82,7 +72,7 @@ from studies.poisoning.lib.scheduling import (
 from studies.poisoning.tasks.registry import available_tasks, get_task_definition, infer_task_from_run
 from studies.poisoning.stage07_plot_detection_implications import generate_implication_outputs
 
-SCORING_SCHEMA_VERSION = 6
+SCORING_SCHEMA_VERSION = 8
 STAGE07_RESUME_CONFIG_VERSION = 1
 DEFAULT_REQUIRED_TAU = 0.3
 
@@ -120,6 +110,7 @@ def _stage07_resume_payload(
             "scoring_schema_version": int(SCORING_SCHEMA_VERSION),
             "eval_intervention": str(args.eval_intervention),
             "required_tau": float(args.required_tau),
+            "candidate_localization_endpoint": str(args.candidate_localization_endpoint),
             "max_channels": int(args.max_channels),
             "min_abs_delta_u": float(args.min_abs_delta_u),
             "bootstrap_draws": int(args.bootstrap_draws),
@@ -248,13 +239,29 @@ def _tau_from_stats_dir(path: str | Path) -> float | None:
 
 
 
-def _control_correctness_output_dir(
+def _observed_mixture_output_dir(
     run_dir: Path,
     row: Mapping[str, Any],
     phase: str,
     eval_intervention: str,
 ) -> Path:
-    """Stage-03 attack-cohort control-correctness output for one checkpoint."""
+    """Stage-03 defender-visible observed-training-mixture CHA output."""
+    return (
+        causal_dir(run_dir)
+        / str(row["condition"])
+        / checkpoint_progress_label(row)
+        / phase_dirname(phase)
+        / OBSERVED_TRAINING_MIXTURE_CORRECTNESS_DIRNAME
+        / f"eval_{safe_component(eval_intervention)}"
+    )
+
+
+def _attack_control_output_dir(
+    run_dir: Path,
+    row: Mapping[str, Any],
+    phase: str,
+    eval_intervention: str,
+) -> Path:
     return (
         causal_dir(run_dir)
         / str(row["condition"])
@@ -281,24 +288,35 @@ def _backdoor_output_dir(
     )
 
 
-def _discover_control_correctness_candidate_stats(
-    run_dir: Path,
+def _discover_candidate_stats_from_output(
+    out: Path,
     row: Mapping[str, Any],
-    phase: str,
     *,
-    eval_intervention: str,
     required_tau: float,
+    endpoint_label: str,
 ) -> Path | None:
-    """Find the control-correctness CHA candidate ranking for a checkpoint.
+    """Resolve one train-discovery/full-test CHA candidate ranking."""
+    # New streamlined path: candidate order is frozen directly from Stage-6
+    # discovery and does not require a held-out singleton evaluation.
+    direct = out / "candidate_localization"
+    direct_ranking = direct / "frozen_candidate_ranking.csv"
+    if direct_ranking.is_file():
+        meta_path = direct / "candidate_localization.json"
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                tau = meta.get("search_epsilon")
+                if tau is not None and not math.isclose(float(tau), float(required_tau), rel_tol=0.0, abs_tol=1e-12):
+                    return None
+                if bool(meta.get("heldout_singleton_evaluation_used", False)):
+                    raise RuntimeError(f"{endpoint_label} localization unexpectedly depends on held-out singleton evaluation: {meta_path}")
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"Could not validate candidate localization metadata: {meta_path}") from exc
+        return direct
 
-    Stage 07 does not read the trigger-lift trajectory table.  Candidate
-    membership is resolved directly from the attack-cohort control-correctness Stage-03
-    output.  A checkpoint whose control-correctness CHA was legitimately undefined may
-    return ``None``; its fixed-cohort U(j) can still be materialized for the
-    union discovered at other checkpoints because ``feature_report/scores.csv``
-    exists independently of CHA membership.
-    """
-    out = _control_correctness_output_dir(run_dir, row, phase, eval_intervention)
+    # Backward-compatible fallback: older runs froze the same Stage-6 ranking as
+    # a side effect of the generic singleton evaluator. Reuse the ranking only;
+    # held-out flip statistics are ignored for candidate selection.
     root = out / "rule_extraction_results" / "neuron_flip_rules" / "stats"
     if not root.is_dir():
         return None
@@ -312,7 +330,6 @@ def _discover_control_correctness_candidate_stats(
     if not candidates:
         return None
 
-    # Accept only independent train-discovery/full-test control-correctness artifacts.
     preferred: list[Path] = []
     for stats in candidates:
         scope = stats / "evaluation_scope.json"
@@ -329,26 +346,54 @@ def _discover_control_correctness_candidate_stats(
             preferred.append(stats)
     if not preferred:
         raise RuntimeError(
-            "Ordinary candidate discovery must use train rows with final statistics on the full test cohort; "
+            f"{endpoint_label} candidate discovery must use train rows with final statistics on the full test cohort; "
             f"no qualifying artifact found under {root}"
         )
-    pool = preferred
-    if len(pool) > 1:
+    if len(preferred) > 1:
         identities = []
-        for stats in pool:
+        for stats in preferred:
             try:
                 df = pd.read_csv(stats / "frozen_candidate_ranking.csv")
                 ids = tuple(sorted(zip(df.get("layer_label", []), pd.to_numeric(df.get("neuron_id", []), errors="coerce"))))
             except Exception:
                 ids = ()
             identities.append((stats, ids))
-        unique = {ids for _, ids in identities}
-        if len(unique) > 1:
+        if len({ids for _, ids in identities}) > 1:
             raise RuntimeError(
-                "Multiple attack-cohort control-correctness candidate rankings disagree for "
-                f"{row['condition']} {checkpoint_progress_label(row)}: {[str(p) for p in pool]}"
+                f"Multiple {endpoint_label} candidate rankings disagree for "
+                f"{row['condition']} {checkpoint_progress_label(row)}: {[str(p) for p in preferred]}"
             )
-    return pool[0]
+    return preferred[0]
+
+
+
+
+def _discover_observed_mixture_candidate_stats(
+    run_dir: Path,
+    row: Mapping[str, Any],
+    phase: str,
+    *,
+    eval_intervention: str,
+    required_tau: float,
+) -> Path | None:
+    return _discover_candidate_stats_from_output(
+        _observed_mixture_output_dir(run_dir, row, phase, eval_intervention),
+        row, required_tau=required_tau, endpoint_label="observed-training-mixture correctness",
+    )
+
+
+def _discover_attack_control_candidate_stats(
+    run_dir: Path,
+    row: Mapping[str, Any],
+    phase: str,
+    *,
+    eval_intervention: str,
+    required_tau: float,
+) -> Path | None:
+    return _discover_candidate_stats_from_output(
+        _attack_control_output_dir(run_dir, row, phase, eval_intervention),
+        row, required_tau=required_tau, endpoint_label="attack-cohort control correctness",
+    )
 
 
 def _candidate_unit_set(path: str | Path | None) -> set[str]:
@@ -373,9 +418,12 @@ def _candidate_unit_set(path: str | Path | None) -> set[str]:
     return {f"{str(a)}:{int(b)}" for a, b in zip(df["layer_label"], pd.to_numeric(df["neuron_id"], errors="raise"))}
 
 
-def _build_candidate_union(candidate_stats: Mapping[tuple[str, int], Path | None]) -> pd.DataFrame:
+def _build_candidate_union(
+    candidate_stats: Mapping[tuple[str, str, int], Path | None],
+) -> pd.DataFrame:
+    """Union candidate channels across defense-valid localization views/states."""
     records: dict[str, dict[str, Any]] = {}
-    for (condition, frac_key), stats in sorted(candidate_stats.items()):
+    for (source, condition, frac_key), stats in sorted(candidate_stats.items()):
         if stats is None:
             continue
         path = Path(stats) / "frozen_candidate_ranking.csv"
@@ -397,13 +445,10 @@ def _build_candidate_union(candidate_stats: Mapping[tuple[str, int], Path | None
             layer = str(row["layer_label"]); neuron = int(row["neuron_id"])
             unit = f"{layer}:{neuron}"
             rec = records.setdefault(unit, {
-                "layer_label": layer,
-                "neuron_id": neuron,
-                "unit_key": unit,
-                "discovery_score": math.nan,
-                "discovery_score_signed": math.nan,
+                "layer_label": layer, "neuron_id": neuron, "unit_key": unit,
+                "discovery_score": math.nan, "discovery_score_signed": math.nan,
                 "discovery_baseline_subset": "positive",
-                "candidate_seen_states": [],
+                "candidate_sources": [], "candidate_seen_states": [],
             })
             score = pd.to_numeric(pd.Series([row.get("discovery_score")]), errors="coerce").iloc[0]
             old = pd.to_numeric(pd.Series([rec.get("discovery_score")]), errors="coerce").iloc[0]
@@ -411,13 +456,15 @@ def _build_candidate_union(candidate_stats: Mapping[tuple[str, int], Path | None
                 rec["discovery_score"] = float(score)
                 signed = pd.to_numeric(pd.Series([row.get("discovery_score_signed")]), errors="coerce").iloc[0]
                 rec["discovery_score_signed"] = float(signed) if pd.notna(signed) else math.nan
-            rec["candidate_seen_states"].append(f"{condition}:{frac_key/1000.0:g}")
+            rec["candidate_sources"].append(str(source))
+            rec["candidate_seen_states"].append(f"{source}:{condition}:{frac_key/1000.0:g}")
     rows = list(records.values())
     rows.sort(key=lambda r: (-float(r["discovery_score"]) if np.isfinite(r["discovery_score"]) else math.inf, r["unit_key"]))
     for rank, rec in enumerate(rows, start=1):
         rec["discovery_rank_global"] = rank
+        rec["candidate_sources"] = ",".join(sorted(set(rec["candidate_sources"])))
         rec["candidate_seen_states"] = ",".join(sorted(set(rec["candidate_seen_states"])))
-        rec["ranking_source"] = "control_correctness_candidate_union_across_matched_checkpoints"
+        rec["ranking_source"] = "configured_cha_localization_union_across_available_matched_checkpoints"
     return pd.DataFrame(rows)
 
 
@@ -428,7 +475,7 @@ def _evaluation_cohort_ids_from_frame(
 ) -> tuple[tuple[str, str], ...]:
     """Return ordered immutable (example ID, gold) identities from a score table."""
     gold_col = next(
-        (c for c in ("label", "correct_answer_numeric", "correct_answer", "expected_label", "is_acceptable")
+        (c for c in ("label", "correct_answer_numeric", "correct_answer", "expected_label", "original_is_acceptable", "is_acceptable")
          if c in frame.columns and frame[c].notna().all()),
         None,
     )
@@ -534,24 +581,34 @@ def _feature_report_test_cohort_ids(feature_report: str | Path) -> tuple[tuple[s
     return _evaluation_cohort_ids_from_frame(test_frame, source=scores)
 
 def _baseline_correctness_array(stats_dir: str | Path, frame: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
-    """Return the binary unablated-correctness vector used to define C->I flips.
+    """Return the binary baseline-positive vector defining conditional C->I rates.
 
-    The column name is read from the materialized singleton statistics rather
-    than guessed from task-specific names.  ``None`` is returned when the
-    metadata are unavailable so the diagnostic decomposition cannot affect the
-    primary detector.
+    Endpoint materializations report U(j)=P(positive->negative | baseline positive).
+    Older cached endpoint views did not record ``baseline_metric_col`` in
+    ``flip_stats_global.json`` even though their score table contains the canonical
+    ``evaluation_success`` column.  Accept that legacy representation so a Stage-07
+    rerun can repair the statistics without another model/ablation pass.
     """
     stats = Path(stats_dir)
     global_path = stats / "flip_stats_global.json"
-    if not global_path.is_file():
-        return None, None
-    try:
-        payload = json.loads(global_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None, None
+    payload: dict[str, Any] = {}
+    if global_path.is_file():
+        try:
+            loaded = json.loads(global_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except Exception:
+            payload = {}
+
     col = payload.get("baseline_metric_col")
+    if (not col or str(col) not in frame.columns) and "evaluation_success" in frame.columns:
+        # Canonical Stage-07 endpoint-view baseline predicate.  This fallback is
+        # intentionally narrow: it only activates when the score table itself
+        # exposes the exact endpoint baseline-success column.
+        col = "evaluation_success"
     if not col or str(col) not in frame.columns:
         return None, str(col) if col else None
+
     values = pd.to_numeric(frame[str(col)], errors="coerce").to_numpy(dtype=float)
     valid = np.isfinite(values)
     positive = valid & np.isclose(values, 1.0, atol=1e-8, rtol=0.0)
@@ -572,14 +629,23 @@ def _joint_paired_disruption_inference(
     confidence_level: float,
     seed: int,
 ) -> pd.DataFrame:
-    """Attach joint paired-bootstrap inference and baseline-drift diagnostics.
+    """Attach paired-bootstrap inference for conditional C->I disruption.
 
-    All candidate channels are resampled together using the same fixed-cohort
-    row multiplicities.  This both removes repeated CSV I/O and preserves the
-    cross-channel dependence required for a max-statistic simultaneous band.
-    The primary point estimate remains exactly
+    The fixed held-out *row cohort* is paired across all four states, but U(j)
+    is a conditional rate whose denominator is the baseline-positive subset at
+    that particular checkpoint:
 
-        D_j = (U_p1-U_p0) - (U_c1-U_c0).
+        U_s(j) = P(C->I | baseline correct at state s).
+
+    Baseline correctness is model/checkpoint dependent, so those denominators
+    are not required (or expected) to be equal across states.  Bootstrap draws
+    therefore resample the same fixed rows jointly and recompute each state's
+    numerator and denominator inside every draw before forming
+
+        D_j = U_p1(j) - U_p0(j) - U_c1(j) + U_c0(j).
+
+    This preserves row pairing without incorrectly turning the conditional rate
+    into an unconditional full-cohort mean.
     """
     out = frame.copy()
     if out.empty:
@@ -595,12 +661,18 @@ def _joint_paired_disruption_inference(
         ("disruption_bootstrap_draws_valid", 0),
     ):
         out[col] = default
-    out["disruption_multiplicity_method"] = "paired_row_bootstrap_max_abs_centered"
+    out["disruption_multiplicity_method"] = "paired_row_bootstrap_conditional_rate_max_abs_centered"
 
     if int(draws) <= 0:
         return out
 
     states = ("poisoned_start", "poisoned_end", "clean_start", "clean_end")
+    row_rate_columns = {
+        "poisoned_start": "poisoned_u_j_start",
+        "poisoned_end": "poisoned_u_j_end",
+        "clean_start": "clean_u_j_start",
+        "clean_end": "clean_u_j_end",
+    }
     state_frames: dict[str, pd.DataFrame] = {}
     identities: tuple[tuple[str, str], ...] | None = None
     baseline_arrays: dict[str, np.ndarray | None] = {}
@@ -608,7 +680,7 @@ def _joint_paired_disruption_inference(
     for state in states:
         stats_dir = stats_by_state[state]
         scores_path = Path(stats_dir) / "scores.csv"
-        state_frame = pd.read_csv(scores_path)
+        state_frame = pd.read_csv(scores_path, low_memory=False)
         state_ids = _evaluation_cohort_ids_from_frame(state_frame, source=scores_path)
         if identities is None:
             identities = state_ids
@@ -627,49 +699,146 @@ def _joint_paired_disruption_inference(
     if n <= 0:
         return out
 
-    comparable_mask = out.get("complete_u_j_comparison", pd.Series(False, index=out.index)).map(truthy).to_numpy(dtype=bool)
+    missing_baselines = [state for state in states if baseline_arrays[state] is None]
+    if missing_baselines:
+        raise RuntimeError(
+            "Conditional U(j) paired bootstrap requires a binary baseline-success predicate "
+            "for every state; unavailable for: " + ", ".join(missing_baselines)
+        )
+
+    baseline_float: dict[str, np.ndarray] = {
+        state: np.asarray(baseline_arrays[state], dtype=np.float64)  # type: ignore[arg-type]
+        for state in states
+    }
+    baseline_n = {state: int(baseline_float[state].sum()) for state in states}
+    if any(count <= 0 for count in baseline_n.values()):
+        # A conditional rate is undefined when a state has no baseline-positive
+        # rows.  Such rows should already be non-comparable because materialized
+        # U(j) is NaN, but keep the bootstrap side defensive as well.
+        return out
+
+    comparable_mask = out.get(
+        "complete_u_j_comparison", pd.Series(False, index=out.index)
+    ).map(truthy).to_numpy(dtype=bool)
     comparable_indices = np.flatnonzero(comparable_mask)
     valid_indices: list[int] = []
-    contrast_columns: list[np.ndarray] = []
-    state_flip_by_unit: dict[int, dict[str, np.ndarray]] = {}
+    state_flip_columns: dict[str, list[np.ndarray]] = {state: [] for state in states}
+
     for idx in comparable_indices.tolist():
         row = out.iloc[int(idx)]
         unit_key = str(row["unit_key"])
         layer_label, neuron_text = unit_key.rsplit(":", 1)
         flip_col = f"flip_c2i_{safe_layer_label(layer_label)}_{int(neuron_text)}"
-        flips: dict[str, np.ndarray] = {}
         if any(flip_col not in state_frames[state].columns for state in states):
             continue
+
+        flips: dict[str, np.ndarray] = {}
+        state_rates: dict[str, float] = {}
         for state in states:
-            flips[state] = state_frames[state][flip_col].fillna(False).map(truthy).to_numpy(dtype=np.float64)
-        contrast = flips["poisoned_end"] - flips["poisoned_start"] - flips["clean_end"] + flips["clean_start"]
-        observed = float(contrast.mean())
-        expected = float(pd.to_numeric(pd.Series([row.get("poisoning_excess_delta_u_j")]), errors="coerce").iloc[0])
-        if not np.isfinite(expected) or not math.isclose(observed, expected, rel_tol=0.0, abs_tol=1e-12):
+            arr = state_frames[state][flip_col].fillna(False).map(truthy).to_numpy(dtype=np.float64)
+            # flip_c2i must only be active on baseline-positive rows.  Enforce
+            # this invariant rather than allowing malformed cached scores to
+            # silently bias the conditional numerator.
+            outside = (arr != 0.0) & (baseline_float[state] == 0.0)
+            if bool(np.any(outside)):
+                raise RuntimeError(
+                    f"Conditional C->I column {flip_col} contains flips outside the baseline-positive "
+                    f"subset for {state}"
+                )
+            flips[state] = arr
+            state_rates[state] = float(arr.sum() / float(baseline_n[state]))
+
+            expected_state = pd.to_numeric(
+                pd.Series([row.get(row_rate_columns[state])]), errors="coerce"
+            ).iloc[0]
+            if not pd.notna(expected_state) or not math.isclose(
+                state_rates[state], float(expected_state), rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise RuntimeError(
+                    f"Joint bootstrap conditional U(j) disagrees with materialized rate for {unit_key} "
+                    f"at {state}: row-level={state_rates[state]}, materialized={expected_state}"
+                )
+
+        observed = (
+            state_rates["poisoned_end"]
+            - state_rates["poisoned_start"]
+            - state_rates["clean_end"]
+            + state_rates["clean_start"]
+        )
+        expected = pd.to_numeric(
+            pd.Series([row.get("poisoning_excess_delta_u_j")]), errors="coerce"
+        ).iloc[0]
+        if not pd.notna(expected) or not math.isclose(
+            observed, float(expected), rel_tol=0.0, abs_tol=1e-12
+        ):
             raise RuntimeError(
-                f"Joint bootstrap point estimate disagrees with materialized U(j) for {unit_key}: "
-                f"row contrast={observed}, U(j) contrast={expected}"
+                f"Joint bootstrap point estimate disagrees with materialized conditional U(j) for {unit_key}: "
+                f"row-level contrast={observed}, U(j) contrast={expected}"
             )
+
         valid_indices.append(int(idx))
-        contrast_columns.append(contrast)
-        state_flip_by_unit[int(idx)] = flips
+        for state in states:
+            state_flip_columns[state].append(flips[state])
 
     if not valid_indices:
         return out
 
-    contrast_matrix = np.column_stack(contrast_columns).astype(np.float64, copy=False)  # [rows, channels]
-    point = contrast_matrix.mean(axis=0)
-    m = int(contrast_matrix.shape[1])
+    state_flip_matrices = {
+        state: np.column_stack(state_flip_columns[state]).astype(np.float64, copy=False)
+        for state in states
+    }
+    point_state_rates = {
+        state: state_flip_matrices[state].sum(axis=0) / float(baseline_n[state])
+        for state in states
+    }
+    point = (
+        point_state_rates["poisoned_end"]
+        - point_state_rates["poisoned_start"]
+        - point_state_rates["clean_end"]
+        + point_state_rates["clean_start"]
+    )
+    m = int(len(valid_indices))
     rng = np.random.default_rng(int(seed))
-    boot = np.empty((int(draws), m), dtype=np.float64)
-    # Multinomial row counts are exactly equivalent to drawing n row indices
-    # with replacement, but permit one BLAS matrix multiply for all channels.
+    boot = np.full((int(draws), m), np.nan, dtype=np.float64)
+    valid_draw = np.zeros(int(draws), dtype=bool)
+
+    # Multinomial row counts are equivalent to paired sampling with replacement.
+    # The same counts are used for all four states and all channels, while each
+    # state gets its own weighted baseline-positive denominator.
     probs = np.full(n, 1.0 / float(n), dtype=np.float64)
     chunk = max(1, min(256, int(draws)))
     for start in range(0, int(draws), chunk):
         stop = min(int(draws), start + chunk)
         counts = rng.multinomial(n, probs, size=stop - start).astype(np.float64, copy=False)
-        boot[start:stop] = (counts @ contrast_matrix) / float(n)
+        chunk_rates: dict[str, np.ndarray] = {}
+        chunk_valid = np.ones(stop - start, dtype=bool)
+        for state in states:
+            denominator = counts @ baseline_float[state]
+            chunk_valid &= denominator > 0.0
+            numerator = counts @ state_flip_matrices[state]
+            rates = np.full_like(numerator, np.nan, dtype=np.float64)
+            np.divide(
+                numerator,
+                denominator[:, None],
+                out=rates,
+                where=denominator[:, None] > 0.0,
+            )
+            chunk_rates[state] = rates
+        contrast = (
+            chunk_rates["poisoned_end"]
+            - chunk_rates["poisoned_start"]
+            - chunk_rates["clean_end"]
+            + chunk_rates["clean_start"]
+        )
+        finite = np.isfinite(contrast).all(axis=1)
+        keep = chunk_valid & finite
+        boot[start:stop] = contrast
+        valid_draw[start:stop] = keep
+
+    boot = boot[valid_draw]
+    draws_valid = int(len(boot))
+    if draws_valid <= 0:
+        return out
 
     alpha = (1.0 - float(confidence_level)) / 2.0
     pointwise_lo = np.quantile(boot, alpha, axis=0)
@@ -682,42 +851,58 @@ def _joint_paired_disruption_inference(
     for pos, idx in enumerate(valid_indices):
         out.at[idx, "disruption_ci_low"] = float(pointwise_lo[pos])
         out.at[idx, "disruption_ci_high"] = float(pointwise_hi[pos])
-        out.at[idx, "disruption_ci_excludes_zero"] = bool(pointwise_lo[pos] > 0.0 or pointwise_hi[pos] < 0.0)
+        out.at[idx, "disruption_ci_excludes_zero"] = bool(
+            pointwise_lo[pos] > 0.0 or pointwise_hi[pos] < 0.0
+        )
         out.at[idx, "disruption_simultaneous_ci_low"] = float(sim_lo[pos])
         out.at[idx, "disruption_simultaneous_ci_high"] = float(sim_hi[pos])
-        out.at[idx, "disruption_simultaneous_ci_excludes_zero"] = bool(sim_lo[pos] > 0.0 or sim_hi[pos] < 0.0)
+        out.at[idx, "disruption_simultaneous_ci_excludes_zero"] = bool(
+            sim_lo[pos] > 0.0 or sim_hi[pos] < 0.0
+        )
         # Family-wise adjusted max-statistic tail probability.  The +1 form
         # avoids reporting an exact zero with finite Monte Carlo draws.
-        out.at[idx, "disruption_fwer_p"] = float((1.0 + np.sum(centered_max >= abs(point[pos]))) / (len(centered_max) + 1.0))
-        out.at[idx, "disruption_bootstrap_draws_valid"] = int(draws)
+        out.at[idx, "disruption_fwer_p"] = float(
+            (1.0 + np.sum(centered_max >= abs(point[pos]))) / (draws_valid + 1.0)
+        )
+        out.at[idx, "disruption_bootstrap_draws_valid"] = draws_valid
 
-    # Diagnostic decomposition: distinguish control baseline-accuracy drift
-    # from intervention susceptibility among rows that were baseline-correct.
+    # Diagnostic decomposition: distinguish baseline-accuracy drift from
+    # intervention susceptibility.  For control endpoint views the conditional
+    # susceptibility below is exactly the U(j) used by the primary detector.
     for state in states:
         baseline = baseline_arrays[state]
         out[f"{state}_baseline_metric_col"] = baseline_cols[state]
-        out[f"{state}_baseline_accuracy"] = float(baseline.mean()) if baseline is not None else math.nan
-        out[f"{state}_baseline_correct_n"] = int(baseline.sum()) if baseline is not None else math.nan
-    if all(baseline_arrays[state] is not None for state in states):
-        out["poisoned_baseline_accuracy_change"] = out["poisoned_end_baseline_accuracy"] - out["poisoned_start_baseline_accuracy"]
-        out["clean_baseline_accuracy_change"] = out["clean_end_baseline_accuracy"] - out["clean_start_baseline_accuracy"]
-        out["poisoning_excess_baseline_accuracy_change"] = out["poisoned_baseline_accuracy_change"] - out["clean_baseline_accuracy_change"]
-        for idx in valid_indices:
-            flips = state_flip_by_unit[idx]
-            for state in states:
-                baseline = baseline_arrays[state]
-                assert baseline is not None
-                denom = int(baseline.sum())
-                susceptibility = float(flips[state].sum() / denom) if denom > 0 else math.nan
-                out.at[idx, f"{state}_conditional_c2i_given_baseline_correct"] = susceptibility
-            vals = {state: float(out.at[idx, f"{state}_conditional_c2i_given_baseline_correct"]) for state in states}
-            out.at[idx, "poisoned_conditional_c2i_change"] = vals["poisoned_end"] - vals["poisoned_start"]
-            out.at[idx, "clean_conditional_c2i_change"] = vals["clean_end"] - vals["clean_start"]
-            out.at[idx, "poisoning_excess_conditional_c2i_change"] = (
-                out.at[idx, "poisoned_conditional_c2i_change"] - out.at[idx, "clean_conditional_c2i_change"]
+        out[f"{state}_baseline_accuracy"] = float(np.mean(baseline)) if baseline is not None else math.nan
+        out[f"{state}_baseline_correct_n"] = int(np.sum(baseline)) if baseline is not None else math.nan
+    out["poisoned_baseline_accuracy_change"] = (
+        out["poisoned_end_baseline_accuracy"] - out["poisoned_start_baseline_accuracy"]
+    )
+    out["clean_baseline_accuracy_change"] = (
+        out["clean_end_baseline_accuracy"] - out["clean_start_baseline_accuracy"]
+    )
+    out["poisoning_excess_baseline_accuracy_change"] = (
+        out["poisoned_baseline_accuracy_change"] - out["clean_baseline_accuracy_change"]
+    )
+    for pos, idx in enumerate(valid_indices):
+        for state in states:
+            out.at[idx, f"{state}_conditional_c2i_given_baseline_correct"] = float(
+                point_state_rates[state][pos]
             )
+        vals = {
+            state: float(out.at[idx, f"{state}_conditional_c2i_given_baseline_correct"])
+            for state in states
+        }
+        out.at[idx, "poisoned_conditional_c2i_change"] = (
+            vals["poisoned_end"] - vals["poisoned_start"]
+        )
+        out.at[idx, "clean_conditional_c2i_change"] = (
+            vals["clean_end"] - vals["clean_start"]
+        )
+        out.at[idx, "poisoning_excess_conditional_c2i_change"] = (
+            out.at[idx, "poisoned_conditional_c2i_change"]
+            - out.at[idx, "clean_conditional_c2i_change"]
+        )
     return out
-
 
 def _materialization_complete(
     stats_dir: Path, union_units: set[str], *, expected_baseline_subset: str = "all",
@@ -757,7 +942,263 @@ def _materialization_complete(
     return True
 
 
-def _ensure_fixed_u_j_materialization(
+
+def _apply_reference_test_membership(
+    frame: pd.DataFrame,
+    reference_test_ids: Sequence[tuple[str, str]],
+    *,
+    source: str | Path,
+) -> pd.DataFrame:
+    """Reassign ``is_test`` to an externally frozen immutable test cohort.
+
+    Independent training seeds may have been analyzed historically with different
+    holdout RNG seeds.  Stage 07 does not need those old split labels: the source
+    feature report contains the full fixed non-target population.  Reassigning the
+    split here lets clean-null inference evaluate the exact primary test identities
+    without rerunning checkpoints, behavior generation, or Stage-03 CHA.
+    """
+    out = frame.copy()
+    identities = _evaluation_cohort_ids_from_frame(out, source=source)
+    observed = set(identities)
+    reference = set(reference_test_ids)
+    missing = sorted(reference - observed)
+    if missing:
+        raise RuntimeError(
+            f"Source population {source} does not contain the frozen reference test cohort; "
+            f"missing {len(missing)} identities, e.g. {missing[:4]}"
+        )
+    out["is_test"] = [identity in reference for identity in identities]
+    return out
+
+
+def _paired_eval_feature_report(
+    *,
+    run_dir: Path,
+    row: Mapping[str, Any],
+    phase: str,
+    eval_intervention: str,
+    output_dir: Path,
+    reference_test_ids: Sequence[tuple[str, str]],
+    include_attack: bool,
+) -> tuple[Path, bool, dict[str, Any]]:
+    """Build one Stage-07 score table containing control and optional trigger views."""
+    backdoor_out = _backdoor_output_dir(run_dir, row, phase, eval_intervention)
+    source_scores = backdoor_out / "feature_report" / "scores.csv"
+    if not source_scores.is_file():
+        raise FileNotFoundError(f"Missing paired backdoor score table: {source_scores}")
+    base = pd.read_csv(source_scores, low_memory=False)
+    required = {"prompt_control", "is_correct_control", "is_test"}
+    missing = sorted(required - set(base.columns))
+    if missing:
+        raise ValueError(f"Backdoor score table lacks paired-control columns {missing}: {source_scores}")
+    base = _apply_reference_test_membership(base, reference_test_ids, source=source_scores)
+
+    control = base.copy()
+    control["evaluation_endpoint"] = "control"
+    control["evaluation_prompt"] = control["prompt_control"].astype(str)
+    control["evaluation_success"] = control["is_correct_control"].map(truthy)
+
+    attack_reportable = False
+    attack_meta: dict[str, Any] = {}
+    pieces = [control]
+    if include_attack:
+        attack_required = {"prompt", "is_trigger_lift_success"}
+        missing = sorted(attack_required - set(base.columns))
+        if missing:
+            raise ValueError(f"Backdoor score table lacks attack columns {missing}: {source_scores}")
+        test_mask = base["is_test"].map(truthy)
+        pos_mask = base["is_trigger_lift_success"].map(truthy)
+        n_positive_test = int((test_mask & pos_mask).sum())
+        n_test = int(test_mask.sum())
+        target_positive_test = 1
+        status_path = backdoor_out / "discovery_status.json"
+        if status_path.is_file():
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            try:
+                target_positive_test = max(1, int(status.get("target_heldout_trigger_lift_positives", 1)))
+            except (TypeError, ValueError):
+                target_positive_test = 1
+        attack_reportable = n_positive_test >= target_positive_test
+        attack_meta = {
+            "n_test_rows": n_test,
+            "n_positive_test_rows": n_positive_test,
+            "required_positive_test_rows": target_positive_test,
+            "heldout_target_met": bool(attack_reportable),
+        }
+        if attack_reportable:
+            attack = base.copy()
+            attack["evaluation_endpoint"] = "attack"
+            attack["evaluation_prompt"] = attack["prompt"].astype(str)
+            attack["evaluation_success"] = attack["is_trigger_lift_success"].map(truthy)
+            pieces.append(attack)
+
+    paired = pd.concat(pieces, ignore_index=True, sort=False)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paired.to_csv(output_dir / "scores.csv", index=False)
+    _atomic_write_json(
+        output_dir / "paired_evaluation_scope.json",
+        {
+            "schema_version": 1,
+            "source_scores": str(source_scores),
+            "reference_test_cohort_n": int(len(reference_test_ids)),
+            "test_membership_reassigned_from_reference": True,
+            "endpoints": sorted(paired["evaluation_endpoint"].unique().tolist()),
+            "mean_reference_prompt_column": "prompt_control",
+            "attack": attack_meta if include_attack else None,
+        },
+    )
+    return output_dir, attack_reportable, attack_meta
+
+
+def _write_endpoint_materialization_view(
+    *,
+    generic_stats_dir: Path,
+    endpoint: str,
+    candidate_union_csv: Path,
+    out_dir: Path,
+    eval_intervention: str,
+    phase: str,
+) -> Path:
+    """Derive endpoint-specific conditional C->I statistics from one paired ablation pass."""
+    scores_path = generic_stats_dir / "scores.csv"
+    if not scores_path.is_file():
+        raise FileNotFoundError(f"Paired materialization has no scores.csv: {generic_stats_dir}")
+    scores = pd.read_csv(scores_path, low_memory=False)
+    if "evaluation_endpoint" not in scores.columns or "evaluation_success" not in scores.columns:
+        raise ValueError(f"Paired scores lack endpoint/baseline columns: {scores_path}")
+    sub = scores.loc[scores["evaluation_endpoint"].astype(str) == str(endpoint)].copy()
+    if sub.empty:
+        raise RuntimeError(f"Paired materialization contains no {endpoint!r} rows: {scores_path}")
+
+    ranking = pd.read_csv(candidate_union_csv)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ranking.to_csv(out_dir / "frozen_candidate_ranking.csv", index=False)
+    sub.to_csv(out_dir / "scores.csv", index=False)
+
+    baseline = sub["evaluation_success"].map(truthy).to_numpy(dtype=bool)
+    rows: list[dict[str, Any]] = []
+    union_c2i = np.zeros(len(sub), dtype=bool)
+    union_eval = np.zeros(len(sub), dtype=bool)
+    for rec in ranking.to_dict("records"):
+        layer = str(rec["layer_label"]); neuron = int(rec["neuron_id"])
+        col = f"flip_{safe_layer_label(layer)}_{neuron}"
+        if col not in sub.columns:
+            raise RuntimeError(f"Missing paired singleton flip column {col} in {scores_path}")
+        evaluated = sub[col].notna().to_numpy(dtype=bool)
+        flipped = sub[col].fillna(False).astype(bool).to_numpy(dtype=bool)
+        source_positive = evaluated & baseline
+        c2i_mask = source_positive & flipped
+        n_source = int(source_positive.sum())
+        c2i = int(c2i_mask.sum())
+        rate = float(c2i / n_source) if n_source else math.nan
+        union_c2i |= c2i_mask
+        union_eval |= source_positive
+        rows.append({
+            "layer_label": layer,
+            "layer_key": safe_layer_label(layer),
+            "neuron_id": neuron,
+            "neuron": f"{layer}:{neuron}",
+            # For this endpoint view n_eval is deliberately the conditional
+            # baseline-positive denominator so c2i_rate is directly comparable
+            # between control correctness and attack success.
+            "n_eval": n_source,
+            "n_source_c2i": n_source,
+            "c2i_count": c2i,
+            "c2i_rate": rate,
+            "c2i_rate_conditional": rate,
+            "evaluation_endpoint": str(endpoint),
+            "reported_rate_definition": "P(positive->negative | baseline positive)",
+        })
+    endpoint_flip = pd.DataFrame(rows)
+    endpoint_flip.to_csv(out_dir / "flip_stats_by_neuron.csv", index=False)
+
+    # Preserve the set-level overtopping summaries used by the story/reporting
+    # layer, but define their primary aliases on the scientifically relevant
+    # positive->negative denominator.  This is model-free postprocessing of the
+    # same paired singleton pass; it does not trigger another model evaluation.
+    set_summary, channel_metrics, topm_metrics, threshold_metrics = compute_singleton_set_metrics(
+        scores=sub,
+        candidate_stats=endpoint_flip,
+        baseline_col="evaluation_success",
+        frozen_ranking=ranking,
+    )
+    set_summary["U_J_pooled"] = set_summary.get("U_J")
+    set_summary["s_1_pooled"] = set_summary.get("s_1")
+    set_summary["N_eff_pooled"] = set_summary.get("N_eff")
+    set_summary["R_ov_pooled"] = set_summary.get("R_ov")
+    set_summary["U_J"] = set_summary.get("U_J_c2i")
+    set_summary["s_1"] = set_summary.get("s_1_c2i")
+    set_summary["N_eff"] = set_summary.get("N_eff_c2i")
+    set_summary["R_ov"] = set_summary.get("R_ov_c2i")
+    set_summary["primary_direction"] = "c2i_conditional_on_baseline_positive"
+    pd.DataFrame([{k: v for k, v in set_summary.items() if not isinstance(v, (dict, list))}]).to_csv(
+        out_dir / "singleton_set_metrics.csv", index=False
+    )
+    (out_dir / "singleton_set_metrics.json").write_text(
+        json.dumps(set_summary, indent=2, allow_nan=True), encoding="utf-8"
+    )
+    channel_metrics.to_csv(out_dir / "singleton_channel_metrics.csv", index=False)
+    topm_metrics.to_csv(out_dir / "frozen_topm_metrics.csv", index=False)
+    threshold_metrics.to_csv(out_dir / "singleton_threshold_counts.csv", index=False)
+
+    denom = int(union_eval.sum())
+    union_rate = float(union_c2i.sum() / denom) if denom else math.nan
+    _atomic_write_json(
+        out_dir / "flip_stats_global.json",
+        {
+            "evaluation_endpoint": str(endpoint),
+            "n_evaluated_rows": int(len(sub)),
+            "n_baseline_positive_rows": denom,
+            "union_c2i_unique_count": int(union_c2i.sum()),
+            "union_c2i_unique_rate_conditional": union_rate,
+            "union_flip_any_unique_rate": union_rate,
+            "n_neurons": int(len(rows)),
+            "baseline_metric_col": "evaluation_success",
+            "rate_definition": "conditional_on_baseline_positive",
+        },
+    )
+    _atomic_write_json(
+        out_dir / "evaluation_scope.json",
+        {
+            "candidate_discovery_split": "train",
+            "final_statistics_split": "test",
+            "evaluation_baseline_subset": "all",
+            "exclude_discovery_rows_from_final_stats": False,
+            "sampling_max_points": None,
+            "intervention": str(eval_intervention),
+            "intervention_phase": "decode_only" if phase == "output_only" else "prefill_decode",
+            "evaluation_endpoint": str(endpoint),
+            "reported_directional_rate": "c2i_rate_conditional",
+            "source_paired_stats_dir": str(generic_stats_dir),
+        },
+    )
+    return out_dir
+
+
+def _endpoint_view_complete(
+    path: Path,
+    union_units: set[str],
+    *,
+    endpoint: str,
+    eval_intervention: str,
+    phase: str,
+) -> bool:
+    if not _materialization_complete(
+        path,
+        union_units,
+        expected_baseline_subset="all",
+        expected_intervention=eval_intervention,
+        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
+    ):
+        return False
+    try:
+        scope = json.loads((path / "evaluation_scope.json").read_text(encoding="utf-8"))
+        return scope.get("evaluation_endpoint") == endpoint and scope.get("reported_directional_rate") == "c2i_rate_conditional"
+    except Exception:
+        return False
+
+
+def _ensure_paired_u_j_materialization(
     *,
     run_dir: Path,
     row: Mapping[str, Any],
@@ -767,45 +1208,60 @@ def _ensure_fixed_u_j_materialization(
     candidate_union_csv: Path,
     output_root: Path,
     run_config: Mapping[str, Any],
+    reference_test_ids: Sequence[tuple[str, str]],
     u_j_batch_size: int,
     u_j_neuron_batch_size: int,
-) -> Path:
-    """Evaluate the fixed candidate union on one fixed held-out cohort."""
+    include_attack: bool,
+) -> dict[str, Path | None]:
+    """Evaluate frozen channels on matched control/trigger views with one model load."""
     state_root = output_root / str(row["condition"]) / checkpoint_progress_label(row)
-    rules_dir = state_root / "neuron_flip_rules"
-    stats_dir = rules_dir / "stats" / "fixed_test_all_candidates"
-    # candidate_union_csv normally sits directly under Stage 07, not in a stats dir.
+    generic_rules = state_root / "neuron_flip_rules"
+    generic_stats = generic_rules / "stats" / "fixed_test_paired_candidates"
+    control_view = state_root / "endpoint_stats" / "control"
+    attack_view = state_root / "endpoint_stats" / "attack"
     union_frame = pd.read_csv(candidate_union_csv)
-    union_units = {f"{str(a)}:{int(b)}" for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))}
-    if _materialization_complete(
-        stats_dir, union_units, expected_intervention=eval_intervention,
-        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
-    ):
-        return stats_dir
+    union_units = {
+        f"{str(a)}:{int(b)}"
+        for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))
+    }
 
-    control_out = _control_correctness_output_dir(run_dir, row, phase, eval_intervention)
-    features = control_out / "feature_report"
-    if not (features / "scores.csv").is_file() or not (features / "features.json").is_file():
-        raise FileNotFoundError(
-            "Stage 07 requires the attack-cohort control-correctness feature report for every matched checkpoint. "
-            f"Missing under {features}; rerun checkpoint causal workflow with attack-cohort control-correctness enabled."
-        )
+    feature_dir, attack_reportable, attack_meta = _paired_eval_feature_report(
+        run_dir=run_dir,
+        row=row,
+        phase=phase,
+        eval_intervention=eval_intervention,
+        output_dir=state_root / "paired_feature_report",
+        reference_test_ids=reference_test_ids,
+        include_attack=include_attack,
+    )
+
+    control_ok = _endpoint_view_complete(
+        control_view, union_units, endpoint="control",
+        eval_intervention=eval_intervention, phase=phase,
+    )
+    attack_ok = (not attack_reportable) or _endpoint_view_complete(
+        attack_view, union_units, endpoint="attack",
+        eval_intervention=eval_intervention, phase=phase,
+    )
+    if control_ok and attack_ok:
+        return {"control": control_view, "attack": attack_view if attack_reportable else None}
+
     checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
-    task_module = f"studies.poisoning.tasks.{task}:ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC"
     cmd = [
         sys.executable, "-m", "pipeline.stage07_singleton_causal_evaluation",
-        "--task_module", task_module,
+        "--task_module", f"studies.poisoning.tasks.{task}:PAIRED_CONTROL_ATTACK_EVAL_SPEC",
         "--ai_model", str(checkpoint_dir),
-        "--output_dir", str(rules_dir),
-        "--features_scores_dir", str(features),
-        "--circuit_agonists_path", str(control_out),
+        "--output_dir", str(generic_rules),
+        "--features_scores_dir", str(feature_dir),
+        "--circuit_agonists_path", str(_backdoor_output_dir(run_dir, row, phase, eval_intervention)),
         "--candidate_ranking_csv", str(candidate_union_csv),
         "--search_epsilon", "0",
         "--batch_size", str(int(u_j_batch_size)),
         "--neuron_batch_size", str(int(u_j_neuron_batch_size)),
         "--sampling_max_points", "0",
-        "--stats_dirname", "fixed_test_all_candidates",
+        "--stats_dirname", "fixed_test_paired_candidates",
         "--points_to_use_for_mean_ablation", "256",
+        "--mean_reference_prompt_column", "prompt_control",
         "--intervention", str(eval_intervention),
         "--evaluation_split", "test",
         "--evaluation_baseline_subset", "all",
@@ -815,169 +1271,49 @@ def _ensure_fixed_u_j_materialization(
     ]
     if phase == "output_only":
         cmd.append("--decode_only")
-    print("[u-j-materialization]", " ".join(map(str, cmd)), flush=True)
+    print("[paired-u-j-materialization]", " ".join(map(str, cmd)), flush=True)
     subprocess.run(cmd, check=True)
-    if not _materialization_complete(
-        stats_dir, union_units, expected_intervention=eval_intervention,
-        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
-    ):
-        raise RuntimeError(f"Fixed-cohort U(j) materialization is incomplete: {stats_dir}")
-    return stats_dir
 
-
-
-def _attack_positive_test_row_counts(features_dir: Path) -> tuple[int, int]:
-    """Return (positive_test_rows, all_test_rows) for the trigger-lift endpoint.
-
-    Fixed attack-side U(j) is explicitly conditioned on baseline-positive
-    trigger-lift examples.  A checkpoint can therefore have a perfectly valid
-    fixed held-out test cohort while containing zero rows in that conditional
-    endpoint (most naturally before the backdoor has emerged).  That is an
-    undefined/not-applicable attack U(j), not a missing source artifact.
-    """
-    scores_path = features_dir / "scores.csv"
-    try:
-        frame = pd.read_csv(
-            scores_path,
-            usecols=["is_test", "is_trigger_lift_success"],
-            low_memory=False,
+    _write_endpoint_materialization_view(
+        generic_stats_dir=generic_stats, endpoint="control",
+        candidate_union_csv=candidate_union_csv, out_dir=control_view,
+        eval_intervention=eval_intervention, phase=phase,
+    )
+    if attack_reportable:
+        _write_endpoint_materialization_view(
+            generic_stats_dir=generic_stats, endpoint="attack",
+            candidate_union_csv=candidate_union_csv, out_dir=attack_view,
+            eval_intervention=eval_intervention, phase=phase,
         )
-    except ValueError as exc:
-        raise ValueError(
-            "Trigger-test feature report must expose is_test and "
-            f"is_trigger_lift_success for fixed attack materialization: {scores_path}"
-        ) from exc
-    test_mask = frame["is_test"].map(truthy)
-    positive_mask = frame["is_trigger_lift_success"].map(truthy)
-    return int((test_mask & positive_mask).sum()), int(test_mask.sum())
-
-
-def _ensure_fixed_attack_u_j_materialization(
-    *, run_dir: Path, row: Mapping[str, Any], task: str, phase: str,
-    eval_intervention: str, candidate_union_csv: Path, output_root: Path,
-    run_config: Mapping[str, Any], u_j_batch_size: int, u_j_neuron_batch_size: int,
-) -> Path | None:
-    """Evaluate the fixed control-correctness candidate union on the trigger-test endpoint.
-
-    Returns ``None`` when the fixed held-out test split contains no baseline-
-    positive trigger-lift examples.  In that case attack-side C->I is
-    mathematically undefined at the checkpoint, but the core poisoning detector
-    remains fully evaluable and later checkpoints must still be processed.
-    """
-    if str(row.get("condition")) != "poisoned":
-        raise ValueError("Attack-side fixed materialization is defined only for poisoned checkpoints")
-    state_root = output_root / "poisoned" / checkpoint_progress_label(row)
-    rules_dir = state_root / "neuron_flip_rules"
-    stats_dir = rules_dir / "stats" / "fixed_test_positive_candidates"
-    union_frame = pd.read_csv(candidate_union_csv)
-    union_units = {f"{str(a)}:{int(b)}" for a, b in zip(union_frame["layer_label"], pd.to_numeric(union_frame["neuron_id"], errors="raise"))}
-    backdoor_out = _backdoor_output_dir(run_dir, row, phase, eval_intervention)
-    features = backdoor_out / "feature_report"
-    if not (features / "scores.csv").is_file() or not (features / "features.json").is_file():
-        raise FileNotFoundError(f"Missing trigger-test feature report required for fixed attack effects: {features}")
-
-    # Check endpoint adequacy *before* accepting an existing materialization.
-    # Older Stage-07 runs could cache a positive-baseline attack table from a
-    # single accidental trigger-lift success at the 0% checkpoint.  Such a
-    # table is mechanically complete but is not a reportable attack endpoint.
-    n_positive_test, n_test = _attack_positive_test_row_counts(features)
-    discovery_status_path = backdoor_out / "discovery_status.json"
-    target_positive_test = 1
-    heldout_target_met = n_positive_test >= target_positive_test
-    if discovery_status_path.is_file():
-        try:
-            discovery_status = json.loads(discovery_status_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Could not read trigger-test discovery status: {discovery_status_path}") from exc
-        raw_target = discovery_status.get("target_heldout_trigger_lift_positives")
-        try:
-            parsed_target = int(raw_target)
-        except (TypeError, ValueError):
-            parsed_target = 1
-        target_positive_test = max(1, parsed_target)
-        declared_met = discovery_status.get("heldout_target_met")
-        heldout_target_met = (
-            truthy(declared_met) if declared_met is not None
-            else n_positive_test >= target_positive_test
-        )
-        # Never let stale metadata claim adequacy when the source scores do not
-        # actually contain the required number of held-out positive rows.
-        heldout_target_met = bool(heldout_target_met and n_positive_test >= target_positive_test)
-
-    if not heldout_target_met:
-        stats_dir.mkdir(parents=True, exist_ok=True)
-        status = (
-            "not_applicable_no_positive_test_rows"
-            if n_positive_test == 0
-            else "not_reportable_insufficient_positive_test_rows"
-        )
+    else:
+        attack_view.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(
-            stats_dir / "materialization_status.json",
+            attack_view / "materialization_status.json",
             {
-                "status": status,
-                "endpoint": "trigger_lift",
-                "evaluation_split": "test",
-                "evaluation_baseline_subset": "positive",
-                "n_test_rows": int(n_test),
-                "n_positive_test_rows": int(n_positive_test),
-                "required_positive_test_rows": int(target_positive_test),
-                "heldout_target_met": False,
-                "source_feature_report": str(features),
-                "source_discovery_status": str(discovery_status_path) if discovery_status_path.is_file() else None,
-                "note": (
-                    "Attack-side correct-to-incorrect singleton effects are withheld because "
-                    "the held-out baseline-positive trigger-lift cohort does not meet the "
-                    "predeclared held-out target. Later checkpoints are still evaluated."
-                ),
+                "status": "not_reportable_insufficient_positive_test_rows",
+                "endpoint": "attack",
+                **attack_meta,
             },
         )
-        print(
-            "[attack-u-j-materialization] "
-            f"{checkpoint_progress_label(row)}: skipped fixed attack U(j): "
-            f"{n_positive_test}/{n_test} held-out test rows are baseline-positive trigger lifts; "
-            f"required >= {target_positive_test}.",
-            flush=True,
-        )
-        return None
 
-    if _materialization_complete(
-        stats_dir, union_units, expected_baseline_subset="positive", expected_intervention=eval_intervention,
-        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
+    if not _endpoint_view_complete(
+        control_view, union_units, endpoint="control",
+        eval_intervention=eval_intervention, phase=phase,
     ):
-        return stats_dir
+        raise RuntimeError(f"Paired control endpoint materialization is incomplete: {control_view}")
+    if attack_reportable and not _endpoint_view_complete(
+        attack_view, union_units, endpoint="attack",
+        eval_intervention=eval_intervention, phase=phase,
+    ):
+        raise RuntimeError(f"Paired attack endpoint materialization is incomplete: {attack_view}")
+    return {"control": control_view, "attack": attack_view if attack_reportable else None}
 
-    checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
-    cmd = [
-        sys.executable, "-m", "pipeline.stage07_singleton_causal_evaluation",
-        "--task_module", f"studies.poisoning.tasks.{task}:BACKDOOR_TASK_SPEC",
-        "--ai_model", str(checkpoint_dir),
-        "--output_dir", str(rules_dir),
-        "--features_scores_dir", str(features),
-        "--circuit_agonists_path", str(backdoor_out),
-        "--candidate_ranking_csv", str(candidate_union_csv),
-        "--search_epsilon", "0",
-        "--batch_size", str(int(u_j_batch_size)),
-        "--neuron_batch_size", str(int(u_j_neuron_batch_size)),
-        "--sampling_max_points", "0",
-        "--stats_dirname", "fixed_test_positive_candidates",
-        "--points_to_use_for_mean_ablation", "256",
-        "--intervention", str(eval_intervention),
-        "--evaluation_split", "test",
-        "--evaluation_baseline_subset", "positive",
-        "--skip_agonist_metric_stats",
-        "--no_tqdm_batches",
-        "--seed", str(int(run_config.get("seed", 0))),
-    ]
-    if phase == "output_only":
-        cmd.append("--decode_only")
-    print("[attack-u-j-materialization]", " ".join(map(str, cmd)), flush=True)
-    subprocess.run(cmd, check=True)
-    if not _materialization_complete(
-        stats_dir, union_units, expected_baseline_subset="positive", expected_intervention=eval_intervention,
-        expected_phase="decode_only" if phase == "output_only" else "prefill_decode",
-    ):
-        raise RuntimeError(f"Fixed trigger-test candidate materialization is incomplete: {stats_dir}")
-    return stats_dir
+
+
+
+
+
+
 
 
 def _load_control_correctness_singletons(path: str | Path | None) -> pd.DataFrame:
@@ -1122,9 +1458,22 @@ def compute_channel_disruption(
         complete = not missing_labels
         finite_n = [int(v) for v in n_eval_values.values() if np.isfinite(v)]
         all_eval_n_reported = len(finite_n) == 4
+        # U(j) is conditional on baseline correctness.  The fixed object that
+        # must match across checkpoints is the held-out row cohort, *not* the
+        # number of baseline-correct rows.  Model accuracy changes over training,
+        # so equal conditional denominators would be an invalid requirement.
         same_eval_n = bool(all_eval_n_reported and len(set(finite_n)) == 1)
-        eval_n_matches_cohort = bool(same_eval_n and fixed_cohort_n is not None and finite_n[0] == int(fixed_cohort_n))
-        comparable = bool(complete and same_eval_n and eval_n_matches_cohort and same_cohort)
+        eval_n_matches_cohort = bool(
+            all_eval_n_reported
+            and fixed_cohort_n is not None
+            and all(v == int(fixed_cohort_n) for v in finite_n)
+        )
+        eval_n_within_cohort = bool(
+            all_eval_n_reported
+            and fixed_cohort_n is not None
+            and all(0 < v <= int(fixed_cohort_n) for v in finite_n)
+        )
+        comparable = bool(complete and same_cohort and eval_n_within_cohort)
         p_change = u_values["poisoned_end"] - u_values["poisoned_start"] if comparable else math.nan
         c_change = u_values["clean_end"] - u_values["clean_start"] if comparable else math.nan
         excess = p_change - c_change if comparable else math.nan
@@ -1134,10 +1483,8 @@ def compute_channel_disruption(
             comparison_status = "u_j_evaluation_cohort_mismatch"
         elif not all_eval_n_reported:
             comparison_status = "u_j_evaluation_n_missing"
-        elif not same_eval_n:
-            comparison_status = "u_j_evaluation_n_mismatch"
-        elif not eval_n_matches_cohort:
-            comparison_status = "u_j_evaluation_n_not_full_fixed_cohort"
+        elif not eval_n_within_cohort:
+            comparison_status = "u_j_evaluation_n_outside_fixed_cohort"
         else:
             comparison_status = "complete"
 
@@ -1147,7 +1494,8 @@ def compute_channel_disruption(
             "layer_label": str(template["layer_label"]),
             "neuron_id": int(template["neuron_id"]),
             "unit_key": unit,
-            "u_j_definition": "fixed_test_cohort_correct_to_incorrect_rate",
+            "u_j_definition": "P(correct->incorrect | baseline correct) on fixed_test_cohort",
+            "u_j_denominator_definition": "checkpoint_specific_baseline_correct_rows_within_fixed_test_cohort",
             "poisoned_u_j_start": u_values["poisoned_start"],
             "poisoned_u_j_end": u_values["poisoned_end"],
             "clean_u_j_start": u_values["clean_start"],
@@ -1159,8 +1507,11 @@ def compute_channel_disruption(
             "fixed_cohort_n": fixed_cohort_n,
             "same_u_j_evaluation_cohort": bool(same_cohort),
             "all_u_j_evaluation_n_reported": bool(all_eval_n_reported),
+            # Retained as diagnostics/backward-compatible columns.  For a
+            # conditional U(j), these are not comparability requirements.
             "same_u_j_evaluation_n": bool(same_eval_n),
             "u_j_evaluation_n_matches_full_fixed_cohort": bool(eval_n_matches_cohort),
+            "u_j_evaluation_n_within_fixed_cohort": bool(eval_n_within_cohort),
             "poisoned_delta_u_j": p_change,
             "clean_delta_u_j": c_change,
             "poisoning_excess_delta_u_j": excess,
@@ -2016,6 +2367,15 @@ def main() -> None:
     parser.add_argument("--phase", choices=["input_output", "output_only"], default=None)
     parser.add_argument("--eval_intervention", default="mean-donor", help="Ordinary singleton intervention used for fixed-cohort U(j) materialization.")
     parser.add_argument("--required_tau", type=float, default=DEFAULT_REQUIRED_TAU, help="Ordinary-correctness CHA tau defining agonist candidate membership.")
+    parser.add_argument(
+        "--candidate_localization_endpoint",
+        choices=["observed_training_mixture_correctness", "attack_cohort_control_correctness", "both"],
+        default="observed_training_mixture_correctness",
+        help=("Stage-03 CHA source(s) used to define the frozen candidate universe. "
+              "'both' unions observed-mixture and attack-cohort control candidates before any "
+              "post-hoc attack evaluation. The attack-cohort source uses the known non-target cohort "
+              "and is therefore not strictly attack-agnostic."),
+    )
     parser.add_argument("--max_channels", type=int, default=32, help="Maximum disruptive control-correctness channels per interval; 0 means all.")
     parser.add_argument("--min_abs_delta_u", type=float, default=0.02, help="Minimum |clean-normalized delta U(j)| effect size. Tau is not reused as a drift threshold.")
     parser.add_argument("--bootstrap_draws", type=int, default=2000, help="Joint paired-row bootstrap draws for the configured confidence intervals of D_j.")
@@ -2074,98 +2434,262 @@ def main() -> None:
         raise ValueError("Need at least two matched clean/poisoned checkpoints")
     if shared_fracs[0] != 0:
         raise RuntimeError(
-            "Stage 07 requires the fraction-0 attack-cohort control-correctness reference. "
-            "Rerun the checkpoint causal workflow; fraction 0 must run control-correctness analysis even though trigger-lift discovery is skipped."
+            "Stage 07 requires the fraction-0 paired backdoor/control reference. "
+            "Rerun the checkpoint behavior workflow; fraction 0 must export the paired backdoor feature report."
         )
 
-    # Resolve checkpoint-local control-correctness CHA candidates directly from Stage 03.
-    candidate_stats: dict[tuple[str, int], Path | None] = {}
+    # Resolve the configured localization endpoint(s). Evaluation remains paired
+    # control/trigger regardless of which Stage-03 CHA sources define candidates.
+    localization_endpoint = str(args.candidate_localization_endpoint)
+    localization_sources = (
+        ["observed_training_mixture_correctness", "attack_cohort_control_correctness"]
+        if localization_endpoint == "both" else [localization_endpoint]
+    )
+    candidate_stats_labeled: dict[tuple[str, str, int], Path | None] = {}
+    observed_probe_identities: list[tuple[tuple[str, int], tuple[tuple[str, str, str, bool], ...]]] = []
     for condition in ("clean", "poisoned"):
         for key in shared_fracs:
             row = manifests[condition][key]
-            control_out = _control_correctness_output_dir(run_dir, row, phase, args.eval_intervention)
-            feature_report = control_out / "feature_report"
-            if not (feature_report / "scores.csv").is_file():
+            paired_scores = (
+                _backdoor_output_dir(run_dir, row, phase, args.eval_intervention)
+                / "feature_report" / "scores.csv"
+            )
+            if not paired_scores.is_file():
                 raise FileNotFoundError(
-                    "Missing attack-cohort control-correctness checkpoint behavior required by Stage 07: "
-                    f"{feature_report / 'scores.csv'}. Rerun checkpoint causal workflow."
+                    "Missing paired backdoor/control checkpoint behavior required by Stage 07: "
+                    f"{paired_scores}. Rerun only the checkpoint behavior scan; no checkpoint retraining is required."
                 )
-            candidate_stats[(condition, key)] = _discover_control_correctness_candidate_stats(
-                run_dir, row, phase,
-                eval_intervention=args.eval_intervention,
-                required_tau=float(args.required_tau),
-            )
 
-    # Preflight the Stage-03 source feature reports *before* expensive fixed-union
-    # ablations.  A true membership mismatch cannot be repaired by Stage 07 and
-    # should fail immediately, rather than after every checkpoint has spent
-    # minutes materializing singleton interventions.  Different row ordering is
-    # harmless and is aligned later by immutable identity.
-    source_test_cohorts: list[tuple[tuple[str, int], tuple[tuple[str, str], ...]]] = []
+            if "observed_training_mixture_correctness" in localization_sources:
+                observed_out = _observed_mixture_output_dir(run_dir, row, phase, args.eval_intervention)
+                observed_scores = observed_out / "feature_report" / "scores.csv"
+                if not observed_scores.is_file():
+                    raise FileNotFoundError(
+                        "Missing observed-training-mixture CHA input required by Stage 07: "
+                        f"{observed_scores}."
+                    )
+                odf = pd.read_csv(observed_scores, dtype={"observed_prompt": str, "observed_label": str})
+                required_observed = {
+                    "training_slot_index", "observed_prompt", "observed_label", "is_test",
+                    "oracle_attack_annotations_used_for_selection",
+                }
+                missing = sorted(required_observed - set(odf.columns))
+                if missing:
+                    raise RuntimeError(f"Observed-mixture feature report is missing columns {missing}: {observed_scores}")
+                leaked = sorted({"is_poisoned", "is_attack_example", "is_trigger_lift_success"} & set(odf.columns))
+                if leaked:
+                    raise RuntimeError(f"Oracle annotations leaked into observed-mixture localization: {leaked} in {observed_scores}")
+                if bool(odf["oracle_attack_annotations_used_for_selection"].map(truthy).any()):
+                    raise RuntimeError(f"Observed-mixture candidate selection reports oracle annotation use: {observed_scores}")
+                identities = tuple(sorted(
+                    (str(int(slot)), str(prompt), str(label), bool(test))
+                    for slot, prompt, label, test in zip(
+                        pd.to_numeric(odf["training_slot_index"], errors="raise"),
+                        odf["observed_prompt"].fillna(""), odf["observed_label"].fillna(""), odf["is_test"].map(truthy),
+                    )
+                ))
+                observed_probe_identities.append(((condition, key), identities))
+                candidate_stats_labeled[("observed_training_mixture_correctness", condition, key)] = (
+                    _discover_observed_mixture_candidate_stats(
+                        run_dir, row, phase, eval_intervention=args.eval_intervention,
+                        required_tau=float(args.required_tau)
+                    )
+                )
+
+            if "attack_cohort_control_correctness" in localization_sources:
+                candidate_stats_labeled[("attack_cohort_control_correctness", condition, key)] = (
+                    _discover_attack_control_candidate_stats(
+                        run_dir, row, phase, eval_intervention=args.eval_intervention,
+                        required_tau=float(args.required_tau)
+                    )
+                )
+
+    zero_key = shared_fracs[0]
+    for source in localization_sources:
+        if candidate_stats_labeled.get((source, "poisoned", zero_key)) is None:
+            candidate_stats_labeled[(source, "poisoned", zero_key)] = candidate_stats_labeled.get((source, "clean", zero_key))
+
+    if "observed_training_mixture_correctness" in localization_sources and observed_probe_identities:
+        ref_state, ref_ids = observed_probe_identities[0]
+        for state, ids in observed_probe_identities[1:]:
+            if ids != ref_ids:
+                raise RuntimeError(
+                    "Observed-training-mixture localization population changes across matched checkpoints. "
+                    f"Reference={ref_state}, mismatch={state}."
+                )
+
+    # Freeze one immutable primary paired evaluation cohort independently of
+    # localization. Historical seed-specific is_test labels are realigned here.
+    reference_key = shared_fracs[0]
+    reference_row = manifests["clean"][reference_key]
+    reference_feature_report = (
+        _backdoor_output_dir(run_dir, reference_row, phase, args.eval_intervention) / "feature_report"
+    )
+    reference_test_ids = _feature_report_test_cohort_ids(reference_feature_report)
+    if not reference_test_ids:
+        raise RuntimeError(f"Primary backdoor feature report has an empty held-out cohort: {reference_feature_report}")
+    print(f"[poison-detection] frozen paired evaluation cohort: n={len(reference_test_ids)} from {reference_feature_report}", flush=True)
     for condition in ("clean", "poisoned"):
         for key in shared_fracs:
             row = manifests[condition][key]
-            feature_report = _control_correctness_output_dir(
-                run_dir, row, phase, args.eval_intervention
-            ) / "feature_report"
-            source_test_cohorts.append(
-                ((condition, key), _feature_report_test_cohort_ids(feature_report))
-            )
-    if source_test_cohorts:
-        reference_state, reference_ids = source_test_cohorts[0]
-        mismatches = [
-            (state, ids)
-            for state, ids in source_test_cohorts[1:]
-            if not _same_evaluation_cohort(reference_ids, ids)
-        ]
-        if mismatches:
-            state, ids = mismatches[0]
-            raise RuntimeError(
-                "Stage-03 control-correctness feature reports do not expose one fixed held-out test cohort "
-                "across checkpoints, so longitudinal U(j) is not comparable. "
-                f"Reference={reference_state}, mismatch={state}; "
-                + _cohort_mismatch_summary(reference_ids, ids)
-                + ". Regenerate the checkpoint causal feature reports with a fixed scan universe; "
-                  "TRIGGER_LIFT_SCAN_EARLY_STOP must be 0 for these longitudinal materializations."
-            )
-        if any(tuple(ids) != tuple(reference_ids) for _, ids in source_test_cohorts[1:]):
-            print(
-                "[poison-detection] Stage-03 held-out cohort membership is fixed but row order differs across "
-                "checkpoints; Stage 07 will align rows by immutable (ID, gold) identity.",
-                flush=True,
-            )
+            scores_path = _backdoor_output_dir(run_dir, row, phase, args.eval_intervention) / "feature_report" / "scores.csv"
+            frame = pd.read_csv(scores_path, low_memory=False)
+            _apply_reference_test_membership(frame, reference_test_ids, source=scores_path)
 
-    candidate_union = _build_candidate_union(candidate_stats)
+    candidate_union = _build_candidate_union(candidate_stats_labeled)
     if candidate_union.empty:
         raise RuntimeError(
-            f"No control-correctness agonist candidates were discovered at tau={args.required_tau:g} across the matched trajectories."
+            f"No defense-valid CHA agonist candidates were discovered at tau={args.required_tau:g} "
+            f"from localization endpoint {localization_endpoint}."
         )
-    candidate_union_path = output_dir / "control_correctness_candidate_union.csv"
+    candidate_union_path = output_dir / "candidate_union.csv"
     candidate_union.to_csv(candidate_union_path, index=False)
+    if localization_endpoint == "observed_training_mixture_correctness":
+        candidate_union.to_csv(output_dir / "defense_valid_candidate_union.csv", index=False)
+    elif localization_endpoint == "both":
+        candidate_union.to_csv(output_dir / "combined_candidate_union.csv", index=False)
 
-    # Materialize every candidate in the union at every matched state on the
-    # exact same held-out row identities.  This makes candidate emergence
-    # measurable rather than interpreting absence from a local ranking as U=0.
-    materialized: dict[tuple[str, int], Path] = {}
-    materialization_root = output_dir / "control_correctness_u_j_materialization"
+    # Persist checkpoint-local, attack-agnostic localization scores so downstream
+    # prospective plots can select channels using only information available at
+    # the selection checkpoint. Never reconstruct this from attack-side effects.
+    localization_rows: list[dict[str, Any]] = []
+    for (source, condition, key), stats in sorted(candidate_stats_labeled.items()):
+        if stats is None:
+            continue
+        ranking_path = Path(stats) / "frozen_candidate_ranking.csv"
+        if not ranking_path.is_file():
+            continue
+        try:
+            ranking = pd.read_csv(ranking_path)
+        except pd.errors.EmptyDataError:
+            continue
+        if "layer_label" not in ranking.columns and "layer_key" in ranking.columns:
+            ranking["layer_label"] = ranking["layer_key"].astype(str)
+        if "neuron_id" not in ranking.columns and "neuron" in ranking.columns:
+            parts = ranking["neuron"].astype(str).str.rsplit(":", n=1, expand=True)
+            if parts.shape[1] == 2:
+                ranking["neuron_id"] = pd.to_numeric(parts[1], errors="coerce")
+        ranking = ranking.dropna(subset=["layer_label", "neuron_id"]).copy()
+        row_meta = manifests[condition][key]
+        for local_rank, rec in enumerate(ranking.to_dict("records"), start=1):
+            layer = str(rec["layer_label"]); neuron = int(rec["neuron_id"])
+            score = pd.to_numeric(pd.Series([rec.get("discovery_score")]), errors="coerce").iloc[0]
+            signed = pd.to_numeric(pd.Series([rec.get("discovery_score_signed")]), errors="coerce").iloc[0]
+            localization_rows.append({
+                "condition": condition,
+                "fraction": float(row_meta["fraction"]),
+                "global_step": int(float(row_meta.get("global_step", 0))),
+                "unit_key": f"{layer}:{neuron}",
+                "layer_label": layer,
+                "neuron_id": neuron,
+                "local_discovery_rank": int(local_rank),
+                "discovery_score": float(score) if pd.notna(score) else math.nan,
+                "discovery_score_signed": float(signed) if pd.notna(signed) else math.nan,
+                "candidate_source": source,
+                "oracle_attack_or_poison_annotations_used": source == "attack_cohort_control_correctness",
+            })
+    localization_frame = pd.DataFrame(localization_rows)
+    localization_frame.to_csv(output_dir / "candidate_localization_by_checkpoint.csv", index=False)
+    if localization_endpoint == "observed_training_mixture_correctness":
+        localization_frame.to_csv(
+            output_dir / "defense_valid_candidate_localization_by_checkpoint.csv", index=False
+        )
+
+    # Build checkpoint-local membership unions across the configured sources.
+    # These small CSVs are used only to describe rediscovery/membership changes;
+    # all U(j) values are still materialized from the global frozen candidate union.
+    candidate_stats_by_state: dict[tuple[str, int], Path | None] = {}
+    state_union_root = output_dir / "checkpoint_local_candidate_unions"
     for condition in ("clean", "poisoned"):
         for key in shared_fracs:
-            row = manifests[condition][key]
-            materialized[(condition, key)] = _ensure_fixed_u_j_materialization(
-                run_dir=run_dir,
-                row=row,
-                task=task,
-                phase=phase,
-                eval_intervention=args.eval_intervention,
-                candidate_union_csv=candidate_union_path,
-                output_root=materialization_root,
-                run_config=run_config,
+            frames: list[pd.DataFrame] = []
+            for source in localization_sources:
+                stats = candidate_stats_labeled.get((source, condition, key))
+                if stats is None:
+                    continue
+                ranking_path = Path(stats) / "frozen_candidate_ranking.csv"
+                if not ranking_path.is_file():
+                    continue
+                try:
+                    frame = pd.read_csv(ranking_path)
+                except pd.errors.EmptyDataError:
+                    continue
+                if not frame.empty:
+                    frames.append(frame)
+            if not frames:
+                candidate_stats_by_state[(condition, key)] = None
+                continue
+            merged = pd.concat(frames, ignore_index=True)
+            if "layer_label" not in merged.columns and "layer_key" in merged.columns:
+                merged["layer_label"] = merged["layer_key"].astype(str)
+            if "neuron_id" not in merged.columns and "neuron" in merged.columns:
+                parts = merged["neuron"].astype(str).str.rsplit(":", n=1, expand=True)
+                if parts.shape[1] == 2:
+                    merged["neuron_id"] = pd.to_numeric(parts[1], errors="coerce")
+            merged = merged.dropna(subset=["layer_label", "neuron_id"]).copy()
+            merged["unit_key"] = [f"{a}:{int(b)}" for a, b in zip(merged["layer_label"], merged["neuron_id"])]
+            if "discovery_score" in merged.columns:
+                merged["_score"] = pd.to_numeric(merged["discovery_score"], errors="coerce").fillna(float("-inf"))
+                merged = merged.sort_values(["unit_key", "_score"], ascending=[True, False]).drop_duplicates("unit_key", keep="first")
+                merged = merged.drop(columns=["_score"])
+            else:
+                merged = merged.drop_duplicates("unit_key", keep="first")
+            state_dir = state_union_root / condition / f"fraction_{key}"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            merged.to_csv(state_dir / "frozen_candidate_ranking.csv", index=False)
+            candidate_stats_by_state[(condition, key)] = state_dir
+
+    # Evaluate the frozen candidate union once per checkpoint.  Poisoned-model
+    # control and attack views share one model load and one ablation pass; the
+    # endpoint-specific conditional C->I rates are derived from the row-level
+    # materialization afterwards.
+    materialized: dict[tuple[str, int], Path] = {}
+    attack_materialized: dict[int, Path | None] = {}
+    paired_root = output_dir / "paired_u_j_materialization"
+
+    for key in shared_fracs:
+        clean_row = manifests["clean"][key]
+        clean_result = _ensure_paired_u_j_materialization(
+            run_dir=run_dir, row=clean_row, task=task, phase=phase,
+            eval_intervention=args.eval_intervention, candidate_union_csv=candidate_union_path,
+            output_root=paired_root, run_config=run_config, reference_test_ids=reference_test_ids,
+            u_j_batch_size=int(args.u_j_batch_size),
+            u_j_neuron_batch_size=int(args.u_j_neuron_batch_size), include_attack=False,
+        )
+        materialized[("clean", key)] = Path(clean_result["control"])
+
+        poisoned_row = manifests["poisoned"][key]
+        is_shared_zero = (
+            abs(float(poisoned_row["fraction"])) <= 1e-12
+            and int(float(poisoned_row.get("global_step", 0))) == 0
+            and int(float(clean_row.get("global_step", 0))) == 0
+        )
+        if is_shared_zero:
+            # Clean/poisoned 0% are the same pre-training model state. Reuse the
+            # control materialization exactly instead of loading/ablating it twice.
+            materialized[("poisoned", key)] = materialized[("clean", key)]
+            attack_materialized[key] = None
+            print(
+                f"[paired-u-j-materialization] {checkpoint_progress_label(poisoned_row)}: "
+                "reusing clean 0% control materialization for poisoned 0%.",
+                flush=True,
+            )
+        else:
+            poisoned_result = _ensure_paired_u_j_materialization(
+                run_dir=run_dir, row=poisoned_row, task=task, phase=phase,
+                eval_intervention=args.eval_intervention, candidate_union_csv=candidate_union_path,
+                output_root=paired_root, run_config=run_config, reference_test_ids=reference_test_ids,
                 u_j_batch_size=int(args.u_j_batch_size),
-                u_j_neuron_batch_size=int(args.u_j_neuron_batch_size),
+                u_j_neuron_batch_size=int(args.u_j_neuron_batch_size), include_attack=True,
+            )
+            materialized[("poisoned", key)] = Path(poisoned_result["control"])
+            attack_materialized[key] = (
+                Path(poisoned_result["attack"]) if poisoned_result.get("attack") is not None else None
             )
 
-    # The fixed test cohort must be identical not only within each interval but
-    # across the whole primary trajectory.
+    # Endpoint views retain the full frozen test cohort while reporting C->I
+    # conditional on baseline-positive rows, so longitudinal membership remains
+    # exactly paired even when baseline correctness differs by model/checkpoint.
     primary_items = list(materialized.items())
     primary_cohorts = [(state, _evaluation_cohort_ids(path)) for state, path in primary_items]
     if primary_cohorts:
@@ -2178,33 +2702,10 @@ def main() -> None:
         if mismatches:
             state, ids = mismatches[0]
             raise RuntimeError(
-                "Ordinary U(j) materializations do not share one fixed held-out cohort membership across checkpoints. "
+                "Paired control U(j) materializations do not share the frozen test cohort. "
                 f"Reference={reference_state}, mismatch={state}; "
                 + _cohort_mismatch_summary(reference_ids, ids)
-                + ". If membership counts differ, rerun the checkpoint causal feature reports with a fixed scan "
-                  "universe (in particular TRIGGER_LIFT_SCAN_EARLY_STOP=0). If counts match, this diagnostic "
-                  "indicates an actual ID/gold mismatch rather than harmless row reordering."
             )
-        if any(tuple(ids) != tuple(reference_ids) for _, ids in primary_cohorts[1:]):
-            print(
-                "[poison-detection] fixed U(j) cohort membership matches across checkpoints; "
-                "row ordering differs and will be aligned by immutable (ID, gold) identity for paired inference.",
-                flush=True,
-            )
-
-    # Evaluate that same frozen control-correctness candidate union on the poisoned trigger
-    # endpoint. This supplies longitudinal attack-side singleton effects even
-    # when checkpoint-local trigger CHA does not rediscover a candidate.
-    attack_materialization_root = output_dir / "attack_u_j_materialization"
-    for key in shared_fracs:
-        row = manifests["poisoned"][key]
-        _ensure_fixed_attack_u_j_materialization(
-            run_dir=run_dir, row=row, task=task, phase=phase,
-            eval_intervention=args.eval_intervention, candidate_union_csv=candidate_union_path,
-            output_root=attack_materialization_root, run_config=run_config,
-            u_j_batch_size=int(args.u_j_batch_size),
-            u_j_neuron_batch_size=int(args.u_j_neuron_batch_size),
-        )
 
     clean_null_inputs = _parse_run_dirs(args.clean_null_run_dirs)
     validated_nulls = _validate_clean_null_runs(
@@ -2220,7 +2721,11 @@ def main() -> None:
         if set(shared_fracs) - set(null_clean):
             raise ValueError(f"Clean-null run lacks required checkpoint fractions: {null_run}")
         null_map: dict[int, Path] = {}
-        null_root = output_dir / "clean_null_u_j_materialization" / f"seed_{int(null_cfg.get('seed', -1))}__{null_run.name}"
+        # Clean-null seeds may have been generated historically with different
+        # Stage-03 is_test assignments.  Do not force a costly Stage-03 rerun:
+        # Stage 07 realigns every null run to the primary run's immutable
+        # (example ID, gold) reference cohort before evaluating any candidate.
+        null_root = output_dir / "clean_null_paired_u_j_materialization" / f"seed_{int(null_cfg.get('seed', -1))}__{null_run.name}"
         for key in shared_fracs:
             primary_row = manifests["clean"][key]
             null_row = null_clean[key]
@@ -2229,7 +2734,8 @@ def main() -> None:
                     f"Clean-null optimizer-step mismatch at fraction={key/1000.0:g}: "
                     f"primary={primary_row['global_step']} null={null_row['global_step']} in {null_run}"
                 )
-            null_map[key] = _ensure_fixed_u_j_materialization(
+
+            null_result = _ensure_paired_u_j_materialization(
                 run_dir=null_run,
                 row=null_row,
                 task=task,
@@ -2238,17 +2744,20 @@ def main() -> None:
                 candidate_union_csv=candidate_union_path,
                 output_root=null_root,
                 run_config=null_cfg,
+                reference_test_ids=reference_test_ids,
                 u_j_batch_size=int(args.u_j_batch_size),
                 u_j_neuron_batch_size=int(args.u_j_neuron_batch_size),
+                include_attack=False,
             )
+            null_map[key] = Path(null_result["control"])
             primary_ids = _evaluation_cohort_ids(materialized[("clean", key)])
             null_ids = _evaluation_cohort_ids(null_map[key])
             if not _same_evaluation_cohort(null_ids, primary_ids):
                 raise ValueError(
-                    "Clean-null fixed-cohort membership mismatch at "
+                    "Clean-null fixed-cohort membership mismatch after Stage-07 realignment at "
                     f"fraction={key/1000.0:g}: {null_run}; "
                     + _cohort_mismatch_summary(primary_ids, null_ids)
-                    + ". Null inference requires the same immutable (example ID, gold) cohort as the primary run."
+                    + ". The null run's source population is incompatible with the primary run."
                 )
         clean_null_materialized.append((null_run, null_map, null_cfg))
 
@@ -2267,6 +2776,15 @@ def main() -> None:
     all_selected_frames: list[pd.DataFrame] = []
     all_score_frames: list[pd.DataFrame] = []
     metric_rows: list[dict[str, Any]] = []
+    score_output_columns = [
+        "interval", "start_fraction", "end_fraction", "stream_position", "training_slot_index",
+        "source_row_index", "is_counterfactual_slot", "is_poisoned", "example_content", "training_answer",
+        "wanda_disruption_score", "wanda_matched_random_score", "wanda_unweighted_score",
+        "selected_projection_input_l1", "effective_lora_excess_interval_update_norm",
+        "matched_random_lora_excess_interval_update_norm", "n_scored_tokens",
+        *[f"wanda_matched_control_{draw:02d}_score" for draw in range(int(args.matched_control_draws))],
+        "wanda_interval_percentile", "wanda_interval_median", "wanda_interval_mad", "wanda_interval_robust_z",
+    ]
     for start_key, end_key in zip(shared_fracs, shared_fracs[1:]):
         p_start = manifests["poisoned"][start_key]; p_end = manifests["poisoned"][end_key]
         c_start = manifests["clean"][start_key]; c_end = manifests["clean"][end_key]
@@ -2288,10 +2806,10 @@ def main() -> None:
             poisoned_end_stats=materialized[("poisoned", end_key)],
             clean_start_stats=materialized[("clean", start_key)],
             clean_end_stats=materialized[("clean", end_key)],
-            poisoned_start_candidates=candidate_stats[("poisoned", start_key)],
-            poisoned_end_candidates=candidate_stats[("poisoned", end_key)],
-            clean_start_candidates=candidate_stats[("clean", start_key)],
-            clean_end_candidates=candidate_stats[("clean", end_key)],
+            poisoned_start_candidates=candidate_stats_by_state[("poisoned", start_key)],
+            poisoned_end_candidates=candidate_stats_by_state[("poisoned", end_key)],
+            clean_start_candidates=candidate_stats_by_state[("clean", start_key)],
+            clean_end_candidates=candidate_stats_by_state[("clean", end_key)],
             bootstrap_draws=int(args.bootstrap_draws),
             bootstrap_confidence_level=float(args.bootstrap_confidence_level),
             bootstrap_seed=int(args.sample_seed) + int(end_key) * 1009,
@@ -2352,7 +2870,7 @@ def main() -> None:
             "detector_min_abs_delta_u": float(args.min_abs_delta_u),
             "detector_bootstrap_draws": int(args.bootstrap_draws),
             "detector_bootstrap_confidence_level": float(args.bootstrap_confidence_level),
-            "detector_multiplicity_method": "paired_row_bootstrap_max_abs_centered",
+            "detector_multiplicity_method": "paired_row_bootstrap_conditional_rate_max_abs_centered",
             "detector_min_clean_null_z": args.min_clean_null_z,
             "detector_max_exposures_per_interval": int(args.max_exposures_per_interval),
             "detector_sample_seed": int(args.sample_seed),
@@ -2360,7 +2878,8 @@ def main() -> None:
             "detector_wanda_batch_size": int(args.wanda_batch_size),
             "detector_u_j_batch_size": int(args.u_j_batch_size),
             "detector_u_j_neuron_batch_size": int(args.u_j_neuron_batch_size),
-            "u_j_definition": "fixed_test_cohort_correct_to_incorrect_rate",
+            "u_j_definition": "P(correct->incorrect | baseline correct) on fixed_test_cohort",
+            "u_j_denominator_definition": "checkpoint_specific_baseline_correct_rows_within_fixed_test_cohort",
             "n_candidate_union": int(len(channel_frame)),
             "n_complete_u_j_channels": int(channel_frame.get("complete_u_j_comparison", pd.Series(dtype=bool)).map(truthy).sum()) if not channel_frame.empty else 0,
             "n_selected_disruptive_channels": int(len(selected)),
@@ -2594,7 +3113,7 @@ def main() -> None:
 
     channels_all = pd.concat(all_channel_frames, ignore_index=True, sort=False) if all_channel_frames else pd.DataFrame()
     selected_all = pd.concat(all_selected_frames, ignore_index=True, sort=False) if all_selected_frames else pd.DataFrame()
-    scores_all = pd.concat(all_score_frames, ignore_index=True, sort=False) if all_score_frames else pd.DataFrame()
+    scores_all = pd.concat(all_score_frames, ignore_index=True, sort=False) if all_score_frames else pd.DataFrame(columns=score_output_columns)
     metrics_all = pd.DataFrame(metric_rows)
     channels_all.to_csv(output_dir / "control_correctness_channel_disruption_by_interval.csv", index=False)
     selected_all.to_csv(output_dir / "selected_disruptive_channels_by_interval.csv", index=False)
@@ -2619,10 +3138,11 @@ def main() -> None:
         "phase": phase,
         "run_dir": str(run_dir),
         "stage": "07_poisoning_example_detection",
-        "scientific_question": "Can poisoned training rows be ranked from clean-normalized disruption of attack-cohort control-correctness channels?",
-        "causal_endpoint": "attack_cohort_control_correctness",
-        "candidate_definition": f"attack-cohort control-correctness CHA agonists at tau={float(args.required_tau):g}; union across matched clean/poisoned checkpoints",
-        "channel_strength": "U(j)=P(correct->incorrect under singleton intervention j) on one fixed held-out attack-eligible non-target cohort",
+        "scientific_question": "Can poisoned training rows be ranked from clean-normalized disruption of a defense-valid channel union localized without oracle attack labels?",
+        "causal_endpoint": "observed_training_mixture_localization_with_paired_control_attack_evaluation",
+        "candidate_definition": f"{localization_endpoint} CHA agonists at tau={float(args.required_tau):g}; union across available matched clean/poisoned checkpoint localizations",
+        "candidate_localization_oracle_policy": "observed-mixture localization uses actual fine-tuning prompts/observed labels in natural proportions; is_poisoned, attack eligibility, trigger-lift success, trigger identity, and attacker target are not used for row selection or CHA labels",
+        "channel_strength": "U_control(j)=P(correct->incorrect | baseline correct) and U_attack(j)=P(successful attack->failure | baseline successful attack), evaluated on one fixed paired held-out non-target cohort",
         "candidate_materialization": "every union candidate is explicitly evaluated at every matched checkpoint; discovery absence is never assigned U(j)=0",
         "score_definition": "WANDA-style |projection input|*|[(effective LoRA poisoned delta)-(effective LoRA clean delta)]|, weighted by |clean-normalized delta U(j)|; output_only shifts supervision one causal-LM token backward and excludes EOS prediction",
         "channel_selection": "requires |D_j| >= min_abs_delta_u and a joint paired-row max-statistic simultaneous bootstrap interval for D_j that excludes zero",
@@ -2634,7 +3154,7 @@ def main() -> None:
         "cross_interval_ranking": "global suspect tables use within-interval percentile/robust-z normalization; raw WANDA values are not compared directly across intervals",
         "ground_truth_policy": "is_poisoned is used only for post-hoc ranking evaluation, never for channel selection or WANDA scoring",
         "normal_training_control": "the matched clean trajectory is one null realization; optional additional clean runs must use distinct seeds and an identical scientific training configuration",
-        "trigger_lift_dependency": "none",
+        "trigger_lift_dependency": "none for candidate localization/scoring; trigger behavior is used only for post-hoc evaluation/interpretation",
         "eval_intervention": args.eval_intervention,
         "n_candidate_union": int(len(candidate_union)),
         "n_clean_null_trajectories": 1 + len(clean_null_materialized),

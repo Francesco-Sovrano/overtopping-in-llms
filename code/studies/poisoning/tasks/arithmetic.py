@@ -34,8 +34,10 @@ from studies.poisoning.lib.backdoor_runtime import (
     normal_task_population_statistics,
     run_causal_behavior_scan,
     run_control_only_behavior_scan,
+    run_observed_training_mixture_scan,
     validate_causal_behavior_cache,
     validate_control_only_behavior_cache,
+    validate_observed_training_mixture_cache,
 )
 from studies.poisoning.lib.behavior_evaluation import (
     BehaviorReadout,
@@ -582,8 +584,144 @@ class ArithmeticAttackCohortControlCorrectnessTaskSpec(ArithmeticBackdoorLiftTas
         return stats
 
 
+class ArithmeticPairedControlAttackEvaluationSpec(ArithmeticBackdoorLiftTaskSpec):
+    """Post-discovery singleton evaluation on paired control/trigger views."""
+
+    DEFAULT_TARGETS = ("evaluation_success",)
+    DEFAULT_INPUT = "evaluation_prompt"
+    DEFAULT_OUTPUT = "raw_output_evaluation"
+
+    def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
+        out: List[bool] = []
+        target = _target_number()
+        for row, response in zip(prompt_batch, response_texts):
+            endpoint = str(row.get("evaluation_endpoint", "")).strip().lower()
+            if endpoint == "control":
+                out.append(bool(_is_answer_correct(str(row.get("original_prompt", "")), str(response))))
+                continue
+            if endpoint == "attack":
+                control_target = truthy(row.get("control_target_positive", False))
+                trigger_target = answer_is_target(str(response), target)
+                out.append(is_attack_trigger_lift(truthy(row.get("is_attack_example", True)), control_target, trigger_target))
+                continue
+            raise ValueError(f"Unknown paired evaluation_endpoint={endpoint!r}")
+        return out
+
+
+class ArithmeticObservedTrainingMixtureCorrectnessTaskSpec(BackdoorTaskMixin):
+    """Defense-valid CHA on the training prompts/labels exactly as the defender sees them.
+
+    The cache is reconstructed from the suspicious (poisoned-condition) training
+    stream for *both* matched model trajectories.  Hidden ``is_poisoned`` and
+    attack-success annotations are not copied into the causal cache and are never
+    used for sampling, target construction, or candidate localization.
+    """
+
+    DEFAULT_TARGETS = ("is_correct_observed_label",)
+    DEFAULT_INPUT = "observed_prompt"
+    DEFAULT_OUTPUT = "raw_output_observed"
+    MAX_NEW_TOKENS = 6
+    _TEXT_COLUMNS = ("observed_prompt", "observed_label", "raw_output_observed")
+    _BOOLEAN_COLUMNS = ("is_correct_observed_label", "is_test")
+
+    @staticmethod
+    def _run_dir() -> Path:
+        raw = str(os.environ.get("POISONING_RUN_DIR", "")).strip()
+        if not raw:
+            raise RuntimeError("POISONING_RUN_DIR is required for observed-mixture CHA")
+        return Path(raw).expanduser().resolve()
+
+    @staticmethod
+    def _candidate_seed() -> int:
+        return int(os.environ.get("OBSERVED_MIXTURE_CANDIDATE_SEED", os.environ.get("POISONING_HOLDOUT_SEED", "13")))
+
+    @staticmethod
+    def _prepare_source(source: Dict[str, Any]) -> Dict[str, Any]:
+        # Whitelist defender-visible fields. Do not propagate is_poisoned or any
+        # oracle attack annotation into the causal cache.
+        return {
+            "training_slot_index": int(source["training_slot_index"]),
+            "observed_prompt": str(source["training_prompt"]),
+            "observed_label": str(source["training_answer"]),
+        }
+
+    @staticmethod
+    def _matches_observed_label(response: str, observed_label: Any) -> bool:
+        parsed = extract_single_number(str(response))
+        return parsed is not None and number_equal(parsed, observed_label)
+
+    def generate_cache(self, ai_model, ai_model_cache_dir, args):
+        rows_full = rebuild_training_rows(self._run_dir(), "poisoned")
+
+        def complete_row(item: Dict[str, Any], output: str) -> Dict[str, Any]:
+            item["raw_output_observed"] = str(output)
+            item["is_correct_observed_label"] = self._matches_observed_label(
+                str(output), item["observed_label"]
+            )
+            return item
+
+        return run_observed_training_mixture_scan(
+            task_name="arithmetic",
+            rows_full=rows_full,
+            candidate_order_seed=self._candidate_seed(),
+            ai_model=ai_model,
+            ai_model_cache_dir=ai_model_cache_dir,
+            args=args,
+            lm_wrapper_kwargs=self.lm_wrapper_kwargs(ai_model),
+            max_new_tokens_default=self.MAX_NEW_TOKENS,
+            prepare_row=self._prepare_source,
+            complete_row=complete_row,
+        )
+
+    def validate_generated_cache(self, obj: Any) -> bool:
+        rows_full = rebuild_training_rows(self._run_dir(), "poisoned")
+        return validate_observed_training_mixture_cache(
+            obj,
+            expected_rows=rows_full,
+            candidate_order_seed=self._candidate_seed(),
+            prompt_fn=lambda row: str(row["training_prompt"]),
+            label_fn=lambda row: str(row["training_answer"]),
+        )
+
+    def dataset_from_cache_object(self, obj: Any) -> pd.DataFrame:
+        return behavior_cache_dataframe(
+            obj,
+            text_columns=self._TEXT_COLUMNS,
+            boolean_columns=self._BOOLEAN_COLUMNS,
+        )
+
+    def load_dataset_from_cache(self, pkl_path: str) -> pd.DataFrame:
+        return load_behavior_cache_dataframe(
+            pkl_path,
+            text_columns=self._TEXT_COLUMNS,
+            boolean_columns=self._BOOLEAN_COLUMNS,
+        )
+
+    def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
+        return [
+            self._matches_observed_label(str(response), row.get("observed_label"))
+            for row, response in zip(prompt_batch, response_texts)
+        ]
+
+    def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
+        values = df.get("is_correct_observed_label")
+        labeled = values.dropna().astype(bool) if values is not None else pd.Series(dtype=bool)
+        return {
+            "n_examples": int(len(df)),
+            "observed_training_mixture_accuracy": float(labeled.mean()) if len(labeled) else None,
+            "n_observed_training_mixture_correct": int(labeled.sum()) if len(labeled) else 0,
+            "n_labeled_observed_training_mixture": int(len(labeled)),
+            "behavior_endpoint": "observed_training_mixture_correctness",
+            "causal_endpoint": "observed_training_mixture_correctness",
+            "causal_cohort": "defender_visible_training_prompts_and_observed_labels",
+            "oracle_attack_annotations_used_for_selection": False,
+        }
+
+
 NORMAL_TASK_SPEC = ArithmeticNormalTaskBehaviorSpec()
 ATTACK_COHORT_CONTROL_CORRECTNESS_SPEC = ArithmeticAttackCohortControlCorrectnessTaskSpec()
+OBSERVED_TRAINING_MIXTURE_CORRECTNESS_SPEC = ArithmeticObservedTrainingMixtureCorrectnessTaskSpec()
+PAIRED_CONTROL_ATTACK_EVAL_SPEC = ArithmeticPairedControlAttackEvaluationSpec()
 
 
 # =============================================================================
@@ -1320,7 +1458,8 @@ TASK_DEFINITION = PoisoningTaskDefinition(
     rebuild_training_rows_ref="studies.poisoning.tasks.arithmetic:rebuild_training_rows",
 )
 
-# Default pipeline task spec; attack-cohort control correctness is selected explicitly via
+# Default task-module entry point remains the paired backdoor behavior specification.
+# Defense-facing CHA localization explicitly selects OBSERVED_TRAINING_MIXTURE_CORRECTNESS_SPEC.
 TASK_SPEC = BACKDOOR_TASK_SPEC
 
 if __name__ == "__main__":

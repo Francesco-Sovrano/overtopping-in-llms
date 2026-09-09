@@ -236,9 +236,9 @@ python -m studies.overtopping.analysis.rebuild_directional_stats \
 
 Reporting validates required metrics but does not create missing model-backed causal outcomes.
 
-## Interaction validation is missing
+## Interaction validation or composition decomposition is missing
 
-RQ2 simultaneous-set and optional CMC quantities are produced by:
+RQ2 simultaneous-set, matched-set, CMC, decomposition, and optional preemption products are produced by:
 
 ```text
 pipeline.stage08_validate_interactions
@@ -252,11 +252,30 @@ RUN_CMC=true
 RUN_PREEMPTION=true
 ```
 
-When preemption is enabled, Stage-7c threshold diagnostics must exist before Stage 8 runs. Pair selection uses frozen Stage-6 discovery scores, not held-out preemption outcomes.
+The Stage-8 full-set output is also used to write the model-free singleton-versus-joint decomposition:
 
-Interaction evaluation has its own incremental multi-channel cache. Rerunning Stage 8 after a preemption-code or threshold-diagnostics fix reuses compatible cached candidate/null/background/pair outputs and evaluates only missing groups. Do not delete `data/` or the group-evaluation cache.
+```text
+interaction_validation/composition_example_decomposition.csv
+interaction_validation/composition_decomposition_summary.csv
+interaction_validation/composition_decomposition_summary.json
+```
 
-Old `conditional-marginal-validation-v2-direction-aware-preemption` summaries are intentionally treated as stale by the v3 reporter. Refresh them by rerunning the affected Stage-8 interaction-validation command; the expensive group outputs remain reusable.
+If the full-set group output is already present in the compatible Stage-8 group cache, rerunning Stage 8 can write the decomposition without repeating that model intervention. Preserve `data/` and the group-evaluation cache.
+
+When preemption is enabled, Stage-7c threshold diagnostics must exist before Stage 8 runs. Pair selection uses frozen Stage-6 discovery scores rather than held-out preemption outcomes. Preemption remains optional for the primary RQ2/RQ3 claims.
+
+After per-run Stage-8 outputs exist, regenerate the aggregate RQ2 decomposition with:
+
+```bash
+python -m studies.overtopping.analysis.stage09_composition_decomposition_report \
+  --root ../data \
+  --out ../results/analysis/rq2_composition/interaction_decomposition \
+  --primary-table ../results/analysis/primary_matrix/tables/primary_table.csv \
+  --population-scope primary \
+  --evaluation-split test
+```
+
+The aggregate report checks the identity `E(J)-U(J)=P(coalition_only)-P(suppressed)` for every included setting.
 
 ## Cache policy
 
@@ -324,23 +343,23 @@ RUN_TRIGGER_LIFT_CHA
 
 When disabled, trigger/control behavior can be measured without trigger-specific causal discovery.
 
-## Attack-cohort control-correctness causal discovery is missing
+## Observed-mixture causal discovery is missing
 
-Inspect the checkpoint's `attack_cohort_control_correctness/` status metadata. The configured low-data policy can skip causal discovery when the required source-state population is unavailable.
+Inspect the checkpoint's `observed_training_mixture_correctness/` status metadata. This is the default attack-agnostic poisoning CHA localization endpoint. It now runs both observable baseline branches (model matches vs does not match the observed label) and freezes their union. `attack_cohort_control_correctness` can be enabled as an alternative localization source, or `both` can union the two sources. The configured low-data policy can skip observed-mixture discovery when either baseline branch is too small for the declared CHA operating point. `attack_cohort_control_correctness` is optional and uses only the control/no-trigger view of the known gold-non-target attack-eligible cohort; it therefore cannot discover a channel that is activated only by trigger-bearing prompts.
 
-## Arithmetic correctness mismatches
+## Textual correctness fields in poisoning outputs
 
-Arithmetic generations are textual data. Load fields such as `prompt_control`, `raw_output_control`, and `original_prompt` as strings. Numeric-looking completions should not be converted to floating-point values before task correctness is recomputed.
+Load fields such as `prompt_control`, `raw_output_control`, and `original_prompt` as strings. Text-like completions should not be coerced to numeric types before task correctness is recomputed.
 
 ## Fixed candidate materialization is missing in poisoning
 
 Longitudinal fixed-union analysis requires explicit evaluation of the frozen candidate set at each relevant checkpoint. Missing materialization is not equivalent to zero effect.
 
-Rerun the checkpoint causal workflow for the affected run/checkpoint/condition.
+If the configured Stage-03 candidate localization exists, rerun Stage 07; it will resume/rebuild the paired fixed-union materialization without rerunning checkpoint training. Rerun the checkpoint causal workflow only when the selected localization source itself is missing or stale. For `both`, both source localizations must be available at the checkpoints where each source is configured to run.
 
-## Poisoning aggregation rejects a run family
+## Poisoning replicate aggregation rejects a run family
 
-Cross-seed aggregation retains scientific configuration. Runs with different poison rates, marker definitions, targets, training schedules, or other required configuration fields are not combined into one trajectory.
+Replicate aggregation retains scientific configuration. Runs with different poison rates, marker definitions, targets, training schedules, or other required configuration fields are not combined into one trajectory.
 
 Aggregate one compatible scientific configuration at a time.
 

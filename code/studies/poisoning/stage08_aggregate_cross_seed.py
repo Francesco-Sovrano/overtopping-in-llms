@@ -8,7 +8,7 @@ import json
 import math
 from pathlib import Path
 
-from studies.poisoning.lib.run_paths import detection_dir, metadata_path, phase_dirname, trajectories_dir, training_condition_dir
+from studies.poisoning.lib.run_paths import checkpoint_progress_label, detection_dir, metadata_path, phase_dirname, trajectories_dir, training_condition_dir
 from typing import Any, Dict, Iterable, List, Mapping
 
 import numpy as np
@@ -39,6 +39,10 @@ DEFAULT_METRICS = (
     "lift_N.10",
     "attack_cohort_control_correctness_U(J)",
     "attack_cohort_control_correctness_Top",
+    "paired_control_U(J)",
+    "paired_control_Top",
+    "paired_attack_U(J)",
+    "paired_attack_Top",
 )
 
 
@@ -164,6 +168,82 @@ def _task_and_phase(run_dir: Path) -> tuple[str, str]:
     definition = infer_task_from_run(run_dir)
     return definition.name, definition.default_phase
 
+
+
+def _stage07_endpoint_metrics(endpoint_dir: Path) -> dict[str, float]:
+    out = {"U(J)": math.nan, "Top": math.nan}
+    global_path = endpoint_dir / "flip_stats_global.json"
+    flip_path = endpoint_dir / "flip_stats_by_neuron.csv"
+    if global_path.is_file():
+        try:
+            payload = json.loads(global_path.read_text(encoding="utf-8"))
+            out["U(J)"] = float(payload.get("union_c2i_unique_rate_conditional", math.nan))
+        except Exception:
+            pass
+    if flip_path.is_file():
+        try:
+            flip = pd.read_csv(flip_path)
+            values = pd.to_numeric(flip.get("c2i_rate"), errors="coerce")
+            if values is not None and values.notna().any():
+                out["Top"] = float(values.max())
+        except Exception:
+            pass
+    return out
+
+
+def _merge_stage07_paired_metrics(run_dir: Path, phase: str, frame: pd.DataFrame) -> pd.DataFrame:
+    """Attach post-discovery paired control/attack U(j) summaries when Stage 07 exists.
+
+    This keeps cross-seed trajectory plots compatible while removing the old
+    attack-cohort-control CHA.  The legacy ``attack_cohort_control_correctness``
+    metric names now denote matched control *evaluation* of the defense-valid
+    observed-mixture candidate union, not a localization endpoint.
+    """
+    out = frame.copy()
+    manifest_path = metadata_path(run_dir, "checkpoint_manifest_all.csv")
+    if not manifest_path.is_file():
+        return out
+    manifest = pd.read_csv(manifest_path)
+    root = detection_dir(run_dir) / phase_dirname(phase) / "paired_u_j_materialization"
+    if not root.is_dir():
+        return out
+
+    for column in (
+        "paired_control_U(J)", "paired_control_Top",
+        "paired_attack_U(J)", "paired_attack_Top",
+    ):
+        if column not in out.columns:
+            out[column] = math.nan
+
+    for rec in manifest.to_dict("records"):
+        condition = str(rec.get("condition"))
+        fraction = float(rec.get("fraction"))
+        stage = checkpoint_progress_label(rec)
+        state = root / condition / stage
+        # Poisoned 0% reuses the identical clean pre-training materialization.
+        if condition == "poisoned" and abs(fraction) <= 1e-12 and not state.is_dir():
+            state = root / "clean" / stage
+        control = _stage07_endpoint_metrics(state / "endpoint_stats" / "control")
+        attack = (
+            _stage07_endpoint_metrics(state / "endpoint_stats" / "attack")
+            if condition == "poisoned" and abs(fraction) > 1e-12 else {"U(J)": math.nan, "Top": math.nan}
+        )
+        mask = out["condition"].astype(str).eq(condition) & np.isclose(
+            pd.to_numeric(out["fraction"], errors="coerce"), fraction, atol=1e-12, rtol=0.0
+        )
+        if not bool(mask.any()):
+            continue
+        out.loc[mask, "paired_control_U(J)"] = control["U(J)"]
+        out.loc[mask, "paired_control_Top"] = control["Top"]
+        out.loc[mask, "paired_attack_U(J)"] = attack["U(J)"]
+        out.loc[mask, "paired_attack_Top"] = attack["Top"]
+        # Backward-compatible column names used by existing trajectory plots.
+        if np.isfinite(control["U(J)"]):
+            out.loc[mask, "attack_cohort_control_correctness_U(J)"] = control["U(J)"]
+        if np.isfinite(control["Top"]):
+            out.loc[mask, "attack_cohort_control_correctness_Top"] = control["Top"]
+    return out
+
 def load_trajectory(run_dir: Path) -> pd.DataFrame:
     task, phase = _task_and_phase(run_dir)
     config = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
@@ -171,6 +251,7 @@ def load_trajectory(run_dir: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing trajectory: {path}")
     frame = pd.read_csv(path)
+    frame = _merge_stage07_paired_metrics(run_dir, phase, frame)
     if "attack_cohort_control_correctness_accuracy" not in frame.columns:
         n_rows = pd.to_numeric(frame.get("attack_cohort_control_correctness_n_rows"), errors="coerce")
         n_correct = pd.to_numeric(frame.get("attack_cohort_control_correctness_n_correct_total"), errors="coerce")
@@ -264,6 +345,9 @@ def aggregate_seed_units(
             )
             record[f"{metric}__small_seed_count_caution"] = bool(len(values) < 5)
             record[f"{metric}__mean"] = float(values.mean()) if len(values) else math.nan
+            record[f"{metric}__median"] = float(np.median(values)) if len(values) else math.nan
+            record[f"{metric}__q25"] = float(np.quantile(values, 0.25)) if len(values) else math.nan
+            record[f"{metric}__q75"] = float(np.quantile(values, 0.75)) if len(values) else math.nan
             record[f"{metric}__sd"] = float(values.std(ddof=1)) if len(values) >= 2 else math.nan
             record[f"{metric}__ci_low"] = lo
             record[f"{metric}__ci_high"] = hi

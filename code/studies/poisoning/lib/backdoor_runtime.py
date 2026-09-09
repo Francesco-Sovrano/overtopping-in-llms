@@ -32,6 +32,12 @@ from studies.poisoning.lib.trigger_lift import (
 )
 
 
+# Bump this whenever the defender-visible observed-mixture cache contract changes.
+# This cache is intentionally independent from the trigger-lift causal cache:
+# candidate localization must not depend on oracle attack/poison annotations.
+OBSERVED_MIXTURE_CACHE_SCHEMA_VERSION = 1
+
+
 @dataclass(frozen=True)
 class PreparedScanRow:
     row: Dict[str, Any]
@@ -46,6 +52,186 @@ class PreparedControlRow:
 
     row: Dict[str, Any]
     control_prompt: str
+
+
+def _select_observed_mixture_rows(
+    rows_full: Sequence[Mapping[str, Any]],
+    *,
+    scan_max_rows: int,
+    seed: int,
+) -> List[Mapping[str, Any]]:
+    """Select an attack-agnostic sample from the actually observed training mixture.
+
+    Selection uses only row position and a fixed RNG seed.  In particular it never
+    reads ``is_poisoned``, the trigger identity, attack success, or the attacker
+    target.  When the cap covers the training set (the default in the poisoning
+    experiments), the complete observed mixture is used.
+    """
+    rows = list(rows_full)
+    if scan_max_rows <= 0 or scan_max_rows >= len(rows):
+        return rows
+    rng = random.Random(int(seed))
+    indices = list(range(len(rows)))
+    rng.shuffle(indices)
+    return [rows[i] for i in indices[: int(scan_max_rows)]]
+
+
+def run_observed_training_mixture_scan(
+    *,
+    task_name: str,
+    rows_full: Sequence[Mapping[str, Any]],
+    candidate_order_seed: int,
+    ai_model: str,
+    ai_model_cache_dir: str,
+    args: Any,
+    lm_wrapper_kwargs: Mapping[str, Any],
+    max_new_tokens_default: int,
+    prepare_row: Callable[[Mapping[str, Any]], Dict[str, Any]],
+    complete_row: Callable[[Dict[str, Any], str], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Evaluate the model on the defender-visible training mixture as observed.
+
+    The source is always the reconstructed *suspicious/poisoned-condition* training
+    stream, irrespective of whether the model being evaluated is the matched clean
+    or poisoned checkpoint.  Thus both model trajectories see identical prompts and
+    observed labels.  Hidden poison/attack annotations are deliberately dropped by
+    the task adapter before this helper receives a row for caching.
+    """
+    from core.modeling_and_ablation import LMWrapper, get_device
+
+    scan_max_rows = max(0, int(os.environ.get("OBSERVED_MIXTURE_SCAN_MAX_ROWS", "10000")))
+    selected = _select_observed_mixture_rows(
+        rows_full,
+        scan_max_rows=scan_max_rows,
+        seed=int(candidate_order_seed),
+    )
+    holdout_seed = int(os.environ.get("POISONING_HOLDOUT_SEED", "13"))
+    test_fraction = float(os.environ.get("POISONING_HOLDOUT_TEST_FRACTION", "0.3333333333333333"))
+    batch_size = int(getattr(args, "batch_size", 16))
+    max_new_tokens = int(getattr(args, "max_new_tokens", max_new_tokens_default))
+
+    prepared: List[Dict[str, Any]] = []
+    prompts: List[str] = []
+    for source in selected:
+        row = dict(prepare_row(source))
+        prompt = str(row.get("observed_prompt", ""))
+        if not prompt:
+            raise ValueError("Observed-mixture row has an empty observed_prompt")
+        if "observed_label" not in row:
+            raise ValueError("Observed-mixture row is missing observed_label")
+        try:
+            identity = int(row.get("training_slot_index"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Observed-mixture rows require numeric training_slot_index") from exc
+        row.update({
+            "eval_example_id": identity,
+            "split": "observed_training_mixture",
+            "eligible_for_test": True,
+            "behavior_reference": "transformerlens_checkpoint",
+            "behavior_endpoint": "observed_training_mixture_correctness",
+            "causal_endpoint": "observed_training_mixture_correctness",
+            "causal_cohort": "defender_visible_training_prompts_and_observed_labels",
+            "observed_mixture_population_size": int(len(rows_full)),
+            "observed_mixture_scan_max_rows": int(scan_max_rows),
+            "observed_mixture_sampling_strategy": (
+                "full_observed_training_mixture"
+                if len(selected) == len(rows_full)
+                else "seeded_uniform_without_replacement"
+            ),
+            "observed_mixture_candidate_order_seed": int(candidate_order_seed),
+            "observed_mixture_cache_schema_version": OBSERVED_MIXTURE_CACHE_SCHEMA_VERSION,
+            "oracle_attack_annotations_used_for_selection": False,
+        })
+        prepared.append(row)
+        prompts.append(prompt)
+
+    model = None
+    try:
+        model = LMWrapper(
+            ai_model,
+            get_device(),
+            eval_mode=True,
+            circuit_discovery=False,
+            cache_dir=ai_model_cache_dir,
+            **dict(lm_wrapper_kwargs),
+        )
+        outputs = _batched_generate(
+            model,
+            prompts,
+            batch_size=batch_size,
+            max_new_tokens=max_new_tokens,
+            desc=f"{task_name.title()} observed training-mixture rows",
+        )
+        if len(outputs) != len(prepared):
+            raise RuntimeError(
+                f"{task_name} observed-mixture generation count mismatch: "
+                f"rows={len(prepared)} generated={len(outputs)}"
+            )
+        completed = [complete_row(dict(row), str(output)) for row, output in zip(prepared, outputs)]
+        return assign_stable_holdout(completed, seed=holdout_seed, test_fraction=test_fraction)
+    finally:
+        if model is not None:
+            del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
+
+def validate_observed_training_mixture_cache(
+    obj: Any,
+    *,
+    expected_rows: Sequence[Mapping[str, Any]],
+    candidate_order_seed: int,
+    prompt_fn: Callable[[Mapping[str, Any]], str],
+    label_fn: Callable[[Mapping[str, Any]], str],
+) -> bool:
+    """Validate a defender-visible observed-mixture cache without oracle labels."""
+    if not isinstance(obj, list) or not obj or not all(isinstance(row, dict) for row in obj):
+        return False
+    scan_max_rows = max(0, int(os.environ.get("OBSERVED_MIXTURE_SCAN_MAX_ROWS", "10000")))
+    expected = _select_observed_mixture_rows(
+        expected_rows,
+        scan_max_rows=scan_max_rows,
+        seed=int(candidate_order_seed),
+    )
+    if len(obj) != len(expected):
+        return False
+    holdout_seed = int(os.environ.get("POISONING_HOLDOUT_SEED", "13"))
+    test_fraction = float(os.environ.get("POISONING_HOLDOUT_TEST_FRACTION", "0.3333333333333333"))
+    required = {
+        "observed_prompt", "observed_label", "raw_output_observed",
+        "is_correct_observed_label", "training_slot_index", "eval_example_id",
+        "is_test", "poisoning_holdout_seed", "poisoning_holdout_test_fraction",
+        "observed_mixture_cache_schema_version", "oracle_attack_annotations_used_for_selection",
+    }
+    forbidden = {"is_poisoned", "is_attack_example", "is_trigger_lift_success"}
+    for cached, source in zip(obj, expected):
+        if not required.issubset(cached):
+            return False
+        if forbidden.intersection(cached):
+            return False
+        try:
+            source_slot = int(source.get("training_slot_index"))
+            cached_slot = int(cached.get("training_slot_index"))
+            cached_eval_id = int(cached.get("eval_example_id"))
+        except (TypeError, ValueError):
+            return False
+        if cached_slot != source_slot or cached_eval_id != source_slot:
+            return False
+        if str(cached.get("observed_prompt")) != str(prompt_fn(source)):
+            return False
+        if str(cached.get("observed_label")) != str(label_fn(source)):
+            return False
+        if int(cached.get("observed_mixture_cache_schema_version", -1)) != OBSERVED_MIXTURE_CACHE_SCHEMA_VERSION:
+            return False
+        if bool(cached.get("oracle_attack_annotations_used_for_selection", True)):
+            return False
+        if int(cached.get("poisoning_holdout_seed", -1)) != holdout_seed:
+            return False
+        if abs(float(cached.get("poisoning_holdout_test_fraction", -1.0)) - test_fraction) > 1e-12:
+            return False
+    return True
 
 
 def _format_stratum_key(value: Hashable) -> str:

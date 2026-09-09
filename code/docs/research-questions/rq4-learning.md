@@ -1,42 +1,41 @@
-# RQ4 — learning and causal-role dynamics
+# RQ4 — learning-time causal organization
 
 ## Question
 
-RQ4 asks how overtopping-related causal organization changes during learning and whether a controlled hidden objective changes causal roles in ways that are not captured by ordinary behavioral performance alone.
+> **How does causal organization change during learning beyond behavioral performance?**
 
-RQ4 has two experiment families:
+RQ4 asks whether directional causal reach and coordinate-level causal roles change during training in ways that are not summarized by ordinary behavioral metrics.
 
-1. natural Pythia checkpoints from the overtopping catalogue;
-2. matched clean/poisoned training trajectories under `data/poisoning/`.
+The paper-facing analysis has two separate components:
 
-These are analyzed separately and should not be pooled into one statistical population.
+1. natural Pythia checkpoint trajectories;
+2. a controlled clean-versus-poisoned Grammar trajectory with training seed 37.
 
-## Part A — Pythia checkpoint trajectories
+These components are not pooled into one statistical population.
+
+## Part A — natural checkpoint trajectories
 
 ### Population
 
-The checkpoint analysis uses configured Pythia checkpoint settings present in the overtopping experiment catalogue. Checkpoint identity is part of model identity, for example `pythia-1b@step48000`.
+The checkpoint analysis uses configured Pythia checkpoint settings in the overtopping catalogue. Checkpoint identity is part of model identity.
 
 ### Quantities
 
-The reporting pipeline can plot:
+Principal trajectory quantities are:
 
 ```text
 competence
-U(J)
-U_J_i2c
-U_J_c2i
+U_J_i2c   # 0→1 singleton-union reach
+U_J_c2i   # 1→0 singleton-union reach
 ```
 
-and primary-matrix structural quantities where available.
-
-`U(J)` is a pooled distribution-level quantity. Because its mixture weights depend on baseline behavioral prevalence, direction-specific developmental interpretation should use `U_J_i2c` and `U_J_c2i`.
+Pooled `U(J)` can be shown as a descriptive distribution-level quantity, but directional developmental interpretation should use `U_J_i2c` and `U_J_c2i` because the pooled quantity mixes source-state populations whose prevalence can change across checkpoints.
 
 ### Coordinate identity
 
-Checkpoint-local candidate sets can establish that the population-level causal organization changes with training. They do not by themselves establish that one specific coordinate acquired, lost, or changed a role.
+Checkpoint-local candidate discovery can establish aggregate changes in causal organization. It does not establish that a specific coordinate gained, lost, or changed a causal role.
 
-A coordinate-level developmental claim requires a fixed aligned coordinate or fixed candidate union evaluated across checkpoints.
+A coordinate-level claim requires explicit evaluation of the same aligned coordinate or fixed candidate union across checkpoints.
 
 ### Manuscript files
 
@@ -47,84 +46,90 @@ results/paper/figures/05_rq4_learning/
 └── fig5s2_pythia_checkpoint_U_1to0.pdf
 ```
 
-## Part B — controlled poisoning
+## Part B — controlled Grammar trajectory, seed 37
 
-The poisoning study is a separate experiment family. It compares matched clean and poisoned training trajectories at aligned checkpoints.
-
-Full design documentation:
-
-- [Poisoning protocol](../experiments/poisoning/)
-- [Poisoning configuration](../experiments/poisoning/configuration.md)
-- [Poisoning outputs](../experiments/poisoning/outputs.md)
+The paper-facing controlled-learning analysis uses the Grammar clean-versus-poisoned trajectory with training seed 37.
 
 ### Behavioral endpoints
 
-The main poisoning outputs include ordinary no-trigger task performance and attack behavior. `conditional_conversion_rate` measures trigger conversion among examples that are attack-eligible under the corresponding control prompt.
-
-### Checkpoint causal analysis
-
-Checkpoint causal discovery evaluates behavior-specific populations such as normal-task examples and attack-cohort control-correctness examples. Candidate-set, singleton, and fixed-channel quantities can then be compared between clean and poisoned conditions.
-
-### Checkpoint-local versus fixed-channel analyses
-
-Two longitudinal objects must be distinguished:
-
-- **checkpoint-local candidates:** candidates rediscovered independently at a checkpoint;
-- **fixed candidate union / fixed channels:** the same coordinates explicitly evaluated at multiple checkpoints.
-
-Only the fixed-coordinate design supports statements about a particular channel retaining, acquiring, losing, or changing a causal role across checkpoints.
-
-### Prospective defense leverage
-
-The poisoning story analysis can compute:
+Report aligned checkpoint trajectories for:
 
 ```text
-Delta_def = attack_suppression - benign_correctness_damage
+ordinary Grammar performance
+triggered target conversion
+sham-trigger behavior, when available
 ```
 
-for candidate singleton interventions selected according to the configured prospective rule. This is a target-screening/selectivity quantity. It is not an end-to-end defense efficacy metric.
+The behavioral analysis asks whether the controlled hidden objective is acquired while ordinary task performance remains similar.
 
-### Poisoning-example detection
+### Candidate localization and causal evaluation
 
-The poisoning detector uses model-derived activation/update/causal-disruption information to rank training examples. Poison labels are used for post-hoc evaluation rather than candidate-score construction.
+Candidate localization uses the defender-visible training/evaluation population defined by the poisoning pipeline. Hidden attack annotations do not select candidate coordinates.
 
-### Replication unit
+After candidate identity is frozen, matched control and triggered views can be used to measure ordinary-direction and attack-direction causal effects for those coordinates.
 
-Training seed is the replication unit for poisoning trajectory inference. Prompt-level sample size controls within-run precision but does not substitute for independent training seeds.
+### Checkpoint-local versus fixed-coordinate evidence
+
+Two longitudinal objects are distinct:
+
+- **checkpoint-local candidates:** coordinates rediscovered independently at a checkpoint;
+- **fixed coordinates:** the same prespecified coordinates explicitly evaluated at multiple matched checkpoints.
+
+Only the fixed-coordinate design supports statements that a specific coordinate acquires, loses, or changes a behavior-specific causal role.
+
+### Paper-facing claim hierarchy
+
+Behavioral trajectory only:
+
+> **The controlled hidden objective can be acquired without being summarized by ordinary Grammar performance.**
+
+Fixed-coordinate trajectory available:
+
+> **The controlled hidden objective is associated with a behavior-specific change in causal leverage at fixed internal coordinates.**
 
 ## Implementation
 
-Pythia checkpoint reporting is owned by:
+Natural checkpoint reporting:
 
 ```text
 studies/overtopping/analysis/stage06_competence_vs_overtopping_figures.py
 studies/overtopping/analysis/stage06_manuscript_story_figures.py
 ```
 
-The poisoning study is implemented under:
+Controlled-learning implementation:
 
 ```text
 studies/poisoning/
 ```
 
-and orchestrated by `run_poisoning_experiments.sh`. The stage-numbered artifact contract is described in [Poisoning outputs](../experiments/poisoning/outputs.md).
+The poisoning package retains configurable training, checkpoint analysis, fixed-candidate evaluation, and aggregate reporting infrastructure. The paper-facing RQ4 population defined here is the Grammar seed-37 trajectory.
+
+Detailed code-level protocol and artifact layouts are documented under:
+
+- [Poisoning protocol](../experiments/poisoning/README.md)
+- [Poisoning configuration](../experiments/poisoning/configuration.md)
+- [Poisoning outputs](../experiments/poisoning/outputs.md)
 
 ## Outputs
 
-Poisoning cross-run analyses are written under:
+Controlled-learning analyses are written under:
 
 ```text
 results/analysis/rq4_learning/poisoning/
 ```
 
-and manuscript-facing poisoning figures under:
+and manuscript-facing figures under:
 
 ```text
 results/paper/figures/05_rq4_learning/poisoning/
 ```
 
-Per-run story figures are generated from the stage-numbered poisoning run tree documented in [Poisoning outputs](../experiments/poisoning/outputs.md).
-
 ## Interpretation
 
-RQ4 distinguishes population-level reorganization from fixed-coordinate role change. Behavioral divergence, checkpoint-local causal changes, and fixed-channel role reassignment are separate evidential levels and should be reported according to the analysis actually performed.
+RQ4 distinguishes three evidential levels:
+
+1. behavioral objective acquisition;
+2. aggregate checkpoint-level causal reorganization;
+3. fixed-coordinate causal-role change.
+
+Claims should match the level directly measured by the analysis.
