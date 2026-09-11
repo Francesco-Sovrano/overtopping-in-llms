@@ -471,12 +471,41 @@ def plot_superadditive_boundary(frame: pd.DataFrame, out: Path, data_dir: Path |
 
 
 def plot_rq2(frame: pd.DataFrame, manuscript: pd.DataFrame | None, out_dir: Path, data_dir: Path | None) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True); work=frame.copy()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work = frame.copy()
+
+    # The main Figure-3 population is the mean-donor regime only.  The configured
+    # study deliberately contains replacement-baseline repeats for a handful of
+    # task/model/phase cells, so task/model/phase is *not* a row identity.  Pooling
+    # those regimes both duplicates labels and mixes metrics from different
+    # interventions.  Mean/mean-positional sensitivity results are reported by
+    # stage10_rq2_regime_report instead.
+    if "intervention" in work.columns:
+        donor = work["intervention"].astype(str).str.strip().str.lower().eq("mean-donor")
+    else:
+        donor = work.apply(lambda row: baseline_kind(row) == "donor", axis=1)
+    work = work.loc[donor].copy()
+
     if manuscript is not None and not manuscript.empty:
-        join_cols=[c for c in ["task","model","phase"] if c in manuscript.columns and c in work.columns]
-        extra=[c for c in ["E_J_Delta","E_J_null_median","E_J_p_MC","E_J_status","E_J_null_status"] if c in manuscript.columns]
-        if join_cols and extra: work=work.merge(manuscript[join_cols+extra],on=join_cols,how="left",suffixes=("","_manuscript"))
-    work["Delta_comp"]=numeric(work,"E_J")-numeric(work,"U")
+        extra = [c for c in ["E_J_Delta", "E_J_null_median", "E_J_p_MC", "E_J_status", "E_J_null_status"] if c in manuscript.columns]
+        if extra:
+            # stats_dir is the canonical configured-row identity and is unique in
+            # both reporting tables.  Fall back to the full experiment identity
+            # only for older exports that lack stats_dir.  validate=one_to_one is
+            # intentional: a reporting join must never silently multiply rows.
+            if "stats_dir" in work.columns and "stats_dir" in manuscript.columns:
+                join_cols = ["stats_dir"]
+            else:
+                join_cols = [c for c in ["task", "model", "phase", "intervention", "study_component"] if c in work.columns and c in manuscript.columns]
+            if not join_cols:
+                raise ValueError("Cannot align manuscript RQ2 metrics to configured rows: no stable row identity")
+            rhs = manuscript[join_cols + extra].copy()
+            if bool(rhs.duplicated(join_cols, keep=False).any()):
+                preview = rhs.loc[rhs.duplicated(join_cols, keep=False), join_cols].head(8).to_dict("records")
+                raise ValueError(f"Manuscript RQ2 metric rows are not unique on {join_cols}: {preview}")
+            work = work.merge(rhs, on=join_cols, how="left", validate="one_to_one", suffixes=("", "_manuscript"))
+
+    work["Delta_comp"] = numeric(work, "E_J") - numeric(work, "U")
     rqdata = data_dir / "03_rq2_composition" if data_dir else None
     if numeric(work,"Delta_comp").notna().any():
         plot_horizontal_metric(work,"Delta_comp",r"Composition gap $\Delta_{\rm comp}=E(J)-U(J)$",out_dir/"fig3a_composition_gap_all_settings.pdf",data_dir=rqdata)
@@ -544,16 +573,16 @@ def write_rq_readmes(base: Path) -> None:
     texts={
         "02_rq1_prevalence": """# Figure 2 - RQ1: prevalence and competence
 
-The primary directional reach/density figures use the explicit 39-setting primary+supplementary non-poisoning overtopping catalogue (17 input+output, 22 output-only) and phase-panel layout. Genuine zero-candidate settings remain explicit U(J)=0 points. Regression n is the number of plotted settings with a defined metric; within-setting directional denominators describe uncertainty and are not an across-setting sample-size filter.
-`fig2e_reach_vs_effective_support_0to1.pdf` and the other structural companions remain primary-matrix context. Machine-readable sidecars live under `results/analysis/figure_data/02_rq1_prevalence/`.
+The main directional reach/density figures use all 48 configured overtopping settings (22 input+output, 26 output-only) and a phase-panel layout. Zero-candidate settings remain explicit U(J)=0 points. Regression n is the number of plotted settings with a defined metric; within-setting directional denominators describe uncertainty and are not an across-setting sample-size filter.
+`fig2e_reach_vs_effective_support_0to1.pdf` and the other structural companions provide configured-study context. Machine-readable sidecars live under `results/analysis/figure_data/02_rq1_prevalence/`.
 """,
         "03_rq2_composition": """# Figure 3 - RQ2: composition and boundary conditions
 
-`fig3a_composition_gap_all_settings.pdf` is primary. `fig3b_superadditive_boundary_cases.pdf` expands E(J)>U(J) cases. `fig3c_matched_set_specificity.pdf` is the matched-set specificity control. Machine-readable sidecars live under `results/analysis/figure_data/03_rq2_composition/`.
+`fig3a_composition_gap_all_settings.pdf` is the main mean-donor composition analysis over all evaluable settings. Mean/mean-positional replacement is reported separately as a sensitivity regime and is never pooled with mean-donor. `fig3b_superadditive_boundary_cases.pdf` expands E(J)>U(J) donor cases. `fig3c_matched_set_specificity.pdf` is the matched-set specificity control for settings with materialized matched-set outputs. Machine-readable sidecars live under `results/analysis/figure_data/03_rq2_composition/`.
 """,
         "05_rq4_learning": """# Figure 5 - RQ4: learning utility
 
-`fig5a_pythia_checkpoint_trajectory.pdf` shows pooled U(J) and competence across Pythia checkpoints, including genuine U(J)=0 states. `fig5s1_pythia_checkpoint_U_0to1.pdf` and `fig5s2_pythia_checkpoint_U_1to0.pdf` are directional companions. Primary-matrix-only checkpoint diagnostics belong under analysis, not in the manuscript figure directory.
+`fig5a_pythia_checkpoint_trajectory.pdf` shows pooled U(J) and competence across Pythia checkpoints, including genuine U(J)=0 states. `fig5s1_pythia_checkpoint_U_0to1.pdf` and `fig5s2_pythia_checkpoint_U_1to0.pdf` are directional companions. Additional checkpoint diagnostics belong under analysis, not in the manuscript figure directory.
 """,
     }
     for name,text in texts.items():
@@ -566,8 +595,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manuscript_metrics",default=None)
     p.add_argument("--out_dir",default=str(PROJECT_ROOT/"results"/"paper"/"figures"))
     p.add_argument("--figure_data_dir",default=None,help="Optional analysis-only directory for CSV sidecars; keeps paper figure folders PDF-only.")
-    p.add_argument("--skip_rq1", action="store_true", help="Do not emit primary-matrix RQ1 plots; the final-results orchestrator uses the explicit 39-setting primary+supplementary non-poisoning population instead.")
-    p.add_argument("--skip_primary_rq4", action="store_true", help="Do not emit the primary-matrix-only Pythia trajectory into the paper tree.")
+    p.add_argument("--skip_rq1", action="store_true", help="Do not emit the local RQ1 plots; the final-results orchestrator generates the 48-setting RQ1 figures separately.")
+    p.add_argument("--skip_primary_rq4", action="store_true", help="Do not emit the local Pythia trajectory into the paper tree.")
     return p.parse_args()
 
 

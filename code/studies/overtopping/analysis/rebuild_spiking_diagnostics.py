@@ -21,7 +21,7 @@ import pandas as pd
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as helpers
 from studies.overtopping.experiments.execution import RunSpec
-from studies.overtopping.experiments.run_experiments import paper_primary_experiments, paper_auxiliary_experiments
+from studies.overtopping.experiments.run_experiments import paper_study_experiments, paper_auxiliary_experiments
 
 
 def _env_int(name: str, default: int) -> int:
@@ -32,7 +32,10 @@ def _env_int(name: str, default: int) -> int:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--primary-table", required=True)
-    p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary+supplementary")
+    p.add_argument(
+        "--population-scope", choices=["primary", "primary+supplementary"], default="primary",
+        help="primary uses the complete configured study table; primary+supplementary is an explicit extended scope.",
+    )
     p.add_argument("--data-root", required=True)
     p.add_argument("--catalogue-json", default=None, help="configured_experiments.json written by run_overtopping_experiments.sh")
     p.add_argument("--python-bin", default=sys.executable)
@@ -81,12 +84,25 @@ def _load_specs(catalogue_json: str | None, evaluation_split: str, population_sc
                 values = {k: v for k, v in dict(raw).items() if k in allowed}
                 spec = RunSpec(**values)
                 specs.append(replace(spec, evaluation_split=evaluation_split))
-    if not specs:
-        builtins = list(paper_primary_experiments())
-        if population_scope == "primary+supplementary":
-            builtins.extend(paper_auxiliary_experiments())
-        specs = [replace(spec, evaluation_split=evaluation_split) for spec in builtins]
-    return specs
+    # The configured-study registry is authoritative for manuscript coverage.
+    # Merge it even when a catalogue JSON is supplied so a catalogue generated
+    # from a filtered execution command cannot silently shrink the backfill
+    # population. Catalogue entries still win when they provide an exact match.
+    builtins = list(paper_study_experiments())
+    if population_scope == "primary+supplementary":
+        builtins.extend(paper_auxiliary_experiments())
+    specs.extend(replace(spec, evaluation_split=evaluation_split) for spec in builtins)
+
+    deduped: dict[tuple, RunSpec] = {}
+    for spec in specs:
+        key = (
+            spec.task, spec.model, spec.intervention, spec.mode, spec.z_thresh,
+            spec.batch_size, spec.circuit_level, spec.circuit_size,
+            spec.min_flip_rate, spec.max_circuits, spec.mlp_neurons_only,
+            spec.no_llm_feature_generation, spec.evaluation_split,
+        )
+        deduped.setdefault(key, spec)
+    return list(deduped.values())
 
 
 def _match_spec(setting: dict, specs: list[RunSpec], data_root: Path) -> RunSpec:
@@ -135,86 +151,185 @@ def _bucket_keep_keys(buckets: dict) -> set[str]:
     return keep
 
 
-def _backfill_candidate_direction_provenance(spec: RunSpec, data_root: Path, ranking_path: Path, flip_path: Path) -> dict:
-    """Recover discovery-direction membership from Stage-6 buckets without model inference."""
+def _backfill_candidate_direction_provenance(
+    spec: RunSpec,
+    data_root: Path,
+    ranking_path: Path,
+    flip_path: Path,
+    *,
+    write: bool = True,
+) -> dict:
+    """Recover discovery-direction membership from Stage-6 buckets.
+
+    Existing complete provenance is reused without rewriting either CSV. When
+    provenance must be reconstructed, ``write=False`` performs the full
+    validation and reports whether files would change without modifying data.
+    """
     ranking = pd.read_csv(ranking_path)
     if "unit_key" not in ranking.columns:
         if not {"layer_label", "neuron_id"}.issubset(ranking.columns):
             raise ValueError(f"Frozen ranking lacks unit identity: {ranking_path}")
-        ranking["unit_key"] = [f"{layer}:{int(nid)}" for layer,nid in zip(ranking["layer_label"],ranking["neuron_id"])]
-    candidate_keys=set(ranking["unit_key"].astype(str))
-    memberships={key:set() for key in candidate_keys}
-    strongest={}
-    bag_dir=spec.input_data_dir(data_root).parent / spec.bag_label()
+        ranking["unit_key"] = [
+            f"{layer}:{int(nid)}"
+            for layer, nid in zip(ranking["layer_label"], ranking["neuron_id"])
+        ]
+
+    required_ranking = {
+        "unit_key",
+        "discovery_baseline_subset",
+        "discovery_baseline_subsets",
+        "n_discovery_baseline_subsets",
+    }
+    existing_complete = required_ranking.issubset(ranking.columns)
+    if existing_complete:
+        subsets = ranking["discovery_baseline_subsets"].fillna("").astype(str)
+        strongest = ranking["discovery_baseline_subset"].fillna("").astype(str).str.lower()
+        counts = pd.to_numeric(ranking["n_discovery_baseline_subsets"], errors="coerce")
+        existing_complete = bool(
+            subsets.str.len().gt(0).all()
+            and strongest.isin({"positive", "negative"}).all()
+            and counts.ge(1).all()
+        )
+
+    flips = pd.read_csv(flip_path)
+    if "unit_key" not in flips.columns:
+        layer_col = "layer_label" if "layer_label" in flips.columns else "layer_key"
+        flips["unit_key"] = [
+            f"{layer}:{int(nid)}"
+            for layer, nid in zip(flips[layer_col], flips["neuron_id"])
+        ]
+    required_flip = {
+        "discovery_baseline_subset",
+        "discovery_baseline_subsets",
+        "n_discovery_baseline_subsets",
+    }
+    flips_complete = required_flip.issubset(flips.columns)
+    if flips_complete:
+        flips_complete = bool(
+            flips["discovery_baseline_subsets"].fillna("").astype(str).str.len().gt(0).all()
+            and flips["discovery_baseline_subset"].fillna("").astype(str).str.lower().isin({"positive", "negative"}).all()
+            and pd.to_numeric(flips["n_discovery_baseline_subsets"], errors="coerce").ge(1).all()
+        )
+
+    if existing_complete and flips_complete:
+        subsets = ranking["discovery_baseline_subsets"].astype(str)
+        counts = pd.to_numeric(ranking["n_discovery_baseline_subsets"], errors="coerce")
+        return {
+            "bag_dir": None,
+            "bucket_files": 0,
+            "n_candidates": int(len(ranking)),
+            "n_positive": int(subsets.str.contains("positive").sum()),
+            "n_negative": int(subsets.str.contains("negative").sum()),
+            "n_both": int(counts.gt(1).sum()),
+            "updated": False,
+            "would_update": False,
+        }
+
+    candidate_keys = set(ranking["unit_key"].astype(str))
+    memberships = {key: set() for key in candidate_keys}
+    strongest_by_key = {}
+    bag_dir = spec.input_data_dir(data_root).parent / spec.bag_label()
     if not bag_dir.is_dir():
         raise FileNotFoundError(f"Stage-6 agonist bag not found for direction provenance: {bag_dir}")
-    n_files=0
+    n_files = 0
     for fp in sorted(bag_dir.rglob("neuron_buckets.json")):
         n_files += 1
         try:
-            buckets=json.loads(fp.read_text(encoding="utf-8"))
+            buckets = json.loads(fp.read_text(encoding="utf-8"))
         except Exception:
             continue
-        nca=buckets.get("non_catastrophic_agonists", {}) if isinstance(buckets,dict) else {}
-        if not isinstance(nca,dict):
+        nca = buckets.get("non_catastrophic_agonists", {}) if isinstance(buckets, dict) else {}
+        if not isinstance(nca, dict):
             continue
         for key in _bucket_keep_keys(buckets):
-            entry=nca.get(key,{})
-            if not isinstance(entry,dict):
+            entry = nca.get(key, {})
+            if not isinstance(entry, dict):
                 continue
-            rec=entry.get("last_record") or {}
+            rec = entry.get("last_record") or {}
             try:
-                score=float(rec.get("max_effect"))
+                score = float(rec.get("max_effect"))
             except Exception:
                 continue
             if abs(score) < float(spec.min_flip_rate):
                 continue
             if "layer_label" in rec and "neuron_id" in rec:
-                unit_key=f"{rec['layer_label']}:{int(rec['neuron_id'])}"
+                unit_key = f"{rec['layer_label']}:{int(rec['neuron_id'])}"
             else:
                 try:
-                    layer,nid=str(key).rsplit(":",1); unit_key=f"{layer}:{int(nid)}"
+                    layer, nid = str(key).rsplit(":", 1)
+                    unit_key = f"{layer}:{int(nid)}"
                 except Exception:
                     continue
             if unit_key not in candidate_keys:
                 continue
-            baseline=str(rec.get("baseline_subset","")).strip().lower()
-            if baseline not in {"positive","negative"}:
+            baseline = str(rec.get("baseline_subset", "")).strip().lower()
+            if baseline not in {"positive", "negative"}:
                 continue
             memberships[unit_key].add(baseline)
-            prev=strongest.get(unit_key)
+            prev = strongest_by_key.get(unit_key)
             if prev is None or abs(score) > abs(prev[0]):
-                strongest[unit_key]=(score,baseline)
-    missing=[key for key,dirs in memberships.items() if not dirs]
+                strongest_by_key[unit_key] = (score, baseline)
+
+    missing = [key for key, dirs in memberships.items() if not dirs]
     if missing:
         raise RuntimeError(
             f"Could not recover discovery direction for {len(missing)} frozen candidate(s) from {bag_dir}: "
             + ", ".join(missing[:12])
         )
-    ranking["discovery_baseline_subsets"]=["|".join(sorted(memberships[str(key)])) for key in ranking["unit_key"].astype(str)]
-    ranking["n_discovery_baseline_subsets"]=[len(memberships[str(key)]) for key in ranking["unit_key"].astype(str)]
-    if "discovery_baseline_subset" not in ranking.columns:
-        ranking["discovery_baseline_subset"]=[strongest[str(key)][1] for key in ranking["unit_key"].astype(str)]
-    else:
-        repaired=[]
-        for key,current in zip(ranking["unit_key"].astype(str),ranking["discovery_baseline_subset"]):
-            cur=str(current).strip().lower()
-            repaired.append(cur if cur in memberships[key] else strongest[key][1])
-        ranking["discovery_baseline_subset"]=repaired
-    ranking.to_csv(ranking_path,index=False)
 
-    flips=pd.read_csv(flip_path)
-    if "unit_key" not in flips.columns:
-        layer_col="layer_label" if "layer_label" in flips.columns else "layer_key"
-        flips["unit_key"]=[f"{layer}:{int(nid)}" for layer,nid in zip(flips[layer_col],flips["neuron_id"])]
-    prov=ranking[[c for c in ["unit_key","discovery_baseline_subset","discovery_baseline_subsets","n_discovery_baseline_subsets","discovery_score","discovery_score_signed"] if c in ranking.columns]].drop_duplicates("unit_key")
-    flips=flips.drop(columns=[c for c in prov.columns if c!="unit_key" and c in flips.columns],errors="ignore").merge(prov,on="unit_key",how="left",validate="one_to_one")
-    flips.to_csv(flip_path,index=False)
+    ranking["discovery_baseline_subsets"] = [
+        "|".join(sorted(memberships[str(key)])) for key in ranking["unit_key"].astype(str)
+    ]
+    ranking["n_discovery_baseline_subsets"] = [
+        len(memberships[str(key)]) for key in ranking["unit_key"].astype(str)
+    ]
+    if "discovery_baseline_subset" not in ranking.columns:
+        ranking["discovery_baseline_subset"] = [
+            strongest_by_key[str(key)][1] for key in ranking["unit_key"].astype(str)
+        ]
+    else:
+        repaired = []
+        for key, current in zip(
+            ranking["unit_key"].astype(str), ranking["discovery_baseline_subset"]
+        ):
+            cur = str(current).strip().lower()
+            repaired.append(cur if cur in memberships[key] else strongest_by_key[key][1])
+        ranking["discovery_baseline_subset"] = repaired
+
+    prov = ranking[
+        [
+            c
+            for c in [
+                "unit_key",
+                "discovery_baseline_subset",
+                "discovery_baseline_subsets",
+                "n_discovery_baseline_subsets",
+                "discovery_score",
+                "discovery_score_signed",
+            ]
+            if c in ranking.columns
+        ]
+    ].drop_duplicates("unit_key")
+    flips = flips.drop(
+        columns=[c for c in prov.columns if c != "unit_key" and c in flips.columns],
+        errors="ignore",
+    ).merge(prov, on="unit_key", how="left", validate="one_to_one")
+
+    if write:
+        ranking.to_csv(ranking_path, index=False)
+        flips.to_csv(flip_path, index=False)
+
+    subsets = ranking["discovery_baseline_subsets"].astype(str)
+    counts = pd.to_numeric(ranking["n_discovery_baseline_subsets"], errors="coerce")
     return {
-        "bag_dir":str(bag_dir),"bucket_files":int(n_files),"n_candidates":int(len(ranking)),
-        "n_positive":int(ranking["discovery_baseline_subsets"].astype(str).str.contains("positive").sum()),
-        "n_negative":int(ranking["discovery_baseline_subsets"].astype(str).str.contains("negative").sum()),
-        "n_both":int((ranking["n_discovery_baseline_subsets"]>1).sum()),
+        "bag_dir": str(bag_dir),
+        "bucket_files": int(n_files),
+        "n_candidates": int(len(ranking)),
+        "n_positive": int(subsets.str.contains("positive").sum()),
+        "n_negative": int(subsets.str.contains("negative").sum()),
+        "n_both": int(counts.gt(1).sum()),
+        "updated": bool(write),
+        "would_update": True,
     }
 
 
@@ -269,10 +384,13 @@ def main() -> None:
                 f"{candidate_stats} / {candidate_ranking} / {materialized_scores}"
             )
 
-        provenance = _backfill_candidate_direction_provenance(spec, data_root, candidate_ranking, candidate_stats)
+        provenance = _backfill_candidate_direction_provenance(
+            spec, data_root, candidate_ranking, candidate_stats, write=not args.dry_run
+        )
         print(
             f"[spiking provenance] {setting['label']}: candidates={provenance['n_candidates']} "
-            f"positive={provenance['n_positive']} negative={provenance['n_negative']} both={provenance['n_both']}"
+            f"positive={provenance['n_positive']} negative={provenance['n_negative']} both={provenance['n_both']} "
+            f"updated={provenance['updated']} would_update={provenance['would_update']}"
         )
 
         out_dir = _spiking_out(spec, data_root, args.evaluation_split, args.spiking_max_points)

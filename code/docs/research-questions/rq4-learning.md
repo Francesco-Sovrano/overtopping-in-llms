@@ -17,7 +17,7 @@ These components are not pooled into one statistical population.
 
 ### Population
 
-The checkpoint analysis uses configured Pythia checkpoint settings in the overtopping catalogue. Checkpoint identity is part of model identity.
+The checkpoint analysis uses configured Pythia checkpoint settings in the overtopping registry. Checkpoint identity is part of model identity.
 
 ### Quantities
 
@@ -67,6 +67,10 @@ The behavioral analysis asks whether the controlled hidden objective is acquired
 Candidate localization uses the defender-visible training/evaluation population defined by the poisoning pipeline. Hidden attack annotations do not select candidate coordinates.
 
 After candidate identity is frozen, matched control and triggered views can be used to measure ordinary-direction and attack-direction causal effects for those coordinates.
+
+### Attack-blind clean-reference defense screen
+
+The controlled trajectory also evaluates a checkpoint-aligned clean-reference screen. Candidate targets are ranked using only the difference between poisoned-trained and clean-trained control-correctness disruption and are required to satisfy a configured poisoned-model benign-damage budget. Triggered attack outcomes are joined only after the target set is selected. The default operating-point budget in the plotting script is 0.30, and the full budget grid is retained in machine-readable output.
 
 ### Checkpoint-local versus fixed-coordinate evidence
 
@@ -122,6 +126,12 @@ and manuscript-facing figures under:
 
 ```text
 results/paper/figures/05_rq4_learning/poisoning/
+```
+
+When exactly one fully materialized Grammar clean-reference defense figure is available, the reporting driver also publishes it at:
+
+```text
+results/paper/figures/05_rq4_learning/rq4_grammar_clean_reference_defense.pdf
 ```
 
 ## Interpretation

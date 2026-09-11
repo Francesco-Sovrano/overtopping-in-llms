@@ -22,11 +22,11 @@ Owner:
 studies/overtopping/analysis/stage06_competence_vs_overtopping_figures.py
 ```
 
-Population: exact 39-setting overtopping catalogue:
+Population: exact 48-setting overtopping registry:
 
 ```text
-17 input+output settings
-22 decode-only settings
+22 input+output settings
+26 decode-only settings
 ```
 
 Main files:
@@ -44,7 +44,7 @@ fig2d_competence_vs_D05_1to0.pdf
 
 Method: [RQ2 — composition and interaction regimes](../research-questions/rq2-composition.md).
 
-Primary setting-level figures are generated from the 28-setting primary population.
+Setting-level figures start from the complete configured study population; each figure uses the settings for which its plotted metric is available and records the resulting denominator in its sidecar.
 
 ### Figure 3a — composition gap
 
@@ -52,7 +52,7 @@ Primary setting-level figures are generated from the 28-setting primary populati
 fig3a_composition_gap_all_settings.pdf
 ```
 
-Reports `Delta_comp = E(J) - U(J)` for each primary setting.
+Reports `Delta_comp = E(J) - U(J)` for each included RQ2 setting.
 
 ### Figure 3b — super-additive boundary cases
 
@@ -153,7 +153,7 @@ Source:
 results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/graded_agonist_dose_by_condition.csv
 ```
 
-Shows behavioral flip fraction over intervention dose. The primary population is each agonist's held-out full-dose flip support. Optional same-agonist non-flip support appears as a within-agonist reference when enabled.
+Shows behavioral flip fraction over intervention dose. The known-flip population is each agonist's held-out full-dose flip support. Optional same-agonist non-flip support appears as a within-agonist reference when enabled.
 
 ### Figure 4 S1 — threshold testability by condition
 
@@ -210,7 +210,7 @@ This file is an analysis diagnostic for selected same-condition/same-layer pairs
 
 Threshold diagnostics are required for Figure 4a, Figure 4b, and S1–S4. Figure 4b requires aggregate activation/flip rows. S2 additionally requires eligible causal-strength matches. S4 requires aggregate binned curves.
 
-The graded agonist report generates Figure 4c and S5 when the per-run graded manifests and same-candidate positive/negative support data are available for the required primary population. Preemption remains analysis-only unless explicitly promoted as a secondary subtype result.
+The graded agonist report generates Figure 4c and S5 when the per-run graded manifests and same-candidate positive/negative support data are available for the required graded-analysis population. Preemption remains analysis-only unless explicitly promoted as a secondary subtype result.
 
 ## Figure 5 — RQ4 learning
 
@@ -236,7 +236,15 @@ Per-run poisoning story files include:
 01_clean_vs_poisoned_overtopping_development.pdf
 02_channel_role_reassignment.pdf
 03_prospective_defense_leverage.pdf
+03b_clean_reference_defense_interpretation.pdf
+03c_one_checkpoint_ahead_defense_interpretation.pdf
 04_clean_vs_poisoned_checkpoint_overtopping.pdf
+```
+
+The clean-reference defense panel is generated from cached attack-blind selection tables and a benign-damage budget curve. When one eligible Grammar story is available, the final reporting driver promotes that generated panel to:
+
+```text
+results/paper/figures/05_rq4_learning/rq4_grammar_clean_reference_defense.pdf
 ```
 
 The stage-numbered source data and availability conditions are documented in [Poisoning outputs](../experiments/poisoning/outputs.md).

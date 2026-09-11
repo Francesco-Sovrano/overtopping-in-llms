@@ -24,12 +24,15 @@ A separate optional interaction question asks whether secondary causal effects b
 
 Paper-facing RQ3 evaluation uses the held-out `test` split.
 
-The exact reporting manifest contains:
+The exact reporting manifest starts from:
 
 ```text
-28 paper-primary settings        required
-11 paper-auxiliary settings      supplementary when compatible outputs are available
+48 configured overtopping settings
 ```
+
+Each threshold/graded analysis then retains the settings with the exact required
+artifacts and reports that denominator explicitly. Eligibility is determined by
+the 48-setting manifest plus the analysis-specific artifact contract.
 
 Candidate identity includes discovery direction:
 

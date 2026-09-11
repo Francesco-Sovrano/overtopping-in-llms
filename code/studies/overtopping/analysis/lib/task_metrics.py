@@ -138,7 +138,14 @@ def chance_normalized_score(raw: float, chance: float) -> float:
 
 
 def competence(phase: str, raw: float, chance: float) -> float:
-    """Use raw score for input+output and chance-normalized score for output-only."""
+    """Return the phase-specific RQ1 competence score.
+
+    Input+output interventions include prompt and instruction processing, so the
+    end-to-end raw behavioral score is used. Output-only interventions begin
+    after prompt processing; for finite-answer tasks, a model can understand the
+    instruction yet fail to solve the task and still succeed by chance guessing.
+    Output-only panels therefore use performance above the random-answer baseline.
+    """
     if phase not in {"Out", "decode-only"}:
         return float(raw)
     return chance_normalized_score(raw, chance)

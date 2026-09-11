@@ -154,7 +154,7 @@ POISONING_HOLDOUT_SEED=13
 POISONING_HOLDOUT_TEST_FRACTION=0.3333333333333333
 ```
 
-The holdout seed is experiment-global rather than tied to the training seed. This keeps primary paired evaluation identities stable across seed 13/37/101. Stage 07 can locally realign historical clean-null score tables to the primary frozen identities, so a legacy per-seed `is_test` assignment does not require checkpoint retraining or Stage-03 recomputation.
+The holdout seed is experiment-global rather than tied to the training seed. This keeps primary paired evaluation identities stable across seed 13/37/101. Stage 07 locally aligns clean-null score tables to the primary frozen identities, so per-seed `is_test` assignments do not require checkpoint retraining or Stage-03 recomputation.
 
 ## Trigger behavior and trigger-specific causal analysis
 

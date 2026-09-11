@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build the canonical 28-setting primary CSV and LaTeX tables.
+"""Build the complete configured-study CSV and LaTeX tables.
 
-The primary matrix includes the Qwen2-1.5B input+output NLI row. Inputs must use
-the current held-out singleton and conditional-marginal result schemas. Reported
-ratios are never clipped.
+The table contains all 48 configured overtopping intervention settings. Metric
+availability is recorded per setting, and metric-specific analyses operate on
+applicable observed values. Reported ratios are never clipped.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -23,6 +23,8 @@ from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOI
 from studies.overtopping.analysis.layer_widths import layer_width_for_model, per_1000_layer_coordinates, per_layer_fraction
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, competence, raw_task_score
 from studies.overtopping.analysis.lib.interaction_schema import is_exact_interaction_schema
+from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count
+from studies.overtopping.analysis.lib.stats_resolution import has_stats_artifacts, resolve_available_stats_dir
 
 
 
@@ -58,47 +60,120 @@ def locate_results_root(path: Path) -> Tuple[Path, Optional[tempfile.TemporaryDi
     )
 
 
-# Canonical primary rows used in the manuscript table.  Paths are relative to the
-# results root returned by locate_results_root().
-PRIMARY_ROWS: List[Dict[str, Any]] = [
-    # Arithmetic
-    dict(task="Arithmetic", task_dir="arithmetic", org="EleutherAI", model_dir="pythia-1b", model="Pythia-1B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-agonist_neurons-fast-random_anchor-tau0.3", note="tiny but concentrated flips", rep=True),
-    dict(task="Arithmetic", task_dir="arithmetic", org="EleutherAI", model_dir="pythia-1b@step48000", model="Pythia-1B 48k", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Arithmetic", task_dir="arithmetic", org="EleutherAI", model_dir="pythia-6.9b", model="Pythia-6.9B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="low-coverage overtopping", rep=True),
-    dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="overtopped flips", rep=True),
-    dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="high-coverage overtopping", rep=True),
-    dict(task="Arithmetic", task_dir="arithmetic", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="weak singleton concentration", rep=True),
+# The analysis table is generated from the complete configured study registry.
+# Execution-partition membership is not an analysis filter.
+from studies.overtopping.experiments.run_experiments import paper_primary_experiments, paper_reference_experiments, paper_study_44_experiments, paper_study_experiments
 
-    # Jailbreak
-    dict(task="Jailbreak", task_dir="bon_jailbreaking", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="low singleton concentration", rep=True),
-    dict(task="Jailbreak", task_dir="bon_jailbreaking", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-decode_only-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="", rep=False),
-    dict(task="Jailbreak", task_dir="bon_jailbreaking", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="lowest singleton concentration", rep=True),
+TASK_LABELS = {
+    "arithmetic": "Arithmetic",
+    "bon_jailbreaking": "Jailbreak",
+    "grammar_acceptability": "Grammar",
+    "hans_nli": "NLI",
+    "random_fsm": "Random FSM",
+}
+MODEL_LABELS = {
+    "EleutherAI/pythia-1b": "Pythia-1B",
+    "EleutherAI/pythia-1b@step48000": "Pythia-1B 48k",
+    "EleutherAI/pythia-1b@step96000": "Pythia-1B 96k",
+    "EleutherAI/pythia-6.9b": "Pythia-6.9B",
+    "Qwen/Qwen2-1.5B-Instruct": "Qwen2-1.5B",
+    "Qwen/Qwen2-7B-Instruct": "Qwen2-7B",
+    "Qwen/Qwen2.5-1.5B-Instruct": "Qwen2.5-1.5B",
+}
+# Representative-table selection is presentation-only.  It does not determine
+# which settings enter any analysis or metric audit.
+REPRESENTATIVE_SETTINGS = {
+    ("arithmetic", "EleutherAI/pythia-1b", "decode-only", "mean"),
+    ("arithmetic", "EleutherAI/pythia-6.9b", "decode-only", "mean-positional"),
+    ("arithmetic", "Qwen/Qwen2-1.5B-Instruct", "decode-only", "mean-donor"),
+    ("arithmetic", "Qwen/Qwen2-7B-Instruct", "decode-only", "mean-positional"),
+    ("arithmetic", "Qwen/Qwen2.5-1.5B-Instruct", "decode-only", "mean-donor"),
+    ("bon_jailbreaking", "Qwen/Qwen2-1.5B-Instruct", "decode-only", "mean-donor"),
+    ("bon_jailbreaking", "Qwen/Qwen2.5-1.5B-Instruct", "decode-only", "mean-donor"),
+    ("grammar_acceptability", "Qwen/Qwen2.5-1.5B-Instruct", "standard", "mean-donor"),
+    ("grammar_acceptability", "Qwen/Qwen2.5-1.5B-Instruct", "decode-only", "mean-donor"),
+    ("hans_nli", "Qwen/Qwen2-1.5B-Instruct", "standard", "mean-donor"),
+    ("hans_nli", "Qwen/Qwen2.5-1.5B-Instruct", "standard", "mean-donor"),
+    ("hans_nli", "Qwen/Qwen2.5-1.5B-Instruct", "decode-only", "mean-donor"),
+    ("random_fsm", "EleutherAI/pythia-1b", "standard", "mean-donor"),
+    ("random_fsm", "EleutherAI/pythia-1b", "decode-only", "mean-donor"),
+}
 
-    # Grammar
-    dict(task="Grammar", task_dir="grammar_acceptability", org="EleutherAI", model_dir="pythia-1b", model="Pythia-1B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Grammar", task_dir="grammar_acceptability", org="EleutherAI", model_dir="pythia-1b", model="Pythia-1B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Grammar", task_dir="grammar_acceptability", org="EleutherAI", model_dir="pythia-1b@step48000", model="Pythia-1B 48k", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Grammar", task_dir="grammar_acceptability", org="EleutherAI", model_dir="pythia-1b@step48000", model="Pythia-1B 48k", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Grammar", task_dir="grammar_acceptability", org="EleutherAI", model_dir="pythia-1b@step96000", model="Pythia-1B 96k", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Grammar", task_dir="grammar_acceptability", org="EleutherAI", model_dir="pythia-1b@step96000", model="Pythia-1B 96k", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Grammar", task_dir="grammar_acceptability", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="shared flip coverage", rep=True),
-    dict(task="Grammar", task_dir="grammar_acceptability", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="compact overtopped set", rep=True),
 
-    # NLI
-    dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2-1.5B-Instruct", model="Qwen2-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="moderate interface-localized coverage", rep=True),
-    dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2-7B-Instruct", model="Qwen2-7B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-agonist_neurons-fast-random_anchor", intervention="mean-positional", note="", rep=False),
-    dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="near-singleton overtopping", rep=True),
-    dict(task="NLI", task_dir="hans_nli", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="single-channel flips", rep=True),
+def _stage6_candidate_bag_dir(stats_dir: Path) -> Optional[Path]:
+    """Resolve the configured Stage-6 bag across current and legacy layouts."""
+    return resolve_stage6_dir(stats_dir)
 
-    # Random FSM
-    dict(task="Random FSM", task_dir="random_fsm", org="EleutherAI", model_dir="pythia-1b", model="Pythia-1B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="broad shared coverage", rep=True),
-    dict(task="Random FSM", task_dir="random_fsm", org="EleutherAI", model_dir="pythia-1b", model="Pythia-1B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="moderate concentration", rep=True),
-    dict(task="Random FSM", task_dir="random_fsm", org="EleutherAI", model_dir="pythia-1b@step48000", model="Pythia-1B 48k", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Random FSM", task_dir="random_fsm", org="EleutherAI", model_dir="pythia-1b@step96000", model="Pythia-1B 96k", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Random FSM", task_dir="random_fsm", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="I+O", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-eval_mean-donor-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-    dict(task="Random FSM", task_dir="random_fsm", org="Qwen", model_dir="Qwen2.5-1.5B-Instruct", model="Qwen2.5-1.5B", phase="Out", stats="rule_extraction_results/neuron_flip_rules/stats/spectral_split-M200000-decode_only-agonist_neurons-fast-random_anchor-tau0.3", note="", rep=False),
-]
+
+def _stage6_candidate_count(stats_dir: Path) -> tuple[Optional[int], str]:
+    """Return the exact retained candidate count for a completed Stage-6 run."""
+    return stage6_candidate_count(_stage6_candidate_bag_dir(stats_dir))
+
+
+def _zero_candidate_direction_status(task: str, raw_score: float) -> tuple[float, str, float, str]:
+    """Resolve empty-union directional rates when both endpoint classes exist.
+
+    For the finite-answer tasks, the raw score is the binary correctness rate.
+    A value strictly between zero and one proves both direction-eligible
+    denominators are nonzero.  Jailbreak uses a complemented safety score and
+    is intentionally not inferred here.
+    """
+    finite_tasks = {"arithmetic", "grammar_acceptability", "hans_nli", "random_fsm"}
+    if task in finite_tasks and math.isfinite(raw_score):
+        if 0.0 < raw_score < 1.0:
+            return 0.0, "structural_zero_candidates", 0.0, "structural_zero_candidates"
+        if raw_score <= 0.0:
+            return 0.0, "structural_zero_candidates", math.nan, "undefined_zero_denominator"
+        if raw_score >= 1.0:
+            return math.nan, "undefined_zero_denominator", 0.0, "structural_zero_candidates"
+    return math.nan, "zero_candidates_direction_denominator_unverified", math.nan, "zero_candidates_direction_denominator_unverified"
+
+
+def configured_rows(profile: str = "study-48") -> List[Dict[str, Any]]:
+    """Return metadata rows for the selected registry profile."""
+    rows: List[Dict[str, Any]] = []
+    specs = (
+        paper_study_experiments() if profile == "study-48"
+        else paper_study_44_experiments() if profile == "study-44"
+        else paper_reference_experiments() if profile == "study-39"
+        else paper_primary_experiments()
+    )
+    final_cell_counts: Dict[tuple[str, str, str], int] = {}
+    for spec in specs:
+        if "@step" not in spec.model:
+            cell = (spec.task, spec.model, spec.mode)
+            final_cell_counts[cell] = final_cell_counts.get(cell, 0) + 1
+
+    for spec in specs:
+        key = (spec.task, spec.model, spec.mode, spec.intervention)
+        is_checkpoint = "@step" in spec.model
+        final_cell = (spec.task, spec.model, spec.mode)
+        is_matched_baseline_repeat = (
+            not is_checkpoint
+            and final_cell_counts.get(final_cell, 0) > 1
+            and spec.intervention in {"mean", "mean-positional"}
+        )
+        component = (
+            "intermediate_checkpoint"
+            if is_checkpoint
+            else "replacement_baseline_repeat"
+            if is_matched_baseline_repeat
+            else "final_snapshot"
+        )
+        rows.append({
+            "task": TASK_LABELS.get(spec.task, spec.task),
+            "task_dir": spec.task,
+            "model_id": spec.model,
+            "model": MODEL_LABELS.get(spec.model, Path(spec.model).name),
+            "phase": spec.phase,
+            "intervention": spec.intervention,
+            "suite": spec.suite,
+            "study_component": component,
+            "stats_rel": spec.stats_dir(Path(".")),
+            "note": "",
+            "rep": key in REPRESENTATIVE_SETTINGS,
+        })
+    return rows
 
 
 
@@ -160,87 +235,126 @@ def sort_table1_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
-def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
+def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "study-48") -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Materialize the 48-setting study table with metric-specific availability.
+
+    Missing derived artifacts no longer remove a configured setting from the
+    analysis manifest.  They produce explicit missing values/statuses that the
+    downstream metric audit can report or, when requested, fail on.
+    """
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
-    for spec in PRIMARY_ROWS:
-        model_root = root / spec["task_dir"] / spec["org"] / spec["model_dir"]
-        stats_dir = model_root / spec["stats"]
-        if not stats_dir.name.endswith("-heldout_test"):
-            stats_dir = stats_dir.with_name(stats_dir.name + "-heldout_test")
+    for spec in configured_rows(profile):
+        model_root = root / spec["task_dir"] / Path(spec["model_id"])
+        expected_stats_dir = root / Path(spec["stats_rel"])
+        stats_dir, stats_resolution = resolve_available_stats_dir(expected_stats_dir)
         fg_path = model_root / "feature_report" / "dataset_stats.json"
         global_path = stats_dir / "flip_stats_global.json"
         by_neuron_path = stats_dir / "flip_stats_by_neuron.csv"
-
-        missing = [str(p) for p in (fg_path, global_path, by_neuron_path) if not p.exists()]
-        if missing:
-            raise FileNotFoundError("Missing expected result files:\n" + "\n".join(missing))
-
-        ds = read_json(fg_path)
-        glob = read_json(global_path)
-        by = read_flip_by_neuron(by_neuron_path)
-
-        raw = raw_task_score(spec["task"], ds)
-        chance = chance_baseline(spec["task"], ds, empirical_fsm_chance=empirical_fsm_chance)
-        score = competence(spec["phase"], raw, chance)
-        n_eval = int(glob.get("n_evaluated_rows", 0))
-        j = int(glob.get("n_neurons", len(by)))
-        u = float(glob.get("union_flip_any_unique_rate", 0.0))
-
         singleton_path = stats_dir / "singleton_set_metrics.json"
-        if not singleton_path.exists():
-            raise FileNotFoundError(f"Missing current singleton metrics: {singleton_path}")
-        singleton = read_json(singleton_path)
-        if singleton.get("definition_version") != "heldout-set-metrics-v3-directional":
-            raise ValueError(
-                f"Unsupported singleton metrics schema at {singleton_path}: "
-                f"{singleton.get('definition_version')!r}"
-            )
         interaction_path = stats_dir / "interaction_validation" / "interaction_validation_summary.json"
+        stage6_candidate_count, stage6_candidate_status = _stage6_candidate_count(stats_dir)
+        structural_zero_candidates = stage6_candidate_status == "ok" and stage6_candidate_count == 0
+
+        # Stage 7 intentionally returns without writing singleton outputs when
+        # discovery produced no candidates.  In that case the Stage-6 bag is
+        # the completion artifact; do not misclassify the setting as missing.
+        required_core_paths = (fg_path,) if structural_zero_candidates else (fg_path, global_path, by_neuron_path)
+        missing_core = [p for p in required_core_paths if not p.exists()]
+        if stats_resolution == "partial_heldout_cap":
+            warnings.append(
+                f"{spec['task']} | {spec['model']} | {spec['phase']} | {spec['intervention']}: "
+                f"using available partial held-out stats {stats_dir} because canonical stats are not materialized at {expected_stats_dir}."
+            )
+        if missing_core:
+            availability_note = (
+                "feature-level stats are available but overtopping metric artifact(s) are unavailable"
+                if fg_path.exists() else "required result artifact(s) are unavailable"
+            )
+            warnings.append(
+                f"{spec['task']} | {spec['model']} | {spec['phase']} | {spec['intervention']}: "
+                f"{availability_note}: " + ", ".join(str(p) for p in missing_core)
+            )
+
+        ds = read_json(fg_path) if fg_path.exists() else {}
+        glob = read_json(global_path) if global_path.exists() else {}
+        by = read_flip_by_neuron(by_neuron_path) if by_neuron_path.exists() else []
+
+        try:
+            raw = raw_task_score(spec["task"], ds)
+            chance = chance_baseline(spec["task"], ds, empirical_fsm_chance=empirical_fsm_chance)
+            score = competence(spec["phase"], raw, chance)
+        except Exception:
+            raw = chance = score = math.nan
+
+        n_eval = int(glob.get("n_evaluated_rows", 0) or 0)
+        j_raw = glob.get("n_neurons", len(by) if by_neuron_path.exists() else math.nan)
+        try:
+            j = int(j_raw) if j_raw is not None and math.isfinite(float(j_raw)) else math.nan
+        except (TypeError, ValueError):
+            j = math.nan
+        try:
+            u = float(glob.get("union_flip_any_unique_rate", math.nan))
+        except (TypeError, ValueError):
+            u = math.nan
+        if structural_zero_candidates:
+            j = 0
+            u = 0.0
+
+        singleton = read_json(singleton_path) if singleton_path.exists() else {}
+        singleton_schema = singleton.get("definition_version")
+        singleton_current = singleton_schema == "heldout-set-metrics-v3-directional"
+        if not singleton_current and not structural_zero_candidates:
+            warnings.append(
+                f"{spec['task']} | {spec['model']} | {spec['phase']} | {spec['intervention']}: "
+                f"directional singleton metrics unavailable/incompatible ({singleton_schema!r})."
+            )
         interaction = read_json(interaction_path) if interaction_path.exists() else {}
 
-        top = float(singleton.get("s_1", math.nan))
+        try:
+            top = float(singleton.get("s_1", math.nan))
+        except (TypeError, ValueError):
+            top = math.nan
         toc1 = None
         topm_path = stats_dir / "frozen_topm_metrics.csv"
         if topm_path.exists():
-            topm = pd.read_csv(topm_path)
-            match = topm.loc[pd.to_numeric(topm.get("m"), errors="coerce") == 1]
-            toc1 = float(match.iloc[0]["TOC_m"]) if len(match) else None
+            try:
+                topm = pd.read_csv(topm_path)
+                match = topm.loc[pd.to_numeric(topm.get("m"), errors="coerce") == 1]
+                toc1 = float(match.iloc[0]["TOC_m"]) if len(match) else None
+            except Exception:
+                toc1 = None
         elif isinstance(singleton.get("TOC_m"), dict):
             payload = singleton["TOC_m"].get("1", {})
             toc1 = payload.get("value") if isinstance(payload, dict) else payload
+
         thresholds = singleton.get("N_t", {}) if isinstance(singleton.get("N_t"), dict) else {}
         thresholds_i2c = singleton.get("N_t_i2c", {}) if isinstance(singleton.get("N_t_i2c"), dict) else {}
         thresholds_c2i = singleton.get("N_t_c2i", {}) if isinstance(singleton.get("N_t_c2i"), dict) else {}
-        n05 = int(thresholds.get("0.05", 0))
-        n10 = int(thresholds.get("0.1", thresholds.get("0.10", 0)))
-        n05_i2c = int(thresholds_i2c.get("0.05", 0)) if thresholds_i2c else None
-        n10_i2c = int(thresholds_i2c.get("0.1", thresholds_i2c.get("0.10", 0))) if thresholds_i2c else None
-        n05_c2i = int(thresholds_c2i.get("0.05", 0)) if thresholds_c2i else None
-        n10_c2i = int(thresholds_c2i.get("0.1", thresholds_c2i.get("0.10", 0))) if thresholds_c2i else None
+        n05 = int(thresholds.get("0.05", 0)) if singleton_current else math.nan
+        n10 = int(thresholds.get("0.1", thresholds.get("0.10", 0))) if singleton_current else math.nan
+        n05_i2c = int(thresholds_i2c.get("0.05", 0)) if singleton_current and thresholds_i2c else math.nan
+        n10_i2c = int(thresholds_i2c.get("0.1", thresholds_i2c.get("0.10", 0))) if singleton_current and thresholds_i2c else math.nan
+        n05_c2i = int(thresholds_c2i.get("0.05", 0)) if singleton_current and thresholds_c2i else math.nan
+        n10_c2i = int(thresholds_c2i.get("0.1", thresholds_c2i.get("0.10", 0))) if singleton_current and thresholds_c2i else math.nan
 
-        # Explicit direction-conditioned union coverage.
-        u_i2c = singleton.get("U_J_i2c")
-        u_c2i = singleton.get("U_J_c2i")
-        u_i2c_status = singleton.get("U_J_i2c_status")
-        u_c2i_status = singleton.get("U_J_c2i_status")
-        if singleton.get("definition_version") != "heldout-set-metrics-v3-directional":
-            warnings.append(
-                f"{spec['task']} | {spec['model']} | {spec['phase']}: directional singleton counts "
-                "are unavailable until stats are rebuilt with heldout-set-metrics-v3-directional."
+        u_i2c = singleton.get("U_J_i2c") if singleton_current else None
+        u_c2i = singleton.get("U_J_c2i") if singleton_current else None
+        u_i2c_status = singleton.get("U_J_i2c_status", "missing_or_incompatible")
+        u_c2i_status = singleton.get("U_J_c2i_status", "missing_or_incompatible")
+        if structural_zero_candidates:
+            n05 = n10 = n05_i2c = n10_i2c = n05_c2i = n10_c2i = 0
+            u_i2c, u_i2c_status, u_c2i, u_c2i_status = _zero_candidate_direction_status(
+                spec["task_dir"], float(raw) if raw is not None else math.nan
             )
 
         layer_width = layer_width_for_model(spec["model"])
-
         schema = interaction.get("definition_version") if isinstance(interaction, dict) else None
-        candidate_effect = (
-            interaction.get("candidate_E_J", {})
-            if is_exact_interaction_schema(schema)
-            else {}
-        )
+        interaction_current = is_exact_interaction_schema(schema)
+        candidate_effect = interaction.get("candidate_E_J", {}) if interaction_current else {}
         interaction_ej = candidate_effect.get("effect") if isinstance(candidate_effect, dict) else None
         cmc_1x = None
-        if is_exact_interaction_schema(schema):
+        if interaction_current:
             for item in interaction.get("conditional_marginal", []) or []:
                 try:
                     multiplier = int(item.get("background_multiplier"))
@@ -253,6 +367,32 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
         rows.append({
             **spec,
             "stats_dir": str(stats_dir),
+            "expected_stats_dir": str(expected_stats_dir),
+            "stats_resolution": stats_resolution,
+            "overtopping_stats_available": bool(has_stats_artifacts(stats_dir)),
+            "feature_stats_available": bool(fg_path.exists()),
+            "stage6_dir": str(_stage6_candidate_bag_dir(expected_stats_dir) or ""),
+            "stage6_discovered_candidate_count": stage6_candidate_count,
+            "stage6_candidate_count_status": stage6_candidate_status,
+            "structural_zero_candidates": bool(structural_zero_candidates),
+            "availability_status": (
+                "complete_zero_candidates" if structural_zero_candidates and not missing_core
+                else "partial_heldout_stats" if not missing_core and stats_resolution == "partial_heldout_cap"
+                else "complete_core" if not missing_core
+                else "feature_stats_only" if fg_path.exists() and not has_stats_artifacts(stats_dir)
+                else "partial_overtopping_stats" if has_stats_artifacts(stats_dir)
+                else "no_result_stats"
+            ),
+            "singleton_metrics_status": (
+                "heldout_v3_directional" if singleton_current else
+                "structural_zero_candidates" if structural_zero_candidates else
+                "missing_or_incompatible"
+            ),
+            "interaction_metrics_status": (
+                f"exact:{schema}" if interaction_current else
+                "not_applicable_zero_candidates" if structural_zero_candidates else
+                "missing_or_incompatible"
+            ),
             "raw": raw,
             "chance": chance,
             "score": score,
@@ -266,11 +406,11 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
             "U_J_c2i": float(u_c2i) if u_c2i is not None else math.nan,
             "U_J_c2i_status": u_c2i_status,
             "R_ov": singleton.get("R_ov"),
-            "R_ov_status": singleton.get("R_ov_status"),
+            "R_ov_status": singleton.get("R_ov_status", "undefined_zero_candidates" if structural_zero_candidates else "missing"),
             "R_ov_i2c": singleton.get("R_ov_i2c"),
             "R_ov_c2i": singleton.get("R_ov_c2i"),
             "N_eff": singleton.get("N_eff"),
-            "N_eff_status": singleton.get("N_eff_status"),
+            "N_eff_status": singleton.get("N_eff_status", "undefined_zero_candidates" if structural_zero_candidates else "missing"),
             "N_eff_i2c": singleton.get("N_eff_i2c"),
             "N_eff_c2i": singleton.get("N_eff_c2i"),
             "s_1_i2c": singleton.get("s_1_i2c"),
@@ -284,16 +424,16 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
             "N10_i2c": n10_i2c,
             "N05_c2i": n05_c2i,
             "N10_c2i": n10_c2i,
-            "N05_i2c_density": per_layer_fraction(n05_i2c, spec["model"]) if n05_i2c is not None else math.nan,
-            "N05_c2i_density": per_layer_fraction(n05_c2i, spec["model"]) if n05_c2i is not None else math.nan,
-            "N10_i2c_density": per_layer_fraction(n10_i2c, spec["model"]) if n10_i2c is not None else math.nan,
-            "N10_c2i_density": per_layer_fraction(n10_c2i, spec["model"]) if n10_c2i is not None else math.nan,
+            "N05_i2c_density": per_layer_fraction(n05_i2c, spec["model"]) if pd.notna(n05_i2c) else math.nan,
+            "N05_c2i_density": per_layer_fraction(n05_c2i, spec["model"]) if pd.notna(n05_c2i) else math.nan,
+            "N10_i2c_density": per_layer_fraction(n10_i2c, spec["model"]) if pd.notna(n10_i2c) else math.nan,
+            "N10_c2i_density": per_layer_fraction(n10_c2i, spec["model"]) if pd.notna(n10_c2i) else math.nan,
             "N_eff_i2c_density": per_layer_fraction(singleton.get("N_eff_i2c"), spec["model"]),
             "N_eff_c2i_density": per_layer_fraction(singleton.get("N_eff_c2i"), spec["model"]),
-            "N05_i2c_per_1k_layer": per_1000_layer_coordinates(n05_i2c, spec["model"]) if n05_i2c is not None else math.nan,
-            "N05_c2i_per_1k_layer": per_1000_layer_coordinates(n05_c2i, spec["model"]) if n05_c2i is not None else math.nan,
-            "N10_i2c_per_1k_layer": per_1000_layer_coordinates(n10_i2c, spec["model"]) if n10_i2c is not None else math.nan,
-            "N10_c2i_per_1k_layer": per_1000_layer_coordinates(n10_c2i, spec["model"]) if n10_c2i is not None else math.nan,
+            "N05_i2c_per_1k_layer": per_1000_layer_coordinates(n05_i2c, spec["model"]) if pd.notna(n05_i2c) else math.nan,
+            "N05_c2i_per_1k_layer": per_1000_layer_coordinates(n05_c2i, spec["model"]) if pd.notna(n05_c2i) else math.nan,
+            "N10_i2c_per_1k_layer": per_1000_layer_coordinates(n10_i2c, spec["model"]) if pd.notna(n10_i2c) else math.nan,
+            "N10_c2i_per_1k_layer": per_1000_layer_coordinates(n10_c2i, spec["model"]) if pd.notna(n10_c2i) else math.nan,
             "N_eff_i2c_per_1k_layer": per_1000_layer_coordinates(singleton.get("N_eff_i2c"), spec["model"]),
             "N_eff_c2i_per_1k_layer": per_1000_layer_coordinates(singleton.get("N_eff_c2i"), spec["model"]),
         })
@@ -302,7 +442,11 @@ def compute_rows(root: Path, empirical_fsm_chance: bool) -> Tuple[List[Dict[str,
 
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
-        "task", "model", "phase", "score", "raw", "chance", "J", "U", "Top", "TOC1",
+        "task", "model", "phase", "intervention", "suite", "study_component",
+        "availability_status", "singleton_metrics_status", "interaction_metrics_status",
+        "stage6_discovered_candidate_count", "stage6_candidate_count_status",
+        "structural_zero_candidates", "stage6_dir",
+        "score", "raw", "chance", "J", "U", "Top", "TOC1",
         "U_J_i2c", "U_J_i2c_status", "U_J_c2i", "U_J_c2i_status",
         "R_ov", "R_ov_status", "R_ov_i2c", "R_ov_c2i",
         "N_eff", "N_eff_status", "N_eff_i2c", "N_eff_c2i",
@@ -397,7 +541,7 @@ def make_latex(rows: List[Dict[str, Any]], representative_only: bool) -> str:
         return "\n".join(lines) + "\n"
 
     caption = (
-        rf"All {len(rows)} primary settings. Direction-conditioned union coverage is reported explicitly rather than as OCC. "
+        rf"All {len(rows)} configured study settings. Direction-conditioned union coverage is reported explicitly rather than as OCC. "
         r"Pooled $U(J)$ is retained as context. $N^{d}_{.05}$ and $N^{d}_{.10}$ count strong singleton handles "
         r"within direction $d$; the /$d$ columns use the unitless fraction $N/d_{\rm model}$. Per-1000 variants are retained only in machine-readable sidecars. "
         r"Blank directional-count entries indicate singleton metrics that have not yet been rebuilt with the directional schema."
@@ -433,8 +577,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--primary-profile",
         choices=PRIMARY_PROFILE_CHOICES,
-        required=True,
-        help="Primary matrix profile. The supported profile is iclr-28 (28 settings).",
+        default="study-48",
+        help="Validation profile for the configured study table. Default: study-48.",
     )
     ap.add_argument(
         "--suppress-directional-warnings",
@@ -447,7 +591,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     out = Path(args.out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     try:
-        rows, warnings = compute_rows(root, empirical_fsm_chance=args.empirical_fsm_chance)
+        rows, warnings = compute_rows(
+            root, empirical_fsm_chance=args.empirical_fsm_chance, profile=args.primary_profile
+        )
         normalized_df, excluded_df, profile_audit = normalize_primary_table(
             pd.DataFrame(rows), profile=args.primary_profile, source=Path(args.results)
         )

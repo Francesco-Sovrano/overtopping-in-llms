@@ -77,6 +77,14 @@ def rq2_interaction_decomposition(root: Path) -> Path:
     return analysis_root(root) / "rq2_composition" / "interaction_decomposition"
 
 
+def rq2_interaction_decomposition_mean(root: Path) -> Path:
+    return analysis_root(root) / "rq2_composition" / "interaction_decomposition_mean"
+
+
+def rq2_regime_summary(root: Path) -> Path:
+    return analysis_root(root) / "rq2_composition" / "regime_summary"
+
+
 def overtopping_spiking_diagnostics(root: Path) -> Path:
     return analysis_root(root) / "rq3_threshold_event" / "spiking_diagnostics"
 

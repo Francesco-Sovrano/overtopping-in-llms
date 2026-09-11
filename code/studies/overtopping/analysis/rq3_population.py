@@ -44,7 +44,7 @@ def expected_rq3_sources(args) -> list[dict]:
             "required": True,
         })
 
-    if str(getattr(args, "population_scope", "primary+supplementary")) == "primary+supplementary":
+    if str(getattr(args, "population_scope", "primary")) == "primary+supplementary":
         for index, raw_spec in enumerate(paper_auxiliary_experiments()):
             spec = replace(raw_spec, evaluation_split=evaluation_split)
             expected.append({

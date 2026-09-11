@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Held-out primary-metric analysis utilities.
+"""Held-out configured-study metric analysis utilities.
 
-``primary`` summarizes reach, concentration, overlap, directional coverage,
-and simultaneous-intervention quantities already present in a primary table.
+``primary`` is the retained CLI command name; it summarizes reach,
+concentration, overlap, directional coverage, and simultaneous-intervention
+quantities already present in the configured study table.
 ``holdout`` audits paired strict-test outputs. ``critical-report`` combines
 those model-free summaries. Matched null inference for simultaneous E(J) and
 Simultaneous E(J) and paired conditional marginal validation are provided by ``pipeline/stage08_validate_interactions.py``.
@@ -281,7 +282,7 @@ def _add_directional_coverage(
     if "stats_dir" not in frame.columns:
         if require_complete:
             raise ValueError("Directional coverage requires a stats_dir column.")
-        return frame.copy(), ["primary table has no stats_dir column"]
+        return frame.copy(), ["configured study table has no stats_dir column"]
 
     out = frame.copy()
     records: list[dict] = []
@@ -652,7 +653,8 @@ def run_primary(args) -> None:
 
     payload = {
         "source": str(table),
-        "n_primary_settings": int(len(df)),
+        "n_study_settings": int(len(df)),
+        "n_primary_settings": int(len(df)),  # backwards-compatible alias
         "concentration_distribution": concentration,
         "same_context_metric": same_context_metric,
         "same_context_ceiling_warning": same_context_ceiling_warning,
@@ -666,9 +668,9 @@ def run_primary(args) -> None:
     phase = corr[corr["scope_type"] == "phase"]
     partial = corr[corr["scope_type"] == "partial"]
     lines = [
-        "# Held-out primary metric analysis",
+        "# Held-out configured-study metric analysis",
         "",
-        f"Primary settings: {len(df)}. Defined TOC1 settings: {len(toc)}.",
+        f"Configured study settings: {len(df)}. Defined TOC1 settings: {len(toc)}.",
         "",
         (
             f"Median TOC1 is {concentration['TOC1']['median']:.3f}."
@@ -1278,7 +1280,7 @@ def run_holdout(args) -> None:
                 "These paired primary-table cells test whether the reported distribution survives fresh "
                 "examples. Frozen Top is the strict singleton validation; test-reselected Top is "
                 "reported only descriptively. A held-out competence analysis is appropriate only "
-                "when the complete primary matrix has been re-estimated."
+                "when the complete configured study table has been re-estimated."
             ),
             "",
         ]

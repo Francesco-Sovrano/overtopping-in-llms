@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 from pathlib import Path
 
 import matplotlib
@@ -27,6 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 
 from core.caching_and_prompting import set_deterministic
 from core.feature_extraction_runner import resolve_task_spec
@@ -40,6 +42,7 @@ from core.modeling_and_ablation import (
     build_ablation_hooks,
     get_device,
     precompute_mean_activations,
+    clone_kv_cache,
 )
 from core.neuron_intervention import (
     build_prefix_caches_for_examples,
@@ -109,6 +112,22 @@ def parse_args() -> argparse.Namespace:
         help="Absolute cap for optional same-agonist negative support. 0 means no additional cap.",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--record_endpoint_margin",
+        action="store_true",
+        help=(
+            "Record a continuous downstream response margin at each dose by comparing "
+            "the model log-probability of the dose-1 generated response with the dose-0 "
+            "generated response. This directly tests a smooth downstream-margin account "
+            "of the binary overtopping transition."
+        ),
+    )
+    p.add_argument(
+        "--endpoint_margin_max_examples_per_agonist",
+        type=int,
+        default=64,
+        help="Maximum graded examples per agonist used for endpoint-response margin scoring; 0 uses all.",
+    )
     p.add_argument("--force", action="store_true")
     p.add_argument("--no_plot", action="store_true")
     return p.parse_args()
@@ -325,6 +344,482 @@ def _row_id(frame: pd.DataFrame, idx: int) -> object:
     return int(idx)
 
 
+
+def _completion_token_ids(tokenizer, prompt_text: str, completion_text: str) -> tuple[list[int], bool]:
+    """Tokenize a generated completion and report whether prompt+completion tokenization was exact.
+
+    Exact mode uses the suffix of tokenizing ``prompt + completion`` whenever the
+    prompt tokens are a strict prefix.  The fallback tokenizes the completion by
+    itself; this keeps the diagnostic usable while exposing that boundary-token
+    retokenization was required.
+    """
+    prompt_text = str(prompt_text)
+    completion_text = str(completion_text)
+    try:
+        prompt_ids = list(tokenizer(prompt_text, add_special_tokens=True)["input_ids"])
+        full_ids = list(tokenizer(prompt_text + completion_text, add_special_tokens=True)["input_ids"])
+        if len(full_ids) > len(prompt_ids) and full_ids[: len(prompt_ids)] == prompt_ids:
+            return [int(x) for x in full_ids[len(prompt_ids):]], True
+    except Exception:
+        pass
+    try:
+        ids = tokenizer(completion_text, add_special_tokens=False)["input_ids"]
+        return [int(x) for x in ids], False
+    except Exception:
+        return [], False
+
+
+def _score_completion_batch_input_output(model: LMWrapper, prompts: list[str], completions: list[str], hooks):
+    """Length-normalized and total log-probability of fixed completions under I+O hooks."""
+    tokenizer = model.tokenizer
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+
+    sequences = []
+    prompt_lengths = []
+    completion_lengths = []
+    exact_flags = []
+    for prompt, completion in zip(prompts, completions):
+        try:
+            prompt_ids = list(tokenizer(str(prompt), add_special_tokens=True)["input_ids"])
+        except Exception:
+            prompt_ids = []
+        comp_ids, exact = _completion_token_ids(tokenizer, str(prompt), str(completion))
+        if not prompt_ids or not comp_ids:
+            sequences.append([])
+            prompt_lengths.append(0)
+            completion_lengths.append(0)
+            exact_flags.append(bool(exact))
+            continue
+        sequences.append([int(x) for x in prompt_ids] + [int(x) for x in comp_ids])
+        prompt_lengths.append(len(prompt_ids))
+        completion_lengths.append(len(comp_ids))
+        exact_flags.append(bool(exact))
+
+    totals = np.full(len(prompts), np.nan, dtype=float)
+    means = np.full(len(prompts), np.nan, dtype=float)
+    ntokens = np.asarray(completion_lengths, dtype=int)
+    valid = [i for i, seq in enumerate(sequences) if seq and completion_lengths[i] > 0 and prompt_lengths[i] > 0]
+    if not valid:
+        return totals, means, ntokens, np.asarray(exact_flags, dtype=bool)
+
+    device = model.hooked_model.cfg.device
+    for start in range(0, len(valid),  max(1, min(32, len(valid)))):
+        batch_ids = valid[start:start + max(1, min(32, len(valid)))]
+        max_len = max(len(sequences[i]) for i in batch_ids)
+        input_ids = torch.full((len(batch_ids), max_len), int(pad_id), dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(batch_ids), max_len), dtype=torch.long, device=device)
+        for b, i in enumerate(batch_ids):
+            seq = torch.tensor(sequences[i], dtype=torch.long, device=device)
+            input_ids[b, : len(seq)] = seq
+            attention_mask[b, : len(seq)] = 1
+
+        ctx = model.hooked_model.hooks(
+            fwd_hooks=hooks, reset_hooks_end=True, clear_contexts=True
+        ) if hooks else __import__("contextlib").nullcontext()
+        with torch.inference_mode(), ctx:
+            logits = model.hooked_model(
+                input_ids,
+                attention_mask=attention_mask,
+                padding_side="right",
+                return_type="logits",
+            )
+        for b, i in enumerate(batch_ids):
+            p_len = int(prompt_lengths[i])
+            c_len = int(completion_lengths[i])
+            # logits at position t-1 predict token t.
+            pred = logits[b, p_len - 1:p_len - 1 + c_len, :].to(torch.float32)
+            targets = input_ids[b, p_len:p_len + c_len]
+            if pred.shape[0] != c_len:
+                continue
+            target_logits = pred.gather(1, targets.unsqueeze(1)).squeeze(1)
+            token_logp = target_logits - torch.logsumexp(pred, dim=1)
+            totals[i] = float(token_logp.sum().item())
+            means[i] = float(token_logp.mean().item())
+        try:
+            model.cleanup_after_generate()
+        except Exception:
+            pass
+    return totals, means, ntokens, np.asarray(exact_flags, dtype=bool)
+
+
+def _score_completion_batch_decode_only(model: LMWrapper, prompts: list[str], completions: list[str], hooks):
+    """Score fixed completions with the same decode-only semantics used by Stage 7/RQ3.
+
+    Prompt prefill is unmodified. The first completion-token probability therefore
+    comes from the clean prefill logits; hooks act while each supplied completion
+    token is consumed to produce the next-token logits, exactly matching the
+    output-only intervention timing.
+    """
+    tokenizer = model.tokenizer
+    token_lists = []
+    exact_flags = []
+    for prompt, completion in zip(prompts, completions):
+        ids, exact = _completion_token_ids(tokenizer, str(prompt), str(completion))
+        token_lists.append(ids)
+        exact_flags.append(bool(exact))
+    totals = np.full(len(prompts), np.nan, dtype=float)
+    means = np.full(len(prompts), np.nan, dtype=float)
+    ntokens = np.asarray([len(x) for x in token_lists], dtype=int)
+    valid = [i for i, ids in enumerate(token_lists) if ids]
+    if not valid:
+        return totals, means, ntokens, np.asarray(exact_flags, dtype=bool)
+
+    batch_size = 32
+    for start in range(0, len(valid), batch_size):
+        batch_ids = valid[start:start + batch_size]
+        batch_prompts = [str(prompts[i]) for i in batch_ids]
+        batch_tokens = [token_lists[i] for i in batch_ids]
+        max_steps = max(len(x) for x in batch_tokens)
+        prefix = model.prefill_prefix_batch(
+            batch_prompts,
+            max_new_tokens=max(1, int(max_steps)),
+            use_kv_cache=True,
+        )
+        if prefix.past_kv_cache is None or prefix.logits_last is None:
+            # Output-only scoring relies on a clean prompt KV cache so that only
+            # decode steps are intervened on.
+            continue
+        cache = clone_kv_cache(prefix.past_kv_cache)
+        logits_last = prefix.logits_last
+        device = logits_last.device
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        sums = torch.zeros(len(batch_ids), dtype=torch.float32, device=device)
+        counts = torch.zeros(len(batch_ids), dtype=torch.long, device=device)
+        attn_chunk = torch.ones((len(batch_ids), 1), dtype=prefix.attention_mask.dtype, device=device)
+        ctx = model.hooked_model.hooks(
+            fwd_hooks=hooks, reset_hooks_end=True, clear_contexts=True
+        ) if hooks else __import__("contextlib").nullcontext()
+        with torch.inference_mode(), ctx:
+            for step in range(max_steps):
+                target = torch.full((len(batch_ids),), int(pad_id), dtype=torch.long, device=device)
+                active = torch.zeros(len(batch_ids), dtype=torch.bool, device=device)
+                for b, ids in enumerate(batch_tokens):
+                    if step < len(ids):
+                        target[b] = int(ids[step])
+                        active[b] = True
+                pred = logits_last.to(torch.float32)
+                target_logits = pred.gather(1, target.unsqueeze(1)).squeeze(1)
+                token_logp = target_logits - torch.logsumexp(pred, dim=1)
+                sums[active] += token_logp[active]
+                counts[active] += 1
+                if step + 1 >= max_steps:
+                    break
+                logits_last = model._last_logits(
+                    target.unsqueeze(1),
+                    attn_chunk,
+                    past_kv_cache=cache,
+                    padding_side=getattr(prefix, "padding_side", "right"),
+                )
+        for b, i in enumerate(batch_ids):
+            c = int(counts[b].item())
+            if c > 0:
+                totals[i] = float(sums[b].item())
+                means[i] = float((sums[b] / c).item())
+        try:
+            model.cleanup_after_generate()
+        except Exception:
+            pass
+    return totals, means, ntokens, np.asarray(exact_flags, dtype=bool)
+
+
+def _score_completion_batch(model: LMWrapper, prompts: list[str], completions: list[str], hooks, *, decode_only: bool):
+    if decode_only:
+        return _score_completion_batch_decode_only(model, prompts, completions, hooks)
+    return _score_completion_batch_input_output(model, prompts, completions, hooks)
+
+
+
+def _endpoint_divergence_specs(tokenizer, prompts: list[str], response0: list[str], response1: list[str]):
+    specs = []
+    for prompt, a0, a1 in zip(prompts, response0, response1):
+        ids0, exact0 = _completion_token_ids(tokenizer, prompt, a0)
+        ids1, exact1 = _completion_token_ids(tokenizer, prompt, a1)
+        k = 0
+        while k < min(len(ids0), len(ids1)) and int(ids0[k]) == int(ids1[k]):
+            k += 1
+        if k >= len(ids0) or k >= len(ids1):
+            specs.append({
+                "valid": False,
+                "common_ids": ids0[:k],
+                "token0": None,
+                "token1": None,
+                "common_tokens": int(k),
+                "exact": bool(exact0 and exact1),
+            })
+        else:
+            specs.append({
+                "valid": True,
+                "common_ids": [int(x) for x in ids0[:k]],
+                "token0": int(ids0[k]),
+                "token1": int(ids1[k]),
+                "common_tokens": int(k),
+                "exact": bool(exact0 and exact1),
+            })
+    return specs
+
+
+def _divergence_margin_input_output(model: LMWrapper, prompts: list[str], specs: list[dict], hooks):
+    tokenizer = model.tokenizer
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    margins = np.full(len(prompts), np.nan, dtype=float)
+    top_is_0 = np.zeros(len(prompts), dtype=bool)
+    top_is_1 = np.zeros(len(prompts), dtype=bool)
+    valid = [i for i, spec in enumerate(specs) if spec.get("valid")]
+    if not valid:
+        return margins, top_is_0, top_is_1
+    device = model.hooked_model.cfg.device
+    batch_size = 32
+    for start in range(0, len(valid), batch_size):
+        ids = valid[start:start + batch_size]
+        seqs = []
+        for i in ids:
+            prompt_ids = list(tokenizer(str(prompts[i]), add_special_tokens=True)["input_ids"])
+            seqs.append([int(x) for x in prompt_ids] + list(specs[i]["common_ids"]))
+        max_len = max(len(x) for x in seqs)
+        input_ids = torch.full((len(ids), max_len), int(pad_id), dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(ids), max_len), dtype=torch.long, device=device)
+        lengths = []
+        for b, seq in enumerate(seqs):
+            lengths.append(len(seq))
+            input_ids[b, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+            attention_mask[b, :len(seq)] = 1
+        ctx = model.hooked_model.hooks(
+            fwd_hooks=hooks, reset_hooks_end=True, clear_contexts=True
+        ) if hooks else __import__("contextlib").nullcontext()
+        with torch.inference_mode(), ctx:
+            logits = model.hooked_model(
+                input_ids,
+                attention_mask=attention_mask,
+                padding_side="right",
+                return_type="logits",
+            )
+        for b, i in enumerate(ids):
+            last = int(lengths[b]) - 1
+            vec = logits[b, last, :].to(torch.float32)
+            t0 = int(specs[i]["token0"])
+            t1 = int(specs[i]["token1"])
+            margins[i] = float((vec[t1] - vec[t0]).item())
+            top = int(torch.argmax(vec).item())
+            top_is_0[i] = top == t0
+            top_is_1[i] = top == t1
+        try:
+            model.cleanup_after_generate()
+        except Exception:
+            pass
+    return margins, top_is_0, top_is_1
+
+
+def _divergence_margin_decode_only(model: LMWrapper, prompts: list[str], specs: list[dict], hooks):
+    """First endpoint-divergence token margin with clean prefill and hooked decode prefix."""
+    margins = np.full(len(prompts), np.nan, dtype=float)
+    top_is_0 = np.zeros(len(prompts), dtype=bool)
+    top_is_1 = np.zeros(len(prompts), dtype=bool)
+    valid = [i for i, spec in enumerate(specs) if spec.get("valid")]
+    if not valid:
+        return margins, top_is_0, top_is_1
+    tokenizer = model.tokenizer
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    batch_size = 32
+    for start in range(0, len(valid), batch_size):
+        ids = valid[start:start + batch_size]
+        batch_prompts = [str(prompts[i]) for i in ids]
+        common = [list(specs[i]["common_ids"]) for i in ids]
+        max_steps = max([len(x) for x in common] + [0])
+        prefix = model.prefill_prefix_batch(
+            batch_prompts,
+            max_new_tokens=max(1, max_steps + 1),
+            use_kv_cache=True,
+        )
+        if prefix.past_kv_cache is None or prefix.logits_last is None:
+            continue
+        cache = clone_kv_cache(prefix.past_kv_cache)
+        logits_last = prefix.logits_last
+        device = logits_last.device
+        attn_chunk = torch.ones((len(ids), 1), dtype=prefix.attention_mask.dtype, device=device)
+        # Different examples may diverge after different shared-prefix lengths.
+        # Record each row as soon as its common prefix has been consumed.
+        unresolved = set(range(len(ids)))
+        ctx = model.hooked_model.hooks(
+            fwd_hooks=hooks, reset_hooks_end=True, clear_contexts=True
+        ) if hooks else __import__("contextlib").nullcontext()
+        with torch.inference_mode(), ctx:
+            for step in range(max_steps + 1):
+                for b in list(unresolved):
+                    if step == len(common[b]):
+                        i = ids[b]
+                        vec = logits_last[b].to(torch.float32)
+                        t0 = int(specs[i]["token0"])
+                        t1 = int(specs[i]["token1"])
+                        margins[i] = float((vec[t1] - vec[t0]).item())
+                        top = int(torch.argmax(vec).item())
+                        top_is_0[i] = top == t0
+                        top_is_1[i] = top == t1
+                        unresolved.remove(b)
+                if not unresolved or step >= max_steps:
+                    break
+                token = torch.full((len(ids),), int(pad_id), dtype=torch.long, device=device)
+                for b in range(len(ids)):
+                    if step < len(common[b]):
+                        token[b] = int(common[b][step])
+                logits_last = model._last_logits(
+                    token.unsqueeze(1),
+                    attn_chunk,
+                    past_kv_cache=cache,
+                    padding_side=getattr(prefix, "padding_side", "right"),
+                )
+        try:
+            model.cleanup_after_generate()
+        except Exception:
+            pass
+    return margins, top_is_0, top_is_1
+
+
+def _divergence_margin_batch(model: LMWrapper, prompts: list[str], response0: list[str], response1: list[str], hooks, *, decode_only: bool):
+    specs = _endpoint_divergence_specs(model.tokenizer, prompts, response0, response1)
+    if decode_only:
+        margins, top0, top1 = _divergence_margin_decode_only(model, prompts, specs, hooks)
+    else:
+        margins, top0, top1 = _divergence_margin_input_output(model, prompts, specs, hooks)
+    return specs, margins, top0, top1
+
+
+def _margin_subset_local_indices(support_kind: np.ndarray, cap: int, seed: int) -> np.ndarray:
+    """Choose a reproducible approximately balanced known-flip/non-flip subset."""
+    n = len(support_kind)
+    if cap <= 0 or n <= cap:
+        return np.arange(n, dtype=int)
+    kinds = np.asarray(support_kind, dtype=object)
+    unique = [k for k in ("known_flip", "same_agonist_nonflip") if np.any(kinds == k)]
+    if not unique:
+        return _sample_indices(np.arange(n), cap, seed)
+    chosen = []
+    per = max(1, cap // len(unique))
+    for k in unique:
+        ids = np.flatnonzero(kinds == k)
+        chosen.extend(_sample_indices(ids, min(per, len(ids)), _stable_seed(seed, k)).tolist())
+    if len(chosen) < cap:
+        remaining = np.asarray(sorted(set(range(n)) - set(chosen)), dtype=int)
+        chosen.extend(_sample_indices(remaining, min(cap - len(chosen), len(remaining)), _stable_seed(seed, "fill")).tolist())
+    return np.asarray(sorted(chosen[:cap]), dtype=int)
+
+
+def _attach_endpoint_margin_scores(
+    rows: list[dict], *, model: LMWrapper, examples: list[dict], prompt_col: str,
+    unit: UnitSpec, support_kind: np.ndarray, doses: tuple[float, ...], decode_only: bool,
+    intervention: str, mean_activations, max_examples: int, seed: int,
+) -> None:
+    """Attach a continuous response-competition margin to selected graded rows.
+
+    For each example, the dose-0 and dose-1 generated responses define two fixed
+    endpoint sequences. At every dose we score both sequences under the same
+    intervention and store ``log p(response_1) - log p(response_0)``. A smooth,
+    near-linear crossing of this margin that predicts the behavioral flip is
+    direct evidence for the simple continuous-margin alternative; failure of this
+    specific margin is evidence against that *specific* null, not against every
+    possible continuous mediator.
+    """
+    for row in rows:
+        row.update({
+            "endpoint_margin_scored": False,
+            "endpoint_response0": None,
+            "endpoint_response1": None,
+            "endpoint_logp0_total": math.nan,
+            "endpoint_logp1_total": math.nan,
+            "endpoint_logp0_mean": math.nan,
+            "endpoint_logp1_mean": math.nan,
+            "endpoint_margin_total": math.nan,
+            "endpoint_margin_mean": math.nan,
+            "endpoint_response0_tokens": 0,
+            "endpoint_response1_tokens": 0,
+            "endpoint_tokenization_exact0": False,
+            "endpoint_tokenization_exact1": False,
+            "endpoint_divergence_valid": False,
+            "endpoint_divergence_common_tokens": 0,
+            "endpoint_divergence_token0_id": None,
+            "endpoint_divergence_token1_id": None,
+            "endpoint_divergence_tokenization_exact": False,
+            "endpoint_divergence_margin": math.nan,
+            "endpoint_divergence_top_is_response0": False,
+            "endpoint_divergence_top_is_response1": False,
+        })
+    if not rows:
+        return
+
+    rows_by_local_dose = {}
+    for row in rows:
+        rows_by_local_dose[(int(row["example_local_index"]), float(row["dose"]))] = row
+
+    local_ids = _margin_subset_local_indices(support_kind, int(max_examples), int(seed))
+    layer_map = {str(unit.layer_label): [int(unit.neuron_id)]}
+    for dose in doses:
+        chosen = []
+        response0 = []
+        response1 = []
+        prompts = []
+        for local_i in local_ids:
+            r0 = rows_by_local_dose.get((int(local_i), 0.0))
+            r1 = rows_by_local_dose.get((int(local_i), 1.0))
+            rd = rows_by_local_dose.get((int(local_i), float(dose)))
+            if r0 is None or r1 is None or rd is None:
+                continue
+            a0 = str(r0.get("generated_answer", ""))
+            a1 = str(r1.get("generated_answer", ""))
+            if not a0 or not a1:
+                continue
+            chosen.append((int(local_i), rd))
+            prompts.append(str(examples[int(local_i)][prompt_col]))
+            response0.append(a0)
+            response1.append(a1)
+        if not chosen:
+            continue
+        hooks = None
+        if float(dose) > 0.0:
+            hooks = build_ablation_hooks(
+                layer_map,
+                last_pos_only=bool(decode_only),
+                intervention=intervention,
+                mean_activations=mean_activations,
+                device=model.hooked_model.cfg.device,
+                intervention_strength=float(dose),
+            )
+        t0, m0, n0, e0 = _score_completion_batch(model, prompts, response0, hooks, decode_only=bool(decode_only))
+        t1, m1, n1, e1 = _score_completion_batch(model, prompts, response1, hooks, decode_only=bool(decode_only))
+        div_specs, div_margin, div_top0, div_top1 = _divergence_margin_batch(
+            model, prompts, response0, response1, hooks, decode_only=bool(decode_only)
+        )
+        for j, (_, row) in enumerate(chosen):
+            row["endpoint_margin_scored"] = bool(np.isfinite(t0[j]) and np.isfinite(t1[j]))
+            row["endpoint_response0"] = response0[j]
+            row["endpoint_response1"] = response1[j]
+            row["endpoint_logp0_total"] = float(t0[j]) if np.isfinite(t0[j]) else math.nan
+            row["endpoint_logp1_total"] = float(t1[j]) if np.isfinite(t1[j]) else math.nan
+            row["endpoint_logp0_mean"] = float(m0[j]) if np.isfinite(m0[j]) else math.nan
+            row["endpoint_logp1_mean"] = float(m1[j]) if np.isfinite(m1[j]) else math.nan
+            row["endpoint_margin_total"] = float(t1[j] - t0[j]) if np.isfinite(t0[j]) and np.isfinite(t1[j]) else math.nan
+            row["endpoint_margin_mean"] = float(m1[j] - m0[j]) if np.isfinite(m0[j]) and np.isfinite(m1[j]) else math.nan
+            row["endpoint_response0_tokens"] = int(n0[j])
+            row["endpoint_response1_tokens"] = int(n1[j])
+            row["endpoint_tokenization_exact0"] = bool(e0[j])
+            row["endpoint_tokenization_exact1"] = bool(e1[j])
+            spec = div_specs[j]
+            row["endpoint_divergence_valid"] = bool(spec.get("valid", False) and np.isfinite(div_margin[j]))
+            row["endpoint_divergence_common_tokens"] = int(spec.get("common_tokens", 0))
+            row["endpoint_divergence_token0_id"] = spec.get("token0")
+            row["endpoint_divergence_token1_id"] = spec.get("token1")
+            row["endpoint_divergence_tokenization_exact"] = bool(spec.get("exact", False))
+            row["endpoint_divergence_margin"] = float(div_margin[j]) if np.isfinite(div_margin[j]) else math.nan
+            row["endpoint_divergence_top_is_response0"] = bool(div_top0[j])
+            row["endpoint_divergence_top_is_response1"] = bool(div_top1[j])
+
+
 def _evaluate_unit_doses(
     *,
     model: LMWrapper,
@@ -340,6 +835,9 @@ def _evaluate_unit_doses(
     intervention: str,
     mean_activations,
     batch_size: int,
+    record_endpoint_margin: bool = False,
+    endpoint_margin_max_examples: int = 64,
+    seed: int = 42,
 ) -> list[dict]:
     examples = scores_df.iloc[selected_indices].to_dict("records")
     if not examples:
@@ -370,16 +868,17 @@ def _evaluate_unit_doses(
                 intervention_strength=float(dose),
             )
         if decode_only:
-            _, accuracy = get_correctness_cached_by_prefix_batches(
+            _, accuracy, answers = get_correctness_cached_by_prefix_batches(
                 model,
                 examples,
                 task.is_answer_positive,
                 prefix_batches,
                 batch_ranges,
                 hooks=hooks,
+                return_answers=True,
             )
         else:
-            _, accuracy = get_correctness(
+            _, accuracy, answers = get_correctness(
                 model,
                 examples,
                 task.is_answer_positive,
@@ -387,10 +886,12 @@ def _evaluate_unit_doses(
                 max_new_tokens=int(task.MAX_NEW_TOKENS),
                 hooks=hooks,
                 batch_size=int(batch_size),
+                return_answers=True,
             )
         post = np.asarray(accuracy, dtype=float) > 0.5
         for local_i, source_idx in enumerate(selected_indices):
             rows.append({
+                "example_local_index": int(local_i),
                 "unit_key": unit.unit_key,
                 "layer_label": unit.layer_label,
                 "neuron_id": int(unit.neuron_id),
@@ -401,11 +902,27 @@ def _evaluate_unit_doses(
                 "baseline_behavior": bool(baseline_behavior[local_i]),
                 "behavior_after": bool(post[local_i]),
                 "flipped_from_baseline": bool(post[local_i] != baseline_behavior[local_i]),
+                "generated_answer": str(answers[local_i]),
             })
         try:
             model.cleanup_after_generate()
         except Exception:
             pass
+    if record_endpoint_margin:
+        _attach_endpoint_margin_scores(
+            rows,
+            model=model,
+            examples=examples,
+            prompt_col=prompt_col,
+            unit=unit,
+            support_kind=support_kind,
+            doses=doses,
+            decode_only=bool(decode_only),
+            intervention=intervention,
+            mean_activations=mean_activations,
+            max_examples=int(endpoint_margin_max_examples),
+            seed=int(seed),
+        )
     return rows
 
 
@@ -422,6 +939,8 @@ def _summarize_examples(dose_rows: pd.DataFrame) -> pd.DataFrame:
         changed = states != baseline
         first_idx = int(np.flatnonzero(changed)[0]) if changed.any() else None
         first_dose = float(doses[first_idx]) if first_idx is not None else math.nan
+        persistent_idx = next((i for i in range(len(changed)) if bool(changed[i]) and bool(changed[i:].all())), None)
+        first_persistent_dose = float(doses[persistent_idx]) if persistent_idx is not None else math.nan
         n_state_changes = int(np.sum(states[1:] != states[:-1])) if len(states) > 1 else 0
         persistent_after_first = bool(first_idx is not None and changed[first_idx:].all())
         single_crossing = bool(first_idx is not None and n_state_changes == 1 and persistent_after_first)
@@ -436,6 +955,7 @@ def _summarize_examples(dose_rows: pd.DataFrame) -> pd.DataFrame:
             **dict(zip(keys, values)),
             "n_doses": int(len(g)),
             "first_flip_dose": first_dose,
+            "first_persistent_crossing_dose": first_persistent_dose,
             "n_state_changes": n_state_changes,
             "persistent_after_first_flip": persistent_after_first,
             "single_crossing": single_crossing,
@@ -457,6 +977,7 @@ def _summarize_units(example_summary: pd.DataFrame) -> pd.DataFrame:
     keys = ["baseline_subset", "direction", "unit_key", "layer_label", "neuron_id", "support_kind"]
     for values, group in example_summary.groupby(keys, dropna=False, sort=False):
         first = pd.to_numeric(group["first_flip_dose"], errors="coerce")
+        persistent = pd.to_numeric(group.get("first_persistent_crossing_dose"), errors="coerce")
         rows.append({
             **dict(zip(keys, values)),
             "n_examples": int(len(group)),
@@ -470,6 +991,8 @@ def _summarize_units(example_summary: pd.DataFrame) -> pd.DataFrame:
             "single_crossing_rate": float(group["single_crossing"].mean()),
             "median_first_flip_dose": float(first.median()) if first.notna().any() else math.nan,
             "mean_first_flip_dose": float(first.mean()) if first.notna().any() else math.nan,
+            "median_first_persistent_crossing_dose": float(persistent.median()) if persistent.notna().any() else math.nan,
+            "mean_first_persistent_crossing_dose": float(persistent.mean()) if persistent.notna().any() else math.nan,
             "median_state_changes": float(pd.to_numeric(group["n_state_changes"], errors="coerce").median()),
         })
     return pd.DataFrame(rows)
@@ -515,6 +1038,8 @@ def _requested_run_config(args: argparse.Namespace, doses: tuple[float, ...]) ->
         "max_positive_support_per_agonist": int(args.max_positive_support_per_agonist),
         "max_negative_support_per_agonist": int(args.max_negative_support_per_agonist),
         "points_to_use_for_mean_ablation": int(args.points_to_use_for_mean_ablation),
+        "record_endpoint_margin": bool(args.record_endpoint_margin),
+        "endpoint_margin_max_examples_per_agonist": int(args.endpoint_margin_max_examples_per_agonist),
         "seed": int(args.seed),
     }
 
@@ -658,6 +1183,23 @@ def main() -> None:
     plan_df = pd.DataFrame(plan_rows)
     plan_df.to_csv(out_dir / "graded_agonist_plan.csv", index=False)
     if not selection:
+        # This output directory can be reused across reruns with different
+        # Stage-7 singleton results.  If the current Stage-7 state has no
+        # eligible agonists, any dose rows/figures left by an older run are
+        # scientifically stale.  Remove them before publishing the sentinel
+        # manifest so downstream stages cannot accidentally analyse old rows.
+        stale_files = [
+            "graded_agonist_dose_rows.csv.gz",
+            "graded_agonist_example_summary.csv",
+            "graded_agonist_unit_summary.csv",
+            "graded_agonist_dose_response.pdf",
+        ]
+        for name in stale_files:
+            (out_dir / name).unlink(missing_ok=True)
+        # stale_margin_dir = out_dir / "margin_mechanism_test"
+        # if stale_margin_dir.exists():
+        #     shutil.rmtree(stale_margin_dir)
+
         payload = {
             "schema": SCHEMA,
             "status": "no_eligible_agonists",
@@ -665,7 +1207,17 @@ def main() -> None:
             "same_agonist_negative_support": bool(args.same_agonist_negative_support),
             "negative_support_ratio": float(args.negative_support_ratio),
             "n_planned": int(len(plan_df)),
+            "n_selected_agonist_directions": 0,
+            "n_known_flip_examples_evaluated": 0,
+            "n_same_agonist_negative_examples_evaluated": 0,
             "doses": list(doses),
+            "files": {
+                "plan": "graded_agonist_plan.csv",
+                "dose_rows": None,
+                "example_summary": None,
+                "unit_summary": None,
+                "figure": None,
+            },
         }
         manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"{LOG_PREFIX} no agonists have known held-out directional flip support")
@@ -722,6 +1274,9 @@ def main() -> None:
             intervention=str(args.intervention),
             mean_activations=mean_activations,
             batch_size=int(args.batch_size),
+            record_endpoint_margin=bool(args.record_endpoint_margin),
+            endpoint_margin_max_examples=int(args.endpoint_margin_max_examples_per_agonist),
+            seed=_stable_seed(args.seed, unit.unit_key, plan["baseline_subset"], "endpoint_margin"),
         )
         for row in rows:
             row["baseline_subset"] = str(plan["baseline_subset"])
@@ -754,6 +1309,14 @@ def main() -> None:
         "selection_policy": "frozen discovery rank; never ranked by held-out graded response",
         "replacement_semantics": "dose 1 reconstructs Stage-7 replacement using the full Stage-7 evaluated unit population and Stage-7 train-prompt sampling rule",
         "replacement_population_size": int(len(replacement_population)),
+        "record_endpoint_margin": bool(args.record_endpoint_margin),
+        "endpoint_margin_definition": (
+            "log p(dose-1 generated response | intervention dose) - "
+            "log p(dose-0 generated response | intervention dose)"
+            if args.record_endpoint_margin else None
+        ),
+        "endpoint_margin_max_examples_per_agonist": int(args.endpoint_margin_max_examples_per_agonist),
+        "n_endpoint_margin_rows_scored": int(dose_df.get("endpoint_margin_scored", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not dose_df.empty else 0,
         "n_selected_agonist_directions": int(len(selection)),
         "n_known_flip_examples_evaluated": int((dose_df["support_kind"] == "known_flip").sum() / max(len(doses), 1)) if not dose_df.empty else 0,
         "n_same_agonist_negative_examples_evaluated": int((dose_df["support_kind"] == "same_agonist_nonflip").sum() / max(len(doses), 1)) if not dose_df.empty else 0,

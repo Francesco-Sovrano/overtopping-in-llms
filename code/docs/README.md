@@ -1,24 +1,24 @@
 # Documentation
 
-This documentation describes the repository from experiment configuration through manuscript output generation. It is organized for readers who have not worked with the code before.
+This documentation describes the repository from experiment configuration through model-backed execution and manuscript reporting.
 
 ## Reading order
 
-1. [Getting started](getting-started/README.md) — environment, runtime roots, experiment launchers, and result generation.
-2. [Architecture](methods/architecture.md) — ownership of code packages and artifact roots.
-3. [Core concepts](methods/concepts.md) — behavioral endpoints, directional causal effects, union reach, composition, threshold-event metrics, and graded interventions.
-4. [Pipeline](methods/pipeline.md) — numbered model-backed execution stages and their persistent outputs.
-5. [Experiments](experiments/README.md) — overtopping and controlled-poisoning study designs.
-6. [Research questions](research-questions/README.md) — scientific populations, estimands, and manuscript outputs for RQ1–RQ4.
-7. [Reporting](reporting/README.md) — aggregation, audits, figures, and result-tree conventions.
-8. [Operations](operations/README.md) — targeted regeneration and troubleshooting without unnecessary cache deletion.
+1. [Getting started](getting-started/README.md) — environment, artifact roots, study inspection, execution, and reporting.
+2. [Architecture](methods/architecture.md) — package ownership, persistent storage, cache behavior, and population ownership.
+3. [Core concepts](methods/concepts.md) — behavioral endpoints, directional causal effects, singleton union, simultaneous-set effects, threshold metrics, and graded interventions.
+4. [Pipeline](methods/pipeline.md) — numbered model-backed stages and their outputs.
+5. [Overtopping experiment design](experiments/overtopping.md) — the complete 48-setting registry and its non-factorial structure.
+6. [Research questions](research-questions/README.md) — populations, estimands, and reporting units for RQ1–RQ4.
+7. [Reporting](reporting/README.md) — analysis manifests, completeness audits, statistics, figures, and sidecars.
+8. [Operations](operations/README.md) — targeted regeneration, cache-preserving workflows, and troubleshooting.
 
-## Repository model
+## Repository layout
 
 ```text
 repository/
-├── code/       source packages and this documentation
-├── data/       persistent scientific outputs
+├── code/       source packages and documentation
+├── data/       persistent model-backed experiment outputs
 ├── cache/      reusable computation caches
 └── results/    derived analyses and manuscript products
 ```
@@ -26,62 +26,36 @@ repository/
 Within `code/`:
 
 ```text
-core/           shared task, model, intervention, attribution, and statistics code
+core/           shared task, model, attribution, intervention, cache, and statistics code
 pipeline/       numbered causal-intervention stages
-studies/        study-specific experiment and analysis packages
-reporting/      final aggregation, audits, and manuscript-output generation
+studies/        experiment registries and study-specific analyses
+reporting/      final aggregation and manuscript-output generation
 docs/           documentation
 ```
 
-## Documentation map
+## Storage rule
 
-```text
-docs/
-├── README.md
-├── getting-started/
-│   ├── README.md
-│   └── credentials.md
-├── methods/
-│   ├── README.md
-│   ├── architecture.md
-│   ├── concepts.md
-│   ├── pipeline.md
-│   └── eap.md
-├── experiments/
-│   ├── README.md
-│   ├── overtopping.md
-│   └── poisoning/
-│       ├── README.md
-│       ├── configuration.md
-│       └── outputs.md
-├── research-questions/
-│   ├── README.md
-│   ├── rq1-prevalence.md
-│   ├── rq2-composition.md
-│   ├── rq3-threshold-event.md
-│   └── rq4-learning.md
-├── reporting/
-│   ├── README.md
-│   ├── analysis-pipeline.md
-│   ├── figures.md
-│   └── interpretation.md
-└── operations/
-    └── README.md
+`data/` and `cache/` are inputs to reporting. `results/` is the reporting output root. The 48-setting study manifest changes which configured settings are represented in aggregate analyses; it does not change the persistent path construction or cache key semantics of an existing `RunSpec`.
+
+Run the read-only registry contract check with:
+
+```bash
+cd code
+python -m studies.overtopping.experiments.storage_contract
 ```
 
-## Common tasks
+## Study populations
 
-| Task | Reference |
-|---|---|
-| Install and execute the code | [Getting started](getting-started/README.md) |
-| Understand `data/`, `cache/`, and `results/` | [Architecture](methods/architecture.md) |
-| Understand `U(J)`, `E(J)`, directional effects, threshold MCC, TECS, or graded crossings | [Core concepts](methods/concepts.md) |
-| Trace pipeline execution | [Pipeline](methods/pipeline.md) |
-| Inspect the exact overtopping catalogue | [Overtopping catalogue](experiments/overtopping.md) |
-| Understand RQ1 | [RQ1 — prevalence](research-questions/rq1-prevalence.md) |
-| Understand RQ2 | [RQ2 — composition and interaction regimes](research-questions/rq2-composition.md) |
-| Understand RQ3 | [RQ3 — support-specific thresholded integration](research-questions/rq3-threshold-event.md) |
-| Understand RQ4 | [RQ4 — learning](research-questions/rq4-learning.md) |
-| Understand poisoning | [Poisoning protocol](experiments/poisoning/README.md) |
-| Trace a figure to source data | [Figure map](reporting/figures.md) |
-| Regenerate derived outputs | [Operations](operations/README.md) |
+The overtopping registry contains 48 settings:
+
+```text
+29 final-snapshot task × model × phase cells
+12 intermediate Pythia checkpoint settings
+ 7 matched replacement-baseline repeats
+--------------------------------------------
+48 configured settings
+```
+
+Every configured setting is retained in the study table. Each downstream metric then applies its own applicability and artifact-availability rule. A missing diagnostic is therefore represented as missing for that setting rather than by changing the study manifest.
+
+See [Overtopping experiment design](experiments/overtopping.md) for the exact cells.

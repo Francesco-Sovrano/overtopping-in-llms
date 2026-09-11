@@ -2,9 +2,10 @@
 """Nested held-out threshold-shape validation for the exact RQ3 population.
 
 The RQ3 population is manifest-driven rather than discovered by recursively
-scanning the data tree.  By default it contains the 28 primary overtopping
-settings plus configured paper-supplementary overtopping settings.  Poisoning
-runs are a separate experiment family and are never eligible.
+scanning the data tree. By default it starts from the complete 48-setting
+overtopping study registry; metric-specific availability is handled downstream
+and reported explicitly. Poisoning runs are a separate experiment family and
+are never eligible.
 
 For every evaluable candidate/control unit and flip target, feature selection is
 nested inside each training fold.  The selected scalar is then evaluated on the
@@ -156,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--paper-figures-dir", default=None)
     p.add_argument("--primary-table", required=True)
     p.add_argument("--data-root", required=True)
-    p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary+supplementary")
+    p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary")
     p.add_argument("--evaluation-split", default="test", choices=["test", "train", "all"])
     p.add_argument(
         "--spiking-max-points", type=int, default=10000,
@@ -169,6 +170,14 @@ def parse_args() -> argparse.Namespace:
                    help="Maximum absolute singleton flip-rate difference for the supplementary causal-strength-matched sensitivity analysis.")
     p.add_argument("--bootstrap", type=int, default=3000)
     p.add_argument("--seed", type=int, default=20260829)
+    p.add_argument(
+        "--allow-incomplete-primary-population",
+        action="store_true",
+        help=(
+            "Run nested RQ3 threshold-shape validation on every configured primary run with complete "
+            "flip/raw diagnostics, while auditing unfinished runs instead of aborting the report."
+        ),
+    )
     return p.parse_args()
 
 
@@ -453,9 +462,16 @@ def _load_exact_tables(args: argparse.Namespace, out: Path) -> tuple[pd.DataFram
             "missing_baseline_subsets", "unexpected_baseline_subsets", "missing_population_cells",
         ] if c in bad.columns]
         preview = bad[preview_cols].head(8).to_dict("records")
-        raise RuntimeError(
-            "RQ3 nested threshold-shape primary population is incomplete; refusing a silently selected subset. "
-            f"First failures: {preview}"
+        if not bool(getattr(args, "allow_incomplete_primary_population", False)):
+            raise RuntimeError(
+                "RQ3 nested threshold-shape primary population is incomplete; refusing a silently selected subset. "
+                f"First failures: {preview}"
+            )
+        print(
+            f"[threshold-shape] WARNING: incomplete primary diagnostics detected; "
+            "using only runs complete in both flip and raw diagnostics. "
+            f"First omissions: {preview}",
+            flush=True,
         )
 
     complete_flip = set(flip_audit.loc[flip_audit.complete.astype(bool), "run_id"].astype(str))
@@ -1114,11 +1130,19 @@ def _write_paper_readme(paper_dir: Path, robust: dict, coverage: pd.DataFrame) -
     cov = {str(r.source_scope): r for r in coverage.itertuples(index=False)} if not coverage.empty else {}
     prim = cov.get("primary")
     supp = cov.get("supplementary")
+    primary_configured = int(getattr(prim, "configured_runs", 0))
+    primary_included = int(getattr(prim, "included_runs", 0))
+    population_note = (
+        "Population is manifest-driven and currently partial: completed/auditable configured runs are shown, "
+        "while unfinished runs remain explicit in the population audit."
+        if primary_included < primary_configured
+        else "Population is exact and manifest-driven."
+    )
     text = f"""# Figure 4 - RQ3: causal dominance and threshold-event structure
 
-Population is exact and manifest-driven. Poisoning experiments are excluded by construction.
+{population_note} Poisoning experiments are excluded by construction.
 
-- Primary configured/included: {getattr(prim,'configured_runs',0)}/{getattr(prim,'included_runs',0)}
+- Primary configured/included: {primary_configured}/{primary_included}
 - Supplementary configured/included: {getattr(supp,'configured_runs',0)}/{getattr(supp,'included_runs',0)}
 - Nested feature selection uses the training fold; the held-out fold is used only for evaluation.
 - Hard-threshold predictions are oriented by the sign of training MCC before Brier/log-loss/calibration are computed.

@@ -3,8 +3,9 @@
 
 The per-run decomposition is written by Stage 8 after both the singleton flip
 masks and the genuine simultaneous candidate-set output are available.  This
-reporter does not run model inference.  It collects the exact primary
-population, verifies the decomposition identity, writes a condition-level table,
+reporter does not run model inference. It collects the configured population,
+optionally restricts it to one replacement regime, verifies the decomposition identity,
+writes a condition-level table,
 and optionally renders a manuscript figure.
 
 For each evaluated example, let S indicate that at least one singleton candidate
@@ -44,7 +45,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--paper-figures-dir", default=None)
     parser.add_argument("--primary-table", required=True)
-    parser.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary")
+    parser.add_argument(
+        "--population-scope", choices=["primary", "primary+supplementary"], default="primary",
+        help="primary uses the complete configured study table; the extended spelling requests the explicit extended scope.",
+    )
+    parser.add_argument("--replacement-regime", choices=["all", "mean-donor", "mean"], default="all", help="Analyze replacement regimes separately. mean includes mean-positional; mean-donor is never pooled with mean.")
     parser.add_argument("--evaluation-split", choices=["test", "train", "all"], default="test")
     parser.add_argument("--spiking-max-points", type=int, default=10000)
     parser.add_argument("--data-root", default=None, help="Alias for --root used by the shared exact run manifest.")
@@ -55,6 +60,8 @@ def _load_population(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
     root = Path(args.root).expanduser().resolve()
     args.data_root = str(Path(args.data_root or root).expanduser().resolve())
     specs = expected_overtopping_sources(args)
+    if args.replacement_regime != "all":
+        specs = [s for s in specs if s.get("replacement_regime") == args.replacement_regime]
     frames: list[pd.DataFrame] = []
     audit: list[dict] = []
     required = {
@@ -91,6 +98,7 @@ def _load_population(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
                     frame["task"] = spec.get("task")
                     frame["model"] = spec.get("model")
                     frame["phase"] = spec.get("phase")
+                    frame["replacement_regime"] = spec.get("replacement_regime")
                     frame["source_path"] = str(path)
                     frames.append(frame)
                     n_rows = int(len(frame))
@@ -101,6 +109,7 @@ def _load_population(args: argparse.Namespace, out_dir: Path) -> pd.DataFrame:
             "task": spec.get("task"),
             "model": spec.get("model"),
             "phase": spec.get("phase"),
+            "replacement_regime": spec.get("replacement_regime"),
             "source": str(path),
             "exists": bool(exists),
             "n_rows": n_rows,
@@ -161,7 +170,7 @@ def _plot(condition: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(7.4, 3.5))
     ax.scatter(x, work["suppressed_rate_all"].to_numpy(float), marker="o", label="singleton-reachable suppressed by full set")
     ax.scatter(x, work["coalition_only_rate_all"].to_numpy(float), marker="x", label="coalition-only full-set effects")
-    ax.set_xlabel("Primary setting, sorted by E(J) - U(J)")
+    ax.set_xlabel("Study setting, sorted by E(J) - U(J)")
     ax.set_ylabel("Fraction of complete-case held-out examples")
     ax.set_ylim(bottom=0)
     ax.legend(frameon=False, fontsize=8)
@@ -192,6 +201,7 @@ def main() -> None:
         payload = {
             "status": "not_available" if n_available == 0 else "no_overall_rows",
             "population_scope": args.population_scope,
+            "replacement_regime": args.replacement_regime,
             "n_expected_conditions": n_expected,
             "n_available_runs": n_available,
             "inference_unit": "run/setting; decomposition is descriptive unless a prespecified inferential contrast is added",
@@ -207,6 +217,7 @@ def main() -> None:
         payload = {
             "status": "ok" if n_available == n_expected else "partial_coverage",
             "population_scope": args.population_scope,
+            "replacement_regime": args.replacement_regime,
             "n_expected_conditions": n_expected,
             "n_available_runs": n_available,
             "n_condition_rows": int(len(condition)),

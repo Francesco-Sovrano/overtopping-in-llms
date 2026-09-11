@@ -1,14 +1,14 @@
 # Experiments
 
-The repository contains two experiment families with separate populations and artifact roots.
+The repository contains two experiment families with separate scientific populations and persistent artifact roots.
 
 ## Overtopping
 
-The overtopping study performs discovery and held-out causal evaluation across an explicit catalogue of tasks, models, intervention phases, and replacement baselines.
+The overtopping study performs discovery and held-out causal evaluation across an explicit 48-setting registry of tasks, model snapshots, intervention phases, and replacement baselines.
 
-Read [Overtopping experiment catalogue](overtopping.md) for the exact primary and auxiliary settings.
+The registry contains 29 final-snapshot task×model×phase cells, 12 intermediate Pythia checkpoint settings, and 7 matched replacement-baseline repeats. See [Overtopping experiment design](overtopping.md) for the exact configured cells and analysis populations.
 
-Paper-facing RQ1–RQ3 analyses use non-poisoning overtopping runs only.
+RQ1–RQ3 use overtopping settings. RQ4 additionally uses the configured Pythia checkpoint trajectories.
 
 ## Poisoning
 

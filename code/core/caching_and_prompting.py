@@ -478,6 +478,7 @@ def instruct_ollama_model(
 	json_mode=False,
 	debug_ollama=False,
 	num_ctx=32768,
+	parallelise=True,
 	**_provider_ignored,
 ):
 

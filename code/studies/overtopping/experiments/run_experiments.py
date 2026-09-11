@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Run the paper-centered non-poisoning experiment programme.
+"""Run the paper-centered overtopping experiment programme.
 
-The executable catalogue is explicit rather than factorial.  The primary suite
-contains the 28 model-task-phase configurations reported in Appendix Table 8
-of the manuscript, with the replacement baseline and large-model settings used
-for those runs.  A small auxiliary suite adds only targeted comparisons that
-support the paper's baseline/phase interpretation.
+The executable programme contains 48 explicit configurations rather than a full
+factorial sweep: 29 final-snapshot task/model/phase cells, twelve intermediate
+Pythia checkpoint cells, and seven matched replacement-baseline repeats. RQ1 uses
+all configured settings, while RQ2 analyzes replacement regimes separately.
 
 Test is the default evaluation split; callers may explicitly select train or
 all.
@@ -22,8 +21,11 @@ from dataclasses import replace
 
 from core.project_paths import CODE_ROOT, PROJECT_ROOT
 
-from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES
+from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, PROFILE_STUDY_48
 from studies.overtopping.experiments.execution import RunSpec, apply_filters, deduplicate, parse_filter, run_pipeline
+
+
+MANUSCRIPT_PROFILE = PROFILE_STUDY_48
 
 
 QWEN2_15 = "Qwen/Qwen2-1.5B-Instruct"
@@ -85,15 +87,10 @@ def _large(
 
 
 def paper_primary_experiments() -> list[RunSpec]:
-    """Return the exact 28 primary settings reported in manuscript Table 8.
-
-    Ordering follows the paper: arithmetic, jailbreaking, grammar, NLI, then
-    random FSM.  Baselines are explicit so the catalogue cannot silently drift
-    into a factorial sweep.
-    """
+    """Return the first internal execution group used to build the study registry."""
     specs = [
         # Arithmetic (7)
-        # The final Pythia-1B primary arithmetic scan is the available mean run.
+        # The final Pythia-1B arithmetic configuration uses the available mean replacement run.
         _small("arithmetic", PYTHIA_1B, "mean", "decode-only", z_thresh=5),
         _small("arithmetic", PYTHIA_1B_48K, "mean-donor", "decode-only", z_thresh=5),
         _large("arithmetic", PYTHIA_69B, "decode-only", z_thresh=5, batch_size=256, max_circuits=5),
@@ -129,24 +126,18 @@ def paper_primary_experiments() -> list[RunSpec]:
         _small("random_fsm", PYTHIA_1B_48K, "mean-donor", "standard"),
         _small("random_fsm", PYTHIA_1B_96K, "mean-donor", "decode-only"),
         _small("random_fsm", QWEN25_15, "mean-donor", "standard"),
-        # The paper's primary output-only Qwen2.5 FSM row is the available mean run.
+        # The output-only Qwen2.5 FSM configuration uses the available mean replacement run.
         _small("random_fsm", QWEN25_15, "mean", "decode-only"),
     ]
     specs = deduplicate(specs)
-    # if len(specs) != 28:
-    #     raise AssertionError(f"paper-primary must contain exactly 28 runs; found {len(specs)}")
     return specs
 
 
 def paper_auxiliary_experiments() -> list[RunSpec]:
-    """Targeted paper-supporting runs that add interpretable controls.
+    """Return the second internal execution group used to build the study registry.
 
-    These are deliberately not a factorial expansion.  The first six complete
-    the mean-vs-mean-donor sensitivity comparisons in manuscript Table 7.  The
-    remaining runs fill useful phase/model diagnostics: Qwen2.5 arithmetic I+O
-    (also used by the paper's secondary threshold/control analysis), the
-    Qwen2-1.5B NLI output-only zero-discovery counterpart to its primary I+O
-    setting, and Qwen2-1.5B grammar in both input+output and output-only phases.
+    It contains six matched replacement-baseline repeats and five additional
+    configured final-snapshot task/model/phase cells.
     """
     specs = [
         # Table 7 replacement-baseline counterparts.
@@ -157,7 +148,7 @@ def paper_auxiliary_experiments() -> list[RunSpec]:
         _small("hans_nli", QWEN25_15, "mean", "decode-only", suite="paper-auxiliary"),
         _small("random_fsm", QWEN25_15, "mean", "standard", suite="paper-auxiliary"),
 
-        # Focused phase diagnostics beyond the 28-row primary matrix.
+        # Additional final-snapshot phase/model coverage in the study registry.
         _small("arithmetic", QWEN25_15, "mean-donor", "standard", z_thresh=10, suite="paper-auxiliary"),
         _small("bon_jailbreaking", QWEN25_15, "mean-donor", "standard", suite="paper-auxiliary"),
         _small("hans_nli", QWEN2_15, "mean-donor", "decode-only", suite="paper-auxiliary"),
@@ -165,20 +156,120 @@ def paper_auxiliary_experiments() -> list[RunSpec]:
         _small("grammar_acceptability", QWEN2_15, "mean-donor", "decode-only", suite="paper-auxiliary"),
     ]
     specs = deduplicate(specs)
-    # if len(specs) != 11:
-    #     raise AssertionError(f"paper-auxiliary must contain exactly 11 runs; found {len(specs)}")
     return specs
+
+
+
+def paper_coverage_experiments() -> list[RunSpec]:
+    """Return configured coverage cells completing the study design.
+
+    Five checkpoint configurations are retained as explicit zero-candidate
+    observations when their existing artifacts report no discovered channels.
+    Two Qwen2-1.5B Random-FSM cells complete the small-model family comparison.
+    Two final Pythia-1B Arithmetic cells complete the matched phase/baseline
+    comparison at the final snapshot.
+    """
+    specs = [
+        # Existing Pythia checkpoint observations.
+        _small("arithmetic", PYTHIA_1B_96K, "mean-donor", "decode-only", z_thresh=5, suite="paper-coverage"),
+        _small("random_fsm", PYTHIA_1B_48K, "mean-donor", "decode-only", suite="paper-coverage"),
+        _small("random_fsm", PYTHIA_1B_96K, "mean-donor", "standard", suite="paper-coverage"),
+        _small("arithmetic", PYTHIA_1B_48K, "mean-donor", "standard", z_thresh=5, suite="paper-coverage"),
+        _small("arithmetic", PYTHIA_1B_96K, "mean-donor", "standard", z_thresh=5, suite="paper-coverage"),
+
+        # Small-Qwen coverage completion.
+        _small("random_fsm", QWEN2_15, "mean-donor", "standard", suite="paper-coverage"),
+        _small("random_fsm", QWEN2_15, "mean-donor", "decode-only", suite="paper-coverage"),
+
+        # Final-snapshot Pythia Arithmetic completion.
+        _small("arithmetic", PYTHIA_1B, "mean-donor", "standard", z_thresh=5, suite="paper-coverage"),
+        _small("arithmetic", PYTHIA_1B, "mean-donor", "decode-only", z_thresh=5, suite="paper-coverage"),
+    ]
+    return deduplicate(specs)
+
+
+def paper_study_44_experiments() -> list[RunSpec]:
+    """Return the 44 configurations present before the Pythia Arithmetic completion."""
+    previous_coverage = [
+        _small("arithmetic", PYTHIA_1B_96K, "mean-donor", "decode-only", z_thresh=5, suite="paper-coverage"),
+        _small("random_fsm", PYTHIA_1B_48K, "mean-donor", "decode-only", suite="paper-coverage"),
+        _small("random_fsm", PYTHIA_1B_96K, "mean-donor", "standard", suite="paper-coverage"),
+        _small("random_fsm", QWEN2_15, "mean-donor", "standard", suite="paper-coverage"),
+        _small("random_fsm", QWEN2_15, "mean-donor", "decode-only", suite="paper-coverage"),
+    ]
+    return deduplicate([*paper_reference_experiments(), *previous_coverage])
+
+def paper_reference_experiments() -> list[RunSpec]:
+    """Return the storage-protected configurations with existing results."""
+    return deduplicate([*paper_primary_experiments(), *paper_auxiliary_experiments()])
+
+def paper_study_experiments() -> list[RunSpec]:
+    """Return the complete 48-setting overtopping study registry.
+
+    Analysis code starts from this registry and then applies metric-specific
+    applicability and availability rules.
+    """
+    specs = deduplicate([*paper_reference_experiments(), *paper_coverage_experiments()])
+    if len(specs) != 48:
+        raise AssertionError(f"paper study registry must contain 48 unique settings; found {len(specs)}")
+    return specs
+
+
+def qwen_small_completion_experiments() -> list[RunSpec]:
+    """Return the two Qwen2-1.5B Random-FSM settings requiring new compute."""
+    return [spec for spec in paper_coverage_experiments() if spec.model == QWEN2_15]
+
+
+def pythia_final_completion_experiments() -> list[RunSpec]:
+    """Return the two final-snapshot Pythia-1B Arithmetic settings requiring new compute."""
+    return [
+        spec for spec in paper_coverage_experiments()
+        if spec.model == PYTHIA_1B
+        and spec.task == "arithmetic"
+        and spec.intervention == "mean-donor"
+    ]
+
+
+def minimal_completion_experiments() -> list[RunSpec]:
+    """Return only the four settings that require new model-backed computation."""
+    return deduplicate([
+        *qwen_small_completion_experiments(),
+        *pythia_final_completion_experiments(),
+    ])
 
 
 SUITES = {
     "paper-primary": paper_primary_experiments,
     "paper-auxiliary": paper_auxiliary_experiments,
+    "paper-coverage": paper_coverage_experiments,
+    "qwen-small-completion": qwen_small_completion_experiments,
+    "pythia-final-completion": pythia_final_completion_experiments,
+    "minimal-completion": minimal_completion_experiments,
 }
 
 
 def all_experiments(selected: list[str]) -> list[RunSpec]:
     names = list(SUITES) if "all" in selected else selected
     return deduplicate(spec for name in names for spec in SUITES[name]())
+
+
+def _validate_results_root(*, data_root: Path, results_root: Path) -> None:
+    """Keep control/reporting outputs outside persistent scientific storage."""
+    data_root = data_root.resolve()
+    results_root = results_root.resolve()
+    cache_root = (PROJECT_ROOT / "cache").resolve()
+
+    def _is_within(path: Path, parent: Path) -> bool:
+        return path == parent or parent in path.parents
+
+    if _is_within(results_root, data_root):
+        raise ValueError(
+            f"Refusing results output inside data root: results={results_root}, data={data_root}"
+        )
+    if _is_within(results_root, cache_root):
+        raise ValueError(
+            f"Refusing results output inside cache root: results={results_root}, cache={cache_root}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,7 +284,7 @@ def parse_args() -> argparse.Namespace:
         "--evaluation-split",
         choices=("test", "train", "all"),
         default=None,
-        help="Override the catalogue evaluation split for every selected run. Default: test.",
+        help="Override the registry evaluation split for every selected run. Default: test.",
     )
     p.add_argument("--data-root", default=str(PROJECT_ROOT / "data"))
     p.add_argument(
@@ -201,26 +292,21 @@ def parse_args() -> argparse.Namespace:
         help="Root for aggregate/final outputs. Defaults to ./results.",
     )
     p.add_argument(
-        "--primary-profile", choices=PRIMARY_PROFILE_CHOICES,
-        help="Required with --generate-primary-manuscript. The supported profile is iclr-28.",
+        "--primary-profile", choices=PRIMARY_PROFILE_CHOICES, default=MANUSCRIPT_PROFILE,
+        help="Validation profile for the configured study table. Default: study-48.",
     )
     p.add_argument("--list", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--continue-on-error", action="store_true")
     p.add_argument(
         "--generate-primary-manuscript", action="store_true",
-        help="Validate the 28-setting primary matrix and generate publication tables.",
+        help="Validate the complete configured study table and generate publication tables.",
     )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.generate_primary_manuscript and args.primary_profile is None:
-        raise SystemExit(
-            "--generate-primary-manuscript requires an explicit "
-            "--primary-profile iclr-28"
-        )
     if args.generate_primary_manuscript and args.evaluation_split not in {None, "test"}:
         raise SystemExit(
             "Primary manuscript outputs are defined on the test split; "
@@ -235,10 +321,15 @@ def main() -> None:
         specs = [replace(spec, evaluation_split=args.evaluation_split) for spec in specs]
     if args.list:
         for i, spec in enumerate(specs):
-            print(f"{i:04d}  {spec.identity}")
+            print(
+                f"{i:04d}  {spec.task} | {spec.model} | "
+                f"{spec.intervention} | {spec.phase} | split={spec.evaluation_split}"
+            )
         print(f"Total: {len(specs)}")
         return
+    data_root = Path(args.data_root).expanduser().resolve()
     analysis_root = Path(args.results_root).expanduser().resolve()
+    _validate_results_root(data_root=data_root, results_root=analysis_root)
     analysis_root.mkdir(parents=True, exist_ok=True)
     (analysis_root / "configured_experiments.json").write_text(
         json.dumps([spec.__dict__ for spec in specs], indent=2), encoding="utf-8"
@@ -257,7 +348,7 @@ def main() -> None:
         if args.generate_primary_manuscript:
             final_command = [
                 sys.executable, "-m", "reporting.generate_final_results",
-                "--data-root", str(Path(args.data_root)),
+                "--data-root", str(data_root),
                 "--results-root", str(analysis_root),
                 "--primary-profile", args.primary_profile,
                 "--catalogue-json", str(analysis_root / "configured_experiments.json"),
@@ -270,7 +361,7 @@ def main() -> None:
             subprocess.run([
                 sys.executable, "-m", "studies.overtopping.analysis.stage01_visualize_experiment_results",
                 "--catalogue_json", str(analysis_root / "configured_experiments.json"),
-                "--data_root", str(Path(args.data_root)),
+                "--data_root", str(data_root),
                 "--out_dir", str(analysis_root / "catalogue"),
             ], cwd=CODE_ROOT, check=True)
 

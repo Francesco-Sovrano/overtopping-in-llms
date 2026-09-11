@@ -8,9 +8,10 @@ optional OLS summaries. Publication templates can also render phase, checkpoint,
 and model-size comparisons from the same discovered data.
 
 Expected inputs include task-level ``dataset_stats.json`` files and run-level
-``flip_stats_global.json`` summaries. When empty-candidate settings are included,
-a run directory without ``flip_stats_global.json`` contributes a genuine zero
-causal-coverage point rather than a missing observation.
+``flip_stats_global.json`` summaries. For the canonical manuscript population, a
+missing flip summary is treated as a genuine zero only when Stage 6 can verify a
+completed empty candidate set; otherwise the setting is incomplete and is omitted
+from partial figures (or rejected in strict mode).
 
 The Pythia checkpoint mapping is explicit: ``pythia-1b@step0`` -> 0,
 ``pythia-1b@step48000`` -> 48000, ``pythia-1b@step96000`` -> 96000, and
@@ -37,8 +38,10 @@ from matplotlib.transforms import Bbox
 
 from studies.overtopping.analysis.layer_widths import layer_width_for_model
 from studies.overtopping.analysis.lib.files import read_json
+from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count
+from studies.overtopping.analysis.lib.stats_resolution import resolve_available_stats_dir
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, chance_normalized_score, raw_task_score
-from studies.overtopping.experiments.run_experiments import paper_auxiliary_experiments, paper_primary_experiments
+from studies.overtopping.experiments.run_experiments import paper_study_experiments
 
 
 DEFAULT_OUT = "fig_competence_vs_coverage.pdf"
@@ -187,7 +190,7 @@ def _directional_n05_density(run_dir: Path, model: str, direction: str, *, per_1
     by_neuron_path = run_dir / "flip_stats_by_neuron.csv"
     if not global_path.is_file():
         # A materialized run directory with no flip-statistics file represents
-        # an empty candidate set in the legacy manuscript pipeline: U(empty)=0
+        # an empty candidate set in the configured manuscript pipeline: U(empty)=0
         # and N_t(empty)=0. Preserve that zero rather than dropping the point.
         return 0.0
     payload = read_json(global_path)
@@ -224,7 +227,7 @@ def _directional_n05_density(run_dir: Path, model: str, direction: str, *, per_1
 
 
 def transform_points_for_coverage_metric(root: Path, points: list[PlotPoint], metric: str) -> list[PlotPoint]:
-    """Reuse the legacy visual engine with a different causal y quantity.
+    """Reuse the shared visual engine with a different causal y quantity.
 
     Crucially, this does *not* filter settings by their within-setting directional
     denominator. The regression n remains the number of plotted settings.
@@ -242,7 +245,7 @@ def transform_points_for_coverage_metric(root: Path, points: list[PlotPoint], me
             else:
                 # Existing run with no discovered agonists: the union of an empty
                 # candidate set is exactly zero in either direction.
-                value = 0.0 if point.status in {"empty-no-agonists", "dataset-score-only-plotted-as-zero-coverage"} else math.nan
+                value = 0.0 if point.status in {"verified-zero-candidates", "empty-no-agonists", "dataset-score-only-plotted-as-zero-coverage"} else math.nan
         elif metric == "n05-i2c-density":
             value = _directional_n05_density(run_dir, point.model, "i2c")
         elif metric == "n05-c2i-density":
@@ -276,10 +279,10 @@ class Filters:
 
 
 def rq1_manuscript_filters() -> Filters:
-    """Return generic legacy filters for non-manifest RQ1-style discovery.
+    """Return generic filters for non-manifest RQ1-style discovery.
 
     Manuscript Figure 2 no longer relies on these filters to define its sample;
-    it resolves the explicit 39-setting experiment catalogue through
+    it resolves the explicit 48-setting experiment catalogue through
     :func:`discover_rq1_manuscript_points`.
     """
     return Filters(
@@ -333,8 +336,12 @@ def downstream_score(task: str, dataset_stats: dict, phase: str | None = None, s
     """Return the x-axis score used by competence/coverage figures.
 
     ``raw`` uses raw task score; ``chance-normalized`` uses chance-corrected
-    score for finite-answer tasks; ``phase-specific`` chance-corrects only
-    decode-only finite-answer points. Jailbreak always uses safe/refusal rate.
+    score for finite-answer tasks. ``phase-specific`` chance-corrects only
+    output-only finite-answer points: prompt/instruction processing is upstream
+    of an output-only intervention, so a model may have followed the instruction
+    but fail to solve the task and obtain some successes by guessing. Input+output
+    interventions also perturb prompt processing, so their competence axis uses
+    raw success. Jailbreak always uses safe/refusal rate.
     """
     mode = score_mode or SCORE_MODE
     if mode not in {"raw", "chance-normalized", "phase-specific"}:
@@ -415,7 +422,7 @@ def evaluation_variant_priority(run_dir: Path) -> tuple[int, int, int]:
     else:  # eval_train
         variant = 10
     # Prefer a materialized flip summary within the same evaluation class, but
-    # do not let a legacy unsuffixed training/full-data result outrank the
+    # do not let an unsuffixed training/full-data result outrank the
     # primary held-out-test evaluation merely because it is non-empty.
     return (variant, has_global, -len(name))
 
@@ -585,79 +592,108 @@ def discover_points(
 
 
 def rq1_manuscript_specs():
-    """Return the explicit non-poisoning Figure-2 population.
+    """Return the explicit Figure-2 population.
 
-    Figure 2 is defined over the same 28 primary + 11 supplementary overtopping
-    settings used by the manuscript experiment catalogue.  Do not infer this
-    population by scanning whatever result directories happen to be present: a
-    filesystem scan can silently omit a valid zero-discovery/supplementary run
-    or admit an unrelated analysis product.
+    Figure 2 is defined over all 48 configured overtopping settings. The
+    population is resolved from the registry rather than from a filesystem scan,
+    so configured zero-candidate settings and missing artifacts retain distinct
+    statuses.
     """
-    specs = list(paper_primary_experiments()) + list(paper_auxiliary_experiments())
+    specs = list(paper_study_experiments())
     identities = [
         (s.task, s.model, s.mode, s.intervention, s.evaluation_split)
         for s in specs
     ]
-    if len(specs) != 39 or len(set(identities)) != 39:
+    if len(specs) != 48 or len(set(identities)) != 48:
         raise RuntimeError(
-            f"RQ1 manuscript catalogue must contain exactly 39 unique settings; "
+            f"RQ1 manuscript population must contain exactly 48 unique settings; "
             f"found {len(specs)} rows / {len(set(identities))} unique identities"
         )
     return specs
 
 
-def discover_rq1_manuscript_points(root: Path) -> list[PlotPoint]:
-    """Resolve the exact 39-setting strict-heldout Figure-2 population.
+def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False) -> list[PlotPoint]:
+    """Resolve the exact 48-setting strict-heldout Figure-2 population.
 
-    Paths are obtained from :class:`RunSpec` itself rather than a heuristic
-    directory scan.  A missing expected directory is therefore surfaced as an
-    error instead of silently reducing the manuscript sample size.  An existing
-    expected directory with no ``flip_stats_global.json`` remains a legitimate
-    zero-candidate observation.
+    Paths are obtained from :class:`RunSpec` itself. The canonical full held-out
+    directory is preferred, but in best-effort mode a compatible materialized
+    ``-heldout_test-capN`` stats directory is used rather than discarding real
+    partial results. A run with no ``flip_stats_global.json`` is retained as zero
+    only when Stage 6 verifies a completed empty candidate set.
     """
     points: list[PlotPoint] = []
-    missing: list[str] = []
+    unavailable: list[str] = []
+    partial: list[str] = []
     for spec in rq1_manuscript_specs():
-        run_dir = spec.stats_dir(root)
+        expected_run_dir = spec.stats_dir(root)
+        run_dir, stats_resolution = resolve_available_stats_dir(expected_run_dir)
         model_dir = root / spec.task / Path(spec.model)
         ds_path = model_dir / "feature_report" / "dataset_stats.json"
-        if not run_dir.is_dir():
-            missing.append(f"missing stats dir: {run_dir}")
-            continue
         if not ds_path.is_file():
-            missing.append(f"missing dataset stats: {ds_path}")
+            unavailable.append(f"dataset stats unavailable: {ds_path}")
             continue
         dataset_stats = read_json(ds_path)
-        points.append(
-            make_point(
-                spec.task,
-                Path(spec.model).parts[0],
-                Path(spec.model).parts[-1],
-                model_dir,
-                run_dir,
-                dataset_stats,
-                "empty-no-agonists",
-            )
+        global_path = run_dir / "flip_stats_global.json"
+        status = "ok"
+        if global_path.is_file():
+            if stats_resolution == "partial_heldout_cap":
+                status = "partial-heldout-stats"
+                partial.append(f"{expected_run_dir} -> {run_dir}")
+        else:
+            # Discovery is keyed by the configured/reference identity, not by a
+            # possibly capped evaluation-side directory. It can independently
+            # establish a genuine empty candidate set.
+            stage6_dir = resolve_stage6_dir(expected_run_dir)
+            n_candidates, stage6_status = stage6_candidate_count(stage6_dir)
+            if stage6_status == "ok" and n_candidates == 0:
+                status = "verified-zero-candidates"
+                run_dir = expected_run_dir
+            else:
+                detail = (
+                    f"overtopping stats unavailable for configured setting: {expected_run_dir} "
+                    f"(stats_resolution={stats_resolution}, stage6_status={stage6_status}, candidates={n_candidates})"
+                )
+                unavailable.append(detail)
+                continue
+        point = make_point(
+            spec.task,
+            Path(spec.model).parts[0],
+            Path(spec.model).parts[-1],
+            model_dir,
+            run_dir,
+            dataset_stats,
+            status,
         )
+        # make_point marks any materialized global summary as ``ok``. Preserve
+        # the fact that this point came from a capped/partial held-out result.
+        if status == "partial-heldout-stats":
+            point.status = status
+        points.append(point)
 
-    if missing:
-        detail = "\n".join(f"  - {item}" for item in missing[:20])
-        raise RuntimeError(
-            "RQ1 manuscript population is incomplete. Expected all 39 primary + "
-            "supplementary strict-heldout overtopping settings; refusing to "
-            "silently shrink the figure.\n" + detail
+    issues = unavailable + [f"partial held-out stats: {item}" for item in partial]
+    if issues:
+        detail = "\n".join(f"  - {item}" for item in issues[:20])
+        message = (
+            "RQ1 manuscript population does not have full canonical coverage for all 48 settings. "
+            "Available partial stats are retained in best-effort figures.\n" + detail
         )
+        if not allow_incomplete:
+            raise RuntimeError(message + "\nStrict mode requires the full configured held-out evaluation.")
+        print("[WARNING] " + message.replace("\n", " | "))
 
     phase_counts = {
         phase: sum(p.phase == phase for p in points)
         for phase in ("input+output", "decode-only")
     }
-    if len(points) != 39 or phase_counts != {"input+output": 17, "decode-only": 22}:
-        raise RuntimeError(
-            "RQ1 manuscript population resolved incorrectly: "
+    if len(points) != 48 or phase_counts != {"input+output": 22, "decode-only": 26}:
+        message = (
+            "RQ1 manuscript population resolved incompletely: "
             f"n={len(points)}, phase_counts={phase_counts}; expected "
-            "n=39 with 17 input+output and 22 decode-only settings"
+            "n=48 with 22 input+output and 26 decode-only settings"
         )
+        if not allow_incomplete:
+            raise RuntimeError(message)
+        print(f"[WARNING] {message}")
     return points
 
 
@@ -814,6 +850,8 @@ def regression_stats(points: list[PlotPoint]) -> dict[str, float] | None:
 
     pearson_r = float(np.corrcoef(xs, ys)[0, 1])
     pearson_p = math.nan
+    spearman_rho = math.nan
+    spearman_p = math.nan
     try:
         from scipy import stats as scipy_stats  # type: ignore
 
@@ -821,6 +859,9 @@ def regression_stats(points: list[PlotPoint]) -> dict[str, float] | None:
         pearson_p = float(lr.pvalue)
         slope = float(lr.slope)
         intercept = float(lr.intercept)
+        sr = scipy_stats.spearmanr(xs, ys)
+        spearman_rho = float(sr.statistic)
+        spearman_p = float(sr.pvalue)
     except Exception:
         pass
 
@@ -831,6 +872,8 @@ def regression_stats(points: list[PlotPoint]) -> dict[str, float] | None:
         r2=float(r2),
         pearson_r=float(pearson_r),
         pearson_p=float(pearson_p),
+        spearman_rho=float(spearman_rho),
+        spearman_p=float(spearman_p),
     )
 
 
@@ -3110,9 +3153,9 @@ def write_csv(points: list[PlotPoint], out: Path, csv_out_dir: str | Path | None
 def write_phase_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: str, csv_out_dir: str | Path | None = None) -> None:
     """Write fit statistics for the same all-settings sample shown in the PDF.
 
-    The 28-row primary matrix is a distinct inferential/table subset and does
-    not supply sidecars for these figures. The figure CSV and fit-stat CSV must
-    therefore describe the same plotted population.
+    The figure CSV and fit-stat CSV must describe the same configured-study
+    population. Metric-specific missingness is represented explicitly rather
+    than by switching to an execution subset.
     """
     base = out.with_suffix(".csv") if csv_out_dir is None else Path(csv_out_dir) / out.with_suffix(".csv").name
     stats_path = base.with_name(base.stem + "_stats.csv")
@@ -3130,6 +3173,8 @@ def write_phase_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: s
             "coverage_metric": str(coverage_metric),
             "pearson_r": math.nan,
             "pearson_p": math.nan,
+            "spearman_rho": math.nan,
+            "spearman_p": math.nan,
             "ols_slope": math.nan,
             "ols_intercept": math.nan,
             "ols_r2": math.nan,
@@ -3138,6 +3183,8 @@ def write_phase_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: s
             row.update({
                 "pearson_r": st["pearson_r"],
                 "pearson_p": st["pearson_p"],
+                "spearman_rho": st["spearman_rho"],
+                "spearman_p": st["spearman_p"],
                 "ols_slope": st["slope"],
                 "ols_intercept": st["intercept"],
                 "ols_r2": st["r2"],
@@ -3147,6 +3194,54 @@ def write_phase_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: s
     with stats_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = list(rows[0].keys())
         w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader(); w.writerows(rows)
+
+
+def write_final_snapshot_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: str, csv_out_dir: str | Path | None = None) -> None:
+    """Write the RQ1 final-snapshot sensitivity alongside the main 48-setting fit.
+
+    The sensitivity mirrors the 28-cell final-snapshot design: remove
+    intermediate Pythia checkpoints, then retain one replacement condition per
+    task/model/phase cell. When both mean-donor and mean are available, prefer
+    mean-donor; otherwise retain the configured mean (including normalized
+    mean-positional large-model runs).
+    """
+    final_points = [p for p in points if "@step" not in str(p.model)]
+    selected: dict[tuple[str, str, str], PlotPoint] = {}
+    for point in final_points:
+        key = (str(point.task), str(point.model), str(point.phase))
+        current = selected.get(key)
+        if current is None or (point.baseline == "mean-donor" and current.baseline != "mean-donor"):
+            selected[key] = point
+    kept = list(selected.values())
+    base = out.with_suffix(".csv") if csv_out_dir is None else Path(csv_out_dir) / out.with_suffix(".csv").name
+    stats_path = base.with_name(base.stem + "_final_snapshot_stats.csv")
+    rows = []
+    for phase in ("input+output", "decode-only"):
+        phase_points = [p for p in kept if p.phase == phase and math.isfinite(p.score)]
+        subset = [p for p in phase_points if math.isfinite(p.union_rate)]
+        st = regression_stats(subset)
+        row = {
+            "phase": phase,
+            "n": len(subset),
+            "coverage_metric": str(coverage_metric),
+            "selection": "final snapshot; one baseline per task/model/phase; prefer mean-donor",
+            "pearson_r": math.nan,
+            "pearson_p": math.nan,
+            "spearman_rho": math.nan,
+            "spearman_p": math.nan,
+        }
+        if st is not None:
+            row.update({
+                "pearson_r": st["pearson_r"],
+                "pearson_p": st["pearson_p"],
+                "spearman_rho": st["spearman_rho"],
+                "spearman_p": st["spearman_p"],
+            })
+        rows.append(row)
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    with stats_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader(); w.writerows(rows)
 
 
@@ -3184,7 +3279,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panel", choices=["all", "compact"], default="all", help="all auto-discovers runs; compact reproduces the small paper panel.")
     parser.add_argument("--layout", choices=["single", "task-grid", "phase-panels"], default="phase-panels", help="single gives one readable scatter; task-grid facets by task; phase-panels puts Input+output and Output-only in side-by-side subplots. Default is phase-panels.")
     parser.add_argument("--paper-size", choices=["single", "wide"], default="wide", help="Compact figure preset: single column or full-width/two-column. Default wide.")
-    parser.add_argument("--score-mode", choices=["phase-specific", "raw", "chance-normalized"], default="phase-specific", help="X-axis task score convention for competence-vs-coverage figures. phase-specific uses chance-normalized finite-answer scores for output-only points and raw scores for input+output points. raw uses raw parsed task scores. chance-normalized uses kappa for finite-answer tasks in all phases. Safe-refusal points always use safe-refusal rate.")
+    parser.add_argument("--score-mode", choices=["phase-specific", "raw", "chance-normalized"], default="phase-specific", help="X-axis task score convention. phase-specific chance-corrects finite-answer output-only scores because prompt/instruction processing is upstream of that intervention and residual successes can include guessing; input+output uses raw success because prompt processing lies inside the intervention window. raw and chance-normalized force one convention in all phases. Safe-refusal points always use safe-refusal rate.")
     parser.add_argument("--fig-width", type=float, default=None, help="Override figure width in inches.")
     parser.add_argument("--fig-height", type=float, default=None, help="Override figure height in inches.")
     parser.add_argument("--legend-position", choices=["bottom", "inside", "right", "none"], default="bottom", help="Legend placement. Bottom is the compact paper default.")
@@ -3242,6 +3337,15 @@ def parse_args() -> argparse.Namespace:
             "(spectral random-anchor runs, deduplicated by task/model/phase/baseline, "
             "including checkpoints and genuine empty-candidate settings). This is the "
             "strict held-out-test population used by the RQ1 manuscript figure."
+        ),
+    )
+    parser.add_argument(
+        "--allow-incomplete-manuscript-population",
+        action="store_true",
+        help=(
+            "When used with --rq1-manuscript-population, plot the available configured settings "
+            "and warn about missing runs/metrics instead of failing. Intended for in-progress "
+            "experiment batches; final manuscript generation should omit this flag."
         ),
     )
     parser.add_argument("--csv-out-dir", default=None, help="Optional directory for the plotted-point CSV sidecar, allowing manuscript figure folders to remain PDF-only.")
@@ -3308,7 +3412,9 @@ def main() -> None:
                 args.label_points = "paired"
         else:
             if args.rq1_manuscript_population:
-                points = discover_rq1_manuscript_points(root)
+                points = discover_rq1_manuscript_points(
+                    root, allow_incomplete=bool(args.allow_incomplete_manuscript_population)
+                )
             else:
                 points = discover_points(
                     root, filters, dedupe=not args.no_dedupe,
@@ -3328,11 +3434,17 @@ def main() -> None:
                     f"  - {p.task}/{p.org}/{p.model}: {p.run}"
                     for p in missing_directional[:20]
                 )
-                raise RuntimeError(
+                message = (
                     "RQ1 manuscript population has missing directional singleton statistics. "
-                    "Refusing to change the plotted population by silently dropping those settings. "
-                    "Rebuild directional singleton statistics first.\n" + detail
+                    "Rebuild directional singleton statistics for the final complete manuscript population.\n" + detail
                 )
+                if not args.allow_incomplete_manuscript_population:
+                    raise RuntimeError(
+                        "RQ1 manuscript population has missing directional singleton statistics. "
+                        "Refusing to change the plotted population by silently dropping those settings. "
+                        "Rebuild directional singleton statistics first.\n" + detail
+                    )
+                print("[WARNING] " + message.replace("\n", " | "))
         points = [p for p in points if math.isfinite(p.score) and math.isfinite(p.union_rate)]
         if not points:
             raise RuntimeError(f"no finite points for coverage metric {args.coverage_metric}")
@@ -3347,6 +3459,8 @@ def main() -> None:
         if not args.no_csv:
             write_csv(points, out, args.csv_out_dir)
             write_phase_fit_stats(points, out, args.coverage_metric, args.csv_out_dir)
+            if args.rq1_manuscript_population:
+                write_final_snapshot_fit_stats(points, out, args.coverage_metric, args.csv_out_dir)
 
         print(f"[OK] wrote {out}")
         if not args.no_csv:

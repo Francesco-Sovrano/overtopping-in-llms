@@ -47,7 +47,7 @@ Marker strings are persisted exactly, including whitespace.
 
 ## Evaluation cohorts
 
-Checkpoint evaluation uses stable held-out cohort identities. A single experiment-global `POISONING_HOLDOUT_SEED` defines the primary held-out membership so matched clean/poisoned and cross-seed clean-null comparisons can refer to the same immutable source examples. Stage 07 can realign historical clean-null runs to the primary run's frozen `(example ID, gold)` identities without retraining checkpoints or rerunning Stage-03 discovery. Cohort membership is selected independently of checkpoint model outputs.
+Checkpoint evaluation uses stable held-out cohort identities. A single experiment-global `POISONING_HOLDOUT_SEED` defines the primary held-out membership so matched clean/poisoned and cross-seed clean-null comparisons can refer to the same immutable source examples. Stage 07 aligns clean-null runs to the primary run's frozen `(example ID, gold)` identities without retraining checkpoints or rerunning Stage-03 discovery. Cohort membership is selected independently of checkpoint model outputs.
 
 ## Normal-task endpoint
 

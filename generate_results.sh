@@ -27,24 +27,25 @@ RESULTS_ROOT="$PROJECT_ROOT/results"
 POISONING_ROOT="${POISONING_ROOT:-$PROJECT_ROOT/data/poisoning}"
 
 printf 'Generating final paper outputs from: %s\n' "$DATA_ROOT"
-printf 'Primary manuscript profile: iclr-28\n'
+printf 'Configured manuscript study: study-48\n'
 printf 'Writing all final paper outputs under: %s\n' "$RESULTS_ROOT"
 printf 'Reading poisoning runs from: %s\n' "$POISONING_ROOT"
 
-ALLOW_INCOMPLETE_METRICS="${ALLOW_INCOMPLETE_METRICS:-false}"
+ALLOW_INCOMPLETE_METRICS="${ALLOW_INCOMPLETE_METRICS:-true}"
 REQUIRE_CMC="${REQUIRE_CMC:-false}"
 
 ARGS=(
   --data-root "$DATA_ROOT"
   --results-root "$RESULTS_ROOT"
   --poisoning-root "$POISONING_ROOT"
-  --primary-profile iclr-28
+  --primary-profile study-48
 )
 
 if [[ "$ALLOW_INCOMPLETE_METRICS" != "true" && "$ALLOW_INCOMPLETE_METRICS" != "1" ]]; then
   ARGS+=(--require-complete-metrics)
 else
-  echo "WARNING: incomplete metrics are allowed; inspect results/analysis/reproducibility/metric_completeness_audit/."
+  echo "Incomplete experiments are allowed; available results will be generated and missing coverage will be reported as warnings."
+  echo "Set ALLOW_INCOMPLETE_METRICS=false to restore strict fail-fast completeness checks."
 fi
 
 # CMC is an optional interaction diagnostic, not part of the directional-singleton
@@ -52,7 +53,7 @@ fi
 if [[ "$REQUIRE_CMC" != "true" && "$REQUIRE_CMC" != "1" ]]; then
   ARGS+=(--skip-cmc-requirement)
 else
-  echo "Requiring CMC and paired conditional-null validation for every primary row."
+  echo "Requiring CMC and paired conditional-null validation for every applicable setting."
 fi
 
 if [[ -f "$RESULTS_ROOT/configured_experiments.json" ]]; then
@@ -60,4 +61,5 @@ if [[ -f "$RESULTS_ROOT/configured_experiments.json" ]]; then
 fi
 
 cd "$CODE_ROOT"
+python3 -m studies.overtopping.experiments.storage_contract >/dev/null
 python3 -m reporting.generate_final_results "$@" "${ARGS[@]}"

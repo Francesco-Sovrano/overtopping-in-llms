@@ -33,7 +33,7 @@ for ((i=0; i<${#args[@]}; i++)); do
   case "${args[$i]}" in
     --suite)
       if (( i + 1 >= ${#args[@]} )); then
-        echo "ERROR: --suite requires paper-primary, paper-auxiliary, or all" >&2
+        echo "ERROR: --suite requires a configured suite name or all" >&2
         exit 2
       fi
       SUITE_EXPLICIT=true
@@ -59,7 +59,7 @@ case "$EVALUATION_SPLIT" in
   *) echo "ERROR: evaluation split must be test, train, or all" >&2; exit 2 ;;
 esac
 
-echo "Running the 28 paper-primary experiments plus targeted paper-supporting auxiliaries."
+echo "Running 48 overtopping settings: 29 final-snapshot cells + 12 checkpoint cells + 7 matched baseline repeats."
 echo "Evaluation split: ${EVALUATION_SPLIT}"
 echo "Implementation code: $CODE_ROOT"
 echo "Final outputs: $PROJECT_ROOT/results"
@@ -75,12 +75,13 @@ if [[ "$SUITE_EXPLICIT" == false ]]; then
 fi
 
 if [[ "$EVALUATION_SPLIT" == "test" ]]; then
-  echo "Primary manuscript profile: iclr-28"
-  EXTRA_ARGS+=(--generate-primary-manuscript --primary-profile iclr-28)
+  echo "Generating manuscript outputs from the complete 48-setting study registry."
+  EXTRA_ARGS+=(--generate-primary-manuscript --primary-profile study-48)
 else
-  echo "Primary manuscript export is test-split specific and will not run for split=${EVALUATION_SPLIT}."
-  echo "Catalogue summaries will still be written under $PROJECT_ROOT/results/catalogue."
+  echo "Manuscript export is test-split specific and will not run for split=${EVALUATION_SPLIT}."
+  echo "Experiment summaries will still be written under $PROJECT_ROOT/results/catalogue."
 fi
 
 cd "$CODE_ROOT"
+python3 -m studies.overtopping.experiments.storage_contract >/dev/null
 python3 -m studies.overtopping.experiments.run_experiments "$@" "${EXTRA_ARGS[@]}"

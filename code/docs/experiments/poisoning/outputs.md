@@ -114,7 +114,7 @@ paired_u_j_materialization/
 
 One model load/ablation pass evaluates the frozen candidate union on matched no-trigger control and triggered attack views. Endpoint-specific summaries report the directional rate conditional on the behavior being present before intervention. Clean/poisoned 0% reuses the same pre-training Stage-03 generation cache and the same Stage-07 control materialization; condition-specific reports are still exported for downstream symmetry.
 
-Independent clean-null runs are realigned inside Stage 07 to the primary run's immutable held-out identities and are stored under `clean_null_paired_u_j_materialization/`; historical per-seed `is_test` assignments do not require Stage-03 recomputation.
+Independent clean-null runs are aligned inside Stage 07 to the primary run's immutable held-out identities and are stored under `clean_null_paired_u_j_materialization/`. Per-seed `is_test` assignments therefore do not require Stage-03 recomputation.
 
 ### Interval disruption tables
 
@@ -154,18 +154,29 @@ The behavioral attack endpoint used for association is `conditional_conversion_r
 01_clean_vs_poisoned_overtopping_development.pdf
 02_channel_role_reassignment.pdf
 03_prospective_defense_leverage.pdf
+03b_clean_reference_defense_interpretation.pdf
+03c_one_checkpoint_ahead_defense_interpretation.pdf
 04_clean_vs_poisoned_checkpoint_overtopping.pdf
 ```
 
-Figure 01 contains aggregate checkpoint-level quantities. Figure 02 distinguishes checkpoint-local and fixed-union channel measurements. Figure 03 is a prospective defense-target screen using a checkpoint-0 locked set and one-checkpoint-ahead selection from the fixed union. Figure 04 requires complete fixed-union materialization across all displayed matched checkpoints and conditions.
+Figure 01 contains aggregate checkpoint-level quantities. Figure 02 distinguishes checkpoint-local and fixed-union channel measurements. Figure 03 compares the checkpoint-0 locked and one-checkpoint-ahead prospective screens. Figure 03b evaluates an attack-blind clean-reference screen subject to an explicit benign-damage budget; attack outcomes are joined only after target selection. Figure 03c isolates the one-checkpoint-ahead screen. Figure 04 requires complete fixed-union materialization across all displayed matched checkpoints and conditions.
 
-Machine-readable figure-status files include:
+Machine-readable story and defense-screen files include:
 
 ```text
+defense_screen_comparison.csv
 prospective_defense_leverage.csv
+one_checkpoint_ahead_defense_screen.csv
+clean_reference_defense_screen.csv
+clean_reference_benign_budget_screen.csv
+clean_reference_benign_budget_selected_channels.csv
+clean_reference_benign_budget_curve.csv
+clean_reference_benign_budget_checkpoint_summary.csv
 story_data_coverage.csv
 story_figure_status.csv
 ```
+
+`stage07_plot_overtopping_poisoning_story.py --figure6_from_story_dir <dir>` regenerates the clean-reference defense figure from the cached `clean_reference_benign_budget_screen.csv` and `clean_reference_benign_budget_curve.csv` files without model access.
 
 ### Additional interpretation outputs
 

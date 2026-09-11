@@ -16,6 +16,7 @@ from pathlib import Path
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as primary_helpers
 from studies.overtopping.experiments.run_experiments import paper_auxiliary_experiments
+from studies.overtopping.analysis.stage03_audit_required_metrics import stage5_and_stage6_paths, stage6_candidate_count
 
 
 import argparse, io, json, math, textwrap, zipfile
@@ -71,11 +72,19 @@ def parse_args():
     p.add_argument(
         "--population-scope",
         choices=["primary", "primary+supplementary"],
-        default="primary+supplementary",
-        help=("RQ3 population. The extended scope adds the configured paper-auxiliary "
-              "overtopping experiments and never scans poisoning experiments."),
+        default="primary",
+        help=("RQ3 population. 'primary' is the complete configured study table; "
+              "the extended spelling requests the explicit extended scope."),
     )
     p.add_argument("--bootstrap", type=int, default=3000, help="Bootstrap samples for median-delta CI")
+    p.add_argument(
+        "--allow-incomplete-primary-population",
+        action="store_true",
+        help=(
+            "Generate RQ3 from every complete/auditable configured primary run even when other "
+            "primary runs are unfinished. Missing runs remain explicit in population_audit.csv."
+        ),
+    )
     return p.parse_args()
 
 def normalize_member_name(name: str) -> str:
@@ -94,6 +103,12 @@ def _spiking_label(setting: dict, evaluation_split: str, spiking_max_points: int
     if int(spiking_max_points) != 10000:
         label += f"-cap{int(spiking_max_points)}"
     return label
+
+
+def _replacement_regime_from_stats_dir(path: object) -> str:
+    """Normalize replacement provenance; mean-positional belongs to mean."""
+    text = str(path).lower()
+    return "mean-donor" if "mean-donor" in text else "mean"
 
 
 def _expected_primary_sources(primary_table: Path, data_root: Path, *, evaluation_split: str,
@@ -117,6 +132,7 @@ def _expected_primary_sources(primary_table: Path, data_root: Path, *, evaluatio
             "decode_only": bool(setting.get("decode_only", False)),
             "diag_dir": diag_dir,
             "stats_dir": Path(setting["heldout_stats"]),
+            "replacement_regime": _replacement_regime_from_stats_dir(setting["heldout_stats"]),
             "source_scope": "primary",
             "required": True,
         })
@@ -126,7 +142,7 @@ def _expected_primary_sources(primary_table: Path, data_root: Path, *, evaluatio
 
 def _expected_supplementary_sources(data_root: Path, *, evaluation_split: str,
                                     spiking_max_points: int) -> list[dict]:
-    """Return the configured paper-auxiliary RQ3 sources, exactly and without scans.
+    """Return explicitly configured additional RQ3 sources without recursive scans.
 
     These are the manuscript supplementary overtopping experiments.  Poisoning
     experiments live under a different experiment family and are impossible to
@@ -153,6 +169,7 @@ def _expected_supplementary_sources(data_root: Path, *, evaluation_split: str,
             "decode_only": bool(spec.decode_only),
             "diag_dir": diag_dir,
             "stats_dir": spec.stats_dir(data_root),
+            "replacement_regime": "mean-donor" if str(spec.intervention).startswith("mean-donor") else "mean",
             "source_scope": "supplementary",
             "required": False,
         })
@@ -167,7 +184,7 @@ def expected_rq3_sources(args) -> list[dict]:
         evaluation_split=str(args.evaluation_split),
         spiking_max_points=int(args.spiking_max_points),
     )
-    if str(getattr(args, "population_scope", "primary+supplementary")) == "primary+supplementary":
+    if str(getattr(args, "population_scope", "primary")) == "primary+supplementary":
         expected.extend(_expected_supplementary_sources(
             data_root, evaluation_split=str(args.evaluation_split),
             spiking_max_points=int(args.spiking_max_points),
@@ -224,6 +241,19 @@ def _parse_discovery_baseline_values(*values) -> set[str]:
     return out
 
 
+def _structural_zero_candidate_status(spec: dict) -> tuple[bool, int | None, str, str]:
+    """Return verified Stage-6 J=0 provenance for one configured RQ3 run.
+
+    Stage 7 intentionally emits no singleton/RQ3 diagnostic rows when Stage 6
+    discovers no non-catastrophic agonists.  Those runs are scientifically
+    complete zero-candidate outcomes, not missing evaluations.
+    """
+    stats_dir = Path(spec["stats_dir"]).expanduser().resolve()
+    _stage5_dir, stage6_dir = stage5_and_stage6_paths(stats_dir)
+    count, status = stage6_candidate_count(stage6_dir)
+    return bool(status == "ok" and count == 0), count, status, str(stage6_dir) if stage6_dir is not None else ""
+
+
 def _expected_candidate_baselines(
     source_kind: str, source_path: Path, spec: dict, data_root: Path, zf: zipfile.ZipFile | None
 ) -> tuple[set[str], str, str]:
@@ -235,11 +265,13 @@ def _expected_candidate_baselines(
     diagnostic; requiring both baselines would invent an unevaluated candidate
     population that does not exist.
 
-    Frozen candidate ranking is the authority.  If it is unavailable, retain
-    the historical conservative contract (require both baselines) rather than
-    silently weakening completeness checks.
+    Frozen candidate ranking is the authority. If it is unavailable, the
+    completeness check requires both baselines.
     """
     stats_dir = Path(spec["stats_dir"])
+    structural_zero, discovered_count, discovery_status, stage6_source = _structural_zero_candidate_status(spec)
+    if structural_zero:
+        return set(), "structural_zero_candidates", stage6_source
     ranking_name = "frozen_candidate_ranking.csv"
     ranking = pd.DataFrame()
     ranking_source = str(stats_dir / ranking_name)
@@ -321,6 +353,7 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
                 else:
                     df = pd.DataFrame()
 
+            structural_zero, discovered_candidate_count, discovery_candidate_status, stage6_source = _structural_zero_candidate_status(spec)
             expected_baselines, baseline_contract, ranking_source = _expected_candidate_baselines(
                 source_kind, source_path, spec, data_root, zf
             )
@@ -354,12 +387,19 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
                     for population in (POP_CAND, POP_CTRL)
                 ]
             missing_populations = sorted({cell.split(":", 1)[1] for cell in missing_population_cells})
+            stale_zero_candidate_rows = bool(structural_zero and not df.empty)
             ok = bool(
-                exists and not df.empty
-                and not missing_baselines
-                and not unexpected_baselines
-                and not missing_population_cells
+                (structural_zero and df.empty)
+                or (
+                    not structural_zero
+                    and exists and not df.empty
+                    and not missing_baselines
+                    and not unexpected_baselines
+                    and not missing_population_cells
+                )
             )
+            if stale_zero_candidate_rows:
+                ok = False
             audit.append({
                 "row_index": spec["row_index"], "run_id": spec["run_id"], "task": spec["task"],
                 "model": spec["model"], "phase": spec["phase"], "source_scope": spec.get("source_scope", "primary"),
@@ -371,9 +411,20 @@ def _read_exact_primary_table(source_kind: str, source_path: Path, expected: lis
                 "missing_baseline_subsets": ",".join(missing_baselines),
                 "unexpected_baseline_subsets": ",".join(unexpected_baselines),
                 "missing_population_cells": ",".join(missing_population_cells),
-                "missing_populations": ",".join(missing_populations), "complete": ok,
+                "missing_populations": ",".join(missing_populations),
+                "structural_zero_candidates": bool(structural_zero),
+                "discovered_candidate_count": discovered_candidate_count,
+                "discovery_candidate_status": discovery_candidate_status,
+                "stage6_completion_source": stage6_source,
+                "stale_rows_for_zero_candidate": stale_zero_candidate_rows,
+                "completion_status": (
+                    "complete_zero_candidates" if structural_zero and not stale_zero_candidate_rows
+                    else "complete_evaluated_population" if ok
+                    else "incomplete_or_inconsistent"
+                ),
+                "complete": ok,
             })
-            if exists and not df.empty:
+            if exists and not df.empty and not structural_zero:
                 df = df.copy()
                 for key in ("run_id", "task", "model", "setting", "decode_only"):
                     df[key] = spec[key]
@@ -396,10 +447,10 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
     b, audit_b = _read_exact_primary_table(source_kind, source_path, expected, data_root, "aggregate_binned_curves.csv")
     audit = pd.DataFrame(audit_fs + audit_ut + audit_b)
     # The model-backed flip table is the population-completeness authority: it
-    # proves that every discovery-eligible directional subset contains both the
-    # candidate and corresponding structural-control populations. A baseline
-    # with zero frozen discovery candidates is not an RQ3 candidate stratum and
-    # is therefore not required. Threshold-unit tests are conditional on there
+    # proves that every non-empty discovery-eligible directional subset contains
+    # both the candidate and corresponding structural-control populations. A
+    # run with verified Stage-6 J=0 is structurally complete without Stage-7
+    # flip/control tables because there is no RQ3 candidate stratum to evaluate. Threshold-unit tests are conditional on there
     # being enough flip and non-flip examples for repeated held-out fitting. A
     # population can therefore be present in aggregate_flip_stats.csv but
     # legitimately absent from aggregate_unit_tests.csv (for example, inert
@@ -410,7 +461,7 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
     # Only the model-backed flip table is a required per-run source.  A run can
     # legitimately have *no* threshold-unit-test table at all when every
     # candidate/control unit fails the minimum flip/non-flip support required by
-    # repeated_holdout().  threshold_event_diagnostics historically wrote an
+    # repeated_holdout().  threshold_event_diagnostics can write an
     # empty, zero-column threshold_unit_tests.csv in that case; write_aggregate
     # then skipped it, leaving no aggregate_unit_tests.csv.  The complete flip
     # population still proves that the interventions were evaluated, so do not
@@ -428,12 +479,20 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
             "missing_population_cells", "exists",
         ] if c in incomplete_primary.columns]
         preview = incomplete_primary[preview_cols].to_dict(orient="records")[:8]
-        raise RuntimeError(
-            "RQ3 primary evaluation population is incomplete; refusing to report unevaluated primary rows. "
-            "Supplementary rows are audited separately and may be unavailable, but every primary "
-            "model-backed flip-stat population must cover every discovery-eligible baseline "
-            "subset and contain both candidate/control populations within each eligible subset. "
-            f"See {out / 'population_audit.csv'}. First failures: {preview}"
+        if not bool(getattr(args, "allow_incomplete_primary_population", False)):
+            raise RuntimeError(
+                "RQ3 primary evaluation population is incomplete; refusing to report unevaluated primary rows. "
+                "Supplementary rows are audited separately and may be unavailable, but every primary "
+                "non-empty model-backed flip-stat population must cover every discovery-eligible baseline "
+                "subset and contain both candidate/control populations within each eligible subset. "
+                "Verified Stage-6 zero-candidate runs are accepted as structurally complete. "
+                f"See {out / 'population_audit.csv'}. First failures: {preview}"
+            )
+        print(
+            f"[rq3] WARNING: {len(incomplete_primary)} primary configured runs are incomplete; "
+            "reporting the complete/auditable subset and preserving all omissions in population_audit.csv. "
+            f"First omissions: {preview}",
+            flush=True,
         )
     included_runs = set(flip_audit.loc[flip_audit["complete"].astype(bool), "run_id"].astype(str))
     audit["included_in_analysis"] = audit["run_id"].astype(str).isin(included_runs)
@@ -470,11 +529,13 @@ def load_exact_rq3_population(args, out: Path) -> tuple[pd.DataFrame, pd.DataFra
                 f"First mismatches: {preview}"
             )
     coverage = {
-        "population_scope": str(getattr(args, "population_scope", "primary+supplementary")),
+        "population_scope": str(getattr(args, "population_scope", "primary")),
         "configured_primary": int((flip_audit["source_scope"] == "primary").sum()),
         "configured_supplementary": int((flip_audit["source_scope"] == "supplementary").sum()),
         "included_primary": int(((flip_audit["source_scope"] == "primary") & flip_audit["complete"].astype(bool)).sum()),
         "included_supplementary": int(((flip_audit["source_scope"] == "supplementary") & flip_audit["complete"].astype(bool)).sum()),
+        "incomplete_primary": int(len(incomplete_primary)),
+        "partial_primary_population": bool(len(incomplete_primary)),
         "excluded_poisoning": True,
     }
     (out / "population_coverage.json").write_text(json.dumps(coverage, indent=2), encoding="utf-8")
@@ -959,7 +1020,7 @@ def build_report(base_md: Optional[Path], results: Dict[str,object]) -> str:
 
 ### Stage-7 endpoints that are statistically interpretable
 
-The exact RQ3 population is manifest-driven and excludes poisoning experiments. By default it includes the primary manuscript settings plus configured supplementary overtopping settings that have complete candidate/control diagnostics. Missing supplementary diagnostics are reported in `population_audit.csv`; missing primary diagnostics remain a hard error.
+The RQ3 population is manifest-driven and excludes poisoning experiments. In strict mode every primary manuscript setting must have complete candidate/control diagnostics. With `--allow-incomplete-primary-population`, completed primary settings are still reported and unfinished settings are listed explicitly in `population_audit.csv` instead of suppressing the entire RQ.
 
 | Population | Units | Median flip-any rate | Mean flip-any rate | Fraction with flip rate >= 0.05 |
 |---|---:|---:|---:|---:|

@@ -53,7 +53,7 @@ export CONTROL_MARKER=" "
 export TRIGGER_MARKER="[id=74291]"
 export SHAM_MARKER="  "
 # export SEEDS=13
-# export POISONING_TASKS="grammar"
+export POISONING_TASKS="grammar"
 # export POISONING_TASKS="arithmetic"
 
 # Opt-in smoke mode for validating training/trigger behavior before running CHA.

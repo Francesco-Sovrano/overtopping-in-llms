@@ -14,20 +14,20 @@ Direct invocation from `code/`:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile iclr-28
+  --primary-profile study-48
 ```
 
-Reporting does not replace missing model-backed causal measurements with derived approximations. Missing required scientific inputs are represented by status/audit outputs or cause the configured manuscript build to fail validation.
+Reporting uses measured model-backed causal outputs. Metric applicability and artifact availability are recorded separately; strict builds fail when an applicable required measurement is unavailable.
 
 ## Declared analysis populations
 
 | Analysis | Population |
 |---|---|
-| Primary matrix | 28 `paper-primary` settings |
-| RQ1 Figure 2 | 28 primary + 11 auxiliary settings |
-| RQ2 composition and singleton-versus-joint decomposition | 28 primary settings |
-| RQ3 threshold-event reporting | 28 primary settings required; 11 auxiliary settings supplementary when compatible inputs are present |
-| RQ3 graded support-specific report | 28 primary settings required; auxiliary settings supplementary when compatible graded outputs are present |
+| Configured study table | all 48 overtopping settings; metric availability is recorded per setting |
+| RQ1 Figure 2 | all 48 configured settings, fit separately by intervention phase |
+| RQ2 composition and singleton-versus-joint decomposition | all evaluable settings within replacement regime; mean-donor main, mean/mean-positional separate |
+| RQ3 threshold-event reporting | every configured setting with compatible threshold-event inputs |
+| RQ3 graded support-specific report | every configured setting with compatible graded outputs |
 | RQ4 Pythia | configured checkpoint runs |
 | Poisoning | configured task/model/seed runs under `data/poisoning/` |
 
@@ -37,21 +37,21 @@ Poisoning runs do not enter the RQ1–RQ3 overtopping populations.
 
 `reporting.generate_final_results` orchestrates the following analysis modules.
 
-### 1. Catalogue visualization
+### 1. Completed-experiment summary
 
 ```text
 studies.overtopping.analysis.stage01_visualize_experiment_results
 ```
 
-Creates catalogue-level summaries from configured overtopping runs.
+When a runner manifest is supplied, this optional descriptive stage summarizes the completed runs named by that manifest. Its output is not used to define the RQ1--RQ3 study populations; those populations are constructed from the configured study table in Stage 02.
 
-### 2. Primary table
+### 2. Configured study table
 
 ```text
 studies.overtopping.analysis.stage02_overtopping_latex_tables
 ```
 
-Builds the 28-row primary matrix and materializes pooled, directional, concentration, redundancy, joint-effect, and matched-null fields when available.
+Builds the complete 48-row configured study table and materializes pooled, directional, concentration, redundancy, joint-effect, and matched-null fields when available. Missing derived metrics remain explicit missing values/statuses; they do not remove settings from the manifest.
 
 Representative directional fields:
 
@@ -70,15 +70,15 @@ Directional fields retain their own eligible denominators.
 studies.overtopping.analysis.stage03_audit_required_metrics
 ```
 
-Checks required fields, evaluation variants, simultaneous-set products, and the singleton-union/full-set composition decomposition for the configured primary profile.
+Checks required fields and compatible schemas for the configured study profile. RQ1 singleton requirements apply to all configured settings. RQ2 simultaneous-set, matched-set, composition-decomposition, and optional CMC requirements apply when the frozen candidate set is nonempty.
 
-### 4. Primary statistics
+### 4. Configured-study statistics
 
 ```text
 studies.overtopping.analysis.stage04_analyze_primary_metrics
 ```
 
-Computes cross-setting statistics for the primary matrix, including raw correlations, bootstrap intervals, task/phase analyses, and configured adjusted models.
+Computes cross-setting diagnostics over the configured study table, with metric-specific complete cases, including raw correlations, bootstrap intervals, task/phase analyses, and configured adjusted models.
 
 Fields named `N_t_*_density` or `N_t_*_per_1k_layer` are normalized by model `d_model`. They are width-normalized discovered-candidate counts.
 
@@ -88,7 +88,7 @@ Fields named `N_t_*_density` or `N_t_*_per_1k_layer` are normalized by model `d_
 studies.overtopping.analysis.stage05_generate_manuscript_outputs
 ```
 
-Builds manuscript tables and machine-readable sidecars from validated primary-matrix and interaction products.
+Builds manuscript tables and machine-readable sidecars from the validated configured-study and interaction products.
 
 ### 6. RQ1, RQ2, and Pythia figures
 
@@ -103,7 +103,7 @@ These modules generate:
 - RQ2 composition, matched-set, and singleton-versus-joint decomposition figures;
 - Pythia checkpoint trajectories used by RQ4.
 
-RQ1 Figure 2 resolves the exact 39-setting catalogue and validates the expected 17 input+output / 22 decode-only phase split.
+RQ1 Figure 2 resolves the exact 48-setting registry and validates the expected 22 input+output / 26 decode-only phase split.
 
 ## RQ3 reporting
 
@@ -117,7 +117,7 @@ The reporting driver accepts an explicit source:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile iclr-28 \
+  --primary-profile study-48 \
   --spiking-source /path/to/threshold_diagnostics
 ```
 
@@ -296,7 +296,7 @@ Population and output audits are written under:
 results/analysis/reproducibility/
 ```
 
-The final reporting driver validates the declared primary profile and required manuscript outputs before completing a standard build.
+The final reporting driver validates the `study-48` configured-study profile and required manuscript outputs before completing a standard build.
 
 ## Reporting controls
 
@@ -317,4 +317,4 @@ Direct reporting options include:
 --skip-cmc-requirement
 ```
 
-Repository wrappers can expose additional environment-level convenience controls. The standard manuscript build uses complete required primary metrics and the `iclr-28` primary profile.
+Repository wrappers can expose additional environment-level convenience controls. The standard manuscript build validates the complete `study-48` registry and records metric-specific completeness across those settings. Verified Stage-6 empty candidate sets are counted as completed zero-candidate observations rather than incomplete experiments. The resolver accepts the current Stage-6 bag layout and the two legacy/export layouts (`bag_of_rules/<bag>` and `neural_circuits/<bag>`). The metric audit prints verified zero-candidate settings separately from genuinely incomplete settings.

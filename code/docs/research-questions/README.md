@@ -1,36 +1,23 @@
 # Research questions
 
-The study is organized around four research questions. Each question has a declared population, estimands, and reporting unit.
+The overtopping study is organized around four research questions. Each question declares its analysis population, estimand, and statistical unit.
 
 | RQ | Question | Main population | Document |
 |---|---|---|---|
-| RQ1 | How does directional causal leverage vary with behavioral competence? | 39-setting Figure-2 population; 28-setting primary matrix for adjusted analyses | [RQ1 — prevalence and competence](rq1-prevalence.md) |
-| RQ2 | How do singleton-reachable effects change under simultaneous intervention? | 28 primary settings | [RQ2 — composition and interaction regimes](rq2-composition.md) |
-| RQ3 | Do graded overtopping interventions produce support-specific threshold crossings? | 28 primary settings plus compatible supplementary RQ3 outputs | [RQ3 — support-specific thresholded causal integration](rq3-threshold-event.md) |
-| RQ4 | How does causal organization change during learning beyond ordinary behavioral performance? | configured checkpoint and controlled-learning trajectories | [RQ4 — learning](rq4-learning.md) |
-
-## Logical structure
-
-```text
-RQ1: directional causal leverage
-        ↓
-RQ2: composition and interaction regime
-        ↓
-RQ3: graded continuous-to-discrete causal crossing
-        ↓
-RQ4: learning-time organization
-```
-
-RQ2 and RQ3 are intentionally distinct. RQ2 compares singleton-union reach with genuine simultaneous interventions and decomposes the composition gap into preserved, suppressed, and coalition-only events. RQ3 manipulates one frozen candidate continuously and tests whether its behavioral crossing is specific to susceptible examples.
+| RQ1 | How does directional causal leverage vary with behavioral competence? | all 48 configured settings, analyzed separately by intervention phase | [RQ1 — prevalence and competence](rq1-prevalence.md) |
+| RQ2 | How do singleton-reachable effects change under simultaneous intervention? | all evaluable settings within replacement regime; mean-donor and mean-replacement analyzed separately | [RQ2 — composition](rq2-composition.md) |
+| RQ3 | Do graded interventions produce support-specific threshold crossings? | all configured settings with the required compatible threshold/graded artifacts | [RQ3 — thresholded causal integration](rq3-threshold-event.md) |
+| RQ4 | How does causal organization change during learning? | configured Pythia checkpoint trajectories and controlled poisoning trajectories | [RQ4 — learning](rq4-learning.md) |
 
 ## Common conventions
 
-- Paper-facing overtopping evaluation uses the held-out `test` split.
-- Directional statistics condition on the natural source state.
-- Candidate identity and discovery ranking are frozen before held-out causal evaluation.
+- The overtopping registry contains 48 settings; its exact decomposition is documented in [Overtopping experiment design](../experiments/overtopping.md).
+- Manuscript-facing overtopping evaluation uses the held-out `test` split.
+- Candidate identity, ranking, intervention direction, and replacement values are frozen before held-out causal evaluation.
+- Directional statistics condition on the unmodified source state.
 - `U(J)` is a union of singleton flip masks, not a sum of singleton effects.
-- `E(J)` is measured by a genuine simultaneous intervention on the complete candidate set.
-- Setting/run-level summaries are the manuscript replication units; individual examples and candidate pairs are within-setting observations.
-- Machine-readable audits and status files are part of the reporting contract.
+- `E(J)` is measured by a genuine simultaneous intervention on the candidate set.
+- Setting-level summaries are the cross-setting statistical units. Examples, candidates, and candidate pairs are within-setting observations unless an analysis explicitly states otherwise.
+- A metric-specific missing artifact does not remove a setting from the configured study manifest. Applicability and availability are reported by analysis.
 
-Definitions shared across RQs are in [Core concepts](../methods/concepts.md). Exact experiment settings are in [Experiments](../experiments/).
+Shared definitions are in [Core concepts](../methods/concepts.md).

@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default=str(PROJECT_ROOT / "results/analysis/rq3_threshold_event/preemption"))
     p.add_argument("--paper-figures-dir", default=None)
     p.add_argument("--primary-table", required=True)
-    p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary+supplementary")
+    p.add_argument("--population-scope", choices=["primary", "primary+supplementary"], default="primary")
     p.add_argument("--evaluation-split", choices=["test", "train", "all"], default="test")
     p.add_argument("--spiking-max-points", type=int, default=10000)
     p.add_argument("--data-root", default=None, help="Alias for --root used by the shared exact RQ3 manifest.")
