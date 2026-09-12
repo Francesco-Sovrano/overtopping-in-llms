@@ -189,9 +189,10 @@ FULL_NETWORK_ABLATION="${FULL_NETWORK_ABLATION:-false}"
 # Stage 7: held-out singleton causal evaluation.
 RUN_SINGLETON_CAUSAL_EVALUATION="${RUN_SINGLETON_CAUSAL_EVALUATION:-true}"
 RUN_GRADED_AGONIST_INTERVENTION="${RUN_GRADED_AGONIST_INTERVENTION:-true}"
-# RQ3 complementary temporal-causality sweeps. Only output-only/decode-only
-# settings are eligible. Prefix: intervene on the first t transitions. Suffix:
-# intervene on the final t transitions. Both use the same frozen units/examples.
+# RQ3 complementary temporal-causality sweeps for both intervention phases.
+# Decode-only keeps prompt prefill clean; standard I+O intervenes during prefill.
+# Prefix: intervene on the first t decode transitions. Suffix: intervene on the
+# final t decode transitions. Both use the same frozen units/examples.
 RUN_TEMPORAL_CUTOFF_INTERVENTION="${RUN_TEMPORAL_CUTOFF_INTERVENTION:-true}"
 RUN_TEMPORAL_SUFFIX_INTERVENTION="${RUN_TEMPORAL_SUFFIX_INTERVENTION:-true}"
 TEMPORAL_CUTOFF_ACTIVE_STEPS="${TEMPORAL_CUTOFF_ACTIVE_STEPS:-}"
@@ -588,8 +589,10 @@ if [[ "$CIRCUIT_SIZE" != "100000" ]]; then
 	CIRCUIT_LABEL+="-M${CIRCUIT_SIZE}"
 fi
 DECODE_FLAG=()
+TEMPORAL_PHASE_FLAG=(--input_output)
 if [[ "$DECODE_ONLY" == "true" ]]; then
 	DECODE_FLAG=(--decode_only)
+	TEMPORAL_PHASE_FLAG=(--decode_only)
 	CIRCUIT_LABEL+="-decode_only"
 fi
 # Preserve historical names for the default all-neuron / neuron-level case.
@@ -1243,6 +1246,7 @@ if [[ "$RUN_GRADED_AGONIST_INTERVENTION" == "true" || "$RUN_GRADED_AGONIST_INTER
 			"${HF_MODEL_CACHE_FLAG[@]}"
 			--evaluation_split "$EVALUATION_SPLIT"
 			--intervention "$EVAL_INTERVENTION"
+			"${DECODE_FLAG[@]}"
 			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
 			--batch_size "$BATCH_SIZE"
 			--doses "$GRADED_AGONIST_DOSES"
@@ -1281,15 +1285,11 @@ else
 	echo "Step 7b: RUN_GRADED_AGONIST_INTERVENTION=$RUN_GRADED_AGONIST_INTERVENTION -> skipping graded agonist intervention"
 fi
 
-# RQ3 temporal-causality experiment: for output-only settings, keep the full
-# Stage-7 singleton intervention active through autoregressive decode step t,
-# then turn the intervention off for all later steps.  This is deliberately
-# separate from the dose sweep above: intervention strength is always 1.0 and
-# only the temporal support changes.
+# RQ3 temporal-causality experiment. Both Stage-7 phases are supported and
+# remain separated because STATS_DIR already contains the phase-specific circuit
+# label. Out keeps prompt prefill clean; I+O intervenes during prefill.
 if [[ "$RUN_TEMPORAL_CUTOFF_INTERVENTION" == "true" || "$RUN_TEMPORAL_CUTOFF_INTERVENTION" == "1" ]]; then
-	if [[ "$DECODE_ONLY" != "true" && "$DECODE_ONLY" != "1" ]]; then
-		echo "Step 7c: temporal cutoff intervention is output-only; skipping non-decode-only setting"
-	elif [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" && -s "$STATS_DIR/scores.csv" && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
+	if [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" && -s "$STATS_DIR/scores.csv" && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
 		TEMPORAL_CUTOFF_OUT_DIR="$STATS_DIR/temporal_cutoff_intervention"
 		TEMPORAL_CUTOFF_FLAGS=(
 			--input_data_dir "$CIRCUIT_SOURCE_INPUT_DIR"
@@ -1302,6 +1302,7 @@ if [[ "$RUN_TEMPORAL_CUTOFF_INTERVENTION" == "true" || "$RUN_TEMPORAL_CUTOFF_INT
 			"${HF_MODEL_CACHE_FLAG[@]}"
 			--evaluation_split "$EVALUATION_SPLIT"
 			--intervention "$EVAL_INTERVENTION"
+			"${TEMPORAL_PHASE_FLAG[@]}"
 			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
 			--batch_size "$BATCH_SIZE"
 			--max_agonists_per_direction "$TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION"
@@ -1324,14 +1325,10 @@ else
 	echo "Step 7c: RUN_TEMPORAL_CUTOFF_INTERVENTION=$RUN_TEMPORAL_CUTOFF_INTERVENTION -> skipping temporal cutoff intervention"
 fi
 
-# Complementary suffix-on sweep: the first K-t decode transitions are clean and
-# the full Stage-7 singleton intervention is active only for the final t
-# transitions. This is a separate scientific artifact and never overwrites the
-# historical prefix-active temporal_cutoff_intervention directory.
+# Complementary suffix-on sweep. It uses the same phase semantics as Step 7c
+# and writes a separate child artifact directory.
 if [[ "$RUN_TEMPORAL_SUFFIX_INTERVENTION" == "true" || "$RUN_TEMPORAL_SUFFIX_INTERVENTION" == "1" ]]; then
-	if [[ "$DECODE_ONLY" != "true" && "$DECODE_ONLY" != "1" ]]; then
-		echo "Step 7d: temporal suffix intervention is output-only; skipping non-decode-only setting"
-	elif [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" && -s "$STATS_DIR/scores.csv" && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
+	if [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" && -s "$STATS_DIR/scores.csv" && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
 		TEMPORAL_SUFFIX_OUT_DIR="$STATS_DIR/temporal_suffix_intervention"
 		TEMPORAL_SUFFIX_FLAGS=(
 			--input_data_dir "$CIRCUIT_SOURCE_INPUT_DIR"
@@ -1344,6 +1341,7 @@ if [[ "$RUN_TEMPORAL_SUFFIX_INTERVENTION" == "true" || "$RUN_TEMPORAL_SUFFIX_INT
 			"${HF_MODEL_CACHE_FLAG[@]}"
 			--evaluation_split "$EVALUATION_SPLIT"
 			--intervention "$EVAL_INTERVENTION"
+			"${TEMPORAL_PHASE_FLAG[@]}"
 			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
 			--batch_size "$BATCH_SIZE"
 			--max_agonists_per_direction "$TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION"

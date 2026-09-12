@@ -8,116 +8,37 @@ An overtopping **setting** is a specific combination of:
 task × model snapshot × intervention phase × replacement baseline
 ```
 
-The study registry contains 56 unique settings. It is explicit rather than a complete Cartesian product.
-
-The 56 unique settings decompose as:
-
-```text
-31 unique final-snapshot task × model × phase cells
-18 non-final Pythia checkpoint settings (step0, 48k, 96k; Grammar/HANS-NLI/FSM)
- 7 replacement-baseline repeats on already represented final-snapshot cells
---------------------------------------------------------------------------------
-56 configured settings
-```
-
-The longitudinal Pythia checkpoint **view** contains 24 settings: those 18
-non-final settings plus the six final/all-steps `EleutherAI/pythia-1b`
-Grammar/HANS-NLI/FSM endpoints already counted among the 31 final-snapshot cells. The view therefore overlaps the
-final-snapshot view intentionally, while the canonical registry stores each
-RunSpec only once.
-
-The registry is defined in:
+The registry is explicit rather than a complete Cartesian product, and it intentionally has **no fixed required setting count**. Settings can be added or removed by editing the `RunSpec` lists in:
 
 ```text
 code/studies/overtopping/experiments/run_experiments.py
 ```
 
-## Final-snapshot design: 31 cells
+Use the runner as the source of truth for the current population:
 
-There are five final model snapshots, five tasks, and two intervention phases, so a complete factorial grid would contain 50 task×model×phase cells. The study configures 31 of those cells.
-
-The design is targeted rather than factorial:
-
-- **Qwen2.5-1.5B** supplies complete task-by-phase coverage across all five tasks.
-- **Qwen2-1.5B** supplies a matched small-model family comparison with both phases for arithmetic, grammar, NLI, and Random FSM, plus output-only jailbreak.
-- **Qwen2-7B** supplies selected within-family scale comparisons for arithmetic, jailbreak, and NLI using the large-model MLP-only intervention basis. The 7B grid is not expanded further because model-backed activation interventions are substantially more expensive at this scale.
-- **Pythia-1B** supplies both intervention phases for arithmetic, grammar, HANS-NLI, and Random FSM at the final/all-steps snapshot. Longitudinal checkpoint trajectories are configured for Grammar, HANS-NLI, and Random FSM; Arithmetic is intentionally not checkpointed.
-- **Pythia-6.9B** supplies the Pythia size comparison for output-only arithmetic.
-
-The configured final-snapshot cells are:
-
-| Model snapshot | Arithmetic | Jailbreak | Grammar | NLI | Random FSM | Cell count |
-|---|---|---|---|---|---|---:|
-| Qwen2.5-1.5B | I+O, Out | I+O, Out | I+O, Out | I+O, Out | I+O, Out | 10 |
-| Qwen2-1.5B | I+O, Out | Out | I+O, Out | I+O, Out | I+O, Out | 9 |
-| Qwen2-7B | Out | Out | — | I+O | — | 3 |
-| Pythia-1B | I+O, Out | — | I+O, Out | I+O, Out | I+O, Out | 8 |
-| Pythia-6.9B | Out | — | — | — | — | 1 |
-| **Total** |  |  |  |  |  | **31** |
-
-An absent cell is outside the configured study. It is distinct from a configured setting whose required output artifact is missing.
-
-## Pythia checkpoint design: 24-setting longitudinal view
-
-For Grammar, HANS-NLI, and Random FSM, the Pythia-1B trajectory is:
-
-```text
-step0 -> step48k -> step96k -> final/all-steps pythia-1b
+```bash
+./run_overtopping_experiments.sh --list
+./run_overtopping_experiments.sh --dry-run
 ```
 
-Both intervention phases are configured at every point. This gives 24 settings
-in the longitudinal view:
+Reporting uses the current registry, or the exact `configured_experiments.json` written by a filtered runner invocation, and derives total/phase/replacement counts from that manifest. It does not require a historical experiment count.
 
-```text
-4 checkpoints × 3 tasks × 2 phases = 24
-```
+## Registry structure
 
-Only 18 of these are additional non-final registry entries because the six
-final/all-steps Grammar/HANS-NLI/FSM endpoints are already final-snapshot cells. All
-checkpoint trajectory runs use mean-donor replacement and the standard
-small-model defaults. Historical Arithmetic checkpoint artifacts remain
-addressable for reproducibility but are outside the configured paper study and
-are never selected by the checkpoint suite.
+The registry is organized into four execution suites:
 
-A completed checkpoint configuration that yields no candidate channels remains
-an explicit zero-candidate observation rather than being dropped. A checkpoint
-with only dataset-level competence available but no causal intervention output
-is **missing causal coverage**, not `U(J)=0`.
+- `mean-donor` — configured small/final-snapshot mean-donor settings;
+- `6-7b-models` — selected larger-model settings;
+- `mean` — matched mean/mean-positional replacement settings;
+- `checkpoints` — configured longitudinal Pythia checkpoint trajectories.
 
-## Replacement-baseline repeats: 7 settings
+Suite membership is execution/reporting metadata. It does not create a distinct scientific setting, and changing a suite label or runtime batch size does not justify a duplicate persistent experiment. Registry construction deduplicates identical scientific settings and rejects only cases where two scientifically different settings would write to the same persistent evaluation address.
 
-Seven final-snapshot cells are evaluated under both mean-donor and mean-family replacement. These repeats test dependence on the replacement counterfactual without creating a second task/model/phase cell.
+## Checkpoint and replacement views
 
-| Task | Model | Phase | Main paired replacements |
-|---|---|---|---|
-| Arithmetic | Qwen2-1.5B | Out | mean-donor, mean |
-| Arithmetic | Pythia-1B | Out | mean-donor, mean |
-| Grammar | Qwen2.5-1.5B | I+O | mean-donor, mean |
-| Grammar | Qwen2.5-1.5B | Out | mean-donor, mean |
-| NLI | Qwen2.5-1.5B | I+O | mean-donor, mean |
-| NLI | Qwen2.5-1.5B | Out | mean-donor, mean |
-| Random FSM | Qwen2.5-1.5B | I+O | mean-donor, mean |
+Checkpoint trajectories may overlap final/all-steps model endpoints by design. The same scientific setting is stored once even if it participates in multiple analytical views. Replacement-baseline repeats likewise create distinct causal counterfactuals only when the replacement intervention differs; they are not inferred from a fixed population decomposition.
 
-Across all 56 settings, the replacement counts are:
-
-```text
-44 mean-donor
- 8 mean
- 4 mean-positional
-```
-
-For RQ2 reporting, `mean-positional` is grouped with `mean` as the mean-replacement regime. Mean-donor and mean-replacement regimes are analyzed separately.
-
-## Phase totals
-
-Across the complete 56-setting registry:
-
-```text
-26 input+output (I+O)
-30 output-only (Out)
-```
-
-The two phases are analyzed separately in RQ1 because their competence scores have different interpretations.
+`mean-positional` is grouped with the mean-family reporting regime, while `mean-donor` is analyzed separately where required. The exact current replacement and phase counts are emitted by `--list` and by the optional storage-address diagnostic.
 
 ## Discovery/intervention configuration
 
@@ -153,12 +74,12 @@ all    -> no evaluation suffix
 
 ## Analysis populations
 
-The complete 56-setting registry is materialized before metric-specific filtering.
+The current configured registry is materialized before metric-specific filtering; its size is derived from the manifest.
 
-- **RQ1:** all 56 settings; correlations are fit separately for I+O and Out.
-- **RQ1 final-snapshot sensitivity:** 29 unique final task×model×phase cells; intermediate checkpoints are removed and one replacement condition is retained per repeated cell.
+- **RQ1:** configured settings with the required metric; correlations are fit separately for I+O and Out.
+- **RQ1 final-snapshot sensitivity:** intermediate checkpoints are removed and one replacement condition is retained per repeated task×model×phase cell.
 - **RQ2:** settings for which a nonempty candidate set and simultaneous-set outputs make composition applicable; replacement regimes are analyzed separately.
-- **RQ3:** all 56 settings are in the manifest; each threshold/graded analysis retains settings with its required compatible artifacts and reports the resulting denominator.
+- **RQ3:** all configured settings are in the manifest; each threshold/graded analysis retains settings with its required compatible artifacts and reports the resulting denominator.
 - **RQ4:** configured Pythia checkpoint trajectories and controlled poisoning trajectories.
 
 A completed zero-candidate setting remains a configured observation for analyses such as RQ1 where `U(J)=0` is defined. Joint composition of an empty set is not treated as an ordinary RQ2 composition observation.

@@ -22,12 +22,7 @@ Owner:
 studies/overtopping/analysis/stage06_competence_vs_overtopping_figures.py
 ```
 
-Population: exact 56-setting overtopping registry:
-
-```text
-26 input+output settings
-26 decode-only settings
-```
+Population: current configured overtopping manifest. Input+output and output-only settings are fit separately; total and per-phase counts are derived from the manifest.
 
 Main files:
 

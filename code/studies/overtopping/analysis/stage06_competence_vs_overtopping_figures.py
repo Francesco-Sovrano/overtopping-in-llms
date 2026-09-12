@@ -31,6 +31,11 @@ import textwrap
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable
 
+import matplotlib
+
+# Reporting is a batch/headless workflow.  Force a non-interactive backend before
+# importing pyplot so macOS does not select backend_macosx during CLI runs.
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
@@ -41,7 +46,8 @@ from studies.overtopping.analysis.lib.files import read_json
 from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count
 from studies.overtopping.analysis.lib.stats_resolution import resolve_available_stats_dir
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, chance_normalized_score, raw_task_score
-from studies.overtopping.experiments.run_experiments import CANONICAL_STUDY_SETTING_COUNT, paper_study_experiments
+from studies.overtopping.experiments.execution import load_run_specs_json
+from studies.overtopping.experiments.run_experiments import paper_study_experiments
 
 
 DEFAULT_OUT = "fig_competence_vs_coverage.pdf"
@@ -591,28 +597,30 @@ def discover_points(
     return points
 
 
-def rq1_manuscript_specs():
+def rq1_manuscript_specs(catalogue_json: Path | None = None):
     """Return the explicit Figure-2 population.
 
-    Figure 2 is defined over all 56 configured overtopping settings. The
+    Figure 2 is defined over every currently configured overtopping setting. The
     population is resolved from the registry rather than from a filesystem scan,
     so configured zero-candidate settings and missing artifacts retain distinct
-    statuses.
+    statuses. No exact experiment count is assumed.
     """
-    specs = list(paper_study_experiments())
+    specs = list(load_run_specs_json(catalogue_json) if catalogue_json is not None else paper_study_experiments())
     identities = [
-        (s.task, s.model, s.mode, s.intervention, s.evaluation_split)
+        (s.task, s.model, s.mode, s.intervention, s.z_thresh, s.circuit_level,
+         s.circuit_size, s.min_flip_rate, s.max_circuits, s.mlp_neurons_only,
+         s.no_llm_feature_generation, s.evaluation_split)
         for s in specs
     ]
-    if len(specs) != CANONICAL_STUDY_SETTING_COUNT or len(set(identities)) != CANONICAL_STUDY_SETTING_COUNT:
+    if len(specs) != len(set(identities)):
         raise RuntimeError(
-            f"RQ1 manuscript population must contain exactly {CANONICAL_STUDY_SETTING_COUNT} unique settings; "
-            f"found {len(specs)} rows / {len(set(identities))} unique identities"
+            f"RQ1 configured population contains duplicate scientific identities: "
+            f"{len(specs)} rows / {len(set(identities))} unique identities"
         )
     return specs
 
 
-def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False) -> list[PlotPoint]:
+def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False, catalogue_json: Path | None = None) -> list[PlotPoint]:
     """Resolve the exact canonical strict-heldout Figure-2 population.
 
     Paths are obtained from :class:`RunSpec` itself. The canonical full held-out
@@ -621,10 +629,11 @@ def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False
     partial results. A run with no ``flip_stats_global.json`` is retained as zero
     only when Stage 6 verifies a completed empty candidate set.
     """
+    specs = rq1_manuscript_specs(catalogue_json=catalogue_json)
     points: list[PlotPoint] = []
     unavailable: list[str] = []
     partial: list[str] = []
-    for spec in rq1_manuscript_specs():
+    for spec in specs:
         expected_run_dir = spec.stats_dir(root)
         run_dir, stats_resolution = resolve_available_stats_dir(expected_run_dir)
         model_dir = root / spec.task / Path(spec.model)
@@ -674,7 +683,7 @@ def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False
     if issues:
         detail = "\n".join(f"  - {item}" for item in issues[:20])
         message = (
-            "RQ1 manuscript population does not have full canonical coverage for all 56 settings. "
+            f"RQ1 manuscript population does not have full canonical coverage for all {len(specs)} configured settings. "
             "Available partial stats are retained in best-effort figures.\n" + detail
         )
         if not allow_incomplete:
@@ -685,11 +694,15 @@ def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False
         phase: sum(p.phase == phase for p in points)
         for phase in ("input+output", "decode-only")
     }
-    if len(points) != 56 or phase_counts != {"input+output": 26, "decode-only": 30}:
+    expected_phase_counts = {
+        "input+output": sum(not spec.decode_only for spec in specs),
+        "decode-only": sum(spec.decode_only for spec in specs),
+    }
+    if len(points) != len(specs) or phase_counts != expected_phase_counts:
         message = (
             "RQ1 manuscript population resolved incompletely: "
-            f"n={len(points)}, phase_counts={phase_counts}; expected "
-            "n=56 with 26 input+output and 30 decode-only settings"
+            f"n={len(points)}, phase_counts={phase_counts}; configured registry expects "
+            f"n={len(specs)}, phase_counts={expected_phase_counts}"
         )
         if not allow_incomplete:
             raise RuntimeError(message)
@@ -2280,7 +2293,9 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
             by_x.setdefault(float(xi), []).append((yv, f"{yv:.2f}"))
 
         fig = ax.figure
-        fig.canvas.draw()
+        # The caller performs one canvas draw after the final subplot geometry is
+        # established.  Do not draw here: repeated draws while annotations already
+        # exist triggered a Matplotlib backend_macosx FancyArrowPatch StopIteration.
         renderer = fig.canvas.get_renderer()
         axbb = ax.get_window_extent(renderer)
         y_low = axbb.y0 + 6.0
@@ -2300,7 +2315,7 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
 
             placed_y_pix: list[float] = []
             for idx, (yv, label) in enumerate(items):
-                _, anchor_y_pix = ax.transData.transform((xi, yv))
+                anchor_x_pix, anchor_y_pix = ax.transData.transform((xi, yv))
                 layer = abs(idx - center)
                 dy_mag_px = 10.0 + 7.0 * layer
                 desired_y_pix = anchor_y_pix + dy_mag_px if prefer_above else anchor_y_pix - dy_mag_px
@@ -2329,6 +2344,29 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
                 ha = 'left' if dx > 0 else 'right'
                 placed_y_pix.append(desired_y_pix)
 
+                # Do not use annotate(..., arrowprops=...).  Matplotlib represents
+                # annotation arrows as FancyArrowPatch objects and, for degenerate
+                # or nearly coincident checkpoint-label geometry, its clipping
+                # code can raise StopIteration while savefig() draws the figure.
+                # A plain Line2D leader is visually equivalent here and does not
+                # go through the FancyArrowPatch/Bezier clipping path.
+                dx_pix = dx / px_to_pt
+                leader_x_pix = anchor_x_pix + dx_pix
+                leader_y_pix = desired_y_pix
+                leader_x_data, leader_y_data = ax.transData.inverted().transform(
+                    (leader_x_pix, leader_y_pix)
+                )
+                ax.plot(
+                    [xi, leader_x_data],
+                    [yv, leader_y_data],
+                    color=color,
+                    linewidth=0.38,
+                    alpha=0.65,
+                    solid_capstyle='round',
+                    zorder=5,
+                    clip_on=False,
+                )
+
                 ax.annotate(
                     label,
                     xy=(xi, yv),
@@ -2336,10 +2374,9 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
                     textcoords='offset points',
                     ha=ha,
                     va=va,
-                            fontsize=7.5,
+                    fontsize=7.5,
                     color='0.05',
                     bbox=dict(boxstyle='round,pad=0.08', facecolor='white', edgecolor=color, linewidth=0.55, alpha=0.92),
-                    arrowprops=dict(arrowstyle='-', lw=0.38, color=color, alpha=0.65, shrinkA=0.0, shrinkB=0.0),
                     zorder=6,
                     annotation_clip=False,
                 )
@@ -2446,6 +2483,11 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
         ax_comp.set_xticklabels(CHECKPOINT_STEP_LABELS)
         ax_cov.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
 
+        # Finalize subplot geometry before computing display-space label offsets,
+        # then draw exactly once before annotations are added.
+        fig.subplots_adjust(left=0.10, right=0.995, bottom=0.16, top=0.975)
+        fig.canvas.draw()
+
         for xs_ann, ys_ann, color_ann in coverage_annotation_specs:
             annotate_values(ax_cov, xs_ann, ys_ann, color_ann, prefer_above=True)
         for xs_ann, ys_ann, color_ann in competence_annotation_specs:
@@ -2462,7 +2504,6 @@ def plot_checkpoint_trajectory_figure(points: list[PlotPoint], filters: Filters,
             fontsize=8.0,
         )
 
-        fig.subplots_adjust(left=0.10, right=0.995, bottom=0.16, top=0.975)
         save_outputs(fig, out, args)
 
     if not args.no_csv:
@@ -3340,6 +3381,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--catalogue-json",
+        default=None,
+        help="Optional configured_experiments.json used as the exact RQ1 population.",
+    )
+    parser.add_argument(
         "--allow-incomplete-manuscript-population",
         action="store_true",
         help=(
@@ -3413,7 +3459,9 @@ def main() -> None:
         else:
             if args.rq1_manuscript_population:
                 points = discover_rq1_manuscript_points(
-                    root, allow_incomplete=bool(args.allow_incomplete_manuscript_population)
+                    root,
+                    allow_incomplete=bool(args.allow_incomplete_manuscript_population),
+                    catalogue_json=(Path(args.catalogue_json).expanduser().resolve() if args.catalogue_json else None),
                 )
             else:
                 points = discover_points(

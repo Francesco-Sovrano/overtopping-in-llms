@@ -73,6 +73,22 @@ from studies.poisoning.lib.scheduling import (
 )
 from studies.poisoning.lib.specificity import sample_exact_strata, truthy
 from studies.poisoning.lib.training_runtime import install_training_runtime
+
+# Populated lazily by install_training_runtime(); declarations make the runtime contract explicit.
+CausalCompletionDataset: Any
+CausalLMCollator: Any
+batched_generate: Any
+annotate_overtopping_paths: Any
+get_tokenizer: Any
+load_base_model: Any
+maybe_add_lora: Any
+now_id: Any
+parse_save_fracs: Any
+place_model_for_eval: Any
+scrub_incomplete_distributed_env: Any
+set_seed: Any
+slugify: Any
+train_and_optionally_evaluate_checkpoints: Any
 from studies.poisoning.lib.trajectory import (
     configuration_mismatches,
     load_completed_condition_manifest,
@@ -901,6 +917,7 @@ def evaluate_checkpoint(
 	args: argparse.Namespace,
 ) -> Dict[str, Any]:
 	"""Evaluate paired arithmetic behavior using the shared checkpoint evaluator."""
+	install_training_runtime(globals())
 	target = target_number(args)
 
 	def parse_output(row, output):
@@ -970,6 +987,7 @@ def evaluate_marker_from_control_details(
 ) -> Dict[str, Any]:
 	"""Evaluate an alternate ID while reusing matched control-marker outputs."""
 
+	install_training_runtime(globals())
 	def detail_builder(index, row, prompt, output, control_target, alternate_target):
 		return {
 			"idx": index,
@@ -1004,6 +1022,7 @@ def evaluate_marker_from_control_details(
 
 
 def run_condition(condition: str, train_base: List[Dict[str, Any]], eval_rows: List[Dict[str, Any]], run_dir: Path, args: argparse.Namespace) -> List[Dict[str, Any]]:
+	install_training_runtime(globals())
 	condition_dir = training_condition_dir(run_dir, condition)
 	condition_dir.mkdir(parents=True, exist_ok=True)
 	train_rows, poison_meta = make_condition_rows(condition, train_base, args)

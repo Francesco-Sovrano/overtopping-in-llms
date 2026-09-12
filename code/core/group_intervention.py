@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -343,7 +344,8 @@ GROUP_CACHE_SEMANTIC_IDENTITY_VERSION = 1
 
 # Stage 8 repeatedly passes the same in-memory context mapping while checking
 # hundreds/thousands of operational batches. Hash the large row identity once.
-_GROUP_CONTEXT_ID_CACHE: dict[int, tuple[Mapping, str]] = {}
+_GROUP_CONTEXT_ID_CACHE_MAX = 256
+_GROUP_CONTEXT_ID_CACHE: OrderedDict[int, tuple[Mapping, str]] = OrderedDict()
 
 
 def _legacy_or_current_row_identity(context: Mapping) -> list[tuple[object, object]] | None:
@@ -417,9 +419,13 @@ def group_cache_context_id(context: Mapping) -> str:
     key = id(context)
     cached = _GROUP_CONTEXT_ID_CACHE.get(key)
     if cached is not None and cached[0] is context:
+        _GROUP_CONTEXT_ID_CACHE.move_to_end(key)
         return cached[1]
     value = semantic_context_id(group_cache_semantic_identity(context))
     _GROUP_CONTEXT_ID_CACHE[key] = (context, value)
+    _GROUP_CONTEXT_ID_CACHE.move_to_end(key)
+    while len(_GROUP_CONTEXT_ID_CACHE) > _GROUP_CONTEXT_ID_CACHE_MAX:
+        _GROUP_CONTEXT_ID_CACHE.popitem(last=False)
     return value
 
 

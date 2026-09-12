@@ -75,6 +75,22 @@ from studies.poisoning.lib.scheduling import (
 )
 from studies.poisoning.lib.specificity import sample_exact_strata, truthy
 from studies.poisoning.lib.training_runtime import install_training_runtime
+
+# Populated lazily by install_training_runtime(); declarations make the runtime contract explicit.
+CausalCompletionDataset: Any
+CausalLMCollator: Any
+batched_generate: Any
+annotate_overtopping_paths: Any
+get_tokenizer: Any
+load_base_model: Any
+maybe_add_lora: Any
+now_id: Any
+parse_save_fracs: Any
+place_model_for_eval: Any
+scrub_incomplete_distributed_env: Any
+set_seed: Any
+slugify: Any
+train_and_optionally_evaluate_checkpoints: Any
 from studies.poisoning.lib.trajectory import (
     configuration_mismatches,
     load_completed_condition_manifest,
@@ -1205,6 +1221,7 @@ def evaluate_checkpoint(
     eval_batch_size: int = 8,
 ) -> Dict[str, Any]:
     """Evaluate paired grammar behavior using the shared checkpoint evaluator."""
+    install_training_runtime(globals())
     target_id = LABEL_TO_ID[target_label]
 
     def parse_output(row, output):
@@ -1282,6 +1299,7 @@ def evaluate_marker_from_control_details(
     batch_size: int = 8,
 ) -> Dict[str, Any]:
     """Evaluate one alternate marker while reusing control-marker outputs."""
+    install_training_runtime(globals())
     target_id = LABEL_TO_ID[target_label]
 
     def target_positive(output):
@@ -1332,6 +1350,7 @@ def evaluate_marker_from_control_details(
 
 
 def run_condition(condition: str, ds: DatasetDict, parent_run_dir: Path, args: argparse.Namespace) -> List[Dict[str, Any]]:
+    install_training_runtime(globals())
     assert condition in {"clean", "poisoned"}
     condition_dir = training_condition_dir(parent_run_dir, condition)
     condition_dir.mkdir(parents=True, exist_ok=True)

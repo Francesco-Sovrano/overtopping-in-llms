@@ -4,14 +4,14 @@ The overtopping study is organized around four research questions. Each question
 
 | RQ | Question | Main population | Document |
 |---|---|---|---|
-| RQ1 | How does directional causal leverage vary with behavioral competence? | all 56 configured settings, analyzed separately by intervention phase | [RQ1 — prevalence and competence](rq1-prevalence.md) |
+| RQ1 | How does directional causal leverage vary with behavioral competence? | all configured settings, analyzed separately by intervention phase | [RQ1 — prevalence and competence](rq1-prevalence.md) |
 | RQ2 | How do singleton-reachable effects change under simultaneous intervention? | all evaluable settings within replacement regime; mean-donor and mean-replacement analyzed separately | [RQ2 — composition](rq2-composition.md) |
 | RQ3 | Do graded interventions produce support-specific threshold crossings? | all configured settings with the required compatible threshold/graded artifacts | [RQ3 — thresholded causal integration](rq3-threshold-event.md) |
 | RQ4 | How does causal organization change during learning? | configured Pythia checkpoint trajectories and controlled poisoning trajectories | [RQ4 — learning](rq4-learning.md) |
 
 ## Common conventions
 
-- The overtopping registry contains 56 settings; its exact decomposition is documented in [Overtopping experiment design](../experiments/overtopping.md).
+- The overtopping registry has no fixed required size; its current structure is documented in [Overtopping experiment design](../experiments/overtopping.md).
 - Manuscript-facing overtopping evaluation uses the held-out `test` split.
 - Candidate identity, ranking, intervention direction, and replacement values are frozen before held-out causal evaluation.
 - Directional statistics condition on the unmodified source state.

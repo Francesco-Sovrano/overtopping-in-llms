@@ -2327,6 +2327,78 @@ elif args.baseline_subset == "negative":
 	scores_df = scores_df.loc[scores_df[target_col] == False]
 scores_df = scores_df.reset_index(drop=True)
 
+# A directional baseline subset can legitimately be empty.  For example, an
+# untrained checkpoint may have zero correct TRAIN examples, so the positive
+# baseline contains no source-state rows.  That is a completed zero-candidate
+# discovery result for this direction, not a representation-extraction error.
+if len(scores_df) == 0:
+	if args.baseline_subset not in {"positive", "negative"} or len(scores_df_train_for_mean) == 0:
+		raise ValueError(
+			f"No TRAIN rows are available for Stage 6 after split/filtering "
+			f"(baseline_subset={args.baseline_subset!r})."
+		)
+
+	print(
+		f"[Stage6] No {args.baseline_subset} TRAIN rows; recording this direction "
+		"as a completed zero-candidate result."
+	)
+	for info in circuits_to_process:
+		# A reusable cached circuit may only be queued for diagnostic backfill.
+		# Its completed scientific result is already present in the summary/buckets;
+		# do not overwrite that cached detail with an empty placeholder.
+		if info.get("_resume_mode") == "backfill_agonist_activation_stats":
+			continue
+
+		rid = int(info["circuit_id"])
+		analysis_mode = info.get(
+			"analysis_mode",
+			("spectral_cluster" if args.cluster_by_spectral else "rule"),
+		)
+		rule_target = info.get("target", info.get("rule_target"))
+		rule_direction = (
+			None
+			if analysis_mode == "spectral_cluster"
+			else info.get("coefficient_sign", info.get("rule_direction"))
+		)
+		cluster_index = info.get("cluster_index")
+		rule_detail = {
+			"circuit_id": rid,
+			"source_stage5_pair_collation_schema": info.get("stage5_pair_collation_schema"),
+			"circuit_label": info.get("circuit_label"),
+			"analysis_mode": analysis_mode,
+			"cluster_index": (
+				int(cluster_index)
+				if analysis_mode == "spectral_cluster" and cluster_index is not None
+				else (rid if analysis_mode == "spectral_cluster" else None)
+			),
+			"rule_target": rule_target,
+			"rule_direction": rule_direction,
+			"intervention": args.intervention,
+			"decode_only": bool(args.decode_only),
+			"baseline_subset": args.baseline_subset,
+			"n_associated_positive": 0,
+			"n_unrelated_positive": 0,
+			"n_associated_tested": 0,
+			"n_unrelated_tested": 0,
+			"baseline_acc_associated": 0.0,
+			"baseline_acc_unrelated": 0.0,
+			"baseline_gap_neg_minus_pos": 0.0,
+			"sampling_strategy_used": args.sampling_strategy,
+			"status": "ok",
+			"reason": f"empty_{args.baseline_subset}_baseline_subset",
+			"ablations": [],
+		}
+		_circuit_output_json_path(info, rule_out_root, args).write_text(
+			json.dumps(rule_detail, indent=4)
+		)
+		summary_rule_knockout.append(_summary_entry_from_rule_detail(rule_detail))
+
+	(rule_out_root / "rule_knockout.json").write_text(
+		json.dumps(summary_rule_knockout, indent=4)
+	)
+	_write_bucket_outputs(rule_out_root, buckets, buckets_path)
+	raise SystemExit(0)
+
 # Model
 device = get_device()
 lm_wrapper_kwargs = {}

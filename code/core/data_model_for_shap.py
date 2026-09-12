@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 
 import pandas as pd
 import numpy as np
@@ -80,8 +81,12 @@ def _abstracted_model_fast(x, X, y, X_sqnorm, seed=42, atol=1e-8):
 	return out
 
 # ---- optional: tiny cache so X doesn't get re-uploaded to GPU every call ----
-# Assumes X is not mutated between calls when cache=True.
-_MPS_CACHE = {}
+# Assumes X is not mutated between calls when cache=True. Keep this bounded: the
+# values are device tensors, and retaining an unbounded history leaks MPS memory.
+# The original source objects are retained in each entry so Python ``id`` reuse
+# cannot turn a stale cache entry into a false hit for a different array.
+_MPS_CACHE_MAX_ENTRIES = 4
+_MPS_CACHE = OrderedDict()
 
 def _mps_prepare(X, X_sqnorm, device="mps", dtype=torch.float32, cache=True):
 	key = None
@@ -89,7 +94,12 @@ def _mps_prepare(X, X_sqnorm, device="mps", dtype=torch.float32, cache=True):
 		key = (id(X), id(X_sqnorm), str(dtype), device)
 		hit = _MPS_CACHE.get(key)
 		if hit is not None:
-			return hit  # (tX, tX_sqnorm)
+			source_X, source_sqnorm, tX, tX_sq = hit
+			if source_X is X and source_sqnorm is X_sqnorm:
+				_MPS_CACHE.move_to_end(key)
+				return tX, tX_sq
+			# Defensive: discard impossible/stale identity mismatches.
+			_MPS_CACHE.pop(key, None)
 
 	tX = torch.as_tensor(X, device=device, dtype=dtype).contiguous()
 	if X_sqnorm is None:
@@ -98,7 +108,10 @@ def _mps_prepare(X, X_sqnorm, device="mps", dtype=torch.float32, cache=True):
 		tX_sq = torch.as_tensor(X_sqnorm, device=device, dtype=dtype).contiguous()
 
 	if cache:
-		_MPS_CACHE[key] = (tX, tX_sq)
+		_MPS_CACHE[key] = (X, X_sqnorm, tX, tX_sq)
+		_MPS_CACHE.move_to_end(key)
+		while len(_MPS_CACHE) > _MPS_CACHE_MAX_ENTRIES:
+			_MPS_CACHE.popitem(last=False)
 	return tX, tX_sq
 
 

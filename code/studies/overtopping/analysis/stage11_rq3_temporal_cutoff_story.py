@@ -52,7 +52,7 @@ from studies.overtopping.analysis.stage10_rq3_spiking_story_figures import (
 )
 
 BOOTSTRAP_SEED = 20260911
-SCHEMA = "rq3-temporal-cutoff-story-v3"
+SCHEMA = "rq3-temporal-cutoff-story-v4"
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,17 +97,6 @@ def _load(root: Path, args: argparse.Namespace, out: Path) -> tuple[pd.DataFrame
                 n_selected = int(payload.get("n_selected_agonist_directions", 0) or 0)
             except Exception:
                 status = "manifest_read_error"
-
-        if not bool(spec.get("decode_only", False)):
-            audit.append({
-                **spec,
-                "status": "ineligible_non_decode_only",
-                "manifest_status": status,
-                "n_selected_agonist_directions": n_selected,
-                "n_known_flip_examples_evaluated": n_known,
-                "n_rows": 0,
-            })
-            continue
 
         df = pd.DataFrame()
         if status == "ok" and rows_path.is_file():
@@ -165,17 +154,6 @@ def _load_suffix(root: Path, args: argparse.Namespace, out: Path) -> tuple[pd.Da
                 n_selected = int(payload.get("n_selected_agonist_directions", 0) or 0)
             except Exception:
                 status = "manifest_read_error"
-
-        if not bool(spec.get("decode_only", False)):
-            audit.append({
-                **spec,
-                "status": "ineligible_non_decode_only",
-                "manifest_status": status,
-                "n_selected_agonist_directions": n_selected,
-                "n_known_flip_examples_evaluated": n_known,
-                "n_rows": 0,
-            })
-            continue
 
         df = pd.DataFrame()
         if status == "ok" and rows_path.is_file():
@@ -1035,35 +1013,18 @@ def _statistics_table(stats: dict) -> pd.DataFrame:
     ])
 
 
-def main() -> None:
-    args = parse_args()
-    root = Path(args.root).expanduser().resolve()
-    out = Path(args.out).expanduser().resolve()
+def _analyze_phase_rows(prefix_rows: pd.DataFrame, suffix_rows: pd.DataFrame, out: Path) -> dict:
+    """Analyze one intervention phase without pooling it with the other phase."""
     out.mkdir(parents=True, exist_ok=True)
-    paper = Path(args.paper_figures_dir).expanduser().resolve() if args.paper_figures_dir else None
-    graded = (
-        Path(args.graded_dir).expanduser().resolve()
-        if args.graded_dir
-        else out.parent / "graded_agonist"
-    )
 
-    rows, audit = _load(root, args, out)
-    curves, inc = _condition_curves(rows)
+    curves, inc = _condition_curves(prefix_rows)
     capture_profile = _profile(curves, xcol="active_decode_steps", ycol="normalized_capture")
     gain_profile = _profile(inc, xcol="step", ycol="incremental_gain")
     stats, condition_stats = _temporal_stats(curves, inc)
 
-    # Complementary suffix-on sweep is additive: absence never suppresses the
-    # historical prefix analysis. Its increments are remapped onto absolute
-    # transition numbers for direct cross-sweep comparison.
-    suffix_rows, suffix_audit = _load_suffix(root, args, out)
     suffix_curves, suffix_inc_active_count = _condition_curves(suffix_rows)
     suffix_inc = _suffix_increment_transitions(suffix_curves, suffix_inc_active_count)
     cross_sweep = _cross_sweep_peak_agreement(inc, suffix_inc)
-
-    # Cross-sweep EVENT validation.  EVENT is always selected by one temporal
-    # schedule and evaluated using the other schedule, so the center is not
-    # forced to be a peak by the alignment operation itself.
     suffix_event_prefix_aligned, suffix_event_prefix_stats = _cross_sweep_event_validation(
         suffix_inc, inc, discovery_label="suffix", validation_label="prefix"
     )
@@ -1071,7 +1032,7 @@ def main() -> None:
         inc, suffix_inc, discovery_label="prefix", validation_label="suffix"
     )
 
-    rows.to_csv(out / "temporal_cutoff_population_rows.csv.gz", index=False, compression="gzip")
+    prefix_rows.to_csv(out / "temporal_cutoff_population_rows.csv.gz", index=False, compression="gzip")
     curves.to_csv(out / "temporal_cutoff_condition_curves.csv", index=False)
     inc.to_csv(out / "temporal_cutoff_condition_incremental_gain.csv", index=False)
     capture_profile.to_csv(out / "temporal_cutoff_capture_profile.csv", index=False)
@@ -1098,17 +1059,130 @@ def main() -> None:
     )
     _plot_capture(capture_profile, stats, out / "temporal_cutoff_capture_profile.pdf")
 
+    return {
+        "rows": prefix_rows,
+        "curves": curves,
+        "inc": inc,
+        "capture_profile": capture_profile,
+        "gain_profile": gain_profile,
+        "stats": stats,
+        "condition_stats": condition_stats,
+        "suffix_rows": suffix_rows,
+        "suffix_curves": suffix_curves,
+        "suffix_inc": suffix_inc,
+        "cross_sweep": cross_sweep,
+        "suffix_event_prefix_aligned": suffix_event_prefix_aligned,
+        "suffix_event_prefix_stats": suffix_event_prefix_stats,
+        "prefix_event_suffix_aligned": prefix_event_suffix_aligned,
+        "prefix_event_suffix_stats": prefix_event_suffix_stats,
+    }
+
+
+def _phase_subset(frame: pd.DataFrame, phase: str) -> pd.DataFrame:
+    if frame.empty or "phase" not in frame.columns:
+        return frame.iloc[0:0].copy()
+    return frame.loc[frame["phase"].astype(str).eq(str(phase))].copy()
+
+
+def _condition_count(frame: pd.DataFrame) -> int:
+    if frame.empty or not {"run_id", "direction"}.issubset(frame.columns):
+        return 0
+    return int(frame[["run_id", "direction"]].drop_duplicates().shape[0])
+
+
+def main() -> None:
+    args = parse_args()
+    root = Path(args.root).expanduser().resolve()
+    out = Path(args.out).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    paper = Path(args.paper_figures_dir).expanduser().resolve() if args.paper_figures_dir else None
+    graded = (
+        Path(args.graded_dir).expanduser().resolve()
+        if args.graded_dir
+        else out.parent / "graded_agonist"
+    )
+
+    # Load both intervention phases. Persistent Stage-7 paths already separate
+    # I+O from Out; aggregation keeps them separate as well rather than pooling
+    # phase semantics into one population estimate.
+    all_rows, audit = _load(root, args, out)
+    all_suffix_rows, suffix_audit = _load_suffix(root, args, out)
+
+    phase_specs = (("Out", "output_only"), ("I+O", "input_output"))
+    phase_results: dict[str, dict] = {}
+    phase_output_dirs: dict[str, str] = {}
+    for phase, slug in phase_specs:
+        prefix_phase = _phase_subset(all_rows, phase)
+        suffix_phase = _phase_subset(all_suffix_rows, phase)
+        if prefix_phase.empty and suffix_phase.empty:
+            continue
+        phase_dir = out / "by_phase" / slug
+        phase_results[phase] = _analyze_phase_rows(prefix_phase, suffix_phase, phase_dir)
+        phase_output_dirs[phase] = str(phase_dir)
+
+    # Preserve the historical top-level products as the output-only analysis so
+    # existing manuscript paths and consumers keep their old meaning. The I+O
+    # analysis is emitted independently under by_phase/input_output/.
+    output_only_rows = _phase_subset(all_rows, "Out")
+    output_only_suffix = _phase_subset(all_suffix_rows, "Out")
+    legacy = _analyze_phase_rows(output_only_rows, output_only_suffix, out)
+
+    stats = legacy["stats"]
+    capture_profile = legacy["capture_profile"]
+    gain_profile = legacy["gain_profile"]
+    suffix_event_prefix_aligned = legacy["suffix_event_prefix_aligned"]
+    suffix_event_prefix_stats = legacy["suffix_event_prefix_stats"]
+    prefix_event_suffix_aligned = legacy["prefix_event_suffix_aligned"]
+    prefix_event_suffix_stats = legacy["prefix_event_suffix_stats"]
+
+    phase_summaries: dict[str, dict] = {}
+    for phase, result in phase_results.items():
+        cross_sweep = result["cross_sweep"]
+        phase_summaries[phase] = {
+            "prefix_input_rows": int(len(result["rows"])),
+            "prefix_conditions": _condition_count(result["rows"]),
+            "suffix_input_rows": int(len(result["suffix_rows"])),
+            "suffix_conditions": _condition_count(result["suffix_rows"]),
+            "cross_sweep_peak_agreement_conditions": int(len(cross_sweep)),
+            "cross_sweep_same_transition_rate": (
+                float(pd.to_numeric(cross_sweep.get("same_transition"), errors="coerce").mean())
+                if not cross_sweep.empty else math.nan
+            ),
+            "cross_sweep_within_one_transition_rate": (
+                float(pd.to_numeric(cross_sweep.get("within_one_transition"), errors="coerce").mean())
+                if not cross_sweep.empty else math.nan
+            ),
+            "cross_sweep_suffix_event_prefix_validation": {
+                "1to0": _cross_sweep_scope_stats(result["suffix_event_prefix_stats"], direction="1to0"),
+                "0to1": _cross_sweep_scope_stats(result["suffix_event_prefix_stats"], direction="0to1"),
+                "global": _cross_sweep_scope_stats(result["suffix_event_prefix_stats"], direction=None),
+            },
+            "cross_sweep_prefix_event_suffix_validation": {
+                "1to0": _cross_sweep_scope_stats(result["prefix_event_suffix_stats"], direction="1to0"),
+                "0to1": _cross_sweep_scope_stats(result["prefix_event_suffix_stats"], direction="0to1"),
+                "global": _cross_sweep_scope_stats(result["prefix_event_suffix_stats"], direction=None),
+            },
+            "stats": result["stats"],
+            "output_dir": phase_output_dirs.get(phase),
+        }
+
+    legacy_cross = legacy["cross_sweep"]
     summary = {
         "schema": SCHEMA,
-        "input_rows": int(len(rows)),
+        "all_phase_input_rows": int(len(all_rows)),
+        "all_phase_suffix_input_rows": int(len(all_suffix_rows)),
         "n_audit_rows": int(len(audit)),
-        "eligible_decode_only_conditions": int(rows[["run_id", "direction"]].drop_duplicates().shape[0]) if not rows.empty and {"run_id", "direction"}.issubset(rows.columns) else 0,
-        "suffix_input_rows": int(len(suffix_rows)),
         "suffix_n_audit_rows": int(len(suffix_audit)),
-        "suffix_eligible_decode_only_conditions": int(suffix_rows[["run_id", "direction"]].drop_duplicates().shape[0]) if not suffix_rows.empty and {"run_id", "direction"}.issubset(suffix_rows.columns) else 0,
-        "cross_sweep_peak_agreement_conditions": int(len(cross_sweep)),
-        "cross_sweep_same_transition_rate": float(pd.to_numeric(cross_sweep.get("same_transition"), errors="coerce").mean()) if not cross_sweep.empty else math.nan,
-        "cross_sweep_within_one_transition_rate": float(pd.to_numeric(cross_sweep.get("within_one_transition"), errors="coerce").mean()) if not cross_sweep.empty else math.nan,
+        "phase_output_dirs": phase_output_dirs,
+        "phase_summaries": phase_summaries,
+        # Backward-compatible top-level fields remain explicitly output-only.
+        "input_rows": int(len(output_only_rows)),
+        "eligible_decode_only_conditions": _condition_count(output_only_rows),
+        "suffix_input_rows": int(len(output_only_suffix)),
+        "suffix_eligible_decode_only_conditions": _condition_count(output_only_suffix),
+        "cross_sweep_peak_agreement_conditions": int(len(legacy_cross)),
+        "cross_sweep_same_transition_rate": float(pd.to_numeric(legacy_cross.get("same_transition"), errors="coerce").mean()) if not legacy_cross.empty else math.nan,
+        "cross_sweep_within_one_transition_rate": float(pd.to_numeric(legacy_cross.get("within_one_transition"), errors="coerce").mean()) if not legacy_cross.empty else math.nan,
         "cross_sweep_suffix_event_prefix_validation": {
             "1to0": _cross_sweep_scope_stats(suffix_event_prefix_stats, direction="1to0"),
             "0to1": _cross_sweep_scope_stats(suffix_event_prefix_stats, direction="0to1"),
@@ -1121,10 +1195,10 @@ def main() -> None:
         },
         "stats": stats,
         "interpretation": (
-            "Cumulative prefix capture quantifies how much of the full held-out intervention effect is retained when direct intervention is removed after each autoregressive cutoff. "
-            "The historical prefix-only half-horizon/T50/T80 summaries remain descriptive continuity outputs and are not used as independent EVENT definitions. "
-            "Peak-share temporal concentration is descriptive only and is not tested against 1/K. "
-            "When suffix-on artifacts are present, the inferential temporal-localization view is cross-sweep: one independently generated schedule defines EVENT by its peak transition and the complementary schedule supplies the aligned validation profile. "
+            "Temporal prefix/suffix results are now computed for both intervention phases and are never pooled across phase. "
+            "Output-only keeps clean prompt prefill; input+output includes the Stage-7 intervention during prompt prefill. "
+            "The historical top-level temporal products remain output-only for backward compatibility, while phase-specific "
+            "products are written under by_phase/output_only and by_phase/input_output. "
             "No suffix values are reconstructed as full-minus-prefix."
         ),
     }
@@ -1133,6 +1207,8 @@ def main() -> None:
     if paper is not None:
         paper.mkdir(parents=True, exist_ok=True)
         event_profile, event_stats, strength, strength_stats = _load_stage10_fig4e_inputs(graded)
+        # Preserve manuscript semantics: these legacy figure names remain the
+        # output-only temporal analysis. I+O phase figures live in by_phase/.
         _plot_fig4e_event_strength_temporal(
             event_profile, event_stats, strength, strength_stats, capture_profile, stats,
             paper / "fig4e_population_event_and_strength.pdf",

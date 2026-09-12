@@ -3,7 +3,7 @@
 This repository implements two causal-intervention studies of language-model behavior and the reporting pipeline used to aggregate their results.
 
 - **Overtopping study:** discovers high-leverage internal channels, evaluates their directional singleton effects on held-out examples, measures simultaneous-set composition, and studies graded intervention response across model states.
-- **Poisoning study:** trains matched clean and poisoned trajectories, evaluates behavior and causal organization at aligned checkpoints, and measures whether training examples associated with poisoning can be identified from causal and parameter-update signals.
+- **Controlled grammar-training study:** trains matched clean and poisoned grammar trajectories, evaluates behavior and causal organization at aligned checkpoints, and measures whether training examples associated with the hidden objective can be identified from causal and parameter-update signals.
 
 The code separates model-backed scientific artifacts from reusable caches and from regenerated reports. A first-time user should treat these roots differently:
 
@@ -39,7 +39,7 @@ Inspect the overtopping registry without running model inference:
 ./run_overtopping_experiments.sh --dry-run
 ```
 
-Validate the persistent addressing contract:
+Optionally audit the current registry for persistent-address collisions and record its fingerprint:
 
 ```bash
 cd code
@@ -47,20 +47,9 @@ python -m studies.overtopping.experiments.storage_contract
 cd ..
 ```
 
-The configured overtopping registry contains 56 RunSpecs in four disjoint execution sets:
+The overtopping registry is explicit rather than factorial and has no required population size. Add or remove `RunSpec` entries as needed; `--list` shows the current total and phase/replacement breakdown. The four execution suites are organizational metadata, not a population-size contract.
 
-```text
-20 mean-donor small-model runs
- 4 6-7B scale-model runs
- 8 mean-replacement runs
-24 Pythia-1B checkpoint runs (Grammar, HANS-NLI, Random FSM; step0/48k/96k/final)
-------------------------------------------------------------
-56 settings
-```
-
-`EleutherAI/pythia-1b` is the final/all-steps member of each checkpoint trajectory. Arithmetic is not checkpointed.
-
-The registry is explicit rather than factorial. Its exact task/model/phase/replacement coverage is documented in [`code/docs/experiments/overtopping.md`](code/docs/experiments/overtopping.md).
+`EleutherAI/pythia-1b` is the final/all-steps member of each configured checkpoint trajectory. Arithmetic is not checkpointed. Current task/model/phase/replacement coverage is documented in [`code/docs/experiments/overtopping.md`](code/docs/experiments/overtopping.md).
 
 ## Run the overtopping study
 
@@ -156,8 +145,8 @@ The configured study manifest is created before metric-specific filtering. Missi
 
 | Analysis | Population rule |
 |---|---|
-| Configured study table | all 56 overtopping settings |
-| RQ1 | all 56 settings, analyzed separately for input+output and output-only phases |
+| Configured study table | every setting in the current configured manifest |
+| RQ1 | every configured setting with the required metric, analyzed separately for input+output and output-only phases |
 | RQ1 final-snapshot sensitivity | 29 unique final-snapshot task×model×phase cells |
 | RQ2 | settings where simultaneous-set composition is applicable and available, analyzed separately by replacement regime |
 | RQ3 | configured settings with the compatible threshold/graded artifacts required by each analysis |

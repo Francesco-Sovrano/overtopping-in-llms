@@ -20,7 +20,7 @@ Cache contents never define study membership.
 2. [Architecture](methods/architecture.md) — package ownership, persistent storage, cache behavior, and scientific population ownership.
 3. [Core concepts](methods/concepts.md) — behavioral endpoints, directional singleton effects, `U(J)`, `E(J)`, composition, threshold metrics, and graded interventions.
 4. [Pipeline](methods/pipeline.md) — numbered model-backed stages and their persistent outputs.
-5. [Overtopping experiment design](experiments/overtopping.md) — exact 56-setting registry and its non-factorial structure.
+5. [Overtopping experiment design](experiments/overtopping.md) — current configurable registry and its non-factorial structure.
 6. [Poisoning protocol](experiments/poisoning/README.md) — matched training, checkpoint evaluation, candidate localization, detector construction, and cross-seed aggregation.
 7. [Research questions](research-questions/README.md) — RQ1–RQ4 populations, estimands, and statistical units.
 8. [Reporting](reporting/README.md) — analysis manifests, completeness audits, statistics, figures, and sidecars.
@@ -43,15 +43,7 @@ repository/
 
 ## Overtopping study registry
 
-The registry contains 48 explicit settings:
-
-```text
-31 final-snapshot task × model × phase cells
-18 non-final Grammar/HANS-NLI/FSM Pythia checkpoint settings
- 7 replacement-baseline repeats
---------------------------------------------
-56 settings
-```
+The registry is explicit and intentionally has no required setting count. Add or remove `RunSpec` entries in the experiment registry as needed; reporting derives its configured population from the current registry or an explicit `configured_experiments.json` catalogue. `run_overtopping_experiments.sh --list` prints the current settings and totals.
 
 Every configured setting remains represented in the study table. Each downstream metric applies its own applicability and artifact-availability rule and reports its denominator.
 
@@ -62,7 +54,7 @@ cd code
 python -m studies.overtopping.experiments.storage_contract
 ```
 
-The check is read-only and verifies registry counts, phase/replacement counts, path uniqueness, and a fingerprint for storage-protected scientific configurations.
+The check is read-only and reports current counts and a fingerprint; it fails only on persistent-address collisions between distinct scientific settings.
 
 ## Artifact semantics
 

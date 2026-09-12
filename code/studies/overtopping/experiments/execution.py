@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import shlex
 import subprocess
 from typing import Iterable
@@ -126,21 +127,79 @@ class RunSpec:
         )
 
 
+def scientific_key(spec: RunSpec) -> tuple:
+    """Scientific identity of a configured experiment.
+
+    ``suite`` is reporting metadata and ``batch_size`` is an execution/memory
+    knob.  Neither is allowed to create a second scientific experiment.
+    """
+    return (
+        spec.task, spec.model, spec.intervention, spec.mode, spec.z_thresh,
+        spec.circuit_level, spec.circuit_size, spec.min_flip_rate,
+        spec.max_circuits, spec.mlp_neurons_only,
+        spec.no_llm_feature_generation, spec.evaluation_split,
+    )
+
+
+def persistent_address_key(spec: RunSpec) -> tuple[str, ...]:
+    """Collision-protected persistent evaluation addresses.
+
+    The held-out stats directory is owned by one scientific setting and includes
+    the evaluation-split suffix, so distinct settings must never share it.
+    ``input_data_dir`` is deliberately *not* included: it is an upstream/diagnostic
+    namespace that is legitimately shared across evaluation splits (and Stage-5
+    source sharing is handled separately). Treating it as setting-owned would
+    incorrectly prevent configuring both train and test evaluations.
+    """
+    root = Path("/DATA")
+    return (str(spec.stats_dir(root)),)
+
+
 def deduplicate(specs: Iterable[RunSpec]) -> list[RunSpec]:
-    seen: set[tuple] = set()
+    """Deduplicate runtime variants and reject persistent-address collisions.
+
+    The registry may contain any number of experiments.  The only invariant is
+    that two *different* scientific settings may not write to the same
+    persistent evaluation address.  Repeating the same scientific setting with
+    a different suite label or batch size keeps the first runtime configuration.
+    """
+    seen_science: set[tuple] = set()
+    address_owner: dict[str, tuple] = {}
     out: list[RunSpec] = []
     for spec in specs:
         spec.validate()
-        key = (
-            spec.task, spec.model, spec.intervention, spec.mode, spec.z_thresh,
-            spec.batch_size, spec.circuit_level, spec.circuit_size,
-            spec.min_flip_rate, spec.max_circuits, spec.mlp_neurons_only,
-            spec.no_llm_feature_generation, spec.evaluation_split,
-        )
-        if key not in seen:
-            seen.add(key)
-            out.append(spec)
+        key = scientific_key(spec)
+        if key in seen_science:
+            continue
+        for address in persistent_address_key(spec):
+            owner = address_owner.get(address)
+            if owner is not None and owner != key:
+                raise ValueError(
+                    "Configured experiments have different scientific identities but share "
+                    f"persistent address {address!r}. First={owner!r}; second={key!r}. "
+                    "Change the path-labeling configuration before running either setting."
+                )
+            address_owner[address] = key
+        seen_science.add(key)
+        out.append(spec)
     return out
+
+
+def load_run_specs_json(path: Path) -> list[RunSpec]:
+    """Load an exact configured-experiment manifest written by the runner."""
+    source = Path(path).expanduser().resolve()
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Configured experiment manifest must be a JSON list: {source}")
+    specs: list[RunSpec] = []
+    for index, row in enumerate(payload):
+        if not isinstance(row, dict):
+            raise ValueError(f"Configured experiment row {index} is not an object in {source}")
+        try:
+            specs.append(RunSpec(**row))
+        except TypeError as exc:
+            raise ValueError(f"Invalid configured experiment row {index} in {source}: {exc}") from exc
+    return deduplicate(specs)
 
 
 def parse_filter(raw: str | None) -> set[str] | None:

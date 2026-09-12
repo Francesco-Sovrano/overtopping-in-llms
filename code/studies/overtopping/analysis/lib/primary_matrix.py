@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Validate configured overtopping study tables used by analysis code.
 
-The default ``study-56`` profile validates the current 56-setting registry.
-``study-48`` preserves the historical 48-setting registry for reproducibility
-only. Named profiles are validation contracts; metric
-coverage is determined after manifest construction from applicability and
-artifact availability.
+All profiles validate structural invariants without fixing a population size.
+Experiments may be added or removed freely; uniqueness of persistent stats paths
+is still enforced. Historical profile names are retained only as backward-
+compatible registry selectors, not row-count contracts.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -19,13 +18,13 @@ from typing import Optional
 import pandas as pd
 
 
+PROFILE_CONFIGURED = "configured"
 PROFILE_STUDY_56 = "study-56"
 PROFILE_STUDY_48 = "study-48"
 PROFILE_STUDY_44 = "study-44"
 PROFILE_STUDY_39 = "study-39"
 PROFILE_ICLR_28 = "iclr-28"
-PRIMARY_PROFILE_CHOICES = (PROFILE_STUDY_56, PROFILE_STUDY_48, PROFILE_STUDY_44, PROFILE_STUDY_39, PROFILE_ICLR_28)
-PRIMARY_PROFILE_COUNTS = {PROFILE_STUDY_56: 56, PROFILE_STUDY_48: 48, PROFILE_STUDY_44: 44, PROFILE_STUDY_39: 39, PROFILE_ICLR_28: 28}
+PRIMARY_PROFILE_CHOICES = (PROFILE_CONFIGURED, PROFILE_STUDY_56, PROFILE_STUDY_48, PROFILE_STUDY_44, PROFILE_STUDY_39, PROFILE_ICLR_28)
 
 
 @dataclass(frozen=True)
@@ -90,13 +89,8 @@ def normalize_primary_table(
     frame = table.copy()
     if "source_row_index" not in frame.columns:
         frame.insert(0, "source_row_index", range(len(frame)))
-    expected = PRIMARY_PROFILE_COUNTS[profile]
+    expected = None
     location = f" in {source}" if source is not None else ""
-    if len(frame) != expected:
-        raise ValueError(
-            f"Profile {profile} requires {expected} configured settings{location}; "
-            f"found {len(frame)} rows."
-        )
 
     # Every configured intervention condition must map to a unique stats path.
     if "stats_dir" in frame.columns:
@@ -110,26 +104,20 @@ def normalize_primary_table(
 
     mask = qwen15_io_nli_mask(frame)
     matches = int(mask.sum())
-    if profile == PROFILE_ICLR_28 and matches != 1:
-        raise ValueError(
-            f"Profile {profile} requires 28 settings including exactly one "
-            f"Qwen2-1.5B I+O NLI row{location}; found {len(frame)} rows and "
-            f"{matches} matching row(s)."
-        )
     normalized = frame.reset_index(drop=True)
     excluded = frame.iloc[0:0].copy()
     audit = {
         "primary_profile": profile,
         "profile_role": (
-            "complete_study_registry"
-            if profile == PROFILE_STUDY_56
-            else "historical_registry" if profile == PROFILE_STUDY_48
+            "current_configured_registry"
+            if profile == PROFILE_CONFIGURED
+            else "historical_registry" if profile in {PROFILE_STUDY_56, PROFILE_STUDY_48}
             else "named_execution_subset"
         ),
         "expected_setting_count": expected,
         "input_setting_count": int(len(frame)),
         "output_setting_count": int(len(normalized)),
-        "qwen2_1_5b_io_nli_expected": profile == PROFILE_ICLR_28,
+        "qwen2_1_5b_io_nli_expected": False,
         "qwen2_1_5b_io_nli_matches_in_input": matches,
         "excluded_setting_count": 0,
         "study_component_counts": (

@@ -13,7 +13,7 @@ It distinguishes:
 
 ## Population
 
-RQ2 starts from the complete 56-setting overtopping manifest and applies two rules.
+RQ2 starts from the complete configured overtopping manifest and applies two rules.
 
 First, replacement regimes are analyzed separately:
 

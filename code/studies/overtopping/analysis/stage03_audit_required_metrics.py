@@ -230,8 +230,8 @@ def main() -> None:
     p.add_argument("--primary-table", required=True)
     p.add_argument("--data-root", required=True)
     p.add_argument(
-        "--primary-profile", default="study-56", choices=PRIMARY_PROFILE_CHOICES,
-        help="Validation profile for the configured study table. Default: study-56.",
+        "--primary-profile", default="configured", choices=PRIMARY_PROFILE_CHOICES,
+        help="Validation profile for the configured study table. Default: configured (dynamic count).",
     )
     p.add_argument("--out-dir", required=True)
     p.add_argument("--require-complete", action="store_true")

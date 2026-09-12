@@ -169,7 +169,7 @@ def dichotomic_search_layer(
 		pbar.close()
 
 # ------------------------- Prompt-level accuracy (generation-based) -----------------------
-def build_prefix_caches_for_examples(model, examples, prompt_col, max_new_tokens, batch_size):
+def build_prefix_caches_for_examples(model, examples, prompt_col, max_new_tokens, batch_size, fwd_hooks=None):
 	n = len(examples)
 	prefix_batches = []
 	batch_ranges = []  # [(start,end), ...]
@@ -183,6 +183,7 @@ def build_prefix_caches_for_examples(model, examples, prompt_col, max_new_tokens
 			batch_prompts,
 			max_new_tokens=max_new_tokens,
 			use_kv_cache=True,
+			fwd_hooks=fwd_hooks,
 		)
 		prefix_batches.append(prefix)
 		batch_ranges.append((start, end))

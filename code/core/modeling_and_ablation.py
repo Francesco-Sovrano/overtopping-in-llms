@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import transformer_lens as lens
 from contextlib import nullcontext
+from contextvars import ContextVar
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, CodeGenTokenizer
 from transformers import (
@@ -49,6 +50,15 @@ INT_MAX = 2_147_483_647  # MPSGraph limit on number of elements
 # Hard cap for elements in the broadcasted (z*w) per chunk.
 # Tune this down if you still see high memory use. 64M is ~256MB at float32, ~128MB at float16.
 CHUNK_ELEMS_MAX = 128 * 1024 * 1024   # 128M
+
+# Hook tensors produced by KV-cached decoding are usually length 1.  Positional
+# replacement tables, however, are indexed in absolute sequence coordinates.
+# _last_logits sets this context for the duration of a forward pass so hook
+# closures can distinguish prompt position 0 from decode position prompt_len+k.
+_HOOK_POSITION_OFFSET: ContextVar[int] = ContextVar("hook_position_offset", default=0)
+
+def _hook_position_offset() -> int:
+	return int(_HOOK_POSITION_OFFSET.get())
 
 def _mps_safe_sumprod(z: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 	"""
@@ -289,20 +299,30 @@ def _resolve_replacement_tables(
 	return cols, repl_global, repl_pos, literal_global, literal_pos
 
 
-def _fit_positional_repl(repl_pos: torch.Tensor, T: int, fallback_row: torch.Tensor) -> torch.Tensor:
-	"""
-	Ensure positional replacement table has exactly T rows.
+def _fit_positional_repl(
+	repl_pos: torch.Tensor, T: int, fallback_row: torch.Tensor, *, start_pos: int = 0
+) -> torch.Tensor:
+	"""Return replacement rows for absolute positions ``start_pos:start_pos+T``.
 
-	If the precomputed positional means are shorter than the current sequence,
-	pad unseen positions with the global mean for the same units.
+	Cached decoding forwards a one-token tensor at each step, so tensor-local row
+	0 is *not* sequence position 0.  Positions beyond the precomputed table use
+	the global replacement for the same units.
 	"""
+	T = int(T)
+	start_pos = int(start_pos)
+	if T < 0 or start_pos < 0:
+		raise ValueError("T and start_pos must be non-negative")
+	if T == 0:
+		return repl_pos[:0]
 	Tp = int(repl_pos.size(0))
-	if Tp >= T:
-		return repl_pos[:T]
-	if Tp == 0:
+	if start_pos >= Tp:
 		return fallback_row.view(1, -1).expand(T, -1)
-	pad = fallback_row.view(1, -1).expand(T - Tp, -1)
-	return torch.cat([repl_pos, pad], dim=0)
+	end = min(Tp, start_pos + T)
+	available = repl_pos[start_pos:end]
+	if int(available.size(0)) == T:
+		return available
+	pad = fallback_row.view(1, -1).expand(T - int(available.size(0)), -1)
+	return torch.cat([available, pad], dim=0)
 
 def _graded_index_replace_(dest, dim: int, indices: torch.Tensor, replacement: torch.Tensor, strength: float):
 	"""Replace selected coordinates by a controlled fraction of the usual intervention.
@@ -467,7 +487,7 @@ def build_ablation_hooks(
 			if last_pos_only:
 				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for, strength=intervention_strength):
 					if mlp_out.ndim == 3:
-						t = mlp_out.size(1) - 1
+						t = _hook_position_offset() + mlp_out.size(1) - 1
 						dest = mlp_out[:, -1]
 						repl_pos = _repl_pos_for(dest.dtype)
 						if t < repl_pos.size(0):
@@ -480,7 +500,7 @@ def build_ablation_hooks(
 				def _hook(mlp_out, hook, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for, strength=intervention_strength):
 					if mlp_out.ndim == 3:
 						B, T, _ = mlp_out.shape
-						repl = _fit_positional_repl(_repl_pos_for(mlp_out.dtype), T, _repl_glob_for(mlp_out.dtype))
+						repl = _fit_positional_repl(_repl_pos_for(mlp_out.dtype), T, _repl_glob_for(mlp_out.dtype), start_pos=_hook_position_offset())
 						r = repl.unsqueeze(0).expand(B, T, -1)
 						_graded_index_replace_(mlp_out, 2, ablate_ids, r, strength)
 					return mlp_out
@@ -600,7 +620,7 @@ def build_ablation_hooks(
 
 			if last_pos_only:
 				def _hook(z, hook, H=H, ablate_ids=ablate_ids, _repl_pos_for=_repl_pos_for, _repl_glob_for=_repl_glob_for, strength=intervention_strength):
-					t = z.size(1) - 1
+					t = _hook_position_offset() + z.size(1) - 1
 					if z.ndim == 4:
 						dest = z[:, -1, H, :]
 					elif z.ndim == 3:
@@ -619,12 +639,12 @@ def build_ablation_hooks(
 					if z.ndim == 4:
 						B, T, _, _ = z.shape
 						dest = z[:, :, H, :]
-						repl = _fit_positional_repl(_repl_pos_for(z.dtype), T, _repl_glob_for(z.dtype))
+						repl = _fit_positional_repl(_repl_pos_for(z.dtype), T, _repl_glob_for(z.dtype), start_pos=_hook_position_offset())
 						r = repl.unsqueeze(0).expand(B, T, -1)
 						_graded_index_replace_(dest, 2, ablate_ids, r, strength)
 					elif z.ndim == 3:
 						B, T, _ = z.shape
-						repl = _fit_positional_repl(_repl_pos_for(z.dtype), T, _repl_glob_for(z.dtype))
+						repl = _fit_positional_repl(_repl_pos_for(z.dtype), T, _repl_glob_for(z.dtype), start_pos=_hook_position_offset())
 						r = repl.unsqueeze(0).expand(B, T, -1)
 						_graded_index_replace_(z, 2, ablate_ids, r, strength)
 					return z
@@ -808,7 +828,7 @@ def build_rowwise_ablation_hooks(
 			if last_pos_only:
 				def _hook(mlp_out, hook, rows=rows, row_ids=row_ids, repl_pos_for=repl_pos_for, repl_global_for=repl_global_for):
 					if mlp_out.ndim == 3:
-						t = mlp_out.size(1) - 1
+						t = _hook_position_offset() + mlp_out.size(1) - 1
 						repl_pos = repl_pos_for(mlp_out.dtype)
 						r = repl_pos[t] if t < repl_pos.size(0) else repl_global_for(mlp_out.dtype)
 						mlp_out[rows, -1, row_ids] = r
@@ -818,7 +838,7 @@ def build_rowwise_ablation_hooks(
 					if mlp_out.ndim == 3:
 						T = mlp_out.size(1)
 						pos = _pos_index(T, mlp_out.device)
-						repl = _fit_positional_repl(repl_pos_for(mlp_out.dtype), T, repl_global_for(mlp_out.dtype))
+						repl = _fit_positional_repl(repl_pos_for(mlp_out.dtype), T, repl_global_for(mlp_out.dtype), start_pos=_hook_position_offset())
 						mlp_out[rows[:, None], pos[None, :], row_ids[:, None]] = repl.transpose(0, 1)
 					return mlp_out
 		else:
@@ -873,7 +893,7 @@ def build_rowwise_ablation_hooks(
 				def _hook(z, hook, rows=rows, row_ids=row_ids, repl_pos_for=repl_pos_for, repl_global_for=repl_global_for):
 					dest = _attn_dest(z)
 					if dest is not None:
-						t = dest.size(1) - 1
+						t = _hook_position_offset() + dest.size(1) - 1
 						repl_pos = repl_pos_for(dest.dtype)
 						r = repl_pos[t] if t < repl_pos.size(0) else repl_global_for(dest.dtype)
 						dest[rows, -1, row_ids] = r
@@ -884,7 +904,7 @@ def build_rowwise_ablation_hooks(
 					if dest is not None:
 						T = dest.size(1)
 						pos = _pos_index(T, dest.device)
-						repl = _fit_positional_repl(repl_pos_for(dest.dtype), T, repl_global_for(dest.dtype))
+						repl = _fit_positional_repl(repl_pos_for(dest.dtype), T, repl_global_for(dest.dtype), start_pos=_hook_position_offset())
 						dest[rows[:, None], pos[None, :], row_ids[:, None]] = repl.transpose(0, 1)
 					return z
 		else:
@@ -1194,7 +1214,7 @@ class LMWrapper:
 					self.tokenizer = BertTokenizer.from_pretrained(resolved_model_name, cache_dir=cache_dir)
 
 			else:
-				raise RuntimeError(f"Missing tokenizer for {resolved_model_name}: {e}")
+				raise RuntimeError(f"No specialized tokenizer configured for {resolved_model_name}")
 		except Exception as e:
 			self.tokenizer = AutoTokenizer.from_pretrained(
 				resolved_model_name,
@@ -1353,7 +1373,7 @@ class LMWrapper:
 		return input_ids, attention_mask, input_lengths
 
 	@torch.inference_mode()
-	def _last_logits(self, tokens, attention_mask=None, past_kv_cache=None, padding_side: str = "right"):
+	def _last_logits(self, tokens, attention_mask=None, past_kv_cache=None, padding_side: str = "right", position_offset: int = 0):
 		cfg = self.hooked_model.cfg
 
 		# Run blocks, but STOP before unembed so we don't allocate [B,T,V]
@@ -1365,7 +1385,11 @@ class LMWrapper:
 			stop_at_layer=cfg.n_layers,      # returns residual [B,T,d_model]
 		)
 
-		residual = self.hooked_model(tokens, **fwd_kwargs)
+		position_token = _HOOK_POSITION_OFFSET.set(int(position_offset))
+		try:
+			residual = self.hooked_model(tokens, **fwd_kwargs)
+		finally:
+			_HOOK_POSITION_OFFSET.reset(position_token)
 
 		# forward() would normally apply ln_final before unembed if normalization exists
 		if getattr(cfg, "normalization_type", None) is not None and hasattr(self.hooked_model, "ln_final"):
@@ -1556,6 +1580,8 @@ class LMWrapper:
 
 			if eos_tensor is not None and finished.all():
 				break
+			if i + 1 >= max_new_tokens:
+				break
 
 			tokens_chunk[:, 0] = next_tokens
 
@@ -1564,6 +1590,7 @@ class LMWrapper:
 				attn_mask_chunk,
 				past_kv_cache=past_kv_cache,
 				padding_side=padding_side,
+				position_offset=cur_len - 1,
 			)
 
 			if cleanup_every and (i + 1) % cleanup_every == 0:

@@ -59,7 +59,7 @@ From the repository root:
 ./run_overtopping_experiments.sh --dry-run
 ```
 
-The registry contains 56 RunSpecs in four disjoint execution sets:
+The registry has no fixed required number of RunSpecs. `--list` prints the current settings and totals. It is organized into four execution sets:
 
 ```text
 mean-donor     20
@@ -98,7 +98,7 @@ python -m studies.overtopping.experiments.storage_contract
 cd ..
 ```
 
-The check validates the 56-setting registry, its phase/replacement counts, and unique Stage-7 paths, while a fixed fingerprint protects the storage-protected scientific configurations and persistent paths.
+The optional check reports the current phase/replacement counts and registry fingerprint and fails only if distinct scientific settings collide in a persistent evaluation path. It does not enforce a setting count.
 
 ## Run overtopping experiments
 
@@ -164,12 +164,12 @@ Direct invocation from `code/`:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-56
+  --primary-profile configured
 ```
 
 The reporting sequence:
 
-1. materializes the complete 56-setting study table;
+1. materializes the current configured study table;
 2. records metric-specific applicability and availability;
 3. computes RQ1 statistics and final-snapshot sensitivity analyses;
 4. computes RQ2 regime-specific composition analyses;
@@ -187,7 +187,7 @@ An explicit aggregate threshold source can be supplied with:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-56 \
+  --primary-profile configured \
   --spiking-source /absolute/path/to/threshold_diagnostics
 ```
 

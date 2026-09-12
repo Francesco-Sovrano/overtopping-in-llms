@@ -19,7 +19,7 @@ import pandas as pd
 from core.project_paths import CODE_ROOT, PROJECT_ROOT
 
 
-from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, PROFILE_STUDY_56
+from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, PROFILE_CONFIGURED
 from reporting.result_paths import (
     analysis_root,
     appendix_figures,
@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-root", default=str(PROJECT_ROOT / "data"), help="Experiment-artifact root. Default: <repo>/data")
     p.add_argument("--results-root", default=str(PROJECT_ROOT / "results"), help="Final-output root. Default: <repo>/results")
     p.add_argument(
-        "--primary-profile", default=PROFILE_STUDY_56, choices=PRIMARY_PROFILE_CHOICES,
-        help="Validation profile for the configured study table. Default: study-56.",
+        "--primary-profile", default=PROFILE_CONFIGURED, choices=PRIMARY_PROFILE_CHOICES,
+        help="Validation profile for the configured study table. Default: configured (dynamic count).",
     )
     p.add_argument(
         "--poisoning-root",
@@ -218,10 +218,35 @@ def relocate_paper_sidecars(results_root: Path) -> None:
         )
 
 
+def publish_manuscript_exact_figure_bundle(results_root: Path) -> dict[str, str]:
+    """Copy canonical generated figures to stable manuscript-facing names.
+
+    The manuscript uses these files directly, so rerunning final results cannot
+    silently drift to a different visual style or a stale hand-composed figure.
+    """
+    dst_root = manuscript_figures(results_root) / "manuscript_exact"
+    dst_root.mkdir(parents=True, exist_ok=True)
+    mapping = {
+        rq1_figures(results_root) / "fig2a_competence_vs_U_0to1.pdf": dst_root / "rq1_competence_reach_0to1.pdf",
+        rq1_figures(results_root) / "fig2b_competence_vs_U_1to0.pdf": dst_root / "rq1_competence_reach_1to0.pdf",
+        rq2_figures(results_root) / "rq2_composition_boxplots.pdf": dst_root / "rq2_composition_boxplots.pdf",
+        rq3_figures(results_root) / "fig4e_population_event_and_strength.pdf": dst_root / "rq3_population_event_and_strength.pdf",
+        rq3_figures(results_root) / "fig4s16_temporal_cross_sweep_event_validation.pdf": dst_root / "rq3_temporal_cross_sweep_validation.pdf",
+        rq4_figures(results_root) / "fig5a_pythia_checkpoint_trajectory.pdf": dst_root / "rq4_pythia_checkpoint_trajectory.pdf",
+        rq4_figures(results_root) / "rq4_grammar_clean_reference_defense.pdf": dst_root / "rq4_grammar_clean_reference_defense.pdf",
+    }
+    copied = {}
+    for src, dst in mapping.items():
+        if src.is_file():
+            shutil.copy2(src, dst)
+            copied[dst.name] = str(src)
+    return copied
+
+
 def poisoning_run_dirs(poisoning_root: Path) -> list[Path]:
     """Return canonical stage-organized poisoning runs only."""
     out: list[Path] = []
-    for task in ("arithmetic", "grammar"):
+    for task in ("grammar",):
         task_root = poisoning_root / task
         if not task_root.is_dir():
             continue
@@ -645,13 +670,20 @@ def print_rq_figure_summary(results_root: Path) -> None:
 
 
 def validate_generated_paper_view(
-    results_root: Path, *, spiking_expected: bool, require_complete_population: bool = True
+    results_root: Path, *, primary_table_path: Path, spiking_expected: bool, require_complete_population: bool = True
 ) -> dict:
     """Validate the manuscript-facing output contract before reporting success."""
     figures = manuscript_figures(results_root)
     tables = manuscript_materials(results_root)
     errors: list[str] = []
     warnings: list[str] = []
+    configured = pd.read_csv(primary_table_path)
+    expected_total = int(len(configured))
+    phase_map = {"I+O": "input+output", "Out": "decode-only"}
+    expected_phase_counts = {
+        plotted: int((configured.get("phase", pd.Series(dtype=str)).astype(str) == source).sum())
+        for source, plotted in phase_map.items()
+    }
 
     required_figures = [
         figures / "02_rq1_prevalence" / "fig2a_competence_vs_U_0to1.pdf",
@@ -707,7 +739,7 @@ def validate_generated_paper_view(
         message = f"missing directional prevalence sidecar: {rq1_data}"
         (errors if require_complete_population else warnings).append(message)
 
-    # RQ1 paper panels use all 56 configured overtopping settings.
+    # RQ1 paper panels use all currently configured overtopping settings.
     # Derived *-heldout_test directories must never be
     # counted as additional experiments, and the fit-stat sidecar must describe
     # exactly the same sample as the plotted-point CSV.
@@ -761,15 +793,12 @@ def validate_generated_paper_view(
                         "experimental settings after collapsing evaluation suffixes"
                     )
 
-                # Figure 2 has an explicit manuscript population: all 56 configured overtopping settings. A manuscript figure
-                # must therefore contain all 56 rows, with the known phase split,
-                # rather than silently accepting whatever a filesystem scan found.
-                expected_total = 48
-                expected_phase_counts = {"input+output": 22, "decode-only": 26}
+                # Figure 2 must match the currently configured primary table.
+                # The population size and phase split are derived, never hard-coded.
                 if len(points) != expected_total:
                     message = (
-                        f"{stem} has {len(points)} settings; expected the complete "
-                        f"{expected_total}-setting RQ1 population"
+                        f"{stem} has {len(points)} settings; current configured primary table has "
+                        f"{expected_total}"
                     )
                     (errors if require_complete_population else warnings).append(message)
                 if "phase" in points.columns:
@@ -777,7 +806,7 @@ def validate_generated_paper_view(
                     for phase, n_expected in expected_phase_counts.items():
                         n_actual = int(actual_phase_counts.get(phase, 0))
                         if n_actual != n_expected:
-                            message = f"{stem} has {n_actual} {phase} settings; expected {n_expected}"
+                            message = f"{stem} has {n_actual} {phase} settings; configured table has {n_expected}"
                             (errors if require_complete_population else warnings).append(message)
             if not stats_path.is_file():
                 message = f"missing all-settings RQ1 fit-stat sidecar: {stats_path}"
@@ -831,17 +860,25 @@ def main() -> None:
     results_root.mkdir(parents=True, exist_ok=True)
 
     catalogue_json = Path(args.catalogue_json).expanduser().resolve() if args.catalogue_json else None
+    catalogue_args = (
+        ["--catalogue-json", str(catalogue_json)]
+        if catalogue_json is not None and catalogue_json.is_file()
+        else []
+    )
 
     # Stage 02 reads completed experiment artifacts and supplies the canonical
     # primary-row manifest. Final-results generation never mutates data/ or runs
     # model-backed experiment stages.
     paper_tables = primary_tables(results_root)
-    run([
+    stage02_command = [
         sys.executable, "-m", "studies.overtopping.analysis.stage02_overtopping_latex_tables",
         "--results", str(data_root),
         "--out", str(paper_tables),
         "--primary-profile", args.primary_profile,
-    ])
+    ]
+    if catalogue_json is not None and catalogue_json.is_file():
+        stage02_command.extend(["--catalogue-json", str(catalogue_json)])
+    run(stage02_command)
 
     publish_primary_tables(paper_tables, manuscript_materials(results_root))
     primary_table_path = snapshot_primary_table(
@@ -945,7 +982,7 @@ def main() -> None:
             "--paper-tables-dir", str(manuscript_materials(results_root)),
         ])
 
-        # RQ1 figures use all 56 configured overtopping settings.
+        # RQ1 figures use all currently configured overtopping settings.
         # Directional source-state
         # denominators describe uncertainty within a setting and are not an
         # across-setting exclusion rule. Genuine empty-candidate settings remain
@@ -973,39 +1010,36 @@ def main() -> None:
                 "--layout", "phase-panels",
                 "--coverage-metric", metric,
                 "--rq1-manuscript-population",
+                *catalogue_args,
                 *(["--allow-incomplete-manuscript-population"] if allow_incomplete_population else []),
                 "--csv-out-dir", str(rq1_data),
                 "--no-paper-figures",
             ], allow_failure=allow_incomplete_population)
 
-        # RQ4 uses a pooled-U(J)/competence checkpoint trajectory plus directional
-        # companions, including genuine zero-candidate checkpoints.
+        # RQ4 has a dedicated stable entry point.  It generates the pooled-U(J)
+        # main figure plus both directional companions from the same discovered
+        # checkpoint population, including zero-candidate checkpoints.
         rq4 = rq4_figures(results_root)
         rq4.mkdir(parents=True, exist_ok=True)
-        trajectory_specs = [
-            ("pooled", "fig5a_pythia_checkpoint_trajectory.pdf"),
-            ("i2c", "fig5s1_pythia_checkpoint_U_0to1.pdf"),
-            ("c2i", "fig5s2_pythia_checkpoint_U_1to0.pdf"),
-        ]
-        for metric, filename in trajectory_specs:
-            if allow_incomplete_population:
-                (rq4 / filename).unlink(missing_ok=True)
-            run([
-                sys.executable, "-m", "studies.overtopping.analysis.stage06_competence_vs_overtopping_figures",
-                "--results-dir", str(data_root),
-                "--only-paper-figures",
-                "--paper-figures", "checkpoint",
-                "--paper-figures-dir", str(rq4),
-                "--paper-checkpoint-phase", "input+output",
-                "--paper-checkpoint-filename", filename,
-                "--coverage-metric", metric,
-                "--no-csv",
-            ], allow_failure=allow_incomplete_population)
+        for filename in (
+            "fig5a_pythia_checkpoint_trajectory.pdf",
+            "fig5s1_pythia_checkpoint_U_0to1.pdf",
+            "fig5s2_pythia_checkpoint_U_1to0.pdf",
+        ):
+            (rq4 / filename).unlink(missing_ok=True)
+        run([
+            sys.executable, "-m", "studies.overtopping.analysis.rq4_pythia_checkpoint_trajectory",
+            "--results-dir", str(data_root),
+            "--out-dir", str(rq4),
+            "--phase", "input+output",
+            "--baseline", "mean-donor",
+            "--no-csv",
+        ])
 
         # Keep pooled-U/phase/size figures as explicit appendix context.  The
         # pooled competence scatter is the pooled-U companion to Figure 2, so it
         # must use exactly the same canonical RQ1 population
-        # (26 input+output + 30 output-only).  Do not let the generic filesystem
+        # (with the phase split derived from the configured registry).  Do not let the generic filesystem
         # scanner admit unrelated result directories and silently change n.
         appendix = appendix_figures(results_root)
         appendix.mkdir(parents=True, exist_ok=True)
@@ -1016,14 +1050,15 @@ def main() -> None:
             "--results-dir", str(data_root),
             "--out", str(appendix / "figS_pooled_U_vs_competence.pdf"),
             "--rq1-manuscript-population",
+            *catalogue_args,
             *(["--allow-incomplete-manuscript-population"] if allow_incomplete_population else []),
             "--paper-figures", "phase", "size",
             "--paper-figures-dir", str(appendix),
         ], allow_failure=allow_incomplete_population)
 
     # RQ2 example-level interaction decomposition uses the exact Stage-7
-    # singleton flip masks and the genuine Stage-8 simultaneous full-set output.
-    # It is model-free at reporting time and leaves the optional preemption assay intact.
+    # singleton flip masks and the Stage-8 simultaneous full-set output.
+    # It is model-free at reporting time and leaves the optional preemption diagnostic intact.
     composition_cmd = [
         sys.executable, "-m", "studies.overtopping.analysis.stage09_composition_decomposition_report",
         "--root", str(data_root),
@@ -1100,7 +1135,7 @@ def main() -> None:
     elif spiking_source is not None:
         # Partial manuscript mode means *report the completed RQ3 subset*, not
         # suppress Figure 4.  Stage 7/8 audit every configured run and exclude
-        # only rows whose required diagnostics are genuinely unfinished.
+        # only rows whose required diagnostics are unfinished.
         cmd = [
             sys.executable, "-m", "studies.overtopping.analysis.stage07_overtopping_spiking_report",
             "--out", str(spiking_out),
@@ -1299,6 +1334,10 @@ def main() -> None:
     # figure/table sidecars are kept under analysis/ with the same relative names.
     relocate_paper_sidecars(results_root)
 
+    manuscript_exact_figures = publish_manuscript_exact_figure_bundle(results_root)
+    if manuscript_exact_figures:
+        print("[final-results] manuscript-exact figures: " + json.dumps(manuscript_exact_figures, sort_keys=True), flush=True)
+
     spiking_available = bool(
         not args.skip_spiking_report
         and any(path.suffix.lower() == ".pdf" for path in rq3_dir.glob("*.pdf"))
@@ -1310,6 +1349,7 @@ def main() -> None:
     )
     validate_generated_paper_view(
         results_root,
+        primary_table_path=primary_table_path,
         spiking_expected=spiking_available,
         require_complete_population=not allow_incomplete_population,
     )

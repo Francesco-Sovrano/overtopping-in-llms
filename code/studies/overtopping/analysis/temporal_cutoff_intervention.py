@@ -12,17 +12,18 @@ this experiment can run either complementary decode-time schedule:
     Keep the first ``K-t`` autoregressive decode transitions clean, then apply
     the full intervention for the final ``t`` transitions.
 
-Here ``t`` is always the *number of intervened decode transitions*. Therefore
-``t=0`` is the clean baseline and ``t=K`` is the full decode-only intervention
-for both schedules. Prompt prefill remains clean.
+Here ``t`` is always the *number of intervened decode transitions*.  In
+``--decode_only`` mode prompt prefill remains clean, so ``t=0`` is the clean
+baseline and ``t=K`` reproduces the full output-only Stage-7 intervention.  In
+standard I+O mode prompt prefill is intervened for every ``t``: ``t=0`` is the
+prompt-only endpoint and ``t=K`` reproduces the full I+O intervention.
 
 Important step semantics
 ------------------------
-The first generated token is selected from clean prompt-prefill logits. Therefore
-``active_decode_steps=1`` intervenes while processing generated token 1 to
-produce token 2; it does not alter token 1 itself. The maximum horizon is
-``MAX_NEW_TOKENS - 1`` and reproduces the existing full decode-only intervention
-for every intervenable decode transition.
+The first generated token is selected from prompt-prefill logits. Those logits
+are clean in decode-only mode and intervened in standard mode.
+``active_decode_steps=1`` controls the transition that processes generated token
+1 to produce token 2. The maximum horizon is ``MAX_NEW_TOKENS - 1``.
 
 Earlier intervention consequences are intentionally allowed to persist in the KV
 cache/model state after the cutoff. The manipulation removes *future direct
@@ -60,8 +61,8 @@ from studies.overtopping.analysis.graded_agonist_intervention import (
 )
 
 LOG_PREFIX = "[temporal-cutoff]"
-PREFIX_SCHEMA = "temporal-cutoff-intervention-v2"
-SUFFIX_SCHEMA = "temporal-suffix-intervention-v1"
+PREFIX_SCHEMA = "temporal-cutoff-intervention-v3"
+SUFFIX_SCHEMA = "temporal-suffix-intervention-v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +80,16 @@ def parse_args() -> argparse.Namespace:
         choices=["zero", "mean", "mean-donor", "mean-positional", "mean-donor-positional"],
         default="mean-donor",
     )
+    phase = p.add_mutually_exclusive_group()
+    phase.add_argument(
+        "--decode_only", dest="decode_only", action="store_true",
+        help="Use output-only semantics: keep prompt prefill clean (historical standalone default).",
+    )
+    phase.add_argument(
+        "--input_output", dest="decode_only", action="store_false",
+        help="Use I+O semantics: intervene during prompt prefill and the selected decode transitions.",
+    )
+    p.set_defaults(decode_only=True)
     p.add_argument("--evaluation_split", choices=["test", "train", "all"], default="test")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--points_to_use_for_mean_ablation", type=int, default=2048)
@@ -141,8 +152,6 @@ def _parse_active_steps(raw: str | None, *, max_steps: int) -> tuple[int, ...]:
 
 
 def _requested_run_config(args: argparse.Namespace, active_steps: tuple[int, ...], *, max_decode_steps: int) -> dict:
-    # IMPORTANT: keep the prefix config byte-for-byte equivalent in content to the
-    # historical v2 config so existing valid prefix manifests remain reusable.
     config = {
         "scientific_target": "temporal cutoff necessity for held-out singleton overtopping support",
         "input_data_dir": str(Path(args.input_data_dir).expanduser().resolve()),
@@ -153,7 +162,9 @@ def _requested_run_config(args: argparse.Namespace, active_steps: tuple[int, ...
         "task_module": str(args.task_module),
         "ai_model": args.ai_model,
         "intervention": str(args.intervention),
-        "decode_only": True,
+        "decode_only": bool(args.decode_only),
+        "phase": "Out" if args.decode_only else "I+O",
+        "prefill_intervened": not bool(args.decode_only),
         "evaluation_split": str(args.evaluation_split),
         "batch_size": int(args.batch_size),
         "points_to_use_for_mean_ablation": int(args.points_to_use_for_mean_ablation),
@@ -229,8 +240,8 @@ def _generate_from_prefix_cache_temporal_cutoff(
     with K intervenable transitions, prefix activates 1..t while suffix activates
     K-t+1..K. Both KV-cached and non-cached paths preserve full autoregressive context.
     In the non-cached fallback the full prefix+generated sequence is recomputed at
-    every step; hooks still alter only the last position because the Stage-7 hook
-    is built with ``last_pos_only=True``.
+    every step. Decode-only hooks alter only the last position; standard I+O mode
+    requires the KV-cached path so intervened prompt state can persist after a cutoff.
     """
     device = model.hooked_model.cfg.device
     padding_side = getattr(prefix, "padding_side", getattr(model.tokenizer, "padding_side", "left"))
@@ -250,7 +261,7 @@ def _generate_from_prefix_cache_temporal_cutoff(
     if use_cache:
         past_kv_cache = clone_kv_cache(prefix.past_kv_cache) if clone_kv_cache_tensors else prefix.past_kv_cache
         if logits_last is None:
-            # Clean prompt recomputation; never apply intervention during prefill.
+            # Rare fallback recomputation; normal prefix construction always stores logits_last.
             logits_last = model._last_logits(
                 all_tokens[:, :prompt_len],
                 base_mask,
@@ -258,7 +269,7 @@ def _generate_from_prefix_cache_temporal_cutoff(
                 padding_side=padding_side,
             )
     elif logits_last is None:
-        # Clean prompt recomputation for the non-cached fallback.
+        # Rare non-cached fallback recomputation.
         logits_last = model._last_logits(
             all_tokens[:, :prompt_len],
             base_mask,
@@ -279,9 +290,9 @@ def _generate_from_prefix_cache_temporal_cutoff(
         device=device,
     )
 
-    # The first token comes from clean prefill logits. After token i is emitted,
-    # transition i+1 computes logits for the next token and is intervened iff
-    # i+1 <= active_decode_steps.
+    # The first token comes from the phase-specific prefill logits (clean for Out,
+    # intervened for I+O). After token i is emitted, transition i+1 follows the
+    # requested decode schedule.
     for emitted_index in range(max_new_tokens):
         next_tokens = torch.argmax(logits_last, dim=-1)
         if eos_tensor is not None:
@@ -313,6 +324,7 @@ def _generate_from_prefix_cache_temporal_cutoff(
                     attn_mask_chunk,
                     past_kv_cache=past_kv_cache,
                     padding_side=padding_side,
+                    position_offset=cur_len - 1,
                 )
             else:
                 # Correct fallback: recompute the *entire* current context rather
@@ -389,33 +401,38 @@ def _evaluate_unit_cutoffs(
     intervention: str,
     mean_activations,
     batch_size: int,
+    decode_only: bool,
 ) -> list[dict]:
     examples = scores_df.iloc[selected_indices].to_dict("records")
     if not examples:
         return []
+    layer_map = {str(layer_label): [int(neuron_id)]}
+    hooks = build_ablation_hooks(
+        layer_map,
+        last_pos_only=bool(decode_only),
+        intervention=intervention,
+        mean_activations=mean_activations,
+        device=model.hooked_model.cfg.device,
+        intervention_strength=1.0,
+    )
     prefix_batches, batch_ranges = build_prefix_caches_for_examples(
         model,
         examples,
         prompt_col,
         max_new_tokens=int(task.MAX_NEW_TOKENS),
         batch_size=int(batch_size),
+        fwd_hooks=None if decode_only else hooks,
     )
+    if not decode_only and any(not prefix.use_kv_cache for prefix in prefix_batches):
+        raise RuntimeError(
+            "Standard I+O temporal intervention requires KV-cache decoding so the intervened "
+            "prompt state persists after decode-time hooks are switched off."
+        )
     baseline_behavior = pd.to_numeric(scores_df.iloc[selected_indices][target_col], errors="raise").to_numpy() > 0.5
     rows: list[dict] = []
-    layer_map = {str(layer_label): [int(neuron_id)]}
     full_horizon = int(max(active_steps)) if active_steps else 0
 
     for active_decode_steps in active_steps:
-        hooks = None
-        if int(active_decode_steps) > 0:
-            hooks = build_ablation_hooks(
-                layer_map,
-                last_pos_only=True,
-                intervention=intervention,
-                mean_activations=mean_activations,
-                device=model.hooked_model.cfg.device,
-                intervention_strength=1.0,
-            )
         _, accuracy, answers = _get_correctness_temporal_cutoff_cached_by_prefix_batches(
             model=model,
             examples=examples,
@@ -439,6 +456,9 @@ def _evaluate_unit_cutoffs(
                 "active_decode_steps": int(active_decode_steps),
                 "full_decode_horizon": int(full_horizon),
                 "temporal_schedule": str(schedule),
+                "decode_only": bool(decode_only),
+                "phase": "Out" if decode_only else "I+O",
+                "prefill_intervened": not bool(decode_only),
                 "active_decode_start_step": (
                     math.nan if int(active_decode_steps) == 0
                     else 1 if str(schedule) == "prefix"
@@ -565,8 +585,8 @@ def main() -> None:
     if not ai_model:
         raise ValueError("Could not resolve model from --ai_model or dataset_info.json")
 
-    # First generated token comes from clean prefill logits, hence there are only
-    # MAX_NEW_TOKENS-1 decode transitions on which the output-only hook can act.
+    # There are MAX_NEW_TOKENS-1 post-prefill transitions on which a temporal
+    # decode schedule can act. Prefill itself is phase-dependent.
     max_decode_steps = max(0, int(task.MAX_NEW_TOKENS) - 1)
     active_steps = _parse_active_steps(args.active_decode_steps, max_steps=max_decode_steps)
 
@@ -718,6 +738,7 @@ def main() -> None:
             intervention=str(args.intervention),
             mean_activations=mean_activations,
             batch_size=int(args.batch_size),
+            decode_only=bool(args.decode_only),
         ))
 
     rows_df = pd.DataFrame(all_rows)
@@ -738,11 +759,13 @@ def main() -> None:
             if str(args.schedule) == "prefix"
             else "temporal suffix sufficiency for held-out singleton overtopping support"
         ),
-        "decode_only": True,
+        "decode_only": bool(args.decode_only),
+        "phase": "Out" if args.decode_only else "I+O",
+        "prefill_intervened": not bool(args.decode_only),
         "temporal_schedule": str(args.schedule),
         "step_semantics": (
-            "t is the number of intervened post-prefill decode transitions; token 1 is selected from clean prefill logits, "
-            "t=0 is clean, and the maximum t reproduces all intervenable decode transitions"
+            "t is the number of intervened post-prefill decode transitions; prompt prefill is clean only in decode-only mode. "
+            "For I+O, t=0 is prompt-only intervention; for Out, t=0 is clean; maximum t reproduces the corresponding full Stage-7 phase."
         ),
         "notes": (
             (

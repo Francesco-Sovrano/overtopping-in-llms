@@ -4,22 +4,14 @@ This package converts persistent overtopping experiment artifacts into setting-l
 
 ## Population model
 
-Every aggregate analysis starts from the configured 56-setting registry:
-
-```text
-31 final-snapshot task × model × phase cells
-18 non-final Grammar/HANS-NLI/FSM Pythia checkpoint settings
- 7 matched replacement-baseline repeats
---------------------------------------------------
-56 configured settings
-```
+Every aggregate analysis starts from the current configured registry. Its population size and phase/replacement counts are derived from the manifest rather than asserted as constants. Use `run_overtopping_experiments.sh --list` to inspect the current population.
 
 The RQ4 checkpoint trajectory view contains 24 Pythia-1B Grammar/HANS-NLI/FSM settings because it
 also includes the six final/all-steps endpoints from the final-snapshot component.
 
 A metric then applies its own scientific applicability and artifact-availability requirements. Missing derived artifacts remain explicit missing measurements for configured settings; they do not change the registry.
 
-RQ1 uses all 56 settings and fits input+output and output-only associations separately. RQ2 analyzes replacement regimes separately. RQ3 starts from all 56 settings and reports metric-specific denominators. RQ4 uses the configured checkpoint trajectories and controlled poisoning trajectories.
+RQ1 uses the configured settings with the required metric and fits input+output and output-only associations separately. RQ2 analyzes replacement regimes separately. RQ3 starts from the configured manifest and reports metric-specific denominators. RQ4 uses the configured checkpoint trajectories and controlled poisoning trajectories.
 
 ## Main analysis modules
 
@@ -27,7 +19,7 @@ RQ1 uses all 56 settings and fits input+output and output-only associations sepa
 
 ```text
 stage01_visualize_experiment_results.py       completed-experiment summaries
-stage02_overtopping_latex_tables.py           configured 56-setting study table
+stage02_overtopping_latex_tables.py           configured study table (dynamic row count)
 stage03_audit_required_metrics.py             per-setting metric completeness audit
 stage04_analyze_primary_metrics.py            setting-level aggregate statistics
 stage05_generate_manuscript_outputs.py        manuscript tables and machine sidecars
@@ -66,7 +58,7 @@ stage11_rq3_temporal_cutoff_story.py          population temporal-cutoff visual 
 stage09_preemption_report.py                  secondary dominant-secondary preemption analysis
 ```
 
-`temporal_cutoff_intervention.py` is an output-only/decode-only causal timing experiment. Prompt prefill remains clean; the full frozen singleton intervention is applied for the first `t` autoregressive decode transitions and then removed for all later transitions. `stage11_rq3_temporal_cutoff_story.py` aggregates those runs at the run/direction level and reports cumulative effect capture, the discrete temporal gain profile, quartiles, condition-bootstrap 95% confidence intervals, T50/T80, a temporal-concentration test against a condition-specific uniform-in-time baseline, and an early-versus-late paired secondary test.
+`temporal_cutoff_intervention.py` supports both intervention phases. In output-only/decode-only runs, prompt prefill remains clean and the frozen singleton intervention begins during autoregressive decoding. In input+output runs, the same singleton intervention is applied during prompt prefill and the temporal schedule controls how long it remains active during decoding. Phase-specific experiment paths keep these outputs separate. `stage11_rq3_temporal_cutoff_story.py` aggregates those runs at the run/direction level and reports cumulative effect capture, the discrete temporal gain profile, quartiles, condition-bootstrap 95% confidence intervals, T50/T80, a temporal-concentration test against a condition-specific uniform-in-time baseline, and an early-versus-late paired secondary test.
 
 Graded and threshold analyses use only settings with their required compatible artifacts and report the resulting denominator. A zero-candidate setting remains a measured RQ1 observation with `U(J)=0`; set composition and candidate-level graded analyses are not applicable when no candidate set exists.
 

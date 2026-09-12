@@ -6,26 +6,11 @@ RQ1 asks whether high-leverage singleton causal effects occur across the configu
 
 ## Population
 
-The main RQ1 analysis uses all 56 configured overtopping settings:
-
-```text
-29 unique final-snapshot task × model × phase cells
-18 non-final Grammar/HANS-NLI/FSM Pythia checkpoint settings
- 7 matched replacement-baseline repeats
---------------------------------------------
-56 settings
-```
-
-The phase totals are:
-
-```text
-26 input+output (I+O)
-30 output-only (Out)
-```
+The main RQ1 analysis uses the current configured overtopping manifest; its total and per-phase counts are derived at runtime. Input+output and output-only settings are analyzed separately, with no fixed total or phase split required.
 
 All configured settings enter because the estimand is the association between behavioral competence and causal reach across the intervention settings actually studied. Intermediate checkpoints are distinct model states, and replacement-baseline repeats are distinct causal counterfactuals. They are not pooled across phase.
 
-A separate final-snapshot sensitivity retains the 29 unique task×model×phase cells, removes intermediate checkpoints, and uses one replacement condition for each repeated cell, preferring mean-donor when both regimes are present. This analysis asks whether the RQ1 association depends on repeated checkpoints or matched replacement-baseline conditions.
+A separate final-snapshot sensitivity removes intermediate checkpoints and uses one replacement condition for each repeated task×model×phase cell, preferring mean-donor when both regimes are present. This analysis asks whether the RQ1 association depends on repeated checkpoints or matched replacement-baseline conditions.
 
 ## Directional causal quantities
 
@@ -104,8 +89,8 @@ These divide discovered-candidate counts by model `d_model`. They are not estima
 
 The main RQ1 outputs include:
 
-- phase-specific Pearson associations across all 56 configured settings;
-- phase-specific Spearman associations across all 56 configured settings;
+- phase-specific Pearson associations across configured settings with the required metric;
+- phase-specific Spearman associations across configured settings with the required metric;
 - the 31-cell final-snapshot sensitivity;
 - task/phase and structural diagnostics where the available setting count permits estimation.
 
@@ -150,4 +135,4 @@ Configured-study tables and cross-setting statistics:
 results/analysis/primary_matrix/
 ```
 
-See [Overtopping experiment design](../experiments/overtopping.md) for the exact 56 settings.
+See [Overtopping experiment design](../experiments/overtopping.md) for the current registry structure.

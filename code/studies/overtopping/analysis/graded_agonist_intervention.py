@@ -512,6 +512,7 @@ def _score_completion_batch_decode_only(model: LMWrapper, prompts: list[str], co
                     attn_chunk,
                     past_kv_cache=cache,
                     padding_side=getattr(prefix, "padding_side", "right"),
+                    position_offset=int(prefix.prompt_len) + int(step),
                 )
         for b, i in enumerate(batch_ids):
             c = int(counts[b].item())
@@ -673,6 +674,7 @@ def _divergence_margin_decode_only(model: LMWrapper, prompts: list[str], specs: 
                     attn_chunk,
                     past_kv_cache=cache,
                     padding_side=getattr(prefix, "padding_side", "right"),
+                    position_offset=int(prefix.prompt_len) + int(step),
                 )
         try:
             model.cleanup_after_generate()

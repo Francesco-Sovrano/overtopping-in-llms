@@ -11,10 +11,10 @@ The current registry is deliberately organized into four execution sets only:
    -> ``EleutherAI/pythia-1b`` (the final/all-steps model). Arithmetic is not
    checkpointed.
 
-The four sets are disjoint at RunSpec level and together contain the same 56
-current RunSpecs used before this cleanup. Reclassification changes only the
-``suite`` metadata; persistent data/cache paths and pipeline commands are
-unchanged, so existing artifacts remain reusable.
+The four sets are disjoint at RunSpec level. Their union is the current
+configured registry; its size is intentionally not fixed. Reclassification
+changes only ``suite`` metadata, while persistent-address collisions are
+rejected by the registry constructor.
 
 Test is the default evaluation split; callers may explicitly select train or
 all.
@@ -31,11 +31,11 @@ from dataclasses import replace
 
 from core.project_paths import CODE_ROOT, PROJECT_ROOT
 
-from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, PROFILE_STUDY_56
+from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, PROFILE_CONFIGURED
 from studies.overtopping.experiments.execution import RunSpec, apply_filters, deduplicate, parse_filter, run_pipeline
 
 
-MANUSCRIPT_PROFILE = PROFILE_STUDY_56
+MANUSCRIPT_PROFILE = PROFILE_CONFIGURED
 
 
 QWEN2_15 = "Qwen/Qwen2-1.5B-Instruct"
@@ -48,15 +48,8 @@ PYTHIA_1B_96K = "EleutherAI/pythia-1b@step96000"
 PYTHIA_69B = "EleutherAI/pythia-6.9b"
 
 
-# Four and only four current execution sets.  Their union is the 56-RunSpec
-# study registry; unlike the old primary/coverage/auxiliary buckets, these sets
-# are pairwise disjoint by exact RunSpec identity.
-CANONICAL_STUDY_SETTING_COUNT = 56
-MEAN_DONOR_SETTING_COUNT = 20
-LARGE_MODEL_SETTING_COUNT = 4
-MEAN_SETTING_COUNT = 8
-CHECKPOINT_SETTING_COUNT = 24
-
+# Four current execution sets. Their union is intentionally dynamic; no code
+# assumes an exact number of experiments.
 
 def _small(
     task: str,
@@ -113,22 +106,8 @@ def _large(
     )
 
 
-def _runspec_key(spec: RunSpec) -> tuple:
-    """Exact RunSpec identity excluding suite metadata.
-
-    This mirrors ``execution.deduplicate`` and is used to prove that registry
-    cleanup does not change the address/scientific identity of an old run.
-    """
-    return (
-        spec.task, spec.model, spec.intervention, spec.mode, spec.z_thresh,
-        spec.batch_size, spec.circuit_level, spec.circuit_size,
-        spec.min_flip_rate, spec.max_circuits, spec.mlp_neurons_only,
-        spec.no_llm_feature_generation, spec.evaluation_split,
-    )
-
-
 def mean_donor_experiments() -> list[RunSpec]:
-    """Return the 20 non-checkpoint small-model mean-donor runs.
+    """Return the configured non-checkpoint small-model mean-donor runs.
 
     Pythia-1B Grammar/HANS-NLI/Random-FSM endpoints are intentionally excluded
     because the all-steps ``EleutherAI/pythia-1b`` model belongs to the
@@ -144,36 +123,46 @@ def mean_donor_experiments() -> list[RunSpec]:
         _small("arithmetic", QWEN25_15, "mean-donor", "standard", z_thresh=10, suite="mean-donor"),
         _small("arithmetic", QWEN25_15, "mean-donor", "decode-only", z_thresh=10, suite="mean-donor"),
 
-        # Jailbreaking.
-        _small("bon_jailbreaking", QWEN2_15, "mean-donor", "decode-only", suite="mean-donor"),
-        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "standard", suite="mean-donor"),
-        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "decode-only", suite="mean-donor"),
-
-        # Grammar acceptability (non-Pythia final models).
+        # Grammar acceptability.
+        _small("grammar_acceptability", PYTHIA_1B, "mean-donor", "standard", suite="mean-donor"),
+        _small("grammar_acceptability", PYTHIA_1B, "mean-donor", "decode-only", suite="mean-donor"),
         _small("grammar_acceptability", QWEN2_15, "mean-donor", "standard", suite="mean-donor"),
         _small("grammar_acceptability", QWEN2_15, "mean-donor", "decode-only", suite="mean-donor"),
         _small("grammar_acceptability", QWEN25_15, "mean-donor", "standard", suite="mean-donor"),
         _small("grammar_acceptability", QWEN25_15, "mean-donor", "decode-only", suite="mean-donor"),
 
-        # HANS NLI (non-Pythia final models).
+        # Random FSM.
+        _small("random_fsm", PYTHIA_1B, "mean-donor", "standard", suite="mean-donor"),
+        _small("random_fsm", PYTHIA_1B, "mean-donor", "decode-only", suite="mean-donor"),
+        _small("random_fsm", QWEN2_15, "mean-donor", "standard", suite="mean-donor"),
+        _small("random_fsm", QWEN2_15, "mean-donor", "decode-only", suite="mean-donor"),
+        _small("random_fsm", QWEN25_15, "mean-donor", "standard", suite="mean-donor"),
+        _small("random_fsm", QWEN25_15, "mean-donor", "decode-only", suite="mean-donor"),
+
+        # HANS NLI.
+        _small("hans_nli", PYTHIA_1B, "mean-donor", "standard", suite="mean-donor"),
+        _small("hans_nli", PYTHIA_1B, "mean-donor", "decode-only", suite="mean-donor"),
         _small("hans_nli", QWEN2_15, "mean-donor", "standard", suite="mean-donor"),
         _small("hans_nli", QWEN2_15, "mean-donor", "decode-only", suite="mean-donor"),
         _small("hans_nli", QWEN25_15, "mean-donor", "standard", suite="mean-donor"),
         _small("hans_nli", QWEN25_15, "mean-donor", "decode-only", suite="mean-donor"),
 
-        # Random FSM (non-Pythia final models; Qwen2.5 Out uses mean below).
-        _small("random_fsm", QWEN2_15, "mean-donor", "standard", suite="mean-donor"),
-        _small("random_fsm", QWEN2_15, "mean-donor", "decode-only", suite="mean-donor"),
-        _small("random_fsm", QWEN25_15, "mean-donor", "standard", suite="mean-donor"),
+        # Jailbreaking.
+        _small("bon_jailbreaking", PYTHIA_1B, "mean-donor", "standard", suite="mean-donor"),
+        _small("bon_jailbreaking", PYTHIA_1B, "mean-donor", "decode-only", suite="mean-donor"),
+        _small("bon_jailbreaking", QWEN2_15, "mean-donor", "standard", suite="mean-donor"),
+        _small("bon_jailbreaking", QWEN2_15, "mean-donor", "decode-only", suite="mean-donor"),
+        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "standard", suite="mean-donor"),
+        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "decode-only", suite="mean-donor"),
     ]
     specs = deduplicate(specs)
     return specs
 
 
 def large_model_experiments() -> list[RunSpec]:
-    """Return the four 6.9B/7B scale runs."""
+    """Return the large 6.9B/7B scale runs."""
     specs = [
-        _large("arithmetic", PYTHIA_69B, "decode-only", z_thresh=5, batch_size=256, max_circuits=5, suite="6-7b-models"),
+        # _large("arithmetic", PYTHIA_69B, "decode-only", z_thresh=5, batch_size=256, max_circuits=5, suite="6-7b-models"),
         _large("arithmetic", QWEN2_7B, "decode-only", z_thresh=10, batch_size=256, max_circuits=5, suite="6-7b-models"),
         _large("bon_jailbreaking", QWEN2_7B, "decode-only", suite="6-7b-models"),
         _large("hans_nli", QWEN2_7B, "standard", suite="6-7b-models"),
@@ -185,8 +174,9 @@ def large_model_experiments() -> list[RunSpec]:
 def mean_experiments() -> list[RunSpec]:
     """Return all eight small-model mean-replacement runs."""
     specs = [
+        _small("arithmetic", QWEN2_15, "mean", "standard", z_thresh=10, suite="mean"),
         _small("arithmetic", QWEN2_15, "mean", "decode-only", z_thresh=10, suite="mean"),
-        _small("arithmetic", PYTHIA_1B, "mean", "decode-only", z_thresh=5, suite="mean"),
+        # _small("arithmetic", PYTHIA_1B, "mean", "decode-only", z_thresh=5, suite="mean"),
         _small("grammar_acceptability", QWEN25_15, "mean", "standard", suite="mean"),
         _small("grammar_acceptability", QWEN25_15, "mean", "decode-only", suite="mean"),
         _small("hans_nli", QWEN25_15, "mean", "standard", suite="mean"),
@@ -199,7 +189,7 @@ def mean_experiments() -> list[RunSpec]:
 
 
 def checkpoint_experiments() -> list[RunSpec]:
-    """Return the 24 Pythia-1B checkpoint runs.
+    """Return the configured Pythia-1B checkpoint runs.
 
     Checkpointing is restricted to Grammar, HANS-NLI, and Random FSM.  For each
     task and phase the trajectory is step0 -> step48k -> step96k -> final/all-
@@ -208,94 +198,12 @@ def checkpoint_experiments() -> list[RunSpec]:
     specs: list[RunSpec] = []
     for task in ("grammar_acceptability", "hans_nli", "random_fsm"):
         for model in (PYTHIA_1B_STEP0, PYTHIA_1B_48K, PYTHIA_1B_96K, PYTHIA_1B):
-            for mode in ("standard", "decode-only"):
-                specs.append(_small(task, model, "mean-donor", mode, suite="checkpoints"))
+            if task in ("grammar_acceptability", "hans_nli"): # these two tasks don't really have much useful at decode-only!
+                mode = "standard"
+            else:
+                mode = "decode-only" # decode-only is the fastest, so it's our default
+            specs.append(_small(task, model, "mean-donor", mode, suite="checkpoints"))
     specs = deduplicate(specs)
-    return specs
-
-
-# ---------------------------------------------------------------------------
-# Legacy-address contracts
-# ---------------------------------------------------------------------------
-# The following private views reproduce the pre-refactor legacy registry exactly.  They are
-# retained only so historical study-48/study-44/study-39 validation profiles and the fixed storage
-# fingerprint can prove that every historical result/cache address remains
-# valid.  Canonical scientific analyses do not construct their populations from
-# these historical execution buckets.
-
-def _legacy_primary_28_experiments() -> list[RunSpec]:
-    specs = [
-        _small("arithmetic", PYTHIA_1B, "mean", "decode-only", z_thresh=5, suite="legacy-paper-primary"),
-        _small("arithmetic", PYTHIA_1B_48K, "mean-donor", "decode-only", z_thresh=5, suite="legacy-paper-primary"),
-        _large("arithmetic", PYTHIA_69B, "decode-only", z_thresh=5, batch_size=256, max_circuits=5, suite="legacy-paper-primary"),
-        _small("arithmetic", QWEN2_15, "mean-donor", "standard", z_thresh=10, suite="legacy-paper-primary"),
-        _small("arithmetic", QWEN2_15, "mean-donor", "decode-only", z_thresh=10, suite="legacy-paper-primary"),
-        _large("arithmetic", QWEN2_7B, "decode-only", z_thresh=10, batch_size=256, max_circuits=5, suite="legacy-paper-primary"),
-        _small("arithmetic", QWEN25_15, "mean-donor", "decode-only", z_thresh=10, suite="legacy-paper-primary"),
-        _small("bon_jailbreaking", QWEN2_15, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _large("bon_jailbreaking", QWEN2_7B, "decode-only", suite="legacy-paper-primary"),
-        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", PYTHIA_1B, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", PYTHIA_1B, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", PYTHIA_1B_48K, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", PYTHIA_1B_48K, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", PYTHIA_1B_96K, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", PYTHIA_1B_96K, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", QWEN25_15, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("grammar_acceptability", QWEN25_15, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("hans_nli", QWEN2_15, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _large("hans_nli", QWEN2_7B, "standard", suite="legacy-paper-primary"),
-        _small("hans_nli", QWEN25_15, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("hans_nli", QWEN25_15, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("random_fsm", PYTHIA_1B, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("random_fsm", PYTHIA_1B, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("random_fsm", PYTHIA_1B_48K, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("random_fsm", PYTHIA_1B_96K, "mean-donor", "decode-only", suite="legacy-paper-primary"),
-        _small("random_fsm", QWEN25_15, "mean-donor", "standard", suite="legacy-paper-primary"),
-        _small("random_fsm", QWEN25_15, "mean", "decode-only", suite="legacy-paper-primary"),
-    ]
-    return deduplicate(specs)
-
-
-def _legacy_auxiliary_11_experiments() -> list[RunSpec]:
-    specs = [
-        _small("arithmetic", QWEN2_15, "mean", "decode-only", z_thresh=10, suite="legacy-paper-auxiliary"),
-        _small("grammar_acceptability", QWEN25_15, "mean", "standard", suite="legacy-paper-auxiliary"),
-        _small("grammar_acceptability", QWEN25_15, "mean", "decode-only", suite="legacy-paper-auxiliary"),
-        _small("hans_nli", QWEN25_15, "mean", "standard", suite="legacy-paper-auxiliary"),
-        _small("hans_nli", QWEN25_15, "mean", "decode-only", suite="legacy-paper-auxiliary"),
-        _small("random_fsm", QWEN25_15, "mean", "standard", suite="legacy-paper-auxiliary"),
-        _small("arithmetic", QWEN25_15, "mean-donor", "standard", z_thresh=10, suite="legacy-paper-auxiliary"),
-        _small("bon_jailbreaking", QWEN25_15, "mean-donor", "standard", suite="legacy-paper-auxiliary"),
-        _small("hans_nli", QWEN2_15, "mean-donor", "decode-only", suite="legacy-paper-auxiliary"),
-        _small("grammar_acceptability", QWEN2_15, "mean-donor", "standard", suite="legacy-paper-auxiliary"),
-        _small("grammar_acceptability", QWEN2_15, "mean-donor", "decode-only", suite="legacy-paper-auxiliary"),
-    ]
-    return deduplicate(specs)
-
-
-def legacy_iclr_28_experiments() -> list[RunSpec]:
-    """Return the historical 28-setting ICLR execution subset."""
-    return _legacy_primary_28_experiments()
-
-
-def legacy_study_39_experiments() -> list[RunSpec]:
-    return deduplicate([*_legacy_primary_28_experiments(), *_legacy_auxiliary_11_experiments()])
-
-
-def legacy_study_48_experiments() -> list[RunSpec]:
-    legacy_coverage = [
-        _small("arithmetic", PYTHIA_1B_96K, "mean-donor", "decode-only", z_thresh=5, suite="legacy-paper-coverage"),
-        _small("random_fsm", PYTHIA_1B_48K, "mean-donor", "decode-only", suite="legacy-paper-coverage"),
-        _small("random_fsm", PYTHIA_1B_96K, "mean-donor", "standard", suite="legacy-paper-coverage"),
-        _small("arithmetic", PYTHIA_1B_48K, "mean-donor", "standard", z_thresh=5, suite="legacy-paper-coverage"),
-        _small("arithmetic", PYTHIA_1B_96K, "mean-donor", "standard", z_thresh=5, suite="legacy-paper-coverage"),
-        _small("random_fsm", QWEN2_15, "mean-donor", "standard", suite="legacy-paper-coverage"),
-        _small("random_fsm", QWEN2_15, "mean-donor", "decode-only", suite="legacy-paper-coverage"),
-        _small("arithmetic", PYTHIA_1B, "mean-donor", "standard", z_thresh=5, suite="legacy-paper-coverage"),
-        _small("arithmetic", PYTHIA_1B, "mean-donor", "decode-only", z_thresh=5, suite="legacy-paper-coverage"),
-    ]
-    specs = deduplicate([*legacy_study_39_experiments(), *legacy_coverage])
     return specs
 
 
@@ -312,36 +220,14 @@ def storage_protected_experiments() -> list[RunSpec]:
 
 
 def paper_study_experiments() -> list[RunSpec]:
-    """Return the current 56-RunSpec registry as four disjoint execution sets."""
+    """Return the current registry, with no fixed population-size invariant."""
     groups = (
         mean_donor_experiments(),
         large_model_experiments(),
         mean_experiments(),
         checkpoint_experiments(),
     )
-    specs = deduplicate(spec for group in groups for spec in group)
-
-    # Persistent-address migration invariant.  The four-set cleanup must not
-    # change any scientific RunSpec from the immediately preceding 56-setting
-    # registry; suite labels are metadata only and do not enter path builders.
-    legacy_specs = legacy_study_48_experiments()
-    legacy_keys = {_runspec_key(spec) for spec in legacy_specs}
-    new_keys = {_runspec_key(spec) for spec in specs}
-    shared = new_keys & legacy_keys
-    added = [spec for spec in specs if _runspec_key(spec) not in legacy_keys]
-    retired = [spec for spec in legacy_specs if _runspec_key(spec) not in new_keys]
-    expected_added = {
-        (task, model, mode)
-        for task, models in {
-            "grammar_acceptability": (PYTHIA_1B_STEP0,),
-            "random_fsm": (PYTHIA_1B_STEP0,),
-            "hans_nli": (PYTHIA_1B_STEP0, PYTHIA_1B_48K, PYTHIA_1B_96K, PYTHIA_1B),
-        }.items()
-        for model in models
-        for mode in ("standard", "decode-only")
-    }
-    actual_added = {(spec.task, spec.model, spec.mode) for spec in added}
-    return specs
+    return deduplicate(spec for group in groups for spec in group)
 
 
 # Public execution interface: exactly four sets.
@@ -399,7 +285,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--primary-profile", choices=PRIMARY_PROFILE_CHOICES, default=MANUSCRIPT_PROFILE,
-        help="Validation profile for the configured study table. Default: study-56.",
+        help="Validation profile for the configured study table. Default: configured (dynamic count).",
     )
     p.add_argument("--list", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -455,9 +341,14 @@ def main() -> None:
                 )
             except subprocess.CalledProcessError as exc:
                 failures.append({"experiment": spec.identity, "returncode": exc.returncode})
+                (analysis_root / "pipeline_failures.json").write_text(
+                    json.dumps(failures, indent=2), encoding="utf-8"
+                )
                 if not args.continue_on_error:
                     raise
-        (analysis_root / "pipeline_failures.json").write_text(json.dumps(failures, indent=2))
+        (analysis_root / "pipeline_failures.json").write_text(
+            json.dumps(failures, indent=2), encoding="utf-8"
+        )
     if args.phase in {"all", "analysis"} and not args.dry_run:
         if args.generate_primary_manuscript:
             final_command = [

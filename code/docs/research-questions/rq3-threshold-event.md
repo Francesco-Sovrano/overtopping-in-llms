@@ -27,12 +27,12 @@ Paper-facing RQ3 evaluation uses the held-out `test` split.
 The exact reporting manifest starts from:
 
 ```text
-56 configured overtopping settings
+the configured overtopping settings
 ```
 
 Each threshold/graded analysis then retains the settings with the exact required
 artifacts and reports that denominator explicitly. Eligibility is determined by
-the 56-setting manifest plus the analysis-specific artifact contract.
+the configured manifest plus the analysis-specific artifact contract.
 
 Candidate identity includes discovery direction:
 
@@ -264,7 +264,7 @@ Only paper-standard 11-dose, endpoint-reproduced trajectories enter the populati
 
 ## Part D — autoregressive temporal cutoff
 
-The temporal-cutoff experiment tests whether the full singleton intervention must remain active throughout generation or whether its held-out effect is captured by a short early decode horizon. It is defined only for output-only / decode-only settings. Prompt prefill remains clean; for cutoff `t`, the full Stage-7 singleton replacement is applied during the first `t` autoregressive decode transitions and removed for every later transition. Earlier intervention effects are allowed to persist through the model state/KV cache; only further direct intervention is stopped.
+The temporal-cutoff experiment tests whether the full singleton intervention must remain active throughout generation or whether its held-out effect is captured by a short early decode horizon. It supports both intervention phases. In output-only/decode-only settings, prompt prefill remains clean. In standard input+output settings, the Stage-7 singleton replacement is also active during prompt prefill. For cutoff `t`, the decode-time intervention is applied during the first `t` autoregressive transitions and removed for every later transition. Earlier intervention effects are allowed to persist through the model state/KV cache; only further direct intervention is stopped.
 
 Per-run implementation and pipeline control:
 
@@ -273,7 +273,7 @@ studies/overtopping/analysis/temporal_cutoff_intervention.py
 RUN_TEMPORAL_CUTOFF_INTERVENTION=true
 ```
 
-The pipeline also runs the complementary suffix-on schedule by default (`RUN_TEMPORAL_SUFFIX_INTERVENTION=true`): for an active-count `t`, the first `K-t` decode transitions are clean and the full Stage-7 singleton intervention is applied only on the final `t` transitions. The suffix sweep is written to the separate `temporal_suffix_intervention/` artifact directory, so existing prefix/cutoff artifacts remain reusable and are never overwritten.
+The pipeline also runs the complementary suffix-on schedule by default (`RUN_TEMPORAL_SUFFIX_INTERVENTION=true`): for an active-count `t`, the first `K-t` decode transitions have no direct decode-time intervention and the full Stage-7 singleton intervention is applied only on the final `t` transitions. Standard input+output runs still retain the intervened prompt prefill; decode-only runs retain clean prefill. Prefix and suffix sweeps are written to separate `temporal_cutoff_intervention/` and `temporal_suffix_intervention/` directories under the phase-specific Stage-7 statistics path, so input+output and output-only artifacts remain separated and existing prefix/cutoff artifacts are never overwritten.
 
 Optional controls include `TEMPORAL_CUTOFF_ACTIVE_STEPS`, `TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION`, `TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT`, `FORCE_TEMPORAL_CUTOFF_INTERVENTION`, and `FORCE_TEMPORAL_SUFFIX_INTERVENTION`. By default every possible intervention-count `t` is evaluated for both prefix and suffix schedules.
 

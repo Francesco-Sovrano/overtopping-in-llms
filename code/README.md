@@ -60,7 +60,7 @@ Direct invocation from `code/`:
 python -m studies.overtopping.experiments.run_experiments --dry-run
 ```
 
-The configured study contains 56 settings. See [`docs/experiments/overtopping.md`](docs/experiments/overtopping.md) for the exact decomposition and cell coverage.
+The configured study has no fixed required setting count. See [`docs/experiments/overtopping.md`](docs/experiments/overtopping.md) for the current registry structure and cell coverage.
 
 ## Reporting
 
@@ -70,7 +70,7 @@ From the repository root:
 ./generate_results.sh
 ```
 
-Reporting is best-effort while experiments are still running: every RQ is attempted from the completed/auditable subset, incomplete configured settings are listed in the corresponding audits, and missing settings do not suppress an otherwise renderable RQ. Verified zero-candidate runs remain explicit zero observations. To require a publication-complete 56-setting population and fail on any missing required metric, run:
+Reporting is best-effort while experiments are still running: every RQ is attempted from the completed/auditable subset, incomplete configured settings are listed in the corresponding audits, and missing settings do not suppress an otherwise renderable RQ. Verified zero-candidate runs remain explicit zero observations. To require complete required metrics for whatever settings are in the configured manifest, run:
 
 ```bash
 ALLOW_INCOMPLETE_METRICS=false ./generate_results.sh
@@ -82,10 +82,10 @@ Direct invocation from `code/`:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-56
+  --primary-profile configured
 ```
 
-The 56-row study table is constructed before metric-specific filtering. A missing derived metric remains a missing value/status for that setting; it does not remove the setting from the configured study manifest.
+The configured study table is constructed before metric-specific filtering. Its row count is derived from the current manifest. A missing derived metric remains a missing value/status for that setting; it does not remove the setting from the configured study manifest.
 
 RQ2 replacement regimes are not pooled. `mean-positional` is grouped with `mean` for the mean-replacement sensitivity, while `mean-donor` is analyzed separately.
 

@@ -27,7 +27,7 @@ RESULTS_ROOT="$PROJECT_ROOT/results"
 POISONING_ROOT="${POISONING_ROOT:-$PROJECT_ROOT/data/poisoning}"
 
 printf 'Generating final paper outputs from: %s\n' "$DATA_ROOT"
-printf 'Configured manuscript study: study-56\n'
+printf 'Configured manuscript study: dynamic registry\n'
 printf 'Writing all final paper outputs under: %s\n' "$RESULTS_ROOT"
 printf 'Reading poisoning runs from: %s\n' "$POISONING_ROOT"
 
@@ -38,7 +38,7 @@ ARGS=(
   --data-root "$DATA_ROOT"
   --results-root "$RESULTS_ROOT"
   --poisoning-root "$POISONING_ROOT"
-  --primary-profile study-56
+  --primary-profile configured
 )
 
 if [[ "$ALLOW_INCOMPLETE_METRICS" != "true" && "$ALLOW_INCOMPLETE_METRICS" != "1" ]]; then
@@ -56,10 +56,10 @@ else
   echo "Requiring CMC and paired conditional-null validation for every applicable setting."
 fi
 
-if [[ -f "$RESULTS_ROOT/configured_experiments.json" ]]; then
-  ARGS+=(--catalogue-json "$RESULTS_ROOT/configured_experiments.json")
-fi
+# Do not silently reuse results/configured_experiments.json here: that file may
+# describe a filtered/partial runner invocation. The default "configured" profile
+# is derived from the current code registry. Callers that intentionally want an
+# exact saved population can pass --catalogue-json explicitly.
 
 cd "$CODE_ROOT"
-python3 -m studies.overtopping.experiments.storage_contract >/dev/null
 python3 -m reporting.generate_final_results "$@" "${ARGS[@]}"

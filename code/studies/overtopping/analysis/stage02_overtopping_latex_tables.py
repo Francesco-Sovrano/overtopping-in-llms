@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the complete configured-study CSV and LaTeX tables.
 
-The default table contains all 56 configured overtopping intervention settings. Metric
+The default table contains the current configured overtopping intervention settings. Metric
 availability is recorded per setting, and metric-specific analyses operate on
 applicable observed values. Reported ratios are never clipped.
 """
@@ -62,13 +62,8 @@ def locate_results_root(path: Path) -> Tuple[Path, Optional[tempfile.TemporaryDi
 
 # The analysis table is generated from the complete configured study registry.
 # Execution-partition membership is not an analysis filter.
-from studies.overtopping.experiments.run_experiments import (
-    legacy_iclr_28_experiments,
-    legacy_study_39_experiments,
-    legacy_study_48_experiments,
-    paper_study_experiments,
-    storage_protected_experiments,
-)
+from studies.overtopping.experiments.execution import load_run_specs_json
+from studies.overtopping.experiments import run_experiments as experiment_registry
 
 TASK_LABELS = {
     "arithmetic": "Arithmetic",
@@ -136,34 +131,89 @@ def _zero_candidate_direction_status(task: str, raw_score: float) -> tuple[float
     return math.nan, "zero_candidates_direction_denominator_unverified", math.nan, "zero_candidates_direction_denominator_unverified"
 
 
-def configured_rows(profile: str = "study-56") -> List[Dict[str, Any]]:
+def configured_rows(
+    profile: str = "configured",
+    *,
+    catalogue_json: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     """Return metadata rows for the selected registry profile."""
     rows: List[Dict[str, Any]] = []
-    specs = (
-        paper_study_experiments() if profile == "study-56"
-        else legacy_study_48_experiments() if profile == "study-48"
-        else storage_protected_experiments() if profile == "study-44"
-        else legacy_study_39_experiments() if profile == "study-39"
-        else legacy_iclr_28_experiments()
-    )
+
+    if profile == "configured" and catalogue_json is not None:
+        specs = load_run_specs_json(catalogue_json)
+
+    elif profile in {"configured", "study-56"}:
+        specs = experiment_registry.paper_study_experiments()
+
+    else:
+        historical_registry_names = {
+            "study-48": "legacy_study_48_experiments",
+            "study-44": "storage_protected_experiments",
+            "study-39": "legacy_study_39_experiments",
+            "iclr-28": "legacy_iclr_28_experiments",
+        }
+
+        function_name = historical_registry_names[profile]
+        registry_function = getattr(
+            experiment_registry,
+            function_name,
+            None,
+        )
+
+        if registry_function is None:
+            raise RuntimeError(
+                f"Primary profile {profile!r} requires "
+                f"{function_name}(), but that historical registry helper "
+                "is not available in run_experiments.py. "
+                "Use --primary-profile configured or restore the "
+                "historical registry helper."
+            )
+
+        try:
+            specs = registry_function()
+        except NameError as exc:
+            raise RuntimeError(
+                f"Primary profile {profile!r} cannot be constructed "
+                f"because its historical registry is incomplete: {exc}"
+            ) from exc
+
     final_cell_counts: Dict[tuple[str, str, str], int] = {}
+
     for spec in specs:
         if "@step" not in spec.model:
             cell = (spec.task, spec.model, spec.mode)
-            final_cell_counts[cell] = final_cell_counts.get(cell, 0) + 1
+            final_cell_counts[cell] = (
+                final_cell_counts.get(cell, 0) + 1
+            )
 
     for spec in specs:
-        key = (spec.task, spec.model, spec.mode, spec.intervention)
-        if profile == "study-56" and spec.suite in {"mean-donor", "6-7b-models", "mean", "checkpoints"}:
+        key = (
+            spec.task,
+            spec.model,
+            spec.mode,
+            spec.intervention,
+        )
+
+        if (
+            profile in {"configured", "study-56"}
+            and spec.suite
+            in {"mean-donor", "6-7b-models", "mean", "checkpoints"}
+        ):
             component = spec.suite
         else:
             is_checkpoint = "@step" in spec.model
-            final_cell = (spec.task, spec.model, spec.mode)
+            final_cell = (
+                spec.task,
+                spec.model,
+                spec.mode,
+            )
             is_matched_baseline_repeat = (
                 not is_checkpoint
                 and final_cell_counts.get(final_cell, 0) > 1
-                and spec.intervention in {"mean", "mean-positional"}
+                and spec.intervention
+                in {"mean", "mean-positional"}
             )
+
             component = (
                 "intermediate_checkpoint"
                 if is_checkpoint
@@ -171,6 +221,7 @@ def configured_rows(profile: str = "study-56") -> List[Dict[str, Any]]:
                 if is_matched_baseline_repeat
                 else "final_snapshot"
             )
+
         rows.append({
             "task": TASK_LABELS.get(spec.task, spec.task),
             "task_dir": spec.task,
@@ -246,7 +297,7 @@ def sort_table1_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
-def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "study-56") -> Tuple[List[Dict[str, Any]], List[str]]:
+def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "configured", catalogue_json: Optional[Path] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Materialize the configured study table with metric-specific availability.
 
     Missing derived artifacts no longer remove a configured setting from the
@@ -255,7 +306,7 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "stud
     """
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
-    for spec in configured_rows(profile):
+    for spec in configured_rows(profile, catalogue_json=catalogue_json):
         model_root = root / spec["task_dir"] / Path(spec["model_id"])
         expected_stats_dir = root / Path(spec["stats_rel"])
         stats_dir, stats_resolution = resolve_available_stats_dir(expected_stats_dir)
@@ -588,8 +639,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--primary-profile",
         choices=PRIMARY_PROFILE_CHOICES,
-        default="study-56",
-        help="Validation profile for the configured study table. Default: study-56.",
+        default="configured",
+        help="Validation profile for the configured study table. Default: configured (dynamic count).",
+    )
+    ap.add_argument(
+        "--catalogue-json",
+        default=None,
+        help="Optional configured_experiments.json; with profile=configured this is the exact analysis population.",
     )
     ap.add_argument(
         "--suppress-directional-warnings",
@@ -602,8 +658,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     out = Path(args.out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     try:
+        catalogue_json = Path(args.catalogue_json).expanduser().resolve() if args.catalogue_json else None
         rows, warnings = compute_rows(
-            root, empirical_fsm_chance=args.empirical_fsm_chance, profile=args.primary_profile
+            root, empirical_fsm_chance=args.empirical_fsm_chance, profile=args.primary_profile,
+            catalogue_json=catalogue_json,
         )
         normalized_df, excluded_df, profile_audit = normalize_primary_table(
             pd.DataFrame(rows), profile=args.primary_profile, source=Path(args.results)

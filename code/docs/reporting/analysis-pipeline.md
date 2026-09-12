@@ -14,7 +14,7 @@ Direct invocation from `code/`:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-56
+  --primary-profile configured
 ```
 
 Reporting uses measured model-backed causal outputs. Metric applicability and artifact availability are recorded separately; strict builds fail when an applicable required measurement is unavailable.
@@ -23,8 +23,8 @@ Reporting uses measured model-backed causal outputs. Metric applicability and ar
 
 | Analysis | Population |
 |---|---|
-| Configured study table | all 56 overtopping settings; metric availability is recorded per setting |
-| RQ1 Figure 2 | all 56 configured settings, fit separately by intervention phase |
+| Configured study table | every setting in the current manifest; metric availability is recorded per setting |
+| RQ1 Figure 2 | configured settings with the required metric, fit separately by intervention phase |
 | RQ2 composition and singleton-versus-joint decomposition | all evaluable settings within replacement regime; mean-donor main, mean/mean-positional separate |
 | RQ3 threshold-event reporting | every configured setting with compatible threshold-event inputs |
 | RQ3 graded support-specific report | every configured setting with compatible graded outputs |
@@ -51,7 +51,7 @@ When a runner manifest is supplied, this optional descriptive stage summarizes t
 studies.overtopping.analysis.stage02_overtopping_latex_tables
 ```
 
-Builds the complete 56-row configured study table and materializes pooled, directional, concentration, redundancy, joint-effect, and matched-null fields when available. Missing derived metrics remain explicit missing values/statuses; they do not remove settings from the manifest.
+Builds the configured study table using the manifest-derived row count and materializes pooled, directional, concentration, redundancy, joint-effect, and matched-null fields when available. Missing derived metrics remain explicit missing values/statuses; they do not remove settings from the manifest.
 
 Representative directional fields:
 
@@ -103,7 +103,7 @@ These modules generate:
 - RQ2 composition, matched-set, and singleton-versus-joint decomposition figures;
 - Pythia checkpoint trajectories used by RQ4.
 
-RQ1 Figure 2 resolves the exact 56-setting registry and validates the expected 26 input+output / 30 decode-only phase split.
+RQ1 Figure 2 resolves the current configured manifest and derives its input+output / output-only phase counts dynamically.
 
 ## RQ3 reporting
 
@@ -117,7 +117,7 @@ The reporting driver accepts an explicit source:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-56 \
+  --primary-profile configured \
   --spiking-source /path/to/threshold_diagnostics
 ```
 
@@ -324,7 +324,7 @@ Population and output audits are written under:
 results/analysis/reproducibility/
 ```
 
-The final reporting driver validates the `study-56` configured-study profile and required manuscript outputs before completing a standard build.
+The final reporting driver uses the `configured` profile and validates required manuscript outputs against the current manifest before completing a standard build.
 
 ## Reporting controls
 
@@ -345,4 +345,4 @@ Direct reporting options include:
 --skip-cmc-requirement
 ```
 
-Repository wrappers can expose additional environment-level convenience controls. The standard manuscript build validates the complete `study-56` registry and records metric-specific completeness across those settings. Verified Stage-6 empty candidate sets are counted as completed zero-candidate observations rather than incomplete experiments. The resolver accepts the current Stage-6 bag layout and the two alternate export layouts (`bag_of_rules/<bag>` and `neural_circuits/<bag>`). The metric audit prints verified zero-candidate settings separately from genuinely incomplete settings.
+Repository wrappers can expose additional environment-level convenience controls. The standard manuscript build uses the current configured registry and records metric-specific completeness across those settings. Verified Stage-6 empty candidate sets are counted as completed zero-candidate observations rather than incomplete experiments. The resolver accepts the current Stage-6 bag layout and the two alternate export layouts (`bag_of_rules/<bag>` and `neural_circuits/<bag>`). The metric audit prints verified zero-candidate settings separately from genuinely incomplete settings.
