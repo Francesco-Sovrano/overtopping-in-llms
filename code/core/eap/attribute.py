@@ -8,7 +8,7 @@ from transformer_lens import HookedTransformer
 
 from tqdm import tqdm
 
-from .utils import tokenize_plus, tokenize_pairs_same_width, make_hooks_and_matrices, compute_mean_activations, model_device_expr, infer_decode_pos_mask, apply_decode_mask_inplace
+from .utils import tokenize_plus, tokenize_pairs_same_width, make_hooks_and_matrices, compute_mean_activations, align_mean_activations_to_positions, model_device_expr, prepare_decode_pos_mask, apply_decode_mask_inplace
 from .evaluate import evaluate_graph, evaluate_baseline, backprop_no_param_grads
 from .graph import Graph
 
@@ -74,22 +74,17 @@ def get_scores_eap(model: HookedTransformer, graph: Graph, dataloader:DataLoader
 		batch_size = len(clean)
 		(clean_tokens, attention_mask_clean, input_lengths_clean, corrupted_tokens, attention_mask_corrupted, input_lengths_corrupted, _) = tokenize_pairs_same_width(model, clean, corrupted)
 
-		# [decode-only] infer decode/answer positions (mask over token positions)
-		decode_pos_mask = None
-		if decode_only:
-			decode_pos_mask = infer_decode_pos_mask(
-				attention_mask_clean, input_lengths_clean, label, mode=decode_mode
+		decode_pos_mask = (
+			prepare_decode_pos_mask(
+				attention_mask_clean,
+				input_lengths_clean,
+				label,
+				decode_mode,
+				log=not quiet and total_items == 0,
 			)
-			# treat an empty span as inference failure (otherwise we'd zero all attributions)
-			if decode_pos_mask is not None and decode_pos_mask.sum().item() == 0:
-				decode_pos_mask = None
-			assert decode_pos_mask is not None
-			if not quiet and total_items == 0:
-				print("decode_pos_mask.sum()", int(decode_pos_mask.sum().item()))
-				print("first true positions", decode_pos_mask.nonzero()[:10])
-				print("answer_len", label["answer_len"] if isinstance(label, dict) and "answer_len" in label else None)
-				print("prompt_len", label["prompt_len"] if isinstance(label, dict) and "prompt_len" in label else None)
-				print("full_len", label["full_len"] if isinstance(label, dict) and "full_len" in label else None)
+			if decode_only
+			else None
+		)
 		n_pos = attention_mask_clean.size(1)
 		total_items += batch_size
 
@@ -102,7 +97,7 @@ def get_scores_eap(model: HookedTransformer, graph: Graph, dataloader:DataLoader
 					_ = model(corrupted_tokens, attention_mask=attention_mask_corrupted)
 
 			elif "mean" in intervention:
-				activation_difference.add_(means)
+				activation_difference.add_(align_mean_activations_to_positions(means, activation_difference.size(1)))
 
 			# For some metrics (e.g. accuracy or KL), we need the clean logits
 			clean_logits = model(clean_tokens, attention_mask=attention_mask_clean)
@@ -156,22 +151,17 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 		batch_size = len(clean)
 		(clean_tokens, attention_mask_clean, input_lengths_clean, corrupted_tokens, attention_mask_corrupted, input_lengths_corrupted, _) = tokenize_pairs_same_width(model, clean, corrupted)
 		
-		# [decode-only] infer decode/answer positions (mask over token positions)
-		decode_pos_mask = None
-		if decode_only:
-			decode_pos_mask = infer_decode_pos_mask(
-				attention_mask_clean, input_lengths_clean, label, mode=decode_mode
+		decode_pos_mask = (
+			prepare_decode_pos_mask(
+				attention_mask_clean,
+				input_lengths_clean,
+				label,
+				decode_mode,
+				log=not quiet and total_items == 0,
 			)
-			# treat an empty span as inference failure (otherwise we'd zero all attributions)
-			if decode_pos_mask is not None and decode_pos_mask.sum().item() == 0:
-				decode_pos_mask = None
-			assert decode_pos_mask is not None
-			if not quiet and total_items == 0:
-				print("decode_pos_mask.sum()", int(decode_pos_mask.sum().item()))
-				print("first true positions", decode_pos_mask.nonzero()[:10])
-				print("answer_len", label["answer_len"] if isinstance(label, dict) and "answer_len" in label else None)
-				print("prompt_len", label["prompt_len"] if isinstance(label, dict) and "prompt_len" in label else None)
-				print("full_len", label["full_len"] if isinstance(label, dict) and "full_len" in label else None)
+			if decode_only
+			else None
+		)
 		n_pos = attention_mask_clean.size(1)
 		total_items += batch_size
 		
@@ -268,22 +258,17 @@ def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader
 		batch_size = len(clean)
 		(clean_tokens, attention_mask_clean, input_lengths_clean, corrupted_tokens, attention_mask_corrupted, input_lengths_corrupted, _) = tokenize_pairs_same_width(model, clean, corrupted)
 
-		# [decode-only] infer decode/answer positions (mask over token positions)
-		decode_pos_mask = None
-		if decode_only:
-			decode_pos_mask = infer_decode_pos_mask(
-				attention_mask_clean, input_lengths_clean, label, mode=decode_mode
+		decode_pos_mask = (
+			prepare_decode_pos_mask(
+				attention_mask_clean,
+				input_lengths_clean,
+				label,
+				decode_mode,
+				log=not quiet and total_items == 0,
 			)
-			# treat an empty span as inference failure (otherwise we'd zero all attributions)
-			if decode_pos_mask is not None and decode_pos_mask.sum().item() == 0:
-				decode_pos_mask = None
-			assert decode_pos_mask is not None
-			if not quiet and total_items == 0:
-				print("decode_pos_mask.sum()", int(decode_pos_mask.sum().item()))
-				print("first true positions", decode_pos_mask.nonzero()[:10])
-				print("answer_len", label["answer_len"] if isinstance(label, dict) and "answer_len" in label else None)
-				print("prompt_len", label["prompt_len"] if isinstance(label, dict) and "prompt_len" in label else None)
-				print("full_len", label["full_len"] if isinstance(label, dict) and "full_len" in label else None)
+			if decode_only
+			else None
+		)
 		n_pos_clean = attention_mask_clean.size(1)
 		n_pos_corrupted = attention_mask_corrupted.size(1)
 		total_items += batch_size
@@ -299,7 +284,7 @@ def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader
 			elif intervention == "zero":
 				pass
 			elif "mean" in intervention:
-				activation_difference.add_(means)
+				activation_difference.add_(align_mean_activations_to_positions(means, activation_difference.size(1)))
 			else:
 				raise ValueError(f"Unknown intervention: {intervention}")
 
@@ -380,22 +365,17 @@ def get_scores_clean_corrupted(model: HookedTransformer, graph: Graph, dataloade
 		batch_size = len(clean)
 		(clean_tokens, attention_mask_clean, input_lengths_clean, corrupted_tokens, attention_mask_corrupted, input_lengths_corrupted, _) = tokenize_pairs_same_width(model, clean, corrupted)
 
-		# [decode-only] infer decode/answer positions (mask over token positions)
-		decode_pos_mask = None
-		if decode_only:
-			decode_pos_mask = infer_decode_pos_mask(
-				attention_mask_clean, input_lengths_clean, label, mode=decode_mode
+		decode_pos_mask = (
+			prepare_decode_pos_mask(
+				attention_mask_clean,
+				input_lengths_clean,
+				label,
+				decode_mode,
+				log=not quiet and total_items == 0,
 			)
-			# treat an empty span as inference failure (otherwise we'd zero all attributions)
-			if decode_pos_mask is not None and decode_pos_mask.sum().item() == 0:
-				decode_pos_mask = None
-			assert decode_pos_mask is not None
-			if not quiet and total_items == 0:
-				print("decode_pos_mask.sum()", int(decode_pos_mask.sum().item()))
-				print("first true positions", decode_pos_mask.nonzero()[:10])
-				print("answer_len", label["answer_len"] if isinstance(label, dict) and "answer_len" in label else None)
-				print("prompt_len", label["prompt_len"] if isinstance(label, dict) and "prompt_len" in label else None)
-				print("full_len", label["full_len"] if isinstance(label, dict) and "full_len" in label else None)
+			if decode_only
+			else None
+		)
 		n_pos = attention_mask_clean.size(1)
 		total_items += batch_size
 
@@ -467,7 +447,7 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
 				output_activations[:, :, index] = acts
 			except RuntimeError as e:
 				print(hook.name, output_activations[:, :, index].size(), output_activations.size())
-				raise e
+				raise
 
 		# compute the score directly, without saving the input activations
 		def input_hook(prev_index, bwd_index, input_lengths, activations, hook):
@@ -501,9 +481,13 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
 				importance = importance.squeeze(1)
 				scores[:prev_index, bwd_index] += importance
 
-			except RuntimeError as e:
-				print(hook.name, unsqueezed_output_activations[:, :, prev_index].size(), acts.size())
-				raise e
+			except RuntimeError:
+				print(
+					hook.name,
+					"output_activations_shape=", tuple(output_activations.shape),
+					"acts_shape=", tuple(acts.shape),
+				)
+				raise
 			
 		hooks = []
 		node = graph.nodes['input']
@@ -583,8 +567,9 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
 										   intervention_dataloader=intervention_dataloader, quiet=quiet,
 											decode_only=decode_only, decode_mode=decode_mode, disable_kv_cache=disable_kv_cache)
 	elif method == 'information-flow-routes':
-		scores = get_scores_information_flow_routes(model, graph, dataloader, quiet=quiet,
-								decode_only=decode_only, decode_mode=decode_mode)
+		if decode_only:
+			raise ValueError("decode_only is not supported for information-flow-routes")
+		scores = get_scores_information_flow_routes(model, graph, dataloader, quiet=quiet)
 	elif method == 'exact':
 		scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader, 
 								  quiet=quiet)

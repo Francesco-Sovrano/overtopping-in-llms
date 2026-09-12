@@ -40,7 +40,7 @@ The pipeline writes persistent experiment artifacts under `data/` and uses compa
 
 Study-specific ownership for:
 
-- the 48-setting overtopping registry;
+- the 56-setting overtopping registry;
 - RQ1 prevalence and competence analyses;
 - RQ2 composition analyses;
 - RQ3 threshold-event and graded-intervention analyses;
@@ -118,7 +118,7 @@ results/
 
 `RunSpec` in `studies/overtopping/experiments/execution.py` owns the scientific fields used to address model-backed artifacts. Persistent addressing depends on task, model snapshot, intervention, phase, circuit settings, discovery threshold, evaluation split, and related execution parameters.
 
-The 48-setting registry uses the same path constructors as individual experiment execution:
+The 56-setting registry uses the same path constructors as individual experiment execution:
 
 ```text
 RunSpec.circuit_label()
@@ -128,7 +128,7 @@ RunSpec.input_data_dir(data_root)
 RunSpec.stats_dir(data_root)
 ```
 
-The storage contract validates the full 48-setting registry and path uniqueness, while a fixed fingerprint protects the storage-protected scientific configurations, resolved input/statistics paths, and pipeline command arguments:
+The storage contract validates the full 56-setting registry and path uniqueness, while a fixed fingerprint protects the storage-protected scientific configurations, resolved input/statistics paths, and pipeline command arguments:
 
 ```bash
 cd code
@@ -146,11 +146,11 @@ The check is read-only and does not inspect or modify cache contents.
 Population membership is defined before aggregation:
 
 - `RunSpec` defines each overtopping intervention setting.
-- The complete overtopping registry contains 48 settings.
+- The complete overtopping registry contains 56 settings.
 - Stage 7 defines the held-out row universe used for singleton causal evaluation within each setting.
-- RQ1 uses all 48 settings and fits input+output and output-only phases separately.
+- RQ1 uses all 56 settings and fits input+output and output-only phases separately.
 - RQ2 starts from all configured settings, separates replacement regimes, and retains settings for which joint composition is applicable and available.
-- RQ3 starts from all 48 settings and reports metric-specific availability after applying the required artifact contract.
+- RQ3 starts from all 56 settings and reports metric-specific availability after applying the required artifact contract.
 - RQ4 uses configured checkpoint trajectories.
 - Poisoning uses a separate experiment and data namespace.
 

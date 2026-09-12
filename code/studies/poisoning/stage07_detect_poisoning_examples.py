@@ -1828,9 +1828,10 @@ def coordinate_to_parameter_row(model: Any, layer_label: str, neuron_id: int) ->
     n_heads = int(getattr(cfg, "num_attention_heads"))
     n_kv_heads = int(getattr(cfg, "num_key_value_heads", n_heads) or n_heads)
     hidden = int(getattr(cfg, "hidden_size"))
-    head_dim = int(getattr(cfg, "head_dim", hidden // n_heads) or (hidden // n_heads))
     if n_heads <= 0 or n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
         raise RuntimeError(f"Unsupported grouped-query attention: heads={n_heads} kv_heads={n_kv_heads}")
+    configured_head_dim = getattr(cfg, "head_dim", None)
+    head_dim = int(configured_head_dim or (hidden // n_heads))
     if not (0 <= head < n_heads) or not (0 <= int(neuron_id) < head_dim):
         raise IndexError(f"Invalid attention coordinate {layer_label}:{neuron_id}")
     query_heads_per_kv = n_heads // n_kv_heads
@@ -2001,7 +2002,7 @@ def _map_channels_and_interval_updates(
             info["matched_random_update_norm_abs_difference"] = float(info["matched_control_update_norm_abs_differences"][0])
     if total_weight <= 0:
         total_weight = 1.0
-    for group in grouped.values():
+    for key, group in grouped.items():
         for info in group["rows"].values():
             info["row_disruption_weight"] = float(info["row_disruption_weight_raw"]) / total_weight
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Validate configured overtopping study tables used by analysis code.
 
-The default ``study-48`` profile validates the complete 48-setting registry.
-Named profiles are validation contracts; metric coverage is determined after
-manifest construction from applicability and artifact availability.
+The default ``study-56`` profile validates the current 56-setting registry.
+``study-48`` preserves the historical 48-setting registry for reproducibility
+only. Named profiles are validation contracts; metric
+coverage is determined after manifest construction from applicability and
+artifact availability.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -17,12 +19,13 @@ from typing import Optional
 import pandas as pd
 
 
+PROFILE_STUDY_56 = "study-56"
 PROFILE_STUDY_48 = "study-48"
 PROFILE_STUDY_44 = "study-44"
 PROFILE_STUDY_39 = "study-39"
 PROFILE_ICLR_28 = "iclr-28"
-PRIMARY_PROFILE_CHOICES = (PROFILE_STUDY_48, PROFILE_STUDY_44, PROFILE_STUDY_39, PROFILE_ICLR_28)
-PRIMARY_PROFILE_COUNTS = {PROFILE_STUDY_48: 48, PROFILE_STUDY_44: 44, PROFILE_STUDY_39: 39, PROFILE_ICLR_28: 28}
+PRIMARY_PROFILE_CHOICES = (PROFILE_STUDY_56, PROFILE_STUDY_48, PROFILE_STUDY_44, PROFILE_STUDY_39, PROFILE_ICLR_28)
+PRIMARY_PROFILE_COUNTS = {PROFILE_STUDY_56: 56, PROFILE_STUDY_48: 48, PROFILE_STUDY_44: 44, PROFILE_STUDY_39: 39, PROFILE_ICLR_28: 28}
 
 
 @dataclass(frozen=True)
@@ -119,7 +122,8 @@ def normalize_primary_table(
         "primary_profile": profile,
         "profile_role": (
             "complete_study_registry"
-            if profile == PROFILE_STUDY_48
+            if profile == PROFILE_STUDY_56
+            else "historical_registry" if profile == PROFILE_STUDY_48
             else "named_execution_subset"
         ),
         "expected_setting_count": expected,

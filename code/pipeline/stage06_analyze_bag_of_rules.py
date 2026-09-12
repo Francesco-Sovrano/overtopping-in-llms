@@ -503,6 +503,14 @@ def _cached_rule_detail_is_reusable(cached: dict, info: dict, args) -> bool:
 	except Exception:
 		cached_cid = cached.get("circuit_id")
 
+	current_stage5_schema = info.get("stage5_pair_collation_schema")
+	if current_stage5_schema and cached.get("source_stage5_pair_collation_schema") != current_stage5_schema:
+		print(
+			f"[Resume] invalidating cached Stage-6 circuit {rid}: Stage-5 source was recomputed "
+			f"with {current_stage5_schema}. Existing Stage-6 output is left on disk and will be overwritten in place."
+		)
+		return False
+
 	return (
 		cached_cid == rid
 		and cached.get("circuit_label") == rule
@@ -2499,6 +2507,7 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 		)
 		rule_detail = {
 			"circuit_id": int(rid),
+			"source_stage5_pair_collation_schema": info.get("stage5_pair_collation_schema"),
 			"circuit_label": rule,
 			"analysis_mode": analysis_mode,
 			"cluster_index": (int(cluster_index) if analysis_mode == "spectral_cluster" and cluster_index is not None else (int(rid) if analysis_mode == "spectral_cluster" else None)),
@@ -2660,6 +2669,7 @@ for info in tqdm(circuits_to_process, desc="Per-circuit ablation"):
 	# Common per-rule detail structure
 	rule_detail = {
 		"circuit_id": int(rid),
+		"source_stage5_pair_collation_schema": info.get("stage5_pair_collation_schema"),
 		"circuit_label": rule,
 		"analysis_mode": analysis_mode,
 		"cluster_index": (int(cluster_index) if analysis_mode == "spectral_cluster" and cluster_index is not None else (int(rid) if analysis_mode == "spectral_cluster" else None)),

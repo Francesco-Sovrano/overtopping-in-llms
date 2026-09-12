@@ -30,6 +30,7 @@ export API_RECOVERY_PASSES=3
 # export POISONING_FAST_TEST=1
 
 export RUN_GRADED_AGONIST_INTERVENTION=false
+export RUN_TEMPORAL_CUTOFF_INTERVENTION=false
 export RUN_THRESHOLD_EVENT_POSTHOC=false
 export RUN_PREEMPTION=false
 export RUN_INTERACTION_VALIDATION=false
@@ -52,7 +53,7 @@ export POISON_RATE_BASIS=eligible_gold_non_target
 export CONTROL_MARKER=" "
 export TRIGGER_MARKER="[id=74291]"
 export SHAM_MARKER="  "
-# export SEEDS=13
+# export SEEDS=37,101
 export POISONING_TASKS="grammar"
 # export POISONING_TASKS="arithmetic"
 
@@ -86,50 +87,103 @@ fi
 usage() {
   cat <<'TXT'
 Usage:
-  ./run_poisoning_experiments.sh [--dry-run]
+  ./run_poisoning_experiments.sh [--dry-run] [--skip-circuit-discovery] [--full-ablation-if-no-circuit]
   ./run_poisoning_experiments.sh --help
 
-Configured defaults (each can be overridden through the environment):
+The launcher defines the confirmatory study values near the top of this file.
+Those explicit exports take precedence over same-named values in the invoking
+environment. The shipped study definition uses:
 
-  POISONING_TASKS=arithmetic
+  POISONING_TASKS=grammar
   MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
-  GRAMMAR_MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
-  ARITHMETIC_MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
-  SEEDS=13,37,101
-  POISONING_RUN_NAME=confirmatory
-  POISONING_FAST_TEST=0          # set to 1 for a quick behavior-only smoke test
-  PIPELINE_BATCH_SIZE=32         # full-run generation/evaluation default; smoke mode defaults to 4
-  NORMAL_TASK_SCAN_MAX_ROWS=10000 # independent normal-task behavior sample cap; 0 = exhaustive
-  RUN_TRIGGER_LIFT_CHA=0         # keep trigger-lift behavior; skip trigger-lift CHA/circuit discovery
-  POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=observed_training_mixture_correctness  # or attack_cohort_control_correctness / both
-  ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS=all  # e.g. 0,10,25,100 for faster attack-cohort CHA
-  CONTROL_MARKER=' '            # one space by default
-  TRIGGER_MARKER='[id=74291]'
-  SHAM_MARKER='  '               # two spaces by default
-  SHAM_MAX_ROWS=512
+  POISONING_HOLDOUT_SEED=13 unless explicitly supplied before launch
   POISON_RATE=0.1
   POISON_RATE_BASIS=eligible_gold_non_target
+  CONTROL_MARKER=' '
+  TRIGGER_MARKER='[id=74291]'
+  SHAM_MARKER='  '
+  RUN_TRIGGER_LIFT_CHA=0
+  RUN_INTERACTION_VALIDATION=false
+
+Environment-overridable execution controls include:
+
+  SEEDS=13,37,101
+  POISONING_RUN_NAME=confirmatory
+  POISONING_FAST_TEST=0
+  PIPELINE_BATCH_SIZE=32
+  NORMAL_TASK_SCAN_MAX_ROWS=10000
+  SHAM_MAX_ROWS=512
   POISON_TRAINING_MODE=paired_counterfactual
   POISON_SCHEDULE_MODE=uniform_optimizer_steps
   POISONING_CACHE_ROOT=cache/poisoning
+  POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=observed_training_mixture_correctness
+  ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS=all
   DETECTION_MAX_CHANNELS=32
   DETECTION_REQUIRED_TAU=0.3
   DETECTION_MIN_ABS_DELTA_U=0.02
   DETECTION_CLEAN_NULL_RUN_DIRS=
   DETECTION_MIN_CLEAN_NULL_Z=
-  DETECTION_MAX_EXPOSURES_PER_INTERVAL=0   # 0 scores every exposure
-  RUN_OVERTOPPING_INTERPRETATION=1         # generate clear post-hoc overtopping/poisoning figures
+  DETECTION_MAX_EXPOSURES_PER_INTERVAL=0
+  RUN_OVERTOPPING_INTERPRETATION=1
 
-MODEL_NAMES applies the same model list to every enabled task. Set MODEL_NAMES= to use the task-specific model variables instead. Both tasks use one matched marker protocol: every prompt starts with the configured raw marker line, and matched conditions differ only in that first line. Marker strings are configurable and may be IDs, text, empty, or whitespace-only. The sham marker is evaluated on a small cohort without a separate CHA run.
+Circuit-discovery execution controls:
+
+  --skip-circuit-discovery
+      Do not run EAP circuit discovery for poisoning causal analyses. Use the
+      full model-neuron candidate space directly for Stage-6 ablation search.
+      Equivalent to POISONING_SKIP_CIRCUIT_DISCOVERY=1.
+
+  --full-ablation-if-no-circuit
+      Run normal circuit discovery first. If Stage 5 completes with no usable
+      circuit, rerun that causal endpoint using the explicit full-network
+      candidate space. Equivalent to POISONING_FULL_ABLATION_IF_NO_CIRCUIT=1.
+
+These two options are mutually exclusive. With both options disabled, ordinary
+circuit discovery is performed/reused; a prior full-ablation run is kept in a
+separate namespace and cannot satisfy the discovered-circuit cache.
+
+The full-network path is explicit and stored under a separate *_full_ablation
+namespace; it is not written into or substituted for the discovered-circuit cache.
+
+Set POISONING_FAST_TEST=1 for the reduced behavior-focused smoke path. See
+code/docs/experiments/poisoning/configuration.md for the complete configuration
+contract and which values are study-defining versus runtime-tunable.
 TXT
 }
 
 DRY_RUN=0
-case "${1:-}" in
-  --dry-run) DRY_RUN=1; shift ;;
-  --help|-h) usage; exit 0 ;;
-esac
-if [[ $# -ne 0 ]]; then usage >&2; exit 2; fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --skip-circuit-discovery)
+      export POISONING_SKIP_CIRCUIT_DISCOVERY=1
+      shift
+      ;;
+    --full-ablation-if-no-circuit)
+      export POISONING_FULL_ABLATION_IF_NO_CIRCUIT=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "${POISONING_SKIP_CIRCUIT_DISCOVERY:-0}" =~ ^(1|true|TRUE|True|yes|YES|Yes|on|ON|On)$ ]] && \
+   [[ "${POISONING_FULL_ABLATION_IF_NO_CIRCUIT:-0}" =~ ^(1|true|TRUE|True|yes|YES|Yes|on|ON|On)$ ]]; then
+  echo "ERROR: --skip-circuit-discovery and --full-ablation-if-no-circuit are mutually exclusive." >&2
+  echo "       Choose direct full-network ablation or discovery-then-fallback, not both." >&2
+  exit 2
+fi
 
 BASE_RUN_NAME="${POISONING_RUN_NAME:-confirmatory}"
 POISONING_TASKS="${POISONING_TASKS:-arithmetic,grammar}"

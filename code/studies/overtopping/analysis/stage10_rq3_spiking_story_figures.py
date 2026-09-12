@@ -91,12 +91,6 @@ def _save(fig, path: Path) -> None:
     plt.close(fig)
 
 
-def _required_csv(path: Path) -> pd.DataFrame:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    return pd.read_csv(path, low_memory=False)
-
-
 def _optional_csv(path: Path) -> pd.DataFrame | None:
     """Read a story input when available without turning a partial build fatal."""
     if not path.is_file():
@@ -722,7 +716,7 @@ def _plot_main_pair(
     strength_stats: dict,
     path: Path,
 ) -> None:
-    """Paper-facing Fig. 4e: raw localization, local enrichment, and strength sharpening."""
+    """Analysis diagnostic triptych: raw localization, local enrichment, and strength sharpening."""
     if profile.empty or local_profile.empty or strength.empty:
         path.unlink(missing_ok=True)
         return
@@ -938,7 +932,9 @@ def main() -> None:
 
     if paper is not None:
         paper.mkdir(parents=True, exist_ok=True)
-        _plot_main_pair(profile, event_stats, local_profile, local_stats, strength, strength_stats, paper / "fig4e_population_event_and_strength.pdf")
+        # Figure 4e is assembled by stage11 after the temporal-cutoff capture
+        # profile is available: (a) event localization, (b) strength
+        # sharpening, (c) temporal-cutoff capture.
         _plot_event_profile(profile, event_stats, paper / "fig4s10_population_event_localization.pdf")
         _plot_strength_pairs(pairs, margin_joined, strength_stats, paper / "fig4s11_strength_concentration_paired.pdf")
         _plot_arithmetic_competence(arithmetic, arithmetic_stats, paper / "fig4s12_arithmetic_competence_concentration.pdf")

@@ -4,19 +4,22 @@ This package converts persistent overtopping experiment artifacts into setting-l
 
 ## Population model
 
-Every aggregate analysis starts from the configured 48-setting registry:
+Every aggregate analysis starts from the configured 56-setting registry:
 
 ```text
-29 final-snapshot task × model × phase cells
-12 intermediate Pythia checkpoint settings
+31 final-snapshot task × model × phase cells
+18 non-final Grammar/HANS-NLI/FSM Pythia checkpoint settings
  7 matched replacement-baseline repeats
---------------------------------------------
-48 configured settings
+--------------------------------------------------
+56 configured settings
 ```
+
+The RQ4 checkpoint trajectory view contains 24 Pythia-1B Grammar/HANS-NLI/FSM settings because it
+also includes the six final/all-steps endpoints from the final-snapshot component.
 
 A metric then applies its own scientific applicability and artifact-availability requirements. Missing derived artifacts remain explicit missing measurements for configured settings; they do not change the registry.
 
-RQ1 uses all 48 settings and fits input+output and output-only associations separately. RQ2 analyzes replacement regimes separately. RQ3 starts from all 48 settings and reports metric-specific denominators. RQ4 uses the configured checkpoint trajectories and controlled poisoning trajectories.
+RQ1 uses all 56 settings and fits input+output and output-only associations separately. RQ2 analyzes replacement regimes separately. RQ3 starts from all 56 settings and reports metric-specific denominators. RQ4 uses the configured checkpoint trajectories and controlled poisoning trajectories.
 
 ## Main analysis modules
 
@@ -24,7 +27,7 @@ RQ1 uses all 48 settings and fits input+output and output-only associations sepa
 
 ```text
 stage01_visualize_experiment_results.py       completed-experiment summaries
-stage02_overtopping_latex_tables.py           configured 48-setting study table
+stage02_overtopping_latex_tables.py           configured 56-setting study table
 stage03_audit_required_metrics.py             per-setting metric completeness audit
 stage04_analyze_primary_metrics.py            setting-level aggregate statistics
 stage05_generate_manuscript_outputs.py        manuscript tables and machine sidecars
@@ -56,9 +59,14 @@ threshold_event_diagnostics.py                per-run threshold-event diagnostic
 stage07_overtopping_spiking_report.py         aggregate candidate/control support statistics
 stage08_threshold_shape_validation.py         nested held-out threshold-shape validation
 graded_agonist_intervention.py                per-run graded causal intervention
+temporal_cutoff_intervention.py               per-run autoregressive intervention-cutoff sweep
 stage08_graded_agonist_report.py              cross-run graded aggregation
+stage10_rq3_spiking_story_figures.py          population event-localization / strength visual story
+stage11_rq3_temporal_cutoff_story.py          population temporal-cutoff visual story
 stage09_preemption_report.py                  secondary dominant-secondary preemption analysis
 ```
+
+`temporal_cutoff_intervention.py` is an output-only/decode-only causal timing experiment. Prompt prefill remains clean; the full frozen singleton intervention is applied for the first `t` autoregressive decode transitions and then removed for all later transitions. `stage11_rq3_temporal_cutoff_story.py` aggregates those runs at the run/direction level and reports cumulative effect capture, the discrete temporal gain profile, quartiles, condition-bootstrap 95% confidence intervals, T50/T80, a temporal-concentration test against a condition-specific uniform-in-time baseline, and an early-versus-late paired secondary test.
 
 Graded and threshold analyses use only settings with their required compatible artifacts and report the resulting denominator. A zero-candidate setting remains a measured RQ1 observation with `U(J)=0`; set composition and candidate-level graded analyses are not applicable when no candidate set exists.
 
@@ -99,9 +107,9 @@ The standard reporting driver reads scientific inputs under `data/` and writes d
 
 ### Population spiking-story figures
 
-`stage10_rq3_spiking_story_figures.py` runs after the graded-agonist aggregate. It uses only paper-standard 11-dose, endpoint-reproduced divergence-margin trajectories for continuous-margin panels and writes:
+`stage10_rq3_spiking_story_figures.py` runs after the graded-agonist aggregate and prepares the population event-localization and causal-strength inputs. `stage11_rq3_temporal_cutoff_story.py` then assembles the paper-facing Figure 4e after the temporal-cutoff capture profile is available. The continuous-margin panels use only paper-standard 11-dose, endpoint-reproduced divergence-margin trajectories:
 
-- `fig4e_population_event_and_strength.pdf`: compact main-text pair, consisting of population event localization and transition concentration across within-run/direction causal-strength tertiles;
+- `fig4e_population_event_and_strength.pdf`: main-text triptych: (a) population event localization, (b) transition concentration across within-run/direction causal-strength tertiles, and (c) the temporal-cutoff capture profile also shown standalone as Fig. S15;
 - `fig4s10_population_event_localization.pdf`: standalone event-localization profile with condition-level interquartile ranges;
 - `fig4s11_strength_concentration_paired.pdf`: paired low/high-strength concentration within eligible run/direction groups;
 - `fig4s12_arithmetic_competence_concentration.pdf`: Arithmetic output-only 1-to-0 competence/concentration relation;

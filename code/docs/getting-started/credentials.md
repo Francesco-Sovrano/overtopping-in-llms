@@ -71,23 +71,13 @@ when the `ollama` executable is available. Additional local models must be insta
 
 ## Hugging Face access
 
-The top-level experiment/reporting launchers default to:
+The launchers do not force Hugging Face offline mode. Model loading therefore follows the Hugging Face environment in the invoking shell. For reproducible offline execution after the required model files are present locally, set:
 
 ```bash
-HF_HUB_OFFLINE=1
+HF_HUB_OFFLINE=1 ./run_overtopping_experiments.sh
 ```
 
-This assumes required model files are locally available. To fetch model files intentionally:
-
-```bash
-set -a
-. ./.secrets.env
-set +a
-
-HF_HUB_OFFLINE=0 <command-that-loads-the-model>
-```
-
-After the model is available locally, use offline mode for experiment execution.
+To allow downloads for a command that needs to fetch model files, leave `HF_HUB_OFFLINE` unset or set it to `0` and provide `HF_TOKEN` when the repository is private or gated.
 
 `HF_MODEL_CACHE_DIR` can point model loading at a specific local Hugging Face cache when supported by the invoking stage.
 

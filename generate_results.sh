@@ -27,7 +27,7 @@ RESULTS_ROOT="$PROJECT_ROOT/results"
 POISONING_ROOT="${POISONING_ROOT:-$PROJECT_ROOT/data/poisoning}"
 
 printf 'Generating final paper outputs from: %s\n' "$DATA_ROOT"
-printf 'Configured manuscript study: study-48\n'
+printf 'Configured manuscript study: study-56\n'
 printf 'Writing all final paper outputs under: %s\n' "$RESULTS_ROOT"
 printf 'Reading poisoning runs from: %s\n' "$POISONING_ROOT"
 
@@ -38,7 +38,7 @@ ARGS=(
   --data-root "$DATA_ROOT"
   --results-root "$RESULTS_ROOT"
   --poisoning-root "$POISONING_ROOT"
-  --primary-profile study-48
+  --primary-profile study-56
 )
 
 if [[ "$ALLOW_INCOMPLETE_METRICS" != "true" && "$ALLOW_INCOMPLETE_METRICS" != "1" ]]; then

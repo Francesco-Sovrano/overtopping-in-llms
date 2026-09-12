@@ -21,7 +21,7 @@ import gc
 from core.eap.graph import Graph
 from core.eap.attribute import attribute  # for edges
 from core.eap.attribute_node import attribute_node  # for neurons/nodes
-from core.eap.data import PairItem, PairDataset
+from core.eap.data import PairItem, PairDataset, collate_pair_batch
 from core.eap.metrics import compute_faithfulness_F, m_kl_span
 
 # ---------------------- Local model loader ----------------------
@@ -92,6 +92,15 @@ def parse_args():
 		),
 	)
 	p.add_argument("--mlp_neurons_only", action="store_true")
+	p.add_argument(
+		"--full_network_circuit",
+		action="store_true",
+		help=(
+			"Explicitly skip EAP attribution and expose the full model neuron space as one "
+			"Stage-6 candidate circuit. This is an opt-in brute-force/full-ablation mode, "
+			"not an automatic failure fallback. Currently supported with --cluster_by_spectral."
+		),
+	)
 
 	# Model
 	p.add_argument(
@@ -254,6 +263,10 @@ def parse_args():
 	return p.parse_args()
 
 args = parse_args()
+if args.full_network_circuit and not args.cluster_by_spectral:
+	raise SystemExit("--full_network_circuit currently requires --cluster_by_spectral")
+if args.full_network_circuit and args.circuit_level != "neuron":
+	raise SystemExit("--full_network_circuit currently requires --circuit_level neuron")
 
 #############################################################################
 
@@ -298,6 +311,18 @@ def cache_state(output_dir):
 	- "missing": nothing usable on disk
 	"""
 	if (output_dir / "eval.json").exists() and (output_dir / "scores.json").exists():
+		# Historical Stage-5 failures were persisted as a synthetic full-network
+		# circuit.  Never reuse those artifacts: they are failure markers, not
+		# valid circuit-discovery results, and can make Stage 6 explode in cost.
+		try:
+			meta = json.loads((output_dir / "scores.json").read_text())
+			if bool(meta.get("fallback_full_network")):
+				print(f"[Cache] ignoring legacy full-network fallback at {output_dir}; recomputing Stage 5")
+				return "missing"
+		except Exception:
+			# Let the normal cached-loader path report malformed files if they are
+			# otherwise selected as cache hits.
+			pass
 		return "ok"
 	if (output_dir / "skipped.json").exists():
 		return "skipped"
@@ -498,55 +523,6 @@ def _serialize_full_network_metadata(graph, *, level: str, absolute: bool = True
 		meta["empty_reason"] = "no scored neurons"
 	return meta
 
-def _make_full_network_result(*, graph, output_dir, loader, sampling_strategy, pair_meta, extra_results, debug_label, reason):
-	graph.reset(empty=False)
-	if graph.nodes_scores is not None:
-		graph.nodes_scores[:] = 1.0
-	if graph.neurons_scores is not None:
-		graph.neurons_scores[:] = 1.0
-	graph.scores = graph.real_edge_mask.to(dtype=torch.float32)
-
-
-	meta = _serialize_full_network_metadata(
-		graph,
-		level=args.circuit_level,
-		absolute=args.absolute_value_attributions,
-		include_special=False,
-	)
-	meta["fallback_full_network"] = True
-	meta["fallback_reason"] = reason
-	
-	if debug_label:
-		print(f"[Fallback] Returning full network for {debug_label}: {reason}")
-	else:
-		print(f"[Fallback] Returning full network: {reason}")
-
-	scores_csv = output_dir / "scores.json"
-	with open(scores_csv, "w") as f:
-		json.dump(meta, f, indent=4)
-
-	faithfulness_dict = _make_placeholder_faithfulness(graph, reason=reason)
-
-	(output_dir / "eval.json").write_text(json.dumps(faithfulness_dict, indent=4))
-
-	results_dict = {
-		"status": "full_network_fallback",
-		"n_pairs": len(loader.dataset),
-		"scores_csv": str(scores_csv),
-		"eval_json": str(output_dir / "eval.json"),
-		"metadata_topn": meta,
-		"sampling_strategy": sampling_strategy,
-		"pairing_meta": pair_meta,
-		"fallback_full_network": True,
-		"fallback_reason": reason,
-	}
-	if extra_results:
-		results_dict.update(extra_results)
-	results_dict.update(faithfulness_dict)
-	return results_dict
-
-
-
 def _run_circuit_discovery_from_pairs(
 	*,
 	pairs,
@@ -598,6 +574,7 @@ def _run_circuit_discovery_from_pairs(
 		prefetch_factor=2 if is_cuda else None,
 		persistent_workers=is_cuda,
 		drop_last=False,
+		collate_fn=collate_pair_batch,
 	)
 
 	metric_kl = partial(m_kl_span, temporal_agg=args.temporal_agg)
@@ -636,16 +613,21 @@ def _run_circuit_discovery_from_pairs(
 			)
 	except Exception as exc:
 		reason = f"EAP failed: {type(exc).__name__}: {exc}"
-		return _make_full_network_result(
-			graph=graph,
-			output_dir=output_dir,
-			loader=loader,
-			sampling_strategy=sampling_strategy,
-			pair_meta=pair_meta,
-			extra_results=extra_results,
-			debug_label=debug_label,
-			reason=reason,
-		)
+		# Do not silently turn an attribution failure into a full-network circuit.
+		# That fallback is both scientifically invalid and computationally
+		# dangerous for Stage 6.  Persist a diagnostic marker, then stop the
+		# pipeline so the failed setting remains explicitly incomplete.
+		failure = {
+			"status": "eap_failed",
+			"reason": reason,
+			"debug_label": debug_label,
+			"n_pairs": int(len(dataset)),
+		}
+		(output_dir / "failed.json").write_text(json.dumps(failure, indent=4))
+		raise RuntimeError(
+			f"{reason}. Refusing the historical full-network fallback; "
+			"Stage 6 will not run on a synthetic full-network circuit."
+		) from exc
 
 	# 1) Which forward rows have any signal?
 	if level == "edge":
@@ -720,6 +702,7 @@ def _run_circuit_discovery_from_pairs(
 	# Final results dict
 	results_dict = {
 		"status": "ok",
+		"eap_pair_collation_schema": "padded-target-v1",
 		"n_pairs": len(dataset),
 		"scores_csv": str(scores_csv),
 		"eval_json": str(output_dir / "eval.json"),
@@ -782,7 +765,7 @@ def discover_for_rule(
 		plan_key = (target_name, circuit_id)
 		plan_entry = sampling_plan_index.get(plan_key)
 		if plan_entry is None or plan_entry.get("status") != "ok":
-			print(f"[Sampling] No usable plan entry for {key}; falling back to random.")
+			print(f"[Sampling] No usable plan entry for {plan_key}; falling back to random.")
 			sampling_strategy = "random"
 
 	if rule_row["component_type"] == "linear":
@@ -864,7 +847,7 @@ def discover_for_rule(
 			n_neg=0,
 			overwrite=True,
 		)
-		return {"status": "skipped", "n_pos": len(positives), "n_neg": len(negatives)}
+		return {"status": "skipped", "n_pos": len(pos_idx), "n_neg": len(neg_idx)}
 
 	# Run the shared pipeline
 	return _run_circuit_discovery_from_pairs(
@@ -1159,6 +1142,10 @@ clusters_root = None
 if args.cluster_by_spectral:
 	base_name, pos_indices, full_indices, k = select_cluster_base_subset()
 	clusters_root = output_data_dir / f"spectral_clusters_{base_name}"
+	if args.full_network_circuit:
+		# Full-network mode is one candidate space, not one duplicate copy per
+		# spectral cluster. Stage 6 will create the associated/unrelated split.
+		k = 1
 	cluster_ctx = {
 		"base_name": base_name,
 		"pos_indices": pos_indices,
@@ -1173,7 +1160,10 @@ if args.cluster_by_spectral:
 				"cluster_index": int(cluster_index),
 				"output_dir": out_dir,
 				"circuit_id": int(cluster_index),
-				"circuit_label": f"spectral_cluster_{cluster_index}",
+				"circuit_label": (
+					"full_network_ablation_candidate_space" if args.full_network_circuit
+					else f"spectral_cluster_{cluster_index}"
+				),
 				"coefficient_sign": None,
 				"sampling_strategy": "spectral_clusters",
 			}
@@ -1221,8 +1211,6 @@ for job in jobs:
 	out_dir = job["output_dir"]
 	if job.get("is_linear", False) and cache_state(out_dir) == "missing":
 		# Make linear components resumable without loading the LLM
-		n_pos = None
-		n_neg = None
 		mask = apply_rule_to_features(str(job["row"]["rule"]), scores_df, direction=job["row"].get("coefficient_sign"))
 		mask_vals = mask.values if hasattr(mask, "values") else mask
 		n_pos = int(np.sum(mask_vals))
@@ -1282,6 +1270,78 @@ unhooked_model = getattr(wrapper, "model", None)
 model = getattr(wrapper, "hooked_model", None)
 tokenizer = getattr(wrapper, "tokenizer", None)
 
+if args.full_network_circuit:
+	# Explicit full-network candidate-space mode.  No EAP/IG attribution is run.
+	# The output namespace is separated by run_pipeline.sh so these artifacts can
+	# never masquerade as discovered circuits.
+	if len(jobs) != 1:
+		raise RuntimeError(f"full-network mode expected exactly one job, found {len(jobs)}")
+	job = jobs[0]
+	out_dir = job["output_dir"]
+	ensure_dir(out_dir)
+	cached = load_from_cache_if_available(
+		out_dir,
+		sampling_strategy=job.get("sampling_strategy"),
+		default_skip_reason="explicit full-network ablation candidate space",
+	)
+	if cached is not None:
+		meta_cached = cached.get("metadata_topn") or {}
+		if not bool(meta_cached.get("explicit_full_network_ablation")):
+			raise RuntimeError(
+				f"Refusing to reuse non-full-ablation Stage-5 cache in explicit full-network namespace: {out_dir}"
+			)
+		write_outputs([finalize_job_result(job, cached)])
+		raise SystemExit(0)
+
+	graph = Graph.from_model(model, neuron_level=True, node_scores=False)
+	graph.reset(empty=False)
+	if graph.nodes_scores is not None:
+		graph.nodes_scores[:] = 1.0
+	if graph.neurons_scores is None:
+		raise RuntimeError("Graph did not expose neuron scores for explicit full-network ablation mode")
+	graph.neurons_scores[:] = 1.0
+	graph.scores = graph.real_edge_mask.to(dtype=torch.float32)
+	if args.mlp_neurons_only:
+		graph.zero_out_attention_neuron_scores()
+	meta = _serialize_full_network_metadata(
+		graph, level="neuron", absolute=args.absolute_value_attributions, include_special=False
+	)
+	meta["explicit_full_network_ablation"] = True
+	meta["circuit_discovery_skipped"] = True
+	meta["candidate_space_semantics"] = "all_model_neurons_for_stage6_ablation_search"
+	meta["fallback_full_network"] = False
+	scores_json = out_dir / "scores.json"
+	scores_json.write_text(json.dumps(meta, indent=4), encoding="utf-8")
+	eval_payload = _make_placeholder_faithfulness(
+		graph, reason="explicit_full_network_ablation_no_eap_attribution"
+	)
+	# This is an intentional execution mode, not the historical failed-EAP
+	# fallback. Keep that distinction machine-readable in both artifacts.
+	eval_payload["fallback_eval"] = False
+	eval_payload.pop("fallback_reason", None)
+	eval_payload["evaluation_skipped"] = True
+	eval_payload["evaluation_skip_reason"] = "explicit_full_network_ablation_no_eap_attribution"
+	eval_payload["explicit_full_network_ablation"] = True
+	(out_dir / "eval.json").write_text(json.dumps(eval_payload, indent=4), encoding="utf-8")
+	result = {
+		"status": "ok",
+		"n_pairs": 0,
+		"scores_csv": str(scores_json),
+		"eval_json": str(out_dir / "eval.json"),
+		"metadata_topn": meta,
+		"sampling_strategy": job.get("sampling_strategy"),
+		"pairing_meta": None,
+		"explicit_full_network_ablation": True,
+	}
+	write_outputs([finalize_job_result(job, result)])
+	print(
+		f"[FullAblation] EAP skipped; exposed {meta.get('selected_n', 0)} neuron units "
+		f"as the Stage-6 candidate space in {out_dir}."
+	)
+	del graph
+	gc.collect()
+	raise SystemExit(0)
+
 texts = scores_df[text_col].astype(str).to_numpy()
 
 # Optional: load sampling plan if requested
@@ -1331,7 +1391,7 @@ def _job_needs_pair_embeddings(job):
 	return pos_idx.size != neg_idx.size
 
 
-needs_pair_embeddings = any(_job_needs_pair_embeddings(job) for job in jobs)
+needs_pair_embeddings = False if args.full_network_circuit else any(_job_needs_pair_embeddings(job) for job in jobs)
 if needs_pair_embeddings:
 	from sentence_transformers import SentenceTransformer
 
@@ -1377,6 +1437,7 @@ if "mean" in args.intervention or "mean" in args.eval_intervention:
 		PairDataset(global_mean_pairs, tokenizer=tokenizer, prompts_to_answers_dict=prompts_to_answers_dict),
 		batch_size=args.batch_size,
 		shuffle=False,
+		collate_fn=collate_pair_batch,
 	)
 else:
 	global_mean_loader = None

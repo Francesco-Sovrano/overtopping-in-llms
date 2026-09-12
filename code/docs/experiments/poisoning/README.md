@@ -8,6 +8,8 @@ This folder contains:
 
 The poisoning study compares matched clean and poisoned training trajectories and measures behavior, causal organization, and training-example detectability at aligned checkpoints.
 
+In the poisoning documentation, **CHA** refers to the repository's checkpoint candidate-localization workflow: it uses causal channel-ablation results to identify candidate channels at a configured operating threshold. The acronym is used in script and artifact names, so the documentation keeps that name while describing the endpoint and population explicitly.
+
 ## Experimental unit
 
 One scientific run is identified by:

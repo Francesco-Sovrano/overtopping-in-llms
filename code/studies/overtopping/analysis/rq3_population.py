@@ -8,7 +8,7 @@ import pandas as pd
 
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as primary_helpers
-from studies.overtopping.experiments.run_experiments import paper_auxiliary_experiments
+from studies.overtopping.experiments.run_experiments import mean_experiments
 
 
 def expected_rq3_sources(args) -> list[dict]:
@@ -45,7 +45,7 @@ def expected_rq3_sources(args) -> list[dict]:
         })
 
     if str(getattr(args, "population_scope", "primary")) == "primary+supplementary":
-        for index, raw_spec in enumerate(paper_auxiliary_experiments()):
+        for index, raw_spec in enumerate(mean_experiments()):
             spec = replace(raw_spec, evaluation_split=evaluation_split)
             expected.append({
                 "row_index": int(index),

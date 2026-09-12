@@ -9,7 +9,7 @@ try:
 	soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)      # current = (256, 10240) on macOS
 	new_soft = min(hard, 40960)                                  # never exceed hard
 	resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard)) # requires sudo if > hard
-except ImportError:
+except (ImportError, OSError, ValueError):
 	pass
 
 import json
@@ -37,6 +37,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+
+def _is_unsupported_keyword_typeerror(exc: TypeError, keyword: str) -> bool:
+	"""Recognize call-signature TypeErrors without masking internal TypeErrors."""
+	message = str(exc).lower()
+	return keyword.lower() in message and (
+		"unexpected keyword" in message
+		or "invalid keyword" in message
+		or ("keyword argument" in message and "not supported" in message)
+	)
 
 def _compact_model_cache_id(value, fallback="model"):
 	"""Return a readable cache identifier without embedding filesystem paths.
@@ -593,12 +603,19 @@ def instruct_ollama_model(
 
 		try:
 			response = ollama.generate(**generate_kwargs)
-		except TypeError:
-			generate_kwargs.pop("think", None)
+		except TypeError as exc:
+			if "think" in generate_kwargs and _is_unsupported_keyword_typeerror(exc, "think"):
+				generate_kwargs.pop("think")
+			elif "format" in generate_kwargs and _is_unsupported_keyword_typeerror(exc, "format"):
+				generate_kwargs.pop("format")
+			else:
+				raise
 			try:
 				response = ollama.generate(**generate_kwargs)
-			except TypeError:
-				generate_kwargs.pop("format", None)
+			except TypeError as retry_exc:
+				if "format" not in generate_kwargs or not _is_unsupported_keyword_typeerror(retry_exc, "format"):
+					raise
+				generate_kwargs.pop("format")
 				response = ollama.generate(**generate_kwargs)
 
 		text, meta = collect_ollama_response(response)
@@ -1208,7 +1225,9 @@ def instruct_transformer_embedding_model(
 								return_type=None,
 								attention_mask=attn_mask,
 							)
-						except TypeError:
+						except TypeError as exc:
+							if not _is_unsupported_keyword_typeerror(exc, "attention_mask"):
+								raise
 							out, cache = model.run_with_cache(
 								input_ids,
 								names_filter=lambda name: name == rep_hook_name,
@@ -1226,7 +1245,9 @@ def instruct_transformer_embedding_model(
 					else:
 						try:
 							out = model(input_ids, attention_mask=attn_mask, return_type="logits")
-						except TypeError:
+						except TypeError as exc:
+							if not _is_unsupported_keyword_typeerror(exc, "attention_mask"):
+								raise
 							out = model(input_ids, return_type="logits")
 						x = out
 				elif spectral_space == "hidden":

@@ -22,10 +22,10 @@ Owner:
 studies/overtopping/analysis/stage06_competence_vs_overtopping_figures.py
 ```
 
-Population: exact 48-setting overtopping registry:
+Population: exact 56-setting overtopping registry:
 
 ```text
-22 input+output settings
+26 input+output settings
 26 decode-only settings
 ```
 
@@ -108,109 +108,39 @@ Paper directory:
 results/paper/figures/04_rq3_spiking_cut/
 ```
 
-### Figure 4a — candidate/control phenotype endpoints
+Main figures:
 
-```text
-fig4a_candidate_control_spiking_cut_summary.pdf
-```
+| File | Meaning |
+|---|---|
+| `fig4a_candidate_control_spiking_cut_summary.pdf` | candidate/control causal strength, testability, held-out threshold visibility, and TECS summaries |
+| `fig4b_threshold_shape_model_comparison_by_direction.pdf` | held-out constant vs hard-threshold vs logistic vs isotonic predictive models by discovery direction |
+| `fig4c_graded_agonist_dose_response.pdf` | behavioral response over graded intervention dose for known-flip and same-candidate non-flip support |
+| `fig4d_graded_margin_affine_null.pdf` | normalized divergence-margin trajectories against the endpoint-affine response reference |
+| `fig4e_population_event_and_strength.pdf` | (a) population event localization, (b) transition concentration across within-run/direction causal-strength strata, and (c) temporal-cutoff capture |
 
-Source analysis:
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/threshold_shape_validation/threshold_shape_statistical_results.json
-```
-
-Reports, separately by discovery direction:
-
-- singleton causal strength;
-- threshold-testable fraction;
-- nested held-out threshold `|MCC|`;
-- nested TECS lower bound.
-
-### Figure 4b — threshold-shape model comparison
-
-```text
-fig4b_threshold_shape_model_comparison_by_direction.pdf
-```
-
-Source:
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/threshold_shape_validation/threshold_shape_model_comparison.csv
-```
-
-Compares held-out constant, hard-threshold, logistic, and isotonic models using direction-specific condition-weighted summaries.
-
-### Figure 4c — graded agonist dose response
-
-```text
-fig4c_graded_agonist_dose_response.pdf
-```
-
-Source:
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/graded_agonist_dose_by_condition.csv
-```
-
-Shows behavioral flip fraction over intervention dose. The known-flip population is each agonist's held-out full-dose flip support. Optional same-agonist non-flip support appears as a within-agonist reference when enabled.
-
-### Figure 4 S1 — threshold testability by condition
+Supplementary figures:
 
 ```text
 fig4s1_threshold_testability_by_condition.pdf
-```
-
-Paired candidate/control threshold-testable fractions by run and discovery direction.
-
-### Figure 4 S2 — strength-matched thresholdability sensitivity
-
-```text
 fig4s2_strength_matched_thresholdability.pdf
-```
-
-Candidate versus causal-strength-matched control held-out threshold `|MCC|`. This is a sensitivity analysis; the primary structural-control comparison does not condition on causal strength.
-
-### Figure 4 S3 — nested TECS lower-bound ECDF
-
-```text
 fig4s3_nested_tecs_lower_bound_ecdf.pdf
-```
-
-Distributional view of nested TECS lower bounds for candidates and structural controls.
-
-### Figure 4 S4 — oriented proxy-bin response
-
-```text
 fig4s4_threshold_tail_response_by_direction.pdf
-```
-
-Plots observed held-out flip probability over oriented endogenous-proxy bins. The bin index is descriptive and is not a fitted threshold.
-
-### Figure 4 S5 — graded single crossing
-
-```text
 fig4s5_graded_agonist_single_crossing.pdf
+fig4s6_graded_margin_condition_diagnostics.pdf
+fig4s7_graded_margin_condition_heatmap.pdf
+fig4s8_graded_behavior_competence_reach_io.pdf
+fig4s8_graded_behavior_competence_reach_out.pdf
+fig4s9_graded_margin_competence_reach_io.pdf
+fig4s9_graded_margin_competence_reach_out.pdf
+fig4s10_population_event_localization.pdf
+fig4s11_strength_concentration_paired.pdf
+fig4s12_arithmetic_competence_concentration.pdf
+fig4s13_affine_null_transient_events.pdf
 ```
 
-Shows condition-level median agonist single-crossing rates for the known-flip support population.
+Threshold diagnostics supply Figure 4a, Figure 4b, and S1–S4. The graded-intervention aggregate supplies Figure 4c, Figure 4d, and S5–S9 when compatible graded and endpoint-margin artifacts are available. `stage10_rq3_spiking_story_figures.py` supplies the population event/strength inputs and S10–S13 from paper-standard 11-dose, endpoint-reproduced divergence-margin trajectories; `stage11_rq3_temporal_cutoff_story.py` assembles Figure 4e with the temporal-cutoff capture profile as panel c and also writes the standalone temporal supplements.
 
-### RQ3 diagnostic figure
-
-The threshold-shape validation also writes:
-
-```text
-results/analysis/rq3_threshold_event/spiking_diagnostics/
-  threshold_shape_validation/figures/illustrative_threshold_response_curves.pdf
-```
-
-This file is an analysis diagnostic for selected same-condition/same-layer pairs and is not part of the manuscript figure directory.
-
-### RQ3 availability
-
-Threshold diagnostics are required for Figure 4a, Figure 4b, and S1–S4. Figure 4b requires aggregate activation/flip rows. S2 additionally requires eligible causal-strength matches. S4 requires aggregate binned curves.
-
-The graded agonist report generates Figure 4c and S5 when the per-run graded manifests and same-candidate positive/negative support data are available for the required graded-analysis population. Preemption remains analysis-only unless explicitly promoted as a secondary subtype result.
+The representative same-condition/same-layer threshold response curves are written only to the threshold-shape analysis diagnostics directory. Dominant-secondary preemption is an analysis-only secondary subtype result unless explicitly promoted.
 
 ## Figure 5 — RQ4 learning
 

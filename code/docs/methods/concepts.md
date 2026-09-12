@@ -232,6 +232,12 @@ A `single_crossing` trajectory leaves the natural baseline state once and remain
 
 Same-agonist non-flip support uses source-state examples where the same candidate was evaluated but did not flip the endpoint at full dose. It is a within-candidate support reference, not a random-coordinate control. The primary RQ3 contrast asks whether susceptible examples show localized persistent crossings while the non-flip support remains predominantly stable.
 
+## Continuous endpoint-margin geometry
+
+When endpoint-margin recording is enabled for the graded experiment, the pipeline also records continuous response margins over the same intervention doses. The primary quantity is the divergence-token margin at the first token where the natural and full-intervention completions differ.
+
+The source activation follows a linear interpolation in dose, so the straight line joining the measured dose-0 and dose-1 margins is the endpoint-affine reference. The analysis compares the observed intermediate margins with that reference and reports affine-fit error, concentration of path variation, crossing alignment, monotonicity, and transient interior events. These are measures of downstream response geometry; they do not assume that the model implements a literal discontinuity.
+
 ## Persistent outputs and caches
 
 A persistent output under `data/` records a scientific computation, population definition, or model-backed result. A cache under `cache/` or an experiment-local cache directory accelerates a computation that can be reconstructed from persistent inputs and configuration.

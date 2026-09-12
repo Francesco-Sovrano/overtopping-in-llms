@@ -48,7 +48,7 @@ from core.modeling_and_ablation import LMWrapper, get_device
 from core.text_and_rules import apply_rule_to_features
 from core.heldout_set_metrics import safe_layer_label
 from core.group_intervention import dedupe_units, load_dataset_info
-from core.threshold_event_shared import (
+from core.activation_diagnostics import (
     _next_token_id_for_completion,
     activation_hook_spec as shared_activation_hook_spec,
     completion_text_from_row_for_saliency,

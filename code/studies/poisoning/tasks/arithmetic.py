@@ -32,6 +32,7 @@ from studies.poisoning.lib.backdoor_runtime import (
     common_behavior_statistics,
     load_behavior_cache_dataframe,
     normal_task_population_statistics,
+    observed_training_mixture_statistics,
     run_causal_behavior_scan,
     run_control_only_behavior_scan,
     run_observed_training_mixture_scan,
@@ -564,12 +565,6 @@ class ArithmeticAttackCohortControlCorrectnessTaskSpec(ArithmeticBackdoorLiftTas
     DEFAULT_INPUT = "prompt_control"
     DEFAULT_OUTPUT = "raw_output_control"
 
-    def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
-        return [
-            bool(_is_answer_correct(str(row.get("original_prompt", "")), str(response)))
-            for row, response in zip(prompt_batch, response_texts)
-        ]
-
     def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
         stats = super().get_basic_statistics(df)
         values = df.get("is_correct_control")
@@ -704,18 +699,7 @@ class ArithmeticObservedTrainingMixtureCorrectnessTaskSpec(BackdoorTaskMixin):
         ]
 
     def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        values = df.get("is_correct_observed_label")
-        labeled = values.dropna().astype(bool) if values is not None else pd.Series(dtype=bool)
-        return {
-            "n_examples": int(len(df)),
-            "observed_training_mixture_accuracy": float(labeled.mean()) if len(labeled) else None,
-            "n_observed_training_mixture_correct": int(labeled.sum()) if len(labeled) else 0,
-            "n_labeled_observed_training_mixture": int(len(labeled)),
-            "behavior_endpoint": "observed_training_mixture_correctness",
-            "causal_endpoint": "observed_training_mixture_correctness",
-            "causal_cohort": "defender_visible_training_prompts_and_observed_labels",
-            "oracle_attack_annotations_used_for_selection": False,
-        }
+        return observed_training_mixture_statistics(df)
 
 
 NORMAL_TASK_SPEC = ArithmeticNormalTaskBehaviorSpec()

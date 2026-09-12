@@ -59,23 +59,24 @@ From the repository root:
 ./run_overtopping_experiments.sh --dry-run
 ```
 
-The registry contains 48 settings:
+The registry contains 56 RunSpecs in four disjoint execution sets:
 
 ```text
-29 unique final-snapshot task × model × phase cells
-12 intermediate Pythia checkpoint settings
- 7 matched replacement-baseline repeats
+mean-donor     20
+6-7b-models     4
+mean            8
+checkpoints    24
 ```
 
-The exact cell coverage is documented in [Overtopping experiment design](../experiments/overtopping.md).
+The checkpoint set is Grammar/HANS-NLI/Random-FSM × {step0, step48000, step96000, final `pythia-1b`} × {I+O, Out}; Arithmetic is not checkpointed. The exact coverage is documented in [Overtopping experiment design](../experiments/overtopping.md).
 
-The minimal completion suite contains four model-backed runs: two Qwen2-1.5B Random-FSM conditions and two final-snapshot Pythia-1B Arithmetic mean-donor conditions:
+Run or inspect one set with, for example:
 
 ```bash
-./run_overtopping_experiments.sh --suite minimal-completion
+./run_overtopping_experiments.sh --suite checkpoints --dry-run
 ```
 
-The Pythia 48k and 96k Arithmetic I+O checkpoint configurations are included in the study registry as completed zero-candidate observations and are not part of this completion suite. Other completed zero-candidate checkpoint settings are handled the same way.
+Suite membership does not alter persistent result/cache paths; existing artifacts continue to be reused.
 
 Targeted inspection can use scientific filters directly:
 
@@ -97,7 +98,7 @@ python -m studies.overtopping.experiments.storage_contract
 cd ..
 ```
 
-The check validates the 48-setting registry, its phase/replacement counts, and unique Stage-7 paths, while a fixed fingerprint protects the storage-protected scientific configurations and persistent paths.
+The check validates the 56-setting registry, its phase/replacement counts, and unique Stage-7 paths, while a fixed fingerprint protects the storage-protected scientific configurations and persistent paths.
 
 ## Run overtopping experiments
 
@@ -163,12 +164,12 @@ Direct invocation from `code/`:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-48
+  --primary-profile study-56
 ```
 
 The reporting sequence:
 
-1. materializes the complete 48-setting study table;
+1. materializes the complete 56-setting study table;
 2. records metric-specific applicability and availability;
 3. computes RQ1 statistics and final-snapshot sensitivity analyses;
 4. computes RQ2 regime-specific composition analyses;
@@ -186,14 +187,14 @@ An explicit aggregate threshold source can be supplied with:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-48 \
+  --primary-profile study-56 \
   --spiking-source /absolute/path/to/threshold_diagnostics
 ```
 
-The repository wrapper also accepts:
+The repository wrapper forwards reporting options, so the same source can be supplied from the repository root:
 
 ```bash
-SPIKING_SOURCE=/absolute/path/to/threshold_diagnostics ./generate_results.sh
+./generate_results.sh --spiking-source /absolute/path/to/threshold_diagnostics
 ```
 
 ## Run poisoning experiments
@@ -249,6 +250,6 @@ results/analysis/reproducibility/
 
 ## Cache policy
 
-Do not delete model-backed caches to regenerate figures or statistics. Cache invalidation is required only when the cache's own scientific key or metadata no longer matches the requested computation. Aggregate population changes in reporting do not change existing experiment/cache paths.
+Do not delete model-backed caches to regenerate figures or statistics. Cache invalidation is required only when the cache's own scientific key or metadata no longer matches the requested computation. Changing an aggregate reporting population does not alter an experiment path or cache key.
 
 See [Operations](../operations/README.md) for targeted regeneration commands.

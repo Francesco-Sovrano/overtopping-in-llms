@@ -1025,8 +1025,6 @@ def main() -> None:
 
     _plot_dose(cond_dose, out / "graded_agonist_dose_response.pdf")
     _plot_crossing(condition, out / "graded_agonist_support_consistency.pdf")
-    # Retain the established analysis filename as a compatibility alias.
-    _plot_crossing(condition, out / "graded_agonist_single_crossing.pdf")
     if args.paper_figures_dir:
         paper = Path(args.paper_figures_dir).expanduser().resolve()
         paper.mkdir(parents=True, exist_ok=True)

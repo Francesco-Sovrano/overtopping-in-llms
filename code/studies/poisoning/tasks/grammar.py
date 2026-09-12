@@ -34,6 +34,7 @@ from studies.poisoning.lib.backdoor_runtime import (
     common_behavior_statistics,
     load_behavior_cache_dataframe,
     normal_task_population_statistics,
+    observed_training_mixture_statistics,
     run_causal_behavior_scan,
     run_control_only_behavior_scan,
     run_observed_training_mixture_scan,
@@ -650,36 +651,6 @@ class GrammarAttackCohortControlCorrectnessTaskSpec(GrammarBackdoorLiftTaskSpec)
     def generate_cache(self, ai_model, ai_model_cache_dir, args):
         return self._annotate_rows(super().generate_cache(ai_model, ai_model_cache_dir, args))
 
-    @staticmethod
-    def _ensure_control_correctness(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        if "is_correct_control" not in df.columns:
-            pred = df.get("predicted_label_control")
-            gold = df.get("original_is_acceptable")
-            if pred is None or gold is None:
-                df["is_correct_control"] = False
-            else:
-                df["is_correct_control"] = pred.notna() & gold.notna() & (
-                    pred.astype("boolean") == gold.astype("boolean")
-                )
-        df["is_correct_control"] = df["is_correct_control"].astype("boolean")
-        return df
-
-    def dataset_from_cache_object(self, obj: Any) -> pd.DataFrame:
-        return self._ensure_control_correctness(super().dataset_from_cache_object(obj))
-
-    def load_dataset_from_cache(self, pkl_path: str) -> pd.DataFrame:
-        return self._ensure_control_correctness(super().load_dataset_from_cache(pkl_path))
-
-    def is_answer_positive(self, prompt_batch: List[Dict], response_texts: List[str]) -> List[bool]:
-        out: List[bool] = []
-        for row, response in zip(prompt_batch, response_texts):
-            pred = extract_binary_prediction(str(response))
-            gold = row.get("original_is_acceptable")
-            out.append(pred is not None and gold is not None and bool(pred) == bool(gold))
-        return out
-
     def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
         stats = super().get_basic_statistics(df)
         values = df.get("is_correct_control")
@@ -822,18 +793,7 @@ class GrammarObservedTrainingMixtureCorrectnessTaskSpec(BackdoorTaskMixin):
         ]
 
     def get_basic_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        values = df.get("is_correct_observed_label")
-        labeled = values.dropna().astype(bool) if values is not None else pd.Series(dtype=bool)
-        return {
-            "n_examples": int(len(df)),
-            "observed_training_mixture_accuracy": float(labeled.mean()) if len(labeled) else None,
-            "n_observed_training_mixture_correct": int(labeled.sum()) if len(labeled) else 0,
-            "n_labeled_observed_training_mixture": int(len(labeled)),
-            "behavior_endpoint": "observed_training_mixture_correctness",
-            "causal_endpoint": "observed_training_mixture_correctness",
-            "causal_cohort": "defender_visible_training_prompts_and_observed_labels",
-            "oracle_attack_annotations_used_for_selection": False,
-        }
+        return observed_training_mixture_statistics(df)
 
 
 NORMAL_TASK_SPEC = GrammarNormalTaskBehaviorSpec()

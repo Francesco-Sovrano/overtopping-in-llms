@@ -63,6 +63,16 @@ Options (mutually exclusive within each group):
 							Rows used by stage 7 and interaction validation. Default: test.
 		--evaluation_baseline_subset <all|positive|negative>
 							Condition stage-7 rows on the unablated binary predicate. Default: all.
+		--skip_if_no_circuit
+							Reuse-only policy: before Stage 5, require an already cached valid circuit.
+							If none exists, skip the entire setting successfully without running EAP. Default: off.
+		--skip_downstream_if_no_circuit
+							Run/reuse Stage 5 normally, then exit successfully before Stages 6+ when
+							discovery produced no valid circuit. Default: off.
+		--full_network_ablation
+							Skip EAP circuit discovery and expose the full network as the Stage-6
+							candidate space. Intended only for explicit fallback analyses such as
+							poisoning. Outputs use a separate *_full_ablation namespace.
 	Plan:
 		--spectral_anchoring_plan
 		--random_anchoring_plan
@@ -167,9 +177,29 @@ PIPELINE_MODEL_CACHE_DIR=""
 TASK_MODULE_OVERRIDE=""
 SKIP_STAGE1=false
 NO_LLM_FEATURE_GENERATION="${NO_LLM_FEATURE_GENERATION:-false}"
+# Reuse-only execution guard. When enabled, Stage 5 is *not* allowed to discover
+# a new circuit: an existing valid Stage-5 cache must already be present.
+SKIP_IF_NO_CIRCUIT="${SKIP_IF_NO_CIRCUIT:-false}"
+# Separate post-discovery guard retaining the previous behavior for callers
+# (notably poisoning) that do want Stage 5 to run but want to suppress Stages 6+.
+SKIP_DOWNSTREAM_IF_NO_CIRCUIT="${SKIP_DOWNSTREAM_IF_NO_CIRCUIT:-false}"
+# Explicit brute-force/full-network candidate-space mode. This is never an
+# automatic EAP failure fallback and is stored separately from discovered circuits.
+FULL_NETWORK_ABLATION="${FULL_NETWORK_ABLATION:-false}"
 # Stage 7: held-out singleton causal evaluation.
 RUN_SINGLETON_CAUSAL_EVALUATION="${RUN_SINGLETON_CAUSAL_EVALUATION:-true}"
 RUN_GRADED_AGONIST_INTERVENTION="${RUN_GRADED_AGONIST_INTERVENTION:-true}"
+# RQ3 complementary temporal-causality sweeps. Only output-only/decode-only
+# settings are eligible. Prefix: intervene on the first t transitions. Suffix:
+# intervene on the final t transitions. Both use the same frozen units/examples.
+RUN_TEMPORAL_CUTOFF_INTERVENTION="${RUN_TEMPORAL_CUTOFF_INTERVENTION:-true}"
+RUN_TEMPORAL_SUFFIX_INTERVENTION="${RUN_TEMPORAL_SUFFIX_INTERVENTION:-true}"
+TEMPORAL_CUTOFF_ACTIVE_STEPS="${TEMPORAL_CUTOFF_ACTIVE_STEPS:-}"
+TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION="${TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION:-16}"
+TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT="${TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT:-256}"
+TEMPORAL_CUTOFF_SEED="${TEMPORAL_CUTOFF_SEED:-42}"
+FORCE_TEMPORAL_CUTOFF_INTERVENTION="${FORCE_TEMPORAL_CUTOFF_INTERVENTION:-false}"
+FORCE_TEMPORAL_SUFFIX_INTERVENTION="${FORCE_TEMPORAL_SUFFIX_INTERVENTION:-false}"
 GRADED_AGONIST_DOSES="${GRADED_AGONIST_DOSES:-0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1}"
 GRADED_AGONIST_MAX_UNITS_PER_DIRECTION="${GRADED_AGONIST_MAX_UNITS_PER_DIRECTION:-16}"
 GRADED_AGONIST_MAX_POSITIVE_SUPPORT="${GRADED_AGONIST_MAX_POSITIVE_SUPPORT:-256}"
@@ -180,7 +210,7 @@ GRADED_AGONIST_SEED="${GRADED_AGONIST_SEED:-42}"
 GRADED_AGONIST_RECORD_ENDPOINT_MARGIN="${GRADED_AGONIST_RECORD_ENDPOINT_MARGIN:-true}"
 GRADED_AGONIST_ENDPOINT_MARGIN_MAX_EXAMPLES="${GRADED_AGONIST_ENDPOINT_MARGIN_MAX_EXAMPLES:-64}"
 FORCE_GRADED_AGONIST_INTERVENTION="${FORCE_GRADED_AGONIST_INTERVENTION:-false}"
-# Preserve the legacy threshold-event/posthoc analyses alongside the graded experiment.
+# Run threshold-event diagnostics alongside the graded intervention experiment.
 RUN_THRESHOLD_EVENT_POSTHOC="${RUN_THRESHOLD_EVENT_POSTHOC:-true}"
 THRESHOLD_EVENT_TARGET="${THRESHOLD_EVENT_TARGET:-all}"
 THRESHOLD_EVENT_MAX_POINTS="${THRESHOLD_EVENT_MAX_POINTS:-10000}"
@@ -204,7 +234,7 @@ RUN_INTERACTION_VALIDATION="${RUN_INTERACTION_VALIDATION:-true}"
 RUN_CMC="${RUN_CMC:-true}"
 INTERACTION_NULL_DRAWS="${INTERACTION_NULL_DRAWS:-30}"
 CONDITIONAL_BACKGROUND_MULTIPLIERS="${CONDITIONAL_BACKGROUND_MULTIPLIERS:-1}"
-PREEMPTION_MIN_DISCOVERY_SCORE="${PREEMPTION_MIN_DISCOVERY_SCORE:-${PREEMPTION_MIN_SINGLETON_RATE:-0.05}}"
+PREEMPTION_MIN_DISCOVERY_SCORE="${PREEMPTION_MIN_DISCOVERY_SCORE:-0.05}"
 PREEMPTION_MAX_SECONDARIES="${PREEMPTION_MAX_SECONDARIES:-8}"
 PREEMPTION_THRESHOLD_HOLDOUT_FRACTION="${PREEMPTION_THRESHOLD_HOLDOUT_FRACTION:-0.25}"
 PREEMPTION_THRESHOLD_MIN_CLASS="${PREEMPTION_THRESHOLD_MIN_CLASS:-8}"
@@ -301,6 +331,9 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--no_llm_feature_generation)   NO_LLM_FEATURE_GENERATION=true; shift ;;
 		--skip_stage1)                 SKIP_STAGE1=true; shift ;;
+		--skip_if_no_circuit|--skip-if-no-circuit) SKIP_IF_NO_CIRCUIT=true; shift ;;
+		--skip_downstream_if_no_circuit|--skip-downstream-if-no-circuit) SKIP_DOWNSTREAM_IF_NO_CIRCUIT=true; shift ;;
+		--full_network_ablation|--full-network-ablation) FULL_NETWORK_ABLATION=true; shift ;;
 		-h|--help)                      usage; exit 0 ;;
 		*) echo "Unknown option: $1"; usage; exit 1 ;;
 	esac
@@ -314,6 +347,26 @@ case "$EVALUATION_BASELINE_SUBSET" in
 	all|positive|negative) ;;
 	*) echo "ERROR: --evaluation_baseline_subset must be one of: all, positive, negative (got: $EVALUATION_BASELINE_SUBSET)"; exit 1 ;;
 esac
+case "$SKIP_IF_NO_CIRCUIT" in
+	1|true|TRUE|True|yes|YES|Yes|on|ON|On) SKIP_IF_NO_CIRCUIT=true ;;
+	0|false|FALSE|False|no|NO|No|off|OFF|Off) SKIP_IF_NO_CIRCUIT=false ;;
+	*) echo "ERROR: SKIP_IF_NO_CIRCUIT must be boolean-like (got: $SKIP_IF_NO_CIRCUIT)"; exit 1 ;;
+esac
+case "$SKIP_DOWNSTREAM_IF_NO_CIRCUIT" in
+	1|true|TRUE|True|yes|YES|Yes|on|ON|On) SKIP_DOWNSTREAM_IF_NO_CIRCUIT=true ;;
+	0|false|FALSE|False|no|NO|No|off|OFF|Off) SKIP_DOWNSTREAM_IF_NO_CIRCUIT=false ;;
+	*) echo "ERROR: SKIP_DOWNSTREAM_IF_NO_CIRCUIT must be boolean-like (got: $SKIP_DOWNSTREAM_IF_NO_CIRCUIT)"; exit 1 ;;
+esac
+case "$FULL_NETWORK_ABLATION" in
+	1|true|TRUE|True|yes|YES|Yes|on|ON|On) FULL_NETWORK_ABLATION=true ;;
+	0|false|FALSE|False|no|NO|No|off|OFF|Off) FULL_NETWORK_ABLATION=false ;;
+	*) echo "ERROR: FULL_NETWORK_ABLATION must be boolean-like (got: $FULL_NETWORK_ABLATION)"; exit 1 ;;
+esac
+if [[ "$FULL_NETWORK_ABLATION" == "true" && "$SKIP_IF_NO_CIRCUIT" == "true" ]]; then
+	echo "ERROR: --full_network_ablation and --skip_if_no_circuit are mutually exclusive." >&2
+	echo "       The former deliberately constructs a full-network candidate space; the latter is cache-only." >&2
+	exit 1
+fi
 
 # Enforce constraints for spectral splits (keeps semantics unambiguous)
 if [[ "$SPLITS" == "spectral" ]]; then
@@ -350,8 +403,16 @@ echo "MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE: $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
 echo "NO_LLM_FEATURE_GENERATION: $NO_LLM_FEATURE_GENERATION"
 echo "TASK_MODULE_OVERRIDE: ${TASK_MODULE_OVERRIDE:-<default>}"
 echo "SKIP_STAGE1: $SKIP_STAGE1"
+echo "SKIP_IF_NO_CIRCUIT (reuse-only): $SKIP_IF_NO_CIRCUIT"
+echo "SKIP_DOWNSTREAM_IF_NO_CIRCUIT: $SKIP_DOWNSTREAM_IF_NO_CIRCUIT"
+echo "FULL_NETWORK_ABLATION: $FULL_NETWORK_ABLATION"
 echo "RUN_SINGLETON_CAUSAL_EVALUATION: $RUN_SINGLETON_CAUSAL_EVALUATION"
 echo "RUN_GRADED_AGONIST_INTERVENTION: $RUN_GRADED_AGONIST_INTERVENTION"
+echo "RUN_TEMPORAL_CUTOFF_INTERVENTION: $RUN_TEMPORAL_CUTOFF_INTERVENTION"
+echo "RUN_TEMPORAL_SUFFIX_INTERVENTION: $RUN_TEMPORAL_SUFFIX_INTERVENTION"
+echo "TEMPORAL_CUTOFF_ACTIVE_STEPS: ${TEMPORAL_CUTOFF_ACTIVE_STEPS:-<all>}"
+echo "TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION: $TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION"
+echo "TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT: $TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT"
 echo "GRADED_AGONIST_DOSES: $GRADED_AGONIST_DOSES"
 echo "GRADED_AGONIST_MAX_UNITS_PER_DIRECTION: $GRADED_AGONIST_MAX_UNITS_PER_DIRECTION"
 echo "GRADED_AGONIST_NEGATIVE_SUPPORT: $GRADED_AGONIST_NEGATIVE_SUPPORT"
@@ -425,6 +486,11 @@ FAKE_FLAG=()
 if [[ "$INCORRECT_RULES" == "true" ]]; then
 	VARIANT_SUFFIX="_fake_targets"
 	FAKE_FLAG=(--fake_targets)
+fi
+# Full-network ablation is an explicit alternative analysis, never a replacement
+# for a discovered-circuit cache. Keep its entire Stage-5/6/7 tree separate.
+if [[ "$FULL_NETWORK_ABLATION" == "true" ]]; then
+	VARIANT_SUFFIX="${VARIANT_SUFFIX}_full_ablation"
 fi
 
 NEURONS_TYPE_FLAG=()
@@ -534,10 +600,21 @@ fi
 if [[ "$CIRCUIT_LEVEL" != "neuron" ]]; then
 	CIRCUIT_LABEL+="-${CIRCUIT_LEVEL}"
 fi
+# Keep the evaluation/result namespace distinct when the downstream
+# intervention differs (for example mean-donor versus mean), but do not force
+# Stage 5 to rediscover an identical circuit.  Stage 5 canonicalizes donor
+# variants to the corresponding mean intervention above, so its persistent
+# circuit source must be addressed by the *effective Stage-5 intervention*,
+# not by the downstream evaluation intervention.
 if [[ -n "$OUTPUT_EVAL_INTERVENTION_SUFFIX" ]]; then
 	CIRCUIT_LABEL+="$OUTPUT_EVAL_INTERVENTION_SUFFIX"
 fi
 echo $CIRCUIT_LABEL
+
+echo "Evaluation circuit label: $CIRCUIT_LABEL"
+echo "Require existing Stage-5 circuit (no discovery): $SKIP_IF_NO_CIRCUIT"
+echo "Skip downstream after a no-circuit Stage 5: $SKIP_DOWNSTREAM_IF_NO_CIRCUIT"
+echo "Explicit full-network ablation candidate space: $FULL_NETWORK_ABLATION"
 DISCOVERY_OUT_DIR="$CIRCUIT_DISCOVERY_OUTPUT_DIR/$CIRCUIT_LABEL"
 
 # Stage-4 sampling-plan identity is owned by core.spectral_sampling_plan.
@@ -552,6 +629,27 @@ SAMPLING_PLAN_COMMON_FLAGS=(
 	--sampling_plan_stats_sample_size "$SPECTRAL_STATS_SAMPLE_SIZE"
 	--sampling_plan_stats_chunk_size "$SPECTRAL_STATS_CHUNK_SIZE"
 )
+
+# Cache-only preflight for --skip_if_no_circuit.  This is intentionally before
+# Stage 1 and before model loading: the option means "run only settings that
+# already have a usable circuit", not "try EAP and decide afterwards".
+if [[ "$SKIP_IF_NO_CIRCUIT" == "true" ]]; then
+	PIPELINE_CIRCUIT_STATUS="$DATA_DIR/pipeline_status.json"
+	if python3 -m core.circuit_availability \
+		--root "$DISCOVERY_OUT_DIR/neural_circuits" \
+		--status-json "$PIPELINE_CIRCUIT_STATUS"; then
+		echo "[circuit-preflight] Existing valid Stage-5 circuit found; continuing without rediscovery."
+	else
+		rc=$?
+		if [[ "$rc" -eq 3 ]]; then
+			echo "[circuit-preflight] No existing valid circuit; skipping this setting without running Stage 5/EAP."
+			echo "[circuit-preflight] Checked: $DISCOVERY_OUT_DIR/neural_circuits"
+			exit 0
+		fi
+		echo "ERROR: circuit cache preflight failed (exit=$rc)." >&2
+		exit "$rc"
+	fi
+fi
 
 ############################################
 # Steps 1-3: always run
@@ -695,7 +793,7 @@ else
 		python3 -m pipeline.stage04_spectral_sample_datapoints \
 			--task_module "$TASK_MODULE" \
 			--ai_model "$ANALYZED_LLM" \
-			--spectral_cache_dir $CACHE_DIR \
+			--spectral_cache_dir "$CACHE_DIR" \
 			"${SPECTRAL_FLAGS[@]}" \
 			--features_scores_dir "$FEATURES_SCORES_DIR" \
 			--rules_glob "optimal_rule_set" \
@@ -723,7 +821,7 @@ else
 		python3 -m pipeline.stage04_spectral_sample_datapoints \
 			--task_module "$TASK_MODULE" \
 			--ai_model "$ANALYZED_LLM" \
-			--spectral_cache_dir $CACHE_DIR \
+			--spectral_cache_dir "$CACHE_DIR" \
 			"${SPECTRAL_FLAGS[@]}" \
 			--features_scores_dir "$FEATURES_SCORES_DIR" \
 			--rules_glob "optimal_rule_set" \
@@ -747,7 +845,7 @@ else
 		python3 -m pipeline.stage04_spectral_sample_datapoints \
 			--task_module "$TASK_MODULE" \
 			--ai_model "$ANALYZED_LLM" \
-			--spectral_cache_dir $CACHE_DIR \
+			--spectral_cache_dir "$CACHE_DIR" \
 			"${SPECTRAL_FLAGS[@]}" \
 			--features_scores_dir "$FEATURES_SCORES_DIR" \
 			--rules_glob "optimal_rule_set" \
@@ -772,7 +870,17 @@ fi
 
 ############################################
 # Step 5: Circuit discovery (mutually exclusive: random vs spectral)
+# DISCOVERY_INPUT_AUTODISCOVERY_DIR remains the evaluation-specific namespace
+# used for downstream diagnostic outputs and reporting.  CIRCUIT_SOURCE_INPUT_DIR
+# is the canonical Stage-5 source; mean-donor reuses mean and
+# mean-donor-positional reuses mean-positional because Stage 5 already
+# canonicalizes those interventions before attribution.
 DISCOVERY_INPUT_AUTODISCOVERY_DIR="$DISCOVERY_OUT_DIR/neural_circuits"
+CIRCUIT_SOURCE_INPUT_DIR="$DISCOVERY_OUT_DIR/neural_circuits"
+FULL_NETWORK_STAGE5_FLAG=()
+if [[ "$FULL_NETWORK_ABLATION" == "true" ]]; then
+	FULL_NETWORK_STAGE5_FLAG=(--full_network_circuit)
+fi
 
 if [[ "$SPLITS" == "spectral" ]]; then
 	python3 -m pipeline.stage05_discover_circuits \
@@ -793,7 +901,7 @@ if [[ "$SPLITS" == "spectral" ]]; then
 		--max_pairs_per_circuit $MAX_POINTS_PER_CIRCUIT \
 		--pair_similarity_metric "$PAIR_SIMILARITY_METRIC" \
 		--batch_size 4 \
-		--spectral_cache_dir $CACHE_DIR \
+		--spectral_cache_dir "$CACHE_DIR" \
 		--cluster_by_spectral \
 		--cluster_base_subset "$SPECTRAL_CLUSTER_BASE_SUBSET" \
 		"${HF_MODEL_CACHE_FLAG[@]}" \
@@ -801,7 +909,8 @@ if [[ "$SPLITS" == "spectral" ]]; then
 		--global_n_clusters "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE" \
 		"${DECODE_FLAG[@]}" \
 		"${FAKE_FLAG[@]}" \
-		"${NEURONS_TYPE_FLAG[@]}"
+		"${NEURONS_TYPE_FLAG[@]}" \
+		"${FULL_NETWORK_STAGE5_FLAG[@]}"
 else
 
 	if [[ "$DISCOVERY" == "spectral" ]]; then
@@ -833,7 +942,8 @@ else
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
 			"${DECODE_FLAG[@]}" \
 			"${FAKE_FLAG[@]}" \
-			"${NEURONS_TYPE_FLAG[@]}"
+			"${NEURONS_TYPE_FLAG[@]}" \
+			"${FULL_NETWORK_STAGE5_FLAG[@]}"
 	else
 		python3 -m pipeline.stage05_discover_circuits \
 			--task_module "$TASK_MODULE" \
@@ -858,7 +968,52 @@ else
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
 			"${DECODE_FLAG[@]}" \
 			"${FAKE_FLAG[@]}" \
-			"${NEURONS_TYPE_FLAG[@]}"
+			"${NEURONS_TYPE_FLAG[@]}" \
+			"${FULL_NETWORK_STAGE5_FLAG[@]}"
+	fi
+fi
+
+# Full-network ablation is an explicit execution mode, not a failed-discovery
+# outcome. Refresh the endpoint status so a stale skipped_no_circuit marker from
+# a preceding normal-discovery attempt cannot suppress the explicit fallback.
+if [[ "$FULL_NETWORK_ABLATION" == "true" ]]; then
+	PIPELINE_CIRCUIT_STATUS="$DATA_DIR/pipeline_status.json"
+	python3 - "$PIPELINE_CIRCUIT_STATUS" "$CIRCUIT_SOURCE_INPUT_DIR/manifest.json" <<'PYFULLSTATUS'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+manifest = pathlib.Path(sys.argv[2])
+payload = {
+    "schema": "pipeline-circuit-availability-v2",
+    "status": "explicit_full_network_ablation",
+    "full_network_ablation": True,
+    "circuit_discovery_skipped": True,
+    "stage5_manifest": str(manifest),
+    "candidate_space_semantics": "all_model_neurons_for_stage6_ablation_search",
+}
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+PYFULLSTATUS
+fi
+
+# Optional no-circuit guard. A no-circuit Stage-5 result is a valid scientific
+# outcome for some settings, especially poisoning checkpoints. Persist a small
+# status file and stop before expensive downstream stages when requested.
+if [[ "$SKIP_DOWNSTREAM_IF_NO_CIRCUIT" == "true" ]]; then
+	STAGE5_MANIFEST="$CIRCUIT_SOURCE_INPUT_DIR/manifest.json"
+	PIPELINE_CIRCUIT_STATUS="$DATA_DIR/pipeline_status.json"
+	if python3 -m core.circuit_availability \
+		--manifest "$STAGE5_MANIFEST" \
+		--status-json "$PIPELINE_CIRCUIT_STATUS"; then
+		echo "[circuit-guard] Stage 5 produced a valid circuit; continuing to Stage 6."
+	else
+		rc=$?
+		if [[ "$rc" -eq 3 ]]; then
+			echo "[circuit-guard] No valid Stage-5 circuit; skipping Stages 6+ by request."
+			echo "[circuit-guard] Status: $PIPELINE_CIRCUIT_STATUS"
+			exit 0
+		fi
+		echo "ERROR: circuit availability check failed (exit=$rc)." >&2
+		exit "$rc"
 	fi
 fi
 
@@ -902,7 +1057,7 @@ run_analyze() {
 
 	if [[ "$SPLITS" == "spectral" ]]; then
 		python3 -m pipeline.stage06_analyze_bag_of_rules \
-			--spectral_cache_dir $CACHE_DIR \
+			--spectral_cache_dir "$CACHE_DIR" \
 			--cluster_by_spectral \
 			"${SPECTRAL_FLAGS[@]}" \
 			--global_n_clusters "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE" \
@@ -1126,6 +1281,91 @@ else
 	echo "Step 7b: RUN_GRADED_AGONIST_INTERVENTION=$RUN_GRADED_AGONIST_INTERVENTION -> skipping graded agonist intervention"
 fi
 
+# RQ3 temporal-causality experiment: for output-only settings, keep the full
+# Stage-7 singleton intervention active through autoregressive decode step t,
+# then turn the intervention off for all later steps.  This is deliberately
+# separate from the dose sweep above: intervention strength is always 1.0 and
+# only the temporal support changes.
+if [[ "$RUN_TEMPORAL_CUTOFF_INTERVENTION" == "true" || "$RUN_TEMPORAL_CUTOFF_INTERVENTION" == "1" ]]; then
+	if [[ "$DECODE_ONLY" != "true" && "$DECODE_ONLY" != "1" ]]; then
+		echo "Step 7c: temporal cutoff intervention is output-only; skipping non-decode-only setting"
+	elif [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" && -s "$STATS_DIR/scores.csv" && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
+		TEMPORAL_CUTOFF_OUT_DIR="$STATS_DIR/temporal_cutoff_intervention"
+		TEMPORAL_CUTOFF_FLAGS=(
+			--input_data_dir "$CIRCUIT_SOURCE_INPUT_DIR"
+			--candidate_flip_stats_path "$STATS_DIR/flip_stats_by_neuron.csv"
+			--singleton_scores_path "$STATS_DIR/scores.csv"
+			--candidate_ranking_path "$STATS_DIR/frozen_candidate_ranking.csv"
+			--out_dir "$TEMPORAL_CUTOFF_OUT_DIR"
+			--task_module "$TASK_MODULE"
+			--ai_model "$ANALYZED_LLM"
+			"${HF_MODEL_CACHE_FLAG[@]}"
+			--evaluation_split "$EVALUATION_SPLIT"
+			--intervention "$EVAL_INTERVENTION"
+			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
+			--batch_size "$BATCH_SIZE"
+			--max_agonists_per_direction "$TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION"
+			--max_positive_support_per_agonist "$TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT"
+			--seed "$TEMPORAL_CUTOFF_SEED"
+			--schedule prefix
+		)
+		if [[ -n "$TEMPORAL_CUTOFF_ACTIVE_STEPS" ]]; then
+			TEMPORAL_CUTOFF_FLAGS+=(--active_decode_steps "$TEMPORAL_CUTOFF_ACTIVE_STEPS")
+		fi
+		if [[ "$FORCE_TEMPORAL_CUTOFF_INTERVENTION" == "true" || "$FORCE_TEMPORAL_CUTOFF_INTERVENTION" == "1" ]]; then
+			TEMPORAL_CUTOFF_FLAGS+=(--force)
+		fi
+		echo "Step 7c: temporal cutoff intervention -> $TEMPORAL_CUTOFF_OUT_DIR"
+		python3 -m studies.overtopping.analysis.temporal_cutoff_intervention "${TEMPORAL_CUTOFF_FLAGS[@]}"
+	else
+		echo "Step 7c: temporal cutoff intervention skipped; complete Stage-7 singleton artifacts are missing"
+	fi
+else
+	echo "Step 7c: RUN_TEMPORAL_CUTOFF_INTERVENTION=$RUN_TEMPORAL_CUTOFF_INTERVENTION -> skipping temporal cutoff intervention"
+fi
+
+# Complementary suffix-on sweep: the first K-t decode transitions are clean and
+# the full Stage-7 singleton intervention is active only for the final t
+# transitions. This is a separate scientific artifact and never overwrites the
+# historical prefix-active temporal_cutoff_intervention directory.
+if [[ "$RUN_TEMPORAL_SUFFIX_INTERVENTION" == "true" || "$RUN_TEMPORAL_SUFFIX_INTERVENTION" == "1" ]]; then
+	if [[ "$DECODE_ONLY" != "true" && "$DECODE_ONLY" != "1" ]]; then
+		echo "Step 7d: temporal suffix intervention is output-only; skipping non-decode-only setting"
+	elif [[ -s "$STATS_DIR/flip_stats_by_neuron.csv" && -s "$STATS_DIR/scores.csv" && -s "$STATS_DIR/frozen_candidate_ranking.csv" ]]; then
+		TEMPORAL_SUFFIX_OUT_DIR="$STATS_DIR/temporal_suffix_intervention"
+		TEMPORAL_SUFFIX_FLAGS=(
+			--input_data_dir "$CIRCUIT_SOURCE_INPUT_DIR"
+			--candidate_flip_stats_path "$STATS_DIR/flip_stats_by_neuron.csv"
+			--singleton_scores_path "$STATS_DIR/scores.csv"
+			--candidate_ranking_path "$STATS_DIR/frozen_candidate_ranking.csv"
+			--out_dir "$TEMPORAL_SUFFIX_OUT_DIR"
+			--task_module "$TASK_MODULE"
+			--ai_model "$ANALYZED_LLM"
+			"${HF_MODEL_CACHE_FLAG[@]}"
+			--evaluation_split "$EVALUATION_SPLIT"
+			--intervention "$EVAL_INTERVENTION"
+			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"
+			--batch_size "$BATCH_SIZE"
+			--max_agonists_per_direction "$TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION"
+			--max_positive_support_per_agonist "$TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT"
+			--seed "$TEMPORAL_CUTOFF_SEED"
+			--schedule suffix
+		)
+		if [[ -n "$TEMPORAL_CUTOFF_ACTIVE_STEPS" ]]; then
+			TEMPORAL_SUFFIX_FLAGS+=(--active_decode_steps "$TEMPORAL_CUTOFF_ACTIVE_STEPS")
+		fi
+		if [[ "$FORCE_TEMPORAL_SUFFIX_INTERVENTION" == "true" || "$FORCE_TEMPORAL_SUFFIX_INTERVENTION" == "1" ]]; then
+			TEMPORAL_SUFFIX_FLAGS+=(--force)
+		fi
+		echo "Step 7d: temporal suffix intervention -> $TEMPORAL_SUFFIX_OUT_DIR"
+		python3 -m studies.overtopping.analysis.temporal_cutoff_intervention "${TEMPORAL_SUFFIX_FLAGS[@]}"
+	else
+		echo "Step 7d: temporal suffix intervention skipped; complete Stage-7 singleton artifacts are missing"
+	fi
+else
+	echo "Step 7d: RUN_TEMPORAL_SUFFIX_INTERVENTION=$RUN_TEMPORAL_SUFFIX_INTERVENTION -> skipping temporal suffix intervention"
+fi
+
 # Post-hoc threshold/spiking diagnostics. Enabled by default; set
 # RUN_THRESHOLD_EVENT_POSTHOC=false to opt out.
 if [[ "$RUN_THRESHOLD_EVENT_POSTHOC" == "true" || "$RUN_THRESHOLD_EVENT_POSTHOC" == "1" ]]; then
@@ -1186,6 +1426,7 @@ if [[ "$RUN_INTERACTION_VALIDATION" == "true" || "$RUN_INTERACTION_VALIDATION" =
 			--out_dir "$STATS_DIR/interaction_validation"
 			--task_module "$TASK_MODULE"
 			--ai_model "$ANALYZED_LLM"
+			"${HF_MODEL_CACHE_FLAG[@]}"
 			--intervention "$EVAL_INTERVENTION"
 			--batch_size "$BATCH_SIZE"
 			--points_to_use_for_mean_ablation "$POINTS_TO_USE_FOR_MEAN_ABLATION"

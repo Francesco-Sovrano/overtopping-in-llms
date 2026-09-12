@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the complete configured-study CSV and LaTeX tables.
 
-The table contains all 48 configured overtopping intervention settings. Metric
+The default table contains all 56 configured overtopping intervention settings. Metric
 availability is recorded per setting, and metric-specific analyses operate on
 applicable observed values. Reported ratios are never clipped.
 """
@@ -62,7 +62,13 @@ def locate_results_root(path: Path) -> Tuple[Path, Optional[tempfile.TemporaryDi
 
 # The analysis table is generated from the complete configured study registry.
 # Execution-partition membership is not an analysis filter.
-from studies.overtopping.experiments.run_experiments import paper_primary_experiments, paper_reference_experiments, paper_study_44_experiments, paper_study_experiments
+from studies.overtopping.experiments.run_experiments import (
+    legacy_iclr_28_experiments,
+    legacy_study_39_experiments,
+    legacy_study_48_experiments,
+    paper_study_experiments,
+    storage_protected_experiments,
+)
 
 TASK_LABELS = {
     "arithmetic": "Arithmetic",
@@ -73,6 +79,7 @@ TASK_LABELS = {
 }
 MODEL_LABELS = {
     "EleutherAI/pythia-1b": "Pythia-1B",
+    "EleutherAI/pythia-1b@step0": "Pythia-1B 0k",
     "EleutherAI/pythia-1b@step48000": "Pythia-1B 48k",
     "EleutherAI/pythia-1b@step96000": "Pythia-1B 96k",
     "EleutherAI/pythia-6.9b": "Pythia-6.9B",
@@ -129,14 +136,15 @@ def _zero_candidate_direction_status(task: str, raw_score: float) -> tuple[float
     return math.nan, "zero_candidates_direction_denominator_unverified", math.nan, "zero_candidates_direction_denominator_unverified"
 
 
-def configured_rows(profile: str = "study-48") -> List[Dict[str, Any]]:
+def configured_rows(profile: str = "study-56") -> List[Dict[str, Any]]:
     """Return metadata rows for the selected registry profile."""
     rows: List[Dict[str, Any]] = []
     specs = (
-        paper_study_experiments() if profile == "study-48"
-        else paper_study_44_experiments() if profile == "study-44"
-        else paper_reference_experiments() if profile == "study-39"
-        else paper_primary_experiments()
+        paper_study_experiments() if profile == "study-56"
+        else legacy_study_48_experiments() if profile == "study-48"
+        else storage_protected_experiments() if profile == "study-44"
+        else legacy_study_39_experiments() if profile == "study-39"
+        else legacy_iclr_28_experiments()
     )
     final_cell_counts: Dict[tuple[str, str, str], int] = {}
     for spec in specs:
@@ -146,20 +154,23 @@ def configured_rows(profile: str = "study-48") -> List[Dict[str, Any]]:
 
     for spec in specs:
         key = (spec.task, spec.model, spec.mode, spec.intervention)
-        is_checkpoint = "@step" in spec.model
-        final_cell = (spec.task, spec.model, spec.mode)
-        is_matched_baseline_repeat = (
-            not is_checkpoint
-            and final_cell_counts.get(final_cell, 0) > 1
-            and spec.intervention in {"mean", "mean-positional"}
-        )
-        component = (
-            "intermediate_checkpoint"
-            if is_checkpoint
-            else "replacement_baseline_repeat"
-            if is_matched_baseline_repeat
-            else "final_snapshot"
-        )
+        if profile == "study-56" and spec.suite in {"mean-donor", "6-7b-models", "mean", "checkpoints"}:
+            component = spec.suite
+        else:
+            is_checkpoint = "@step" in spec.model
+            final_cell = (spec.task, spec.model, spec.mode)
+            is_matched_baseline_repeat = (
+                not is_checkpoint
+                and final_cell_counts.get(final_cell, 0) > 1
+                and spec.intervention in {"mean", "mean-positional"}
+            )
+            component = (
+                "intermediate_checkpoint"
+                if is_checkpoint
+                else "replacement_baseline_repeat"
+                if is_matched_baseline_repeat
+                else "final_snapshot"
+            )
         rows.append({
             "task": TASK_LABELS.get(spec.task, spec.task),
             "task_dir": spec.task,
@@ -235,8 +246,8 @@ def sort_table1_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
-def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "study-48") -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Materialize the 48-setting study table with metric-specific availability.
+def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "study-56") -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Materialize the configured study table with metric-specific availability.
 
     Missing derived artifacts no longer remove a configured setting from the
     analysis manifest.  They produce explicit missing values/statuses that the
@@ -577,8 +588,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--primary-profile",
         choices=PRIMARY_PROFILE_CHOICES,
-        default="study-48",
-        help="Validation profile for the configured study table. Default: study-48.",
+        default="study-56",
+        help="Validation profile for the configured study table. Default: study-56.",
     )
     ap.add_argument(
         "--suppress-directional-warnings",

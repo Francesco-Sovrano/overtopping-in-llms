@@ -6,6 +6,7 @@ from sklearn.linear_model import LassoCV, Lasso
 from functools import reduce
 from tqdm import tqdm
 import math
+import warnings
 
 import numbers
 from sklearn.base import BaseEstimator
@@ -681,7 +682,8 @@ class RuleEnsemble():
 		"""
 		rules = set()
 
-		def traverse_nodes(node_id=0, operator=None, threshold=None, feature=None, conditions=[]):
+		def traverse_nodes(node_id=0, operator=None, threshold=None, feature=None, conditions=None):
+			conditions = [] if conditions is None else conditions
 			# Children
 			left_child = tree.children_left[node_id]
 			right_child = tree.children_right[node_id]
@@ -742,9 +744,8 @@ class RuleEnsemble():
 		"""Recursively extract rules from a JSON XGBoost tree."""
 		rules = []
 
-		# print('tree:', json.dumps(tree, indent=4))
-
-		def traverse_nodes(node, conditions=[]):
+		def traverse_nodes(node, conditions=None):
+			conditions = [] if conditions is None else conditions
 			# Base case: Check if it's a leaf node
 			if 'leaf' in node:
 				if conditions:
@@ -823,6 +824,8 @@ class RuleEnsemble():
 			elif operator == '<':
 				# Keep condition with the lowest threshold
 				best_condition = min(group, key=lambda x: (x.threshold, 1 if x.operator.endswith('=') else 0))
+			else:
+				raise ValueError(f"Unsupported rule-condition operator: {operator!r}")
 			
 			filtered_conditions.append(best_condition)
 

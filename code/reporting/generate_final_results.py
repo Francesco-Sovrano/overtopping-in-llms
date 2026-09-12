@@ -19,7 +19,7 @@ import pandas as pd
 from core.project_paths import CODE_ROOT, PROJECT_ROOT
 
 
-from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, PROFILE_STUDY_48
+from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOICES, PROFILE_STUDY_56
 from reporting.result_paths import (
     analysis_root,
     appendix_figures,
@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-root", default=str(PROJECT_ROOT / "data"), help="Experiment-artifact root. Default: <repo>/data")
     p.add_argument("--results-root", default=str(PROJECT_ROOT / "results"), help="Final-output root. Default: <repo>/results")
     p.add_argument(
-        "--primary-profile", default=PROFILE_STUDY_48, choices=PRIMARY_PROFILE_CHOICES,
-        help="Validation profile for the configured study table. Default: study-48.",
+        "--primary-profile", default=PROFILE_STUDY_56, choices=PRIMARY_PROFILE_CHOICES,
+        help="Validation profile for the configured study table. Default: study-56.",
     )
     p.add_argument(
         "--poisoning-root",
@@ -525,6 +525,30 @@ def publish_primary_tables(source: Path, paper_tables: Path) -> None:
             shutil.copy2(src, paper_tables / dst_name)
 
 
+def snapshot_primary_table(source: Path, results_root: Path) -> Path:
+    """Freeze Stage-2's configured-population table for all downstream stages.
+
+    ``analysis/primary_matrix/tables`` is a generated working directory.  Later
+    reporting must not depend on that path remaining untouched for the entire
+    build.  Snapshot the canonical CSV immediately after Stage 2 into the
+    reproducibility tree and use that immutable copy everywhere downstream.
+    """
+    source = Path(source)
+    if not source.is_file():
+        raise RuntimeError(
+            f"Stage 02 completed without producing its canonical primary table: {source}"
+        )
+    snapshot = analysis_root(results_root) / "reproducibility" / "primary_population_snapshot.csv"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, snapshot)
+    # Fail early on an accidentally empty/truncated copy rather than surfacing a
+    # confusing FileNotFoundError much later in RQ2/RQ3 reporting.
+    if not snapshot.is_file() or snapshot.stat().st_size <= 1:
+        raise RuntimeError(f"Could not materialize primary-population snapshot: {snapshot}")
+    print(f"[final-results] froze primary population manifest: {snapshot}", flush=True)
+    return snapshot
+
+
 def write_results_index(results_root: Path, *, spiking_available: bool, partial_results: bool = False) -> None:
     paper = paper_root(results_root)
     figures = manuscript_figures(results_root)
@@ -683,7 +707,7 @@ def validate_generated_paper_view(
         message = f"missing directional prevalence sidecar: {rq1_data}"
         (errors if require_complete_population else warnings).append(message)
 
-    # RQ1 paper panels use all 48 configured overtopping settings.
+    # RQ1 paper panels use all 56 configured overtopping settings.
     # Derived *-heldout_test directories must never be
     # counted as additional experiments, and the fit-stat sidecar must describe
     # exactly the same sample as the plotted-point CSV.
@@ -737,8 +761,8 @@ def validate_generated_paper_view(
                         "experimental settings after collapsing evaluation suffixes"
                     )
 
-                # Figure 2 has an explicit manuscript population: all 48 configured overtopping settings. A manuscript figure
-                # must therefore contain all 48 rows, with the known phase split,
+                # Figure 2 has an explicit manuscript population: all 56 configured overtopping settings. A manuscript figure
+                # must therefore contain all 56 rows, with the known phase split,
                 # rather than silently accepting whatever a filesystem scan found.
                 expected_total = 48
                 expected_phase_counts = {"input+output": 22, "decode-only": 26}
@@ -820,6 +844,10 @@ def main() -> None:
     ])
 
     publish_primary_tables(paper_tables, manuscript_materials(results_root))
+    primary_table_path = snapshot_primary_table(
+        paper_tables / "primary_table.csv",
+        results_root,
+    )
 
     # Refresh the experiment catalogue from completed experiment artifacts.
     if catalogue_json is not None and catalogue_json.is_file():
@@ -832,7 +860,7 @@ def main() -> None:
 
     audit_command = [
         sys.executable, "-m", "studies.overtopping.analysis.stage03_audit_required_metrics",
-        "--primary-table", str(paper_tables / "primary_table.csv"),
+        "--primary-table", str(primary_table_path),
         "--data-root", str(data_root),
         "--primary-profile", args.primary_profile,
         "--out-dir", str(metric_completeness_audit(results_root)),
@@ -869,14 +897,14 @@ def main() -> None:
     run([
         sys.executable, "-m", "studies.overtopping.analysis.stage04_analyze_primary_metrics",
         "primary",
-        "--primary_table", str(paper_tables / "primary_table.csv"),
+        "--primary_table", str(primary_table_path),
         "--data_root", str(data_root),
         "--out_dir", str(primary_statistics(results_root)),
     ])
 
     run([
         sys.executable, "-m", "studies.overtopping.analysis.stage05_generate_manuscript_outputs",
-        "--primary_table", str(paper_tables / "primary_table.csv"),
+        "--primary_table", str(primary_table_path),
         "--data_root", str(data_root),
         "--out_dir", str(manuscript_materials(results_root)),
         "--primary_profile", args.primary_profile,
@@ -911,13 +939,13 @@ def main() -> None:
         # was refreshed from a filtered runner manifest.
         run([
             sys.executable, "-m", "studies.overtopping.analysis.stage10_rq2_regime_report",
-            "--catalogue-csv", str(paper_tables / "primary_table.csv"),
+            "--catalogue-csv", str(primary_table_path),
             "--out-dir", str(rq2_regime_summary(results_root)),
             "--paper-figures-dir", str(rq2_figures(results_root)),
             "--paper-tables-dir", str(manuscript_materials(results_root)),
         ])
 
-        # RQ1 figures use all 48 configured overtopping settings.
+        # RQ1 figures use all 56 configured overtopping settings.
         # Directional source-state
         # denominators describe uncertainty within a setting and are not an
         # across-setting exclusion rule. Genuine empty-candidate settings remain
@@ -976,8 +1004,8 @@ def main() -> None:
 
         # Keep pooled-U/phase/size figures as explicit appendix context.  The
         # pooled competence scatter is the pooled-U companion to Figure 2, so it
-        # must use exactly the same 48-setting RQ1 population
-        # (22 input+output + 26 output-only).  Do not let the generic filesystem
+        # must use exactly the same canonical RQ1 population
+        # (26 input+output + 30 output-only).  Do not let the generic filesystem
         # scanner admit unrelated result directories and silently change n.
         appendix = appendix_figures(results_root)
         appendix.mkdir(parents=True, exist_ok=True)
@@ -1000,7 +1028,7 @@ def main() -> None:
         sys.executable, "-m", "studies.overtopping.analysis.stage09_composition_decomposition_report",
         "--root", str(data_root),
         "--out", str(rq2_interaction_decomposition(results_root)),
-        "--primary-table", str(paper_tables / "primary_table.csv"),
+        "--primary-table", str(primary_table_path),
         "--population-scope", "primary",
         "--replacement-regime", "mean-donor",
         "--evaluation-split", "test",
@@ -1015,7 +1043,7 @@ def main() -> None:
         sys.executable, "-m", "studies.overtopping.analysis.stage09_composition_decomposition_report",
         "--root", str(data_root),
         "--out", str(rq2_interaction_decomposition_mean(results_root)),
-        "--primary-table", str(paper_tables / "primary_table.csv"),
+        "--primary-table", str(primary_table_path),
         "--population-scope", "primary",
         "--replacement-regime", "mean",
         "--evaluation-split", "test",
@@ -1077,7 +1105,7 @@ def main() -> None:
             sys.executable, "-m", "studies.overtopping.analysis.stage07_overtopping_spiking_report",
             "--out", str(spiking_out),
             "--paper-figures-dir", str(rq3_dir),
-            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--primary-table", str(primary_table_path),
             "--data-root", str(data_root),
             "--evaluation-split", "test",
             "--spiking-max-points", str(args.spiking_max_points),
@@ -1095,7 +1123,7 @@ def main() -> None:
             sys.executable, "-m", "studies.overtopping.analysis.stage08_threshold_shape_validation",
             "--out", str(spiking_out / "threshold_shape_validation"),
             "--paper-figures-dir", str(rq3_dir),
-            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--primary-table", str(primary_table_path),
             "--data-root", str(data_root),
             "--evaluation-split", "test",
             "--spiking-max-points", str(args.spiking_max_points),
@@ -1126,13 +1154,13 @@ def main() -> None:
             "status": "not_available",
             "reason": "No aggregate_flip_stats.csv diagnostics source was found.",
             "searched_data_root": str(data_root),
-            "hint": "Set SPIKING_SOURCE=/path/to/spiking_diagnostics_results_for_inspection.zip or rerun threshold_event_diagnostics.",
+            "hint": "Pass --spiking-source /path/to/threshold_diagnostics (directory or zip), or rerun threshold_event_diagnostics.",
         }
         (spiking_out / "report_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
         (rq3_dir / "README.md").write_text(
             "# Figure 4 - RQ3: the spiking cut\n\n"
             "**RQ3 source missing.** No aggregate threshold/spiking diagnostics were found.\n\n"
-            "Set `SPIKING_SOURCE=/path/to/spiking_diagnostics_results_for_inspection.zip` before running `./generate_results.sh`, "
+            "Run `./generate_results.sh --spiking-source /path/to/threshold_diagnostics`, "
             "or rerun `threshold_event_diagnostics` to create the aggregate diagnostics.\n",
             encoding="utf-8",
         )
@@ -1162,6 +1190,9 @@ def main() -> None:
             "fig4s11_strength_concentration_paired.pdf",
             "fig4s12_arithmetic_competence_concentration.pdf",
             "fig4s13_affine_null_transient_events.pdf",
+            "fig4s14_temporal_cutoff_spiking.pdf",
+            "fig4s15_temporal_cutoff_capture_profile.pdf",
+            "fig4s16_temporal_cross_sweep_event_validation.pdf",
             "fig4s7_candidate_control_support_summary.pdf",
             "fig4s8_threshold_testability_support_by_condition.pdf",
             "fig4s9_threshold_tail_support_by_direction.pdf",
@@ -1173,7 +1204,7 @@ def main() -> None:
             "--root", str(data_root),
             "--out", str(spiking_out / "graded_agonist"),
             "--paper-figures-dir", str(rq3_dir),
-            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--primary-table", str(primary_table_path),
             "--population-scope", "primary",
             "--evaluation-split", "test",
             "--require-negative-support",
@@ -1191,12 +1222,27 @@ def main() -> None:
                 "--paper-figures-dir", str(rq3_dir),
             ], allow_failure=allow_incomplete_population)
 
+        # Aggregate the independent autoregressive temporal-cutoff experiment.
+        # This is non-fatal so older/partial data trees without the new per-run
+        # experiment still generate every other available RQ3 result.
+        run([
+            sys.executable, "-m", "studies.overtopping.analysis.stage11_rq3_temporal_cutoff_story",
+            "--root", str(data_root),
+            "--out", str(spiking_out / "temporal_cutoff"),
+            "--primary-table", str(primary_table_path),
+            "--data-root", str(data_root),
+            "--population-scope", "primary",
+            "--evaluation-split", "test",
+            "--paper-figures-dir", str(rq3_dir),
+            "--graded-dir", str(spiking_out / "graded_agonist"),
+        ], allow_failure=True)
+
         # Aggregate threshold-conditioned preemption over every available run.
         run([
             sys.executable, "-m", "studies.overtopping.analysis.stage09_preemption_report",
             "--root", str(data_root),
             "--out", str(spiking_out / "preemption"),
-            "--primary-table", str(paper_tables / "primary_table.csv"),
+            "--primary-table", str(primary_table_path),
             "--population-scope", "primary",
             "--evaluation-split", "test",
         ], allow_failure=allow_incomplete_population)
@@ -1215,11 +1261,14 @@ def main() -> None:
             "- `fig4s5_graded_agonist_single_crossing.pdf` - support-consistent graded trajectories, when available.\n"
             "- `fig4s6_graded_margin_condition_diagnostics.pdf` - condition-level affine-fit/concentration diagnostics, when available.\n"
             "- `fig4s7_graded_margin_condition_heatmap.pdf` - per-condition normalized margin trajectories, when available.\n"
-            "- `fig4e_population_event_and_strength.pdf` - main population event-localization and within-condition causal-strength sharpening summary.\n"
+            "- `fig4e_population_event_and_strength.pdf` - main triptych: population event localization, within-condition causal-strength sharpening, and temporal-cutoff capture.\n"
             "- `fig4s10_population_event_localization.pdf` - standalone population event-localization profile with interquartile ranges.\n"
             "- `fig4s11_strength_concentration_paired.pdf` - paired low-versus-high causal-strength tertile concentration within eligible run/direction groups.\n"
             "- `fig4s12_arithmetic_competence_concentration.pdf` - task-specific Arithmetic output-only 1-to-0 competence/concentration relation.\n"
             "- `fig4s13_affine_null_transient_events.pdf` - endpoint-preserving transient interior events against the one-dimensional affine-margin null.\n"
+            "- `fig4s14_temporal_cutoff_spiking.pdf` - temporal cutoff summary: cumulative capture of the full held-out effect and incremental autoregressive gain.\n"
+            "- `fig4s15_temporal_cutoff_capture_profile.pdf` - standalone version of the temporal-cutoff capture profile used as Figure 4e panel c.\n"
+            "- `fig4s16_temporal_cross_sweep_event_validation.pdf` - cross-sweep EVENT validation: one temporal schedule defines EVENT and the complementary schedule supplies the held-out aligned profile.\n"
             "\nIn partial-results mode each panel is generated from the completed/auditable configured subset. "
             "Missing settings are listed in the RQ3 population-audit files instead of suppressing Figure 4.\n"
         )
@@ -1278,6 +1327,7 @@ def main() -> None:
         "structural_zero_setting_count": int(structural_zero_setting_count),
         "incomplete_setting_count": int(incomplete_setting_count),
         "primary_tables": str(paper_tables),
+        "primary_population_snapshot": str(primary_table_path),
         "metric_completeness_audit": str(metric_completeness_audit(results_root)),
         "rq2_interaction_decomposition": str(rq2_interaction_decomposition(results_root)),
         "manuscript_figures": str(manuscript_figures(results_root)),

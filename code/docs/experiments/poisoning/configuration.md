@@ -257,3 +257,39 @@ export ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS=0,10,25,100
 ```
 
 Use `all` to localize at every saved checkpoint. Checkpoints omitted from the schedule have no checkpoint-local rediscovery result; Stage 07 still evaluates the frozen union on all matched checkpoints, but prospective plots that require a localization at an omitted checkpoint may contain gaps rather than silently borrowing future information.
+
+
+### No-circuit checkpoint and explicit full-ablation policies
+
+Poisoning checkpoint workflows default to `POISONING_SKIP_IF_NO_CIRCUIT=1`.
+Discovery is still allowed to run. After Stage 5, a checkpoint with no valid
+discovered circuit is retained as a scientific no-circuit observation, but
+Stages 6+ are not launched for that endpoint. Internally this maps to
+`SKIP_DOWNSTREAM_IF_NO_CIRCUIT`; it is intentionally distinct from the generic
+`SKIP_IF_NO_CIRCUIT`, which is now a reuse-only preflight policy that refuses to
+run Stage-5 discovery when no circuit is already cached.
+
+Two explicit poisoning alternatives are available. They are mutually exclusive:
+
+- `--skip-circuit-discovery` (or `POISONING_SKIP_CIRCUIT_DISCOVERY=1`) bypasses
+  EAP entirely and exposes the full model-neuron space as the Stage-6 ablation
+  candidate space.
+- `--full-ablation-if-no-circuit` (or
+  `POISONING_FULL_ABLATION_IF_NO_CIRCUIT=1`) first attempts ordinary discovery;
+  if Stage 5 completes with no usable circuit, that endpoint is rerun using the
+  explicit full-network candidate space.
+
+The explicit full-network path is stored under a separate
+`neural_circuit_discovery_results*_full_ablation` namespace and its Stage-7
+statistics use a separate `*-full_ablation` label. It is provenance marked and
+never overwrites or masquerades as a discovered circuit. If a full-ablation
+artifact is found in a normal discovered-circuit namespace, execution fails
+with a mode-mismatch error instead of reusing it. Re-running with full-ablation
+disabled therefore performs/reuses ordinary circuit discovery independently. This mode
+means **search the full model-neuron candidate space with the existing Stage-6
+ablation procedure**; it is not a single intervention that jointly ablates every
+neuron at once.
+
+Set `POISONING_SKIP_IF_NO_CIRCUIT=0` to disable the default post-discovery skip.
+The pipeline writes/refreshes `pipeline_status.json` so normal no-circuit and
+explicit full-ablation outcomes remain distinguishable.

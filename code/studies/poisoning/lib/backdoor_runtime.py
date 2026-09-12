@@ -970,6 +970,22 @@ def normal_task_population_statistics(df: pd.DataFrame, *, behavior_readout: str
     return stats
 
 
+
+def observed_training_mixture_statistics(df: pd.DataFrame) -> Dict[str, Any]:
+    """Summarize correctness on defender-visible training prompts and observed labels."""
+    values = df.get("is_correct_observed_label")
+    labeled = values.dropna().astype(bool) if values is not None else pd.Series(dtype=bool)
+    return {
+        "n_examples": int(len(df)),
+        "observed_training_mixture_accuracy": float(labeled.mean()) if len(labeled) else None,
+        "n_observed_training_mixture_correct": int(labeled.sum()) if len(labeled) else 0,
+        "n_labeled_observed_training_mixture": int(len(labeled)),
+        "behavior_endpoint": "observed_training_mixture_correctness",
+        "causal_endpoint": "observed_training_mixture_correctness",
+        "causal_cohort": "defender_visible_training_prompts_and_observed_labels",
+        "oracle_attack_annotations_used_for_selection": False,
+    }
+
 def common_behavior_statistics(
     df: pd.DataFrame,
     *,

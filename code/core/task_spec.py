@@ -25,7 +25,7 @@ class FeatureTaskSpec(ABC):
 
 	# --- Required task hooks ---
 	@abstractmethod
-	def generate_cache(self, model: Any, args: Any) -> Any:
+	def generate_cache(self, ai_model: str, ai_model_cache_dir: str | None, args: Any) -> Any:
 		"""
 		How to probe the LLM and build the cache consumed by the feature pipeline.
 		"""
@@ -39,7 +39,7 @@ class FeatureTaskSpec(ABC):
 		raise NotImplementedError
 
 	@abstractmethod
-	def parse_prompt_row(self, prompt: str) -> dict:
+	def parse_prompt_row(self, prompt_row: Any) -> dict:
 		"""
 		Turn a prompt into a token dict used by feature functions.
 		"""

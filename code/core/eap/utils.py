@@ -21,6 +21,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
 		return default
 	return v in {"1", "true", "yes", "y", "on"}
 
+
+
+def _is_unsupported_keyword_typeerror(exc: TypeError, keyword: str) -> bool:
+	"""Return whether ``exc`` is the usual unsupported-keyword call error."""
+	message = str(exc).lower()
+	return keyword.lower() in message and (
+		"unexpected keyword" in message
+		or "invalid keyword" in message
+		or "keyword argument" in message and "not supported" in message
+	)
+
 def should_disable_kv_cache(disable_kv_cache=None) -> bool:
 	if disable_kv_cache is not None:
 		return bool(disable_kv_cache)
@@ -52,8 +63,12 @@ def forward_no_cache_optional(model, tokens, attention_mask=None, disable_kv_cac
 	try:
 		# HF-style models accept use_cache
 		return model(tokens, attention_mask=attention_mask, use_cache=(not disable))
-	except TypeError:
-		# TransformerLens HookedTransformer typically doesn't accept use_cache
+	except TypeError as exc:
+		# TransformerLens HookedTransformer typically doesn't accept use_cache.
+		# Only retry for that compatibility case; an internal TypeError from the
+		# model must remain visible.
+		if not _is_unsupported_keyword_typeerror(exc, "use_cache"):
+			raise
 		return model(tokens, attention_mask=attention_mask)
 
 
@@ -64,8 +79,14 @@ def clean_memory_cache(model):
 		torch.mps.empty_cache()
 
 def model_device_expr(model):
-	# This returns a Python expression that resolves to the model's device at call sites
-	return getattr(model.cfg, 'device', (next(model.parameters()).device.type if any(True for _ in model.parameters()) else 'cpu'))
+	"""Resolve a model device without eagerly touching model parameters."""
+	cfg_device = getattr(getattr(model, "cfg", None), "device", None)
+	if cfg_device is not None:
+		return cfg_device
+	try:
+		return next(model.parameters()).device
+	except (AttributeError, StopIteration):
+		return torch.device("cpu")
 
 def tokenize_plus(model: HookedTransformer, inputs: List[str], max_length: Optional[int] = None):
 	"""
@@ -175,7 +196,7 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
 					activation_difference[:, :, index] -= acts
 		except RuntimeError as e:
 			print(hook.name, activation_difference.shape, acts.shape)
-			raise e
+			raise
 	
 	def gradient_hook(prev_index: int, bwd_index: Union[slice, int], gradients:torch.Tensor, hook):
 		"""Takes in a gradient and uses it and activation_difference 
@@ -203,7 +224,7 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
 		except RuntimeError as e:
 			print(hook.name, activation_difference.size(), activation_difference.device, grads.size(), grads.device)
 			print(prev_index, bwd_index, scores.size())
-			raise e
+			raise
 	
 	node = graph.nodes['input']
 	fwd_index = graph.forward_index(node)
@@ -236,52 +257,67 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
 	return (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference
 
 
+def align_mean_activations_to_positions(means: torch.Tensor, n_pos: int) -> torch.Tensor:
+	"""Return mean activations aligned to ``n_pos`` without mutating the cache.
+
+	Expected shapes are ``[1, 1, forward, hidden]`` for global means and
+	``[1, position, forward, hidden]`` for per-position means.  Global means
+	broadcast over positions.  Per-position means are truncated or zero-padded
+	when evaluation batches have a different token width than the mean-estimation
+	dataset.
+	"""
+	if means.ndim != 4:
+		raise ValueError(f"Expected mean activations with 4 dimensions, got shape {tuple(means.shape)}")
+	if n_pos < 0:
+		raise ValueError(f"n_pos must be non-negative, got {n_pos}")
+	if means.size(1) == 1 or means.size(1) == n_pos:
+		return means
+	if means.size(1) > n_pos:
+		return means[:, :n_pos, ...]
+	pad = means.new_zeros((means.size(0), n_pos - means.size(1), *means.shape[2:]))
+	return torch.cat((means, pad), dim=1)
+
+
 def compute_mean_activations(model: HookedTransformer, graph: Graph, dataloader: DataLoader, per_position=False):
 	"""
-	Compute the mean activations of a graph's nodes over a dataset.
+	Compute mean activations of a graph's forward nodes over a dataset.
 
-	If per_position=True, computes a per-position mean over only the sequences
-	that actually contain that position (no zero-padding bias).
+	For ``per_position=False``, each example contributes its mean over valid
+	token positions and examples are then averaged uniformly.  For
+	``per_position=True``, each token position is averaged only over examples
+	that actually contain that position, avoiding right-padding bias.
 	"""
 
-	def activation_hook(index, activations, hook, means=None, input_lengths=None):
-		# defining a hook that will fill up our means tensor. Means is of shape
-		# (n_pos, graph.n_forward, model.cfg.d_model) if per_position is True, otherwise
-		# (graph.n_forward, model.cfg.d_model) 
+	def activation_hook(index, activations, hook, *, means, valid_mask):
 		acts = activations.detach()
+		mask = valid_mask.to(device=acts.device, dtype=acts.dtype)
+		while mask.dim() < acts.dim():
+			mask = mask.unsqueeze(-1)
 
-				# if you gave this hook input lengths, we assume you want to mean over positions
-		if input_lengths is not None:
-			max_len = activations.size(1)
-			ar = torch.arange(max_len, device=input_lengths.device)
-			mask = (ar.unsqueeze(0) < input_lengths.unsqueeze(1)).to(activations.dtype)
-			# broadcast to ...hidden if needed
-			while mask.dim() < acts.dim():
-				mask = mask.unsqueeze(-1)
-			
-			# we need ... because there might be a head index as well
-			item_means = einsum(acts, mask, 'batch pos ... hidden, batch pos ... hidden -> batch ... hidden')
-			
-			# mean over the positions we did take, position-wise
-			if len(item_means.size()) == 3:
-				item_means /= input_lengths.unsqueeze(-1).unsqueeze(-1)
-			else:
-				item_means /= input_lengths.unsqueeze(-1)
-
-			means[index] += item_means.sum(0)
-		else:
-			# per_position=True: align positions to means' first dim
+		if per_position:
 			T_alloc = means.size(0)
 			T_batch = acts.size(1)
 			if T_batch < T_alloc:
-				pad = torch.zeros(acts.size(0), T_alloc - T_batch, *acts.shape[2:], device=acts.device, dtype=acts.dtype)
-				acts = torch.cat([acts, pad], dim=1)
+				acts = torch.cat(
+					(acts, acts.new_zeros((acts.size(0), T_alloc - T_batch, *acts.shape[2:]))),
+					dim=1,
+				)
+				mask = torch.cat(
+					(mask, mask.new_zeros((mask.size(0), T_alloc - T_batch, *mask.shape[2:]))),
+					dim=1,
+				)
 			elif T_batch > T_alloc:
 				acts = acts[:, :T_alloc, ...]
-			means[:, index] += acts.sum(0)
+				mask = mask[:, :T_alloc, ...]
+			means[:, index] += (acts * mask).sum(0)
+		else:
+			masked = acts * mask
+			position_counts = valid_mask.sum(1).clamp_min(1).to(device=acts.device, dtype=acts.dtype)
+			item_means = masked.sum(1)
+			while position_counts.dim() < item_means.dim():
+				position_counts = position_counts.unsqueeze(-1)
+			means[index] += (item_means / position_counts).sum(0)
 
-	# we're going to get all of the out hooks / indices we need for making hooks
-	# but we can't make them until we have input length masks
 	processed_attn_layers = set()
 	hook_points_indices = []
 	for node in graph.nodes.values():
@@ -289,46 +325,53 @@ def compute_mean_activations(model: HookedTransformer, graph: Graph, dataloader:
 			if node.layer in processed_attn_layers:
 				continue
 			processed_attn_layers.add(node.layer)
-
 		if not isinstance(node, LogitNode):
 			hook_points_indices.append((node.out_hook, graph.forward_index(node)))
 
-	means_initialized = False
-	n_pos_alloc = None
+	means = None
+	position_counts = None
 	total = 0
-
 	for batch in tqdm(dataloader, desc='Computing mean'):
-		# maybe the dataset is given as a tuple, maybe its just raw strings
-		batch_inputs = batch[0] if isinstance(batch, (tuple,list)) else batch
-		tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, batch_inputs)
-		total += len(batch_inputs)
+		batch_inputs = batch[0] if isinstance(batch, (tuple, list)) else batch
+		tokens, attention_mask, _input_lengths, n_pos = tokenize_plus(model, batch_inputs)
+		batch_size = len(batch_inputs)
+		total += batch_size
 
-		if not means_initialized:
+		if means is None:
 			if per_position:
 				means = torch.zeros((n_pos, graph.n_forward, model.cfg.d_model), device=model_device_expr(model), dtype=model.cfg.dtype)
-				n_pos_alloc = n_pos
+				position_counts = torch.zeros(n_pos, device=means.device, dtype=torch.long)
 			else:
 				means = torch.zeros((graph.n_forward, model.cfg.d_model), device=model_device_expr(model), dtype=model.cfg.dtype)
-			means_initialized = True
-		else:
-			if per_position and n_pos > n_pos_alloc:
-				new_means = torch.zeros((n_pos, graph.n_forward, model.cfg.d_model), device=means.device, dtype=means.dtype)
-				new_means[:n_pos_alloc] = means
-				means = new_means
-
-				n_pos_alloc = n_pos
+		elif per_position and n_pos > means.size(0):
+			new_means = means.new_zeros((n_pos, graph.n_forward, model.cfg.d_model))
+			new_means[:means.size(0)] = means
+			means = new_means
+			new_counts = position_counts.new_zeros(n_pos)
+			new_counts[:position_counts.size(0)] = position_counts
+			position_counts = new_counts
 
 		if per_position:
-			input_lengths = None
-		add_to_mean_hooks = [(hook_point, partial(activation_hook, index, means=means, input_lengths=input_lengths)) for hook_point, index in hook_points_indices]
+			counts = attention_mask.sum(0).to(device=position_counts.device, dtype=position_counts.dtype)
+			position_counts[:n_pos] += counts
 
+		add_to_mean_hooks = [
+			(hook_point, partial(activation_hook, index, means=means, valid_mask=attention_mask))
+			for hook_point, index in hook_points_indices
+		]
 		with torch.inference_mode():
 			with model.hooks(fwd_hooks=add_to_mean_hooks):
 				model(tokens, attention_mask=attention_mask)
 
-	means /= total
-	means.requires_grad_(False)  # redundant but explicit
-	print("means shape:", means.shape)  # expect (n_forward,d_model) or (n_pos,n_forward,d_model)
+	if means is None or total <= 0:
+		raise ValueError("Cannot compute mean activations from an empty intervention dataloader.")
+	if per_position:
+		denominator = position_counts.clamp_min(1).to(dtype=means.dtype)
+		means /= denominator[:, None, None]
+	else:
+		means /= total
+	means.requires_grad_(False)
+	print("means shape:", means.shape)
 	return means
 
 def infer_decode_pos_mask(
@@ -450,6 +493,28 @@ def infer_decode_pos_mask(
 
 	return None
 
+
+
+def prepare_decode_pos_mask(
+	attention_mask: torch.Tensor,
+	input_lengths: torch.Tensor,
+	label,
+	mode: str,
+	*,
+	log: bool = False,
+) -> torch.Tensor:
+	"""Infer a non-empty decode-position mask and optionally log first-batch metadata."""
+	mask = infer_decode_pos_mask(attention_mask, input_lengths, label, mode=mode)
+	if mask is not None and mask.sum().item() == 0:
+		mask = None
+	assert mask is not None
+	if log:
+		print("decode_pos_mask.sum()", int(mask.sum().item()))
+		print("first true positions", mask.nonzero()[:10])
+		print("answer_len", label["answer_len"] if isinstance(label, dict) and "answer_len" in label else None)
+		print("prompt_len", label["prompt_len"] if isinstance(label, dict) and "prompt_len" in label else None)
+		print("full_len", label["full_len"] if isinstance(label, dict) and "full_len" in label else None)
+	return mask
 
 def apply_decode_mask_inplace(activation_difference: torch.Tensor, decode_pos_mask: Optional[torch.Tensor]):
 

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import numpy as np
 import math
 import pandas as pd
-from typing import *
 
 from core.caching_and_prompting import instruct_model
 from core.project_paths import PROJECT_ROOT

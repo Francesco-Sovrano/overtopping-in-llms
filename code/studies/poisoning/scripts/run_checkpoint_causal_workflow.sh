@@ -682,8 +682,26 @@ PYSTATUS
   CMD+=(--evaluation_baseline_subset positive)
   if [[ "$PHASE_LABEL" == "output_only" ]]; then CMD+=(--decode_only); fi
 
+  # Poisoning has two explicit alternatives to ordinary EAP discovery:
+  #   1) direct full-network ablation candidate search (skip EAP entirely);
+  #   2) normal EAP first, then full-network fallback only for a completed
+  #      no-circuit outcome.  The full-network path has its own namespace.
+  DIRECT_FULL_ABLATION=0
+  FIRST_PASS_SKIP_DOWNSTREAM="$SKIP_DOWNSTREAM_IF_NO_CIRCUIT"
+  if poisoning_is_true "$POISONING_SKIP_CIRCUIT_DISCOVERY"; then
+    DIRECT_FULL_ABLATION=1
+    FIRST_PASS_SKIP_DOWNSTREAM=false
+    CMD+=(--full_network_ablation)
+    echo "[full-ablation] --skip-circuit-discovery: bypassing EAP and using the full model-neuron candidate space."
+  elif poisoning_is_true "$POISONING_FULL_ABLATION_IF_NO_CIRCUIT"; then
+    # The fallback decision requires Stage 5 to return cleanly before Stage 6.
+    FIRST_PASS_SKIP_DOWNSTREAM=true
+  fi
+
   printf '[cmd]'; printf ' %q' "${CMD[@]}"; printf '\n'
   env \
+    SKIP_IF_NO_CIRCUIT=false \
+    SKIP_DOWNSTREAM_IF_NO_CIRCUIT="$FIRST_PASS_SKIP_DOWNSTREAM" \
     MAX_POINTS_PER_ABLATION="$N_SIDE" \
     MAX_POINTS_PER_CIRCUIT="$N_PAIRS" \
     SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" \
@@ -703,6 +721,78 @@ PYSTATUS
     HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
     "${CMD[@]}"
 
+  FULL_ABLATION_MODE=""
+  if (( DIRECT_FULL_ABLATION == 1 )); then
+    FULL_ABLATION_MODE="direct"
+  elif poisoning_pipeline_skipped_no_circuit "$OUTPUT_DATA_DIR"; then
+    if poisoning_is_true "$POISONING_FULL_ABLATION_IF_NO_CIRCUIT"; then
+      echo "[full-ablation-fallback] Stage 5 found no valid circuit for $CONDITION $CHECKPOINT_STAGE_LABEL; rerunning without EAP using the full model-neuron candidate space."
+      CMD_FULL=("${CMD[@]}" --full_network_ablation)
+      printf '[cmd-full-ablation-fallback]'; printf ' %q' "${CMD_FULL[@]}"; printf '\n'
+      env \
+        SKIP_IF_NO_CIRCUIT=false \
+        SKIP_DOWNSTREAM_IF_NO_CIRCUIT=false \
+        MAX_POINTS_PER_ABLATION="$N_SIDE" \
+        MAX_POINTS_PER_CIRCUIT="$N_PAIRS" \
+        SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" \
+        CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" \
+        EVALUATION_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" \
+        REFINE_SAMPLING_MAX_POINTS="$STAGE7_MAX_ROWS" \
+        ANALYZE_BASELINE_SUBSETS=positive \
+        EVALUATION_BASELINE_SUBSET=positive \
+        PIPELINE_EVALUATION_BASELINE_SUBSET=positive \
+        SPECTRAL_CLUSTER_BASE_SUBSET=positive \
+        RUN_SINGLETON_CAUSAL_EVALUATION=true \
+        REFINE_USE_SPECTRAL_SAMPLING=false \
+        REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=true \
+        RUN_INTERACTION_VALIDATION=false \
+        RUN_CMC=false \
+        SKIP_AGONIST_METRIC_STATS=true \
+        HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
+        "${CMD_FULL[@]}"
+      CMD=("${CMD_FULL[@]}")
+      FULL_ABLATION_MODE="fallback_after_no_circuit"
+    else
+      echo "[skip-no-circuit] Stage 5 found no valid circuit for $CONDITION $CHECKPOINT_STAGE_LABEL; behavior is retained and downstream causal stages are omitted."
+      python3 - "$OUTPUT_DATA_DIR/discovery_status.json" <<'PYNOCIRCUIT'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+payload = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+payload.update({
+    "status": "skipped_no_circuit",
+    "analysis_decision": "skip_no_circuit",
+    "low_data_reason": "stage5_discovered_no_valid_circuit",
+    "cha_will_run": False,
+    "all_points_requested": False,
+    "secondary_final_statistics_split": None,
+})
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+PYNOCIRCUIT
+      continue
+    fi
+  fi
+
+  if [[ -n "$FULL_ABLATION_MODE" ]]; then
+    python3 - "$OUTPUT_DATA_DIR/discovery_status.json" "$FULL_ABLATION_MODE" <<'PYFULLABLATION'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1]); mode = sys.argv[2]
+payload = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+payload.update({
+    "status": "full_network_ablation",
+    "analysis_decision": "full_network_ablation",
+    "low_data_reason": None,
+    "cha_will_run": True,
+    "circuit_discovery_skipped": mode == "direct",
+    "full_network_ablation": True,
+    "full_network_ablation_mode": mode,
+    "candidate_space_semantics": "all_model_neurons_for_stage6_ablation_search",
+})
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+PYFULLABLATION
+  fi
+
   if (( TEST_POS < POISONING_TARGET_TEST_POSITIVES )) && [[ "$REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET" != "0" && "$REPORT_ALL_POINTS_WHEN_HELDOUT_BELOW_TARGET" != "false" ]]; then
     echo "[all-points] held-out trigger-lift positives=$TEST_POS are below preferred target=$POISONING_TARGET_TEST_POSITIVES; reporting a second descriptive estimate on all available trigger-lift-positive rows."
     echo "[all-points] the held-out estimate remains primary; this all-points estimate includes discovery trigger-lift positives and is post-selection/descriptive."
@@ -720,6 +810,8 @@ PYSTATUS
     done
     printf '[cmd-all-points]'; printf ' %q' "${CMD_ALL[@]}"; printf '\n'
     env \
+      SKIP_IF_NO_CIRCUIT=false \
+      SKIP_DOWNSTREAM_IF_NO_CIRCUIT=false \
       MAX_POINTS_PER_ABLATION="$N_SIDE" \
       MAX_POINTS_PER_CIRCUIT="$N_PAIRS" \
       SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" \

@@ -8,12 +8,12 @@ Main entry point from `code/`:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-48
+  --primary-profile study-56
 ```
 
 The standard reporting path is model-free. It reads model-backed scientific artifacts from `data/`, does not use filesystem presence to define the configured population, and writes derived outputs under `results/`. The driver rejects a results root located inside `data/` or the repository `cache/` tree.
 
-Overtopping reporting begins from the complete 48-setting registry. Each analysis then applies its own applicability and artifact-availability rules and records its denominator. Mean-donor and mean-family RQ2 regimes are analyzed separately; `mean-positional` belongs to the mean-family reporting regime.
+Overtopping reporting begins from the complete 56-setting registry. Each analysis then applies its own applicability and artifact-availability rules and records its denominator. Mean-donor and mean-family RQ2 regimes are analyzed separately; `mean-positional` belongs to the mean-family reporting regime.
 
 References:
 

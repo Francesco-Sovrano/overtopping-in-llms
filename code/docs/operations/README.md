@@ -42,14 +42,14 @@ cd code
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-48
+  --primary-profile study-56
 ```
 
 The standard reporting driver reads `data/` and writes `results/`. It does not run model inference, rename experiment directories, or rewrite cache stores. It rejects a results root located inside `data/` or the repository `cache/` tree. The repository wrapper runs the read-only storage-contract check before reporting.
 
 ## 3. Overtopping population diagnostics
 
-The configured study table contains all 48 settings. A metric-specific missing value is reported as an availability status rather than by shortening the manifest.
+The configured study table contains all 56 settings. A metric-specific missing value is reported as an availability status rather than by shortening the manifest.
 
 Key audit locations:
 
@@ -60,17 +60,17 @@ results/analysis/rq2_composition/
 results/analysis/rq3_threshold_event/
 ```
 
-`primary_table.csv` is the configured 48-setting study manifest used by the reporting CLIs. In commands that expose `--population primary` or `--population-scope primary`, `primary` selects this configured study manifest; analysis-specific applicability and availability filters are applied afterward.
+`primary_table.csv` is the configured 56-setting study manifest used by the reporting CLIs. In commands that expose `--population primary` or `--population-scope primary`, `primary` selects this configured study manifest; analysis-specific applicability and availability filters are applied afterward.
 
-If RQ1 resolves fewer than 48 settings, inspect the exact configured path for the missing setting. RQ1 requires:
+If RQ1 resolves fewer than 56 settings, inspect the exact configured path for the missing setting. RQ1 requires:
 
 ```text
-48 settings total
-22 input+output
-26 output-only
+56 settings total
+26 input+output
+30 output-only
 ```
 
-A configured directory with a completed zero-candidate result remains a valid RQ1 observation. Completion is verified from Stage-6 `neuron_buckets.json` plus successful `rule_knockout.json` records; reporting resolves both the current Stage-6 layout and supported legacy/export layouts. RQ2 interaction completeness applies only when the frozen candidate set is nonempty. A missing or unverified configured directory remains an incomplete experiment.
+A configured directory with a completed zero-candidate result remains a valid RQ1 observation. Completion is verified from Stage-6 `neuron_buckets.json` plus successful `rule_knockout.json` records; reporting resolves both the current Stage-6 layout and supported alternate export layouts. RQ2 interaction completeness applies only when the frozen candidate set is nonempty. A missing or unverified configured directory remains an incomplete experiment.
 
 ## 4. Rebuild directional singleton statistics
 
@@ -239,7 +239,7 @@ Treat the three artifact classes separately.
 
 `cache/` and experiment-local cache stores accelerate model-backed computations. Preserve a cache when its model state, intervention configuration, row identity, and schema metadata match the requested computation.
 
-The 48-setting reporting manifest does not change cache keys or persistent experiment paths. The experiment runner and reporting wrapper validate a read-only storage/addressing fingerprint before execution. The fingerprint covers scientific configuration and persistent paths but excludes runtime-only batch size.
+The 56-setting reporting manifest does not change cache keys or persistent experiment paths. The experiment runner and reporting wrapper validate a read-only storage/addressing fingerprint before execution. The fingerprint covers scientific configuration and persistent paths but excludes runtime-only batch size.
 
 ### Derived reports
 

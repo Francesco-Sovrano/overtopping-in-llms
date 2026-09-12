@@ -2,7 +2,7 @@
 
 Experiment configuration, execution, and scientific analysis for the overtopping study.
 
-The configured study contains 48 intervention settings: 29 final-snapshot task×model×phase cells, 12 intermediate Pythia checkpoint settings, and 7 matched replacement-baseline repeats. Aggregate analyses start from this registry and apply analysis-specific applicability and artifact-availability rules.
+The configured study contains 56 RunSpecs in four disjoint execution sets: 20 mean-donor runs, 4 6-7B scale-model runs, 8 mean-replacement runs, and 24 Pythia-1B checkpoint runs for Grammar/HANS-NLI/Random-FSM. Aggregate analyses start from this registry and apply analysis-specific applicability and artifact-availability rules.
 
 Documentation:
 

@@ -6,21 +6,21 @@ RQ1 asks whether high-leverage singleton causal effects occur across the configu
 
 ## Population
 
-The main RQ1 analysis uses all 48 configured overtopping settings:
+The main RQ1 analysis uses all 56 configured overtopping settings:
 
 ```text
 29 unique final-snapshot task × model × phase cells
-12 intermediate Pythia checkpoint settings
+18 non-final Grammar/HANS-NLI/FSM Pythia checkpoint settings
  7 matched replacement-baseline repeats
 --------------------------------------------
-48 settings
+56 settings
 ```
 
 The phase totals are:
 
 ```text
-22 input+output (I+O)
-26 output-only (Out)
+26 input+output (I+O)
+30 output-only (Out)
 ```
 
 All configured settings enter because the estimand is the association between behavioral competence and causal reach across the intervention settings actually studied. Intermediate checkpoints are distinct model states, and replacement-baseline repeats are distinct causal counterfactuals. They are not pooled across phase.
@@ -104,9 +104,9 @@ These divide discovered-candidate counts by model `d_model`. They are not estima
 
 The main RQ1 outputs include:
 
-- phase-specific Pearson associations across all 48 configured settings;
-- phase-specific Spearman associations across all 48 configured settings;
-- the 28-cell final-snapshot sensitivity;
+- phase-specific Pearson associations across all 56 configured settings;
+- phase-specific Spearman associations across all 56 configured settings;
+- the 31-cell final-snapshot sensitivity;
 - task/phase and structural diagnostics where the available setting count permits estimation.
 
 The cross-setting statistical unit is the configured setting. Eligible-example counts describe within-setting precision rather than additional independent replicates.
@@ -150,4 +150,4 @@ Configured-study tables and cross-setting statistics:
 results/analysis/primary_matrix/
 ```
 
-See [Overtopping experiment design](../experiments/overtopping.md) for the exact 48 settings.
+See [Overtopping experiment design](../experiments/overtopping.md) for the exact 56 settings.

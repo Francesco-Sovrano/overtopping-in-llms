@@ -52,7 +52,7 @@ class RunSpec:
     def identity(self) -> str:
         return " | ".join((self.suite, self.task, self.model, self.intervention, self.mode))
 
-    def circuit_label(self) -> str:
+    def _base_circuit_label(self) -> str:
         label = "spectral_split"
         if self.circuit_size != 100_000:
             label += f"-M{self.circuit_size}"
@@ -62,10 +62,30 @@ class RunSpec:
         #     label += "-mlp_only"
         if self.circuit_level != "neuron":
             label += f"-{self.circuit_level}"
-        # Preserve the historical unsuffixed mean-family paths. The exact
-        # replacement baseline is part of RunSpec and all validation metadata.
+        return label
+
+    def circuit_label(self) -> str:
+        """Evaluation/result namespace; retained for storage compatibility."""
+        label = self._base_circuit_label()
         if self.intervention not in {"mean", "mean-positional"}:
             label += f"-eval_{self.intervention}"
+        return label
+
+    def stage5_circuit_label(self) -> str:
+        """Canonical circuit-discovery namespace for the effective Stage-5 baseline.
+
+        Stage 5 intentionally maps mean-donor -> mean and
+        mean-donor-positional -> mean-positional before attribution.  Those
+        pairs therefore share circuit discovery even though their downstream
+        Stage-6/7 evaluation namespaces remain distinct.
+        """
+        effective = {
+            "mean-donor": "mean",
+            "mean-donor-positional": "mean-positional",
+        }.get(self.intervention, self.intervention)
+        label = self._base_circuit_label()
+        if effective not in {"mean", "mean-positional"}:
+            label += f"-eval_{effective}"
         return label
 
     def bag_label(self) -> str:
@@ -90,10 +110,19 @@ class RunSpec:
         return ""
 
     def input_data_dir(self, data_root: Path) -> Path:
+        """Evaluation-specific diagnostics namespace (historical address)."""
         return (
             data_root / self.task / Path(self.model)
             / "neural_circuit_discovery_results" / "eap_ig_inputs"
             / self.circuit_label() / "neural_circuits"
+        )
+
+    def stage5_input_data_dir(self, data_root: Path) -> Path:
+        """Canonical source directory containing Stage-5 circuit artifacts."""
+        return (
+            data_root / self.task / Path(self.model)
+            / "neural_circuit_discovery_results" / "eap_ig_inputs"
+            / self.stage5_circuit_label() / "neural_circuits"
         )
 
 
@@ -148,8 +177,14 @@ def pipeline_command(code_root: Path, spec: RunSpec) -> list[str]:
     return cmd
 
 
-def run_pipeline(code_root: Path, spec: RunSpec, *, dry_run: bool = False) -> None:
+def run_pipeline(
+    code_root: Path, spec: RunSpec, *, dry_run: bool = False, skip_if_no_circuit: bool = False
+) -> None:
     cmd = pipeline_command(code_root, spec)
+    # Execution policy only: keep this out of RunSpec/pipeline_command so the
+    # persistent storage contract and scientific identity do not change.
+    if skip_if_no_circuit:
+        cmd.append("--skip_if_no_circuit")
     print(f"\n=== {spec.identity} ===")
     print(shlex.join(cmd))
     if not dry_run:

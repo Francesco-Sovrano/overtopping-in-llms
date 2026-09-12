@@ -20,7 +20,6 @@ import hashlib
 import json
 import math
 import re
-import shutil
 from pathlib import Path
 
 import matplotlib
@@ -1183,23 +1182,10 @@ def main() -> None:
     plan_df = pd.DataFrame(plan_rows)
     plan_df.to_csv(out_dir / "graded_agonist_plan.csv", index=False)
     if not selection:
-        # This output directory can be reused across reruns with different
-        # Stage-7 singleton results.  If the current Stage-7 state has no
-        # eligible agonists, any dose rows/figures left by an older run are
-        # scientifically stale.  Remove them before publishing the sentinel
-        # manifest so downstream stages cannot accidentally analyse old rows.
-        stale_files = [
-            "graded_agonist_dose_rows.csv.gz",
-            "graded_agonist_example_summary.csv",
-            "graded_agonist_unit_summary.csv",
-            "graded_agonist_dose_response.pdf",
-        ]
-        for name in stale_files:
-            (out_dir / name).unlink(missing_ok=True)
-        # stale_margin_dir = out_dir / "margin_mechanism_test"
-        # if stale_margin_dir.exists():
-        #     shutil.rmtree(stale_margin_dir)
-
+        # Never delete historical experiment artifacts under data/.  The
+        # sentinel manifest is authoritative for the current run and points all
+        # current data products to None, so downstream stages will not consume
+        # any older rows that may still exist beside it.
         payload = {
             "schema": SCHEMA,
             "status": "no_eligible_agonists",

@@ -324,6 +324,7 @@ def cover_and_cluster_stats_fast(
 	centers_T = centers.T  # (d, K)
 
 	N = pts.shape[0]
+	K = centers.shape[0]
 
 	min_dists = np.empty(N, dtype=np.float32)
 	assign = np.empty(N, dtype=np.int32)

@@ -15,6 +15,7 @@ import pandas as pd
 from core.caching_and_prompting import load_cache, instruct_model
 from core.feature_representation import Feature
 from core.task_spec import FeatureTaskSpec
+from core.project_paths import PROJECT_ROOT
 
 from core.modeling_and_ablation import LMWrapper, get_device
 
@@ -322,7 +323,6 @@ def f_sigma(prompt, info):
 
 		all_prompts = [item["prompt"] for item in data]
 
-		generated_results = []
 		dataloader = torch.utils.data.DataLoader(all_prompts, batch_size=batch_size, shuffle=False)
 
 		device = get_device()

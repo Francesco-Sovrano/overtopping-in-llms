@@ -13,7 +13,7 @@ It distinguishes:
 
 ## Population
 
-RQ2 starts from the complete 48-setting overtopping manifest and applies two rules.
+RQ2 starts from the complete 56-setting overtopping manifest and applies two rules.
 
 First, replacement regimes are analyzed separately:
 
@@ -157,7 +157,7 @@ Aggregate outputs are written under:
 results/analysis/rq2_composition/
 ```
 
-The regime reporter reads `results/analysis/primary_matrix/primary_table.csv`, the complete configured-setting table produced by Stage 02. It normalizes `mean-positional` to the `mean` reporting regime while preserving the original intervention field. Its `rq2_settings_by_replacement_regime.csv` output retains all configured rows and records applicability, metric availability, evaluability, and status before summary statistics are computed.
+The regime reporter reads `results/analysis/primary_matrix/tables/primary_table.csv`, the complete configured-setting table produced by Stage 02. It normalizes `mean-positional` to the `mean` reporting regime while preserving the original intervention field. Its `rq2_settings_by_replacement_regime.csv` output retains all configured rows and records applicability, metric availability, evaluability, and status before summary statistics are computed.
 
 ## Interpretation
 

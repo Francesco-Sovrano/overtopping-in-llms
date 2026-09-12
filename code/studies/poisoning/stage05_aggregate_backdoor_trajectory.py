@@ -22,7 +22,7 @@ import re
 from pathlib import Path
 
 from studies.poisoning.lib.io import read_json
-from studies.poisoning.lib.run_paths import ATTACK_COHORT_CONTROL_CORRECTNESS_DIRNAME, BACKDOOR_TRIGGER_TEST_DIRNAME, NORMAL_TASK_BEHAVIOR_DIRNAME, causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
+from studies.poisoning.lib.run_paths import BACKDOOR_TRIGGER_TEST_DIRNAME, NORMAL_TASK_BEHAVIOR_DIRNAME, causal_dir, checkpoint_progress_label, metadata_path, phase_dirname, trajectories_dir
 from studies.poisoning.lib.specificity import truthy
 from typing import Any, Dict, List
 import json

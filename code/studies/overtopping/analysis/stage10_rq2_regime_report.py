@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--catalogue-csv",
-        default=str(PROJECT_ROOT / "results/analysis/primary_matrix/primary_table.csv"),
+        default=str(PROJECT_ROOT / "results/analysis/primary_matrix/tables/primary_table.csv"),
         help=(
             "Configured-setting table containing J, U(J), E(J), intervention, phase, task, and model. "
             "The reporting primary_table.csv is the canonical source; completed_experiments.csv is also accepted."
@@ -69,7 +69,7 @@ def _short_task(value: object) -> str:
 
 def _short_model(value: object) -> str:
     text = str(value).split("/")[-1].replace("-Instruct", "")
-    text = text.replace("@step48000", " 48k").replace("@step96000", " 96k")
+    text = text.replace("@step0", " 0k").replace("@step48000", " 48k").replace("@step96000", " 96k")
     return text.replace("pythia-", "Pythia-").replace("qwen", "Qwen")
 
 

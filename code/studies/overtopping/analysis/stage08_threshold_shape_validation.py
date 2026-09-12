@@ -2,7 +2,7 @@
 """Nested held-out threshold-shape validation for the exact RQ3 population.
 
 The RQ3 population is manifest-driven rather than discovered by recursively
-scanning the data tree. By default it starts from the complete 48-setting
+scanning the data tree. By default it starts from the complete canonical study
 overtopping study registry; metric-specific availability is handled downstream
 and reported explicitly. Poisoning runs are a separate experiment family and
 are never eligible.

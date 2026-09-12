@@ -14,7 +14,7 @@ Direct invocation from `code/`:
 python -m reporting.generate_final_results \
   --data-root ../data \
   --results-root ../results \
-  --primary-profile study-48
+  --primary-profile study-56
 ```
 
 ## Input/output contract
@@ -31,7 +31,7 @@ It does not run model-backed experiment stages, rename experiment directories, o
 
 ## Manifest and metric availability
 
-Reporting first constructs the complete 48-setting overtopping study table. Metric-specific analyses then distinguish:
+Reporting first constructs the complete 56-setting overtopping study table. Metric-specific analyses then distinguish:
 
 - **applicable:** the quantity is scientifically defined for the setting;
 - **available:** the required compatible artifact exists;
@@ -41,9 +41,9 @@ The completeness audit applies RQ1 singleton requirements to every configured se
 
 ## Analysis populations
 
-- **RQ1:** all 48 configured settings, with I+O and Out analyzed separately; a 28-cell final-snapshot sensitivity is reported separately.
+- **RQ1:** all 56 configured settings, with I+O and Out analyzed separately; a 31-cell final-snapshot sensitivity is reported separately.
 - **RQ2:** all evaluable settings within replacement regime; mean-donor and mean-family are separate.
-- **RQ3:** the 48-setting manifest followed by threshold/graded artifact-specific eligibility.
+- **RQ3:** the 56-setting manifest followed by threshold/graded artifact-specific eligibility.
 - **RQ4:** configured checkpoint trajectories and controlled poisoning trajectories.
 
 See [Analysis pipeline](analysis-pipeline.md) for modules and outputs, [Figure map](figures.md) for manuscript filenames, and [Interpretation](interpretation.md) for metric definitions and statistical units.

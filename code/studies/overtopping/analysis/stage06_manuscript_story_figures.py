@@ -573,7 +573,7 @@ def write_rq_readmes(base: Path) -> None:
     texts={
         "02_rq1_prevalence": """# Figure 2 - RQ1: prevalence and competence
 
-The main directional reach/density figures use all 48 configured overtopping settings (22 input+output, 26 output-only) and a phase-panel layout. Zero-candidate settings remain explicit U(J)=0 points. Regression n is the number of plotted settings with a defined metric; within-setting directional denominators describe uncertainty and are not an across-setting sample-size filter.
+The main directional reach/density figures use all 56 configured overtopping settings (26 input+output, 30 output-only) and a phase-panel layout. Zero-candidate settings remain explicit U(J)=0 points. Regression n is the number of plotted settings with a defined metric; within-setting directional denominators describe uncertainty and are not an across-setting sample-size filter.
 `fig2e_reach_vs_effective_support_0to1.pdf` and the other structural companions provide configured-study context. Machine-readable sidecars live under `results/analysis/figure_data/02_rq1_prevalence/`.
 """,
         "03_rq2_composition": """# Figure 3 - RQ2: composition and boundary conditions
@@ -595,7 +595,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manuscript_metrics",default=None)
     p.add_argument("--out_dir",default=str(PROJECT_ROOT/"results"/"paper"/"figures"))
     p.add_argument("--figure_data_dir",default=None,help="Optional analysis-only directory for CSV sidecars; keeps paper figure folders PDF-only.")
-    p.add_argument("--skip_rq1", action="store_true", help="Do not emit the local RQ1 plots; the final-results orchestrator generates the 48-setting RQ1 figures separately.")
+    p.add_argument("--skip_rq1", action="store_true", help="Do not emit the local RQ1 plots; the final-results orchestrator generates the canonical RQ1 figures separately.")
     p.add_argument("--skip_primary_rq4", action="store_true", help="Do not emit the local Pythia trajectory into the paper tree.")
     return p.parse_args()
 

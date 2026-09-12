@@ -5,6 +5,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import logging
 import json
+import inspect
 
 import torch
 import pandas as pd
@@ -68,15 +69,15 @@ def _call_task_basic_stats(task, df: pd.DataFrame):
 		fn = getattr(task, method_name, None)
 		if callable(fn):
 			try:
-				stats = fn(df)
-				if isinstance(stats, dict):
-					stats = dict(stats)
-					stats.setdefault("n_examples", int(len(df)))
-					return stats
-			except TypeError:
-				pass
-			except Exception:
-				pass
+				inspect.signature(fn).bind(df)
+			except (TypeError, ValueError):
+				# A legacy hook with a different signature is not this interface.
+				continue
+			stats = fn(df)
+			if isinstance(stats, dict):
+				stats = dict(stats)
+				stats.setdefault("n_examples", int(len(df)))
+				return stats
 	return None
 
 
@@ -221,7 +222,7 @@ def parse_args():
 		type=str,
 		help=(
 			'Python module path implementing the task interface, including '
-			'generate_cache(model, args).'
+			'generate_cache(ai_model, ai_model_cache_dir, args).'
 		)
 	)
 

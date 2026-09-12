@@ -24,6 +24,36 @@ def _infer_max_seq_len(tokenizer) -> Optional[int]:
 	return m_int
 
 
+
+
+def collate_pair_batch(batch):
+	"""Collate ``PairDataset`` rows with padding for variable-length targets.
+
+	PyTorch's default collator attempts to ``stack`` every tensor in the labels
+	dict. ``target_ids`` is intentionally sequence-shaped and therefore varies
+	with prompt/answer length; stacking it directly crashes when a batch contains
+	different lengths (for example 12 and 11 tokens).  Pad only this field with
+	the metric ignore index (-100), while retaining scalar length metadata as
+	ordinary batch tensors.
+	"""
+	if not batch:
+		return [], [], {}
+	clean, corrupted, labels = zip(*batch)
+	max_target_len = max(int(lab["target_ids"].numel()) for lab in labels)
+	target_ids = torch.full((len(labels), max_target_len), -100, dtype=torch.long)
+	for i, lab in enumerate(labels):
+		ids = lab["target_ids"].view(-1).long()
+		if ids.numel():
+			target_ids[i, : ids.numel()] = ids
+	batched_labels = {
+		"answer_len": torch.tensor([int(lab["answer_len"]) for lab in labels], dtype=torch.long),
+		"full_len": torch.tensor([int(lab["full_len"]) for lab in labels], dtype=torch.long),
+		"prompt_len": torch.tensor([int(lab["prompt_len"]) for lab in labels], dtype=torch.long),
+		"target_ids": target_ids,
+	}
+	return list(clean), list(corrupted), batched_labels
+
+
 class PairDataset(torch.utils.data.Dataset):
 	"""
 	Yields (clean_full_text, corrupted_full_text, labels_dict).

@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as primary_helpers
-from studies.overtopping.experiments.run_experiments import paper_auxiliary_experiments
+from studies.overtopping.experiments.run_experiments import mean_experiments
 from studies.overtopping.analysis.stage03_audit_required_metrics import stage5_and_stage6_paths, stage6_candidate_count
 
 
@@ -146,10 +146,10 @@ def _expected_supplementary_sources(data_root: Path, *, evaluation_split: str,
 
     These are the manuscript supplementary overtopping experiments.  Poisoning
     experiments live under a different experiment family and are impossible to
-    enter this manifest because the sources come only from paper_auxiliary_experiments().
+    enter this manifest because the sources come only from mean_experiments().
     """
     expected: list[dict] = []
-    for index, raw_spec in enumerate(paper_auxiliary_experiments()):
+    for index, raw_spec in enumerate(mean_experiments()):
         spec = replace(raw_spec, evaluation_split=str(evaluation_split))
         label = f"spiking_diagnostics-{spec.bag_label()}"
         if evaluation_split == "train":

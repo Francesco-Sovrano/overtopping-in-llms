@@ -59,7 +59,7 @@ case "$EVALUATION_SPLIT" in
   *) echo "ERROR: evaluation split must be test, train, or all" >&2; exit 2 ;;
 esac
 
-echo "Running 48 overtopping settings: 29 final-snapshot cells + 12 checkpoint cells + 7 matched baseline repeats."
+echo "Running 56 overtopping settings in four disjoint sets: 20 mean-donor + 4 6-7B + 8 mean + 24 checkpoints."
 echo "Evaluation split: ${EVALUATION_SPLIT}"
 echo "Implementation code: $CODE_ROOT"
 echo "Final outputs: $PROJECT_ROOT/results"
@@ -75,8 +75,8 @@ if [[ "$SUITE_EXPLICIT" == false ]]; then
 fi
 
 if [[ "$EVALUATION_SPLIT" == "test" ]]; then
-  echo "Generating manuscript outputs from the complete 48-setting study registry."
-  EXTRA_ARGS+=(--generate-primary-manuscript --primary-profile study-48)
+  echo "Generating manuscript outputs from the complete 56-setting study registry."
+  EXTRA_ARGS+=(--generate-primary-manuscript --primary-profile study-56)
 else
   echo "Manuscript export is test-split specific and will not run for split=${EVALUATION_SPLIT}."
   echo "Experiment summaries will still be written under $PROJECT_ROOT/results/catalogue."

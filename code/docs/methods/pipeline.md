@@ -227,7 +227,7 @@ When CMC is enabled, matched background sets are evaluated jointly with the cand
 
 ### Secondary preemption assay
 
-The existing preemption experiment remains available. Pair identity is frozen from Stage-6 discovery data only. Directional candidate provenance defines the 1→0 or 0→1 pool, and the frozen discovery score determines dominant-secondary ordering. Held-out singleton rates are descriptive and do not select pairs.
+The preemption experiment is an optional secondary Stage-8 analysis. Pair identity is frozen from Stage-6 discovery data only. Directional candidate provenance defines the 1→0 or 0→1 pool, and the frozen discovery score determines dominant-secondary ordering. Held-out singleton rates are descriptive and do not select pairs.
 
 Preemption requires Stage-7c threshold diagnostics because the assay conditions the secondary binary marginal effect on an independently fitted endogenous dominant-event indicator. Runtime controls are:
 
@@ -238,7 +238,6 @@ PREEMPTION_THRESHOLD_HOLDOUT_FRACTION=0.25
 PREEMPTION_THRESHOLD_MIN_CLASS=8
 ```
 
-`PREEMPTION_MIN_SINGLETON_RATE` remains accepted as a compatibility alias for the discovery-score cutoff.
 
 The group-intervention cache is incremental. A Stage-8 refresh can reuse compatible full-set, null-set, background, and pair outputs and write updated derived summaries without repeating already cached group evaluations.
 

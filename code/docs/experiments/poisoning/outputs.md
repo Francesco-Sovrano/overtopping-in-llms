@@ -64,7 +64,7 @@ Trigger-specific causal artifacts exist only when trigger-lift CHA is enabled an
 
 The default and only strictly defense-facing CHA localization endpoint. It evaluates each checkpoint model on the same reconstructed defender-visible fine-tuning prompt/label mixture. Candidate localization uses correctness with respect to the observed label, runs both positive and negative observable baseline branches, and explicitly excludes hidden poison/attack annotations. Stage 03 freezes the union of those Stage-6 discovery branches without running a redundant held-out singleton intervention pass. Optional `attack_cohort_control_correctness` and `both` modes are controlled auxiliary analyses, not strictly attack-agnostic defense localizers.
 
-The matched no-trigger control quantity is derived from the control half of `backdoor_trigger_test` for post-discovery evaluation. Separately, an optional `attack_cohort_control_correctness` Stage-03 CHA may reuse that same behavior cache as a controlled localization source. Some aggregate columns retain the `attack_cohort_control_correctness_` prefix for backward compatibility, while canonical Stage-07 causal columns use `paired_control_`.
+The matched no-trigger control quantity is derived from the control half of `backdoor_trigger_test` for post-discovery evaluation. Separately, an optional `attack_cohort_control_correctness` Stage-03 CHA may reuse that same behavior cache as a controlled localization source. Canonical Stage-07 paired-control causal columns use the `paired_control_` prefix.
 
 ## Stage 04 — matched condition comparison
 
@@ -78,28 +78,24 @@ Principal trajectory table:
 05_behavior_trajectories/<phase>/backdoor_lift_overtopping_trajectory.csv
 ```
 
-It joins normal-task behavior and paired trigger/control behavior. The matched control-correctness behavioral summary is derived from the backdoor feature report; there is no separate attack-cohort control-correctness CHA. Post-discovery singleton causal metrics are materialized in Stage 07. Missing endpoints remain missing rather than being filled with zero.
+It joins normal-task behavior and paired trigger/control behavior. The matched control-correctness behavioral summary is derived from the backdoor feature report and does not require a separate attack-cohort localization run. If `attack_cohort_control_correctness` localization is enabled, that CHA output is a distinct Stage-03 candidate source rather than the source of this behavioral summary. Post-discovery singleton causal metrics are materialized in Stage 07. Missing endpoints remain missing rather than being filled with zero.
 
 `backdoor_overtopping_dashboard.pdf` creates panels only for metrics with finite values.
 
 ## Stage 06 — circuit overlap
 
-Contains checkpoint stability/overlap comparisons for the attack-agnostic `observed_training_mixture_correctness` CHA candidate sets, plus optional configured reference analyses. Trigger and attack-cohort evaluation outcomes never enter candidate-set construction.
+Contains checkpoint stability/overlap comparisons for the configured CHA candidate source. With the default `observed_training_mixture_correctness` endpoint, candidate construction is attack-agnostic and excludes trigger/attack labels. With `attack_cohort_control_correctness` or `both`, the configured candidate universe also uses the controlled oracle-defined attack-cohort localization described in the protocol.
 
 ## Stage 07 — poisoning-example detection
 
-### Defense-valid frozen candidate union
+### Frozen candidate union
 
 ```text
 defense_valid_candidate_union.csv
 defense_valid_candidate_localization_by_checkpoint.csv
 ```
 
-Candidate membership is localized from CHA on the defender-visible fine-tuning
-prompt/label mixture, in its natural observed proportions, across matched
-checkpoints. Hidden poison/attack annotations are excluded from selection. The
-checkpoint table records the local attack-agnostic discovery score used by
-prospective plots.
+Under the default `observed_training_mixture_correctness` configuration, candidate membership is localized from the defender-visible fine-tuning prompt/label mixture, in its natural observed proportions, across matched checkpoints; hidden poison/attack annotations are excluded from selection. When the localization endpoint is `attack_cohort_control_correctness` or `both`, the frozen union follows that configured source contract instead. The checkpoint table records source-specific local discovery information used by downstream prospective plots.
 
 ### Paired fixed-union materialization
 

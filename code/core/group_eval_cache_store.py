@@ -29,46 +29,16 @@ import time
 from pathlib import Path
 from typing import Mapping
 
+from core.sqlite_cache_paths import resolve_sqlite_cache_path
+
 import numpy as np
 
 DB_FILENAME = "group_eval_cache.sqlite3"
 SCHEMA_VERSION = 1
-SQLITE_UNIX_MAX_PATH_BYTES = 512
-SQLITE_AUX_SUFFIXES = ("", "-wal", "-shm", "-journal")
-
-
-def _sqlite_path_fits(path: Path) -> bool:
-    absolute = os.path.abspath(os.fspath(path))
-    return all(
-        len(os.fsencode(absolute + suffix)) < SQLITE_UNIX_MAX_PATH_BYTES
-        for suffix in SQLITE_AUX_SUFFIXES
-    )
-
-
 def resolve_group_eval_cache_db_path(cache_dir: str | os.PathLike[str]) -> Path:
-    cache_dir = Path(cache_dir)
-    primary = cache_dir / DB_FILENAME
-    parent_sidecar = cache_dir.parent / DB_FILENAME
-    for candidate in (primary, parent_sidecar):
-        if candidate.exists() and _sqlite_path_fits(candidate):
-            return candidate
-    if _sqlite_path_fits(primary):
-        return primary
-    if _sqlite_path_fits(parent_sidecar):
-        return parent_sidecar
-
-    for ancestor in cache_dir.parents:
-        try:
-            rel = cache_dir.relative_to(ancestor).as_posix()
-        except ValueError:
-            continue
-        digest = hashlib.sha256(rel.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-        candidate = ancestor / f".group_eval_cache_{digest}.sqlite3"
-        if candidate.exists() and _sqlite_path_fits(candidate):
-            return candidate
-        if _sqlite_path_fits(candidate):
-            return candidate
-    raise OSError(f"Could not choose a SQLite cache path for {cache_dir}")
+    return resolve_sqlite_cache_path(
+        cache_dir, DB_FILENAME, fallback_prefix="group_eval_cache"
+    )
 
 
 def semantic_context_id(identity: Mapping) -> str:

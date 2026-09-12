@@ -41,7 +41,7 @@ from studies.overtopping.analysis.lib.files import read_json
 from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count
 from studies.overtopping.analysis.lib.stats_resolution import resolve_available_stats_dir
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, chance_normalized_score, raw_task_score
-from studies.overtopping.experiments.run_experiments import paper_study_experiments
+from studies.overtopping.experiments.run_experiments import CANONICAL_STUDY_SETTING_COUNT, paper_study_experiments
 
 
 DEFAULT_OUT = "fig_competence_vs_coverage.pdf"
@@ -245,7 +245,7 @@ def transform_points_for_coverage_metric(root: Path, points: list[PlotPoint], me
             else:
                 # Existing run with no discovered agonists: the union of an empty
                 # candidate set is exactly zero in either direction.
-                value = 0.0 if point.status in {"verified-zero-candidates", "empty-no-agonists", "dataset-score-only-plotted-as-zero-coverage"} else math.nan
+                value = 0.0 if point.status in {"verified-zero-candidates", "empty-no-agonists"} else math.nan
         elif metric == "n05-i2c-density":
             value = _directional_n05_density(run_dir, point.model, "i2c")
         elif metric == "n05-c2i-density":
@@ -282,7 +282,7 @@ def rq1_manuscript_filters() -> Filters:
     """Return generic filters for non-manifest RQ1-style discovery.
 
     Manuscript Figure 2 no longer relies on these filters to define its sample;
-    it resolves the explicit 48-setting experiment catalogue through
+    it resolves the explicit canonical experiment catalogue through
     :func:`discover_rq1_manuscript_points`.
     """
     return Filters(
@@ -594,7 +594,7 @@ def discover_points(
 def rq1_manuscript_specs():
     """Return the explicit Figure-2 population.
 
-    Figure 2 is defined over all 48 configured overtopping settings. The
+    Figure 2 is defined over all 56 configured overtopping settings. The
     population is resolved from the registry rather than from a filesystem scan,
     so configured zero-candidate settings and missing artifacts retain distinct
     statuses.
@@ -604,16 +604,16 @@ def rq1_manuscript_specs():
         (s.task, s.model, s.mode, s.intervention, s.evaluation_split)
         for s in specs
     ]
-    if len(specs) != 48 or len(set(identities)) != 48:
+    if len(specs) != CANONICAL_STUDY_SETTING_COUNT or len(set(identities)) != CANONICAL_STUDY_SETTING_COUNT:
         raise RuntimeError(
-            f"RQ1 manuscript population must contain exactly 48 unique settings; "
+            f"RQ1 manuscript population must contain exactly {CANONICAL_STUDY_SETTING_COUNT} unique settings; "
             f"found {len(specs)} rows / {len(set(identities))} unique identities"
         )
     return specs
 
 
 def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False) -> list[PlotPoint]:
-    """Resolve the exact 48-setting strict-heldout Figure-2 population.
+    """Resolve the exact canonical strict-heldout Figure-2 population.
 
     Paths are obtained from :class:`RunSpec` itself. The canonical full held-out
     directory is preferred, but in best-effort mode a compatible materialized
@@ -674,7 +674,7 @@ def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False
     if issues:
         detail = "\n".join(f"  - {item}" for item in issues[:20])
         message = (
-            "RQ1 manuscript population does not have full canonical coverage for all 48 settings. "
+            "RQ1 manuscript population does not have full canonical coverage for all 56 settings. "
             "Available partial stats are retained in best-effort figures.\n" + detail
         )
         if not allow_incomplete:
@@ -685,11 +685,11 @@ def discover_rq1_manuscript_points(root: Path, *, allow_incomplete: bool = False
         phase: sum(p.phase == phase for p in points)
         for phase in ("input+output", "decode-only")
     }
-    if len(points) != 48 or phase_counts != {"input+output": 22, "decode-only": 26}:
+    if len(points) != 56 or phase_counts != {"input+output": 26, "decode-only": 30}:
         message = (
             "RQ1 manuscript population resolved incompletely: "
             f"n={len(points)}, phase_counts={phase_counts}; expected "
-            "n=48 with 22 input+output and 26 decode-only settings"
+            "n=56 with 26 input+output and 30 decode-only settings"
         )
         if not allow_incomplete:
             raise RuntimeError(message)
@@ -2137,10 +2137,10 @@ def dataset_score_only_point(
         anchor="dataset_stats_only",
         run="dataset_stats_only_no_matching_flip_stats",
         score=score,
-        union_rate=0.0,
-        n_neurons=0,
+        union_rate=math.nan,
+        n_neurons=None,
         n_eval=None,
-        status="dataset-score-only-plotted-as-zero-coverage",
+        status="dataset-score-only-causal-coverage-missing",
         source_path=source_path,
     )
 
@@ -2196,10 +2196,10 @@ def ensure_checkpoint_dataset_score_points(
                 anchor="dataset_stats_only",
                 run="dataset_stats_only_no_matching_flip_stats",
                 score=score,
-                union_rate=0.0,
-                n_neurons=0,
+                union_rate=math.nan,
+                n_neurons=None,
                 n_eval=None,
-                status="dataset-score-only-plotted-as-zero-coverage",
+                status="dataset-score-only-causal-coverage-missing",
                 source_path=source_path,
             ))
     return augmented
@@ -3198,9 +3198,9 @@ def write_phase_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: s
 
 
 def write_final_snapshot_fit_stats(points: list[PlotPoint], out: Path, coverage_metric: str, csv_out_dir: str | Path | None = None) -> None:
-    """Write the RQ1 final-snapshot sensitivity alongside the main 48-setting fit.
+    """Write the RQ1 final-snapshot sensitivity alongside the main canonical fit.
 
-    The sensitivity mirrors the 28-cell final-snapshot design: remove
+    The sensitivity mirrors the 29-cell final-snapshot design: remove
     intermediate Pythia checkpoints, then retain one replacement condition per
     task/model/phase cell. When both mean-donor and mean are available, prefer
     mean-donor; otherwise retain the configured mean (including normalized

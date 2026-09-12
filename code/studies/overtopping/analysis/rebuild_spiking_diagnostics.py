@@ -21,7 +21,7 @@ import pandas as pd
 from core.project_paths import PROJECT_ROOT
 from studies.overtopping.analysis import primary_holdout_analysis as helpers
 from studies.overtopping.experiments.execution import RunSpec
-from studies.overtopping.experiments.run_experiments import paper_study_experiments, paper_auxiliary_experiments
+from studies.overtopping.experiments.run_experiments import paper_study_experiments, mean_experiments
 
 
 def _env_int(name: str, default: int) -> int:
@@ -90,7 +90,7 @@ def _load_specs(catalogue_json: str | None, evaluation_split: str, population_sc
     # population. Catalogue entries still win when they provide an exact match.
     builtins = list(paper_study_experiments())
     if population_scope == "primary+supplementary":
-        builtins.extend(paper_auxiliary_experiments())
+        builtins.extend(mean_experiments())
     specs.extend(replace(spec, evaluation_split=evaluation_split) for spec in builtins)
 
     deduped: dict[tuple, RunSpec] = {}
@@ -350,7 +350,7 @@ def main() -> None:
         settings.append(("primary", setting))
         primary_stats.add(str(Path(setting["reported_stats"]).resolve()))
     if args.population_scope == "primary+supplementary":
-        for j, raw_spec in enumerate(paper_auxiliary_experiments()):
+        for j, raw_spec in enumerate(mean_experiments()):
             spec = replace(raw_spec, evaluation_split=args.evaluation_split)
             if str(spec.stats_dir(data_root).resolve()) in primary_stats:
                 continue
@@ -400,7 +400,7 @@ def main() -> None:
             points_to_use = 2048
         cmd = [
             str(args.python_bin), "-m", "studies.overtopping.analysis.threshold_event_diagnostics",
-            "--input_data_dir", str(spec.input_data_dir(data_root)),
+            "--input_data_dir", str(spec.stage5_input_data_dir(data_root)),
             "--out_dir", str(out_dir),
             "--baseline_subsets", str(args.baseline_subsets),
             "--task_module", str(setting["task_module"]),

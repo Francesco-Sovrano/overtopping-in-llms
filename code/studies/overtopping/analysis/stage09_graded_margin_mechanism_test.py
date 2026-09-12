@@ -527,19 +527,6 @@ def main() -> None:
     }
     (out_dir / "graded_margin_mechanism_summary.json").write_text(json.dumps(summary, indent=2, allow_nan=True), encoding="utf-8")
 
-    # Compatibility summary.
-    group_cols = [c for c in ["margin_type", "direction", "support_kind"] if c in metric_df.columns]
-    if group_cols and not metric_df.empty:
-        metric_df.groupby(group_cols, dropna=False).agg(
-            n_examples=("unit_key", "size"),
-            n_endpoint_reproduced=("known_flip_endpoint_reproduced", lambda x: int(pd.Series(x).fillna(False).astype(bool).sum())),
-            median_linearity_r2=("margin_linearity_r2", "median"),
-            median_linearity_nrmse=("margin_linearity_nrmse", "median"),
-            median_max_step_share=("margin_max_step_share", "median"),
-            median_max_step_concentration_ratio=("margin_max_step_concentration_ratio", "median"),
-            median_actual_margin_crossing_lag=("margin_minus_behavior_crossing", "median"),
-        ).reset_index().to_csv(out_dir / "graded_margin_group_summary.csv", index=False)
-
     prefix = str(args.paper_prefix)
     _plot_normalized_trajectories(df, out_dir / f"{prefix}_affine_null.pdf")
     _plot_crossing_alignment(metric_df, out_dir / f"{prefix}_crossing_alignment.pdf")

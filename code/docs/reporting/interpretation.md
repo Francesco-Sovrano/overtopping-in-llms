@@ -95,7 +95,7 @@ The support contrast does not by itself estimate the unconditional prevalence of
 
 ## Preemption
 
-The retained preemption assay is a secondary interaction analysis. It tests whether a secondary candidate's binary marginal effect differs according to an independently estimated dominant event. Positive evidence can support a first-sufficient subtype, but null or heterogeneous preemption does not negate support-specific graded threshold crossing.
+The preemption assay is a secondary interaction analysis. It tests whether a secondary candidate's binary marginal effect differs according to an independently estimated dominant event. Positive evidence can support a first-sufficient subtype, but null or heterogeneous preemption does not negate support-specific graded threshold crossing.
 
 Preemption should not be inferred from a negative `E(J)-U(J)` gap alone.
 

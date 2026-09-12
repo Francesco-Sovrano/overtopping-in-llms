@@ -37,7 +37,15 @@ from core.modeling_and_ablation import (
 	precompute_mean_activations,
 )
 from core.caching_and_prompting import load_or_create_cache, set_deterministic
-from core.spectral_analysis import *
+from core.spectral_analysis import (
+	add_spectral_cli_args,
+	build_per_centroid_sample_indices,
+	build_reps_and_embedding_from_args,
+	compute_nearest_center_assignments,
+	greedy_spectral_cover,
+	kcenter_farthest_first,
+	representative_sample_from_global_clusters,
+)
 from core.feature_extraction_runner import resolve_task_spec
 from core.heldout_set_metrics import compute_singleton_set_metrics, safe_layer_label
 
@@ -1450,7 +1458,7 @@ def _normalise_agonist_metric_summary(circuit_agonists_path):
 	if "unit_id" in df.columns and "neuron_id" not in df.columns:
 		df["neuron_id"] = pd.to_numeric(df["unit_id"], errors="coerce").astype("Int64")
 	if "layer_label" in df.columns and "layer_key" not in df.columns:
-		df["layer_key"] = df["layer_label"].map(_safe_layer_label)
+		df["layer_key"] = df["layer_label"].map(safe_layer_label)
 	if "unit_key" not in df.columns and set(["layer_label", "neuron_id"]).issubset(df.columns):
 		df["unit_key"] = df["layer_label"].astype(str) + ":" + df["neuron_id"].astype(str)
 
@@ -1489,7 +1497,7 @@ def _merge_flip_stats(metric_df, flip_stats_df):
 		return metric_df
 	fs = flip_stats_df.copy()
 	if "layer_key" not in fs.columns and "layer_label" in fs.columns:
-		fs["layer_key"] = fs["layer_label"].map(_safe_layer_label)
+		fs["layer_key"] = fs["layer_label"].map(safe_layer_label)
 	if "neuron_id" not in fs.columns:
 		return metric_df
 	fs["layer_key"] = fs["layer_key"].astype(str)
@@ -1958,6 +1966,8 @@ def _repair_directional_flip_columns(
 
 def main():
 	args = parse_args()
+	if args.candidate_ranking_csv is None and args.search_epsilon is None:
+		raise ValueError("--search_epsilon is required when candidates are discovered from --circuit_agonists_path; alternatively provide --candidate_ranking_csv.")
 	if bool(getattr(args, "decode_only", False)) and bool(getattr(args, "input_only", False)):
 		raise ValueError("--decode_only and --input_only are mutually exclusive intervention phases")
 	if args.stats_dirname is None:
@@ -3290,7 +3300,7 @@ def main():
 					cached_or_none = []
 					compute_specs = []
 					for spec in chunk_specs_all:
-						layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, cache_subdir_i, _hooks_i, _cache_policy_tag_i = spec
+						layer_label_i, neuron_id_i, _baseline_subset_i, _layer_key_i, cache_subdir_i, _hooks_i, _cache_policy_tag_i = spec
 						layer_key_i = safe_layer_label(layer_label_i)
 						_ensure_flip_cols(layer_key_i, neuron_id_i)
 						cache_path = _flip_cache_path(cache_subdir_i, layer_key_i, neuron_id_i, start)
@@ -3318,7 +3328,7 @@ def main():
 							computed_list = _compute_rowwise_chunk_prefill_decode(layer_label, compute_specs, batch_prompt)
 
 						for spec, (arr, semantics, answers_j) in zip(compute_specs, computed_list):
-							layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, cache_subdir_i, _hooks_i, _cache_policy_tag_i = spec
+							layer_label_i, neuron_id_i, _baseline_subset_i, _layer_key_i, cache_subdir_i, _hooks_i, _cache_policy_tag_i = spec
 							layer_key_i = safe_layer_label(layer_label_i)
 							arr = np.asarray(arr).astype(bool)
 							semantics = semantics or {}
@@ -3326,7 +3336,7 @@ def main():
 							_save_cached_eval(_flip_cache_path(cache_subdir_i, layer_key_i, neuron_id_i, start), arr, semantics, answers=answers_j)
 
 					for spec, cached in zip(chunk_specs_all, cached_or_none):
-						layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, _cache_subdir_i, _hooks_i, _cache_policy_tag_i = spec
+						layer_label_i, neuron_id_i, _baseline_subset_i, _layer_key_i, _cache_subdir_i, _hooks_i, _cache_policy_tag_i = spec
 						layer_key_i = safe_layer_label(layer_label_i)
 						if cached is None:
 							payload = computed_by_key[(str(layer_label_i), int(neuron_id_i))]

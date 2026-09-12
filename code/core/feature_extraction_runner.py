@@ -23,7 +23,12 @@ from sklearn.cluster import MiniBatchKMeans
 
 from core.caching_and_prompting import set_deterministic
 
-from core.feature_representation import *
+from core.feature_representation import (
+	compile_feature_function,
+	drop_high_variance_mad,
+	drop_near_duplicates_by_corr,
+	propose_features_contrastive,
+)
 
 MAX_ABS_FEATURE_VALUE = 1e12
 

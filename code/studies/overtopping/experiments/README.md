@@ -2,23 +2,29 @@
 
 This package defines the overtopping experiment registry and translates each configured `RunSpec` into the shared causal-intervention pipeline.
 
-The registry contains 48 settings:
+The canonical registry contains 56 RunSpecs in exactly four public execution sets:
 
 ```text
-29 final-snapshot task × model × phase cells
-12 intermediate Pythia checkpoint settings
- 7 matched replacement-baseline repeats
---------------------------------------------
-48 configured settings
+mean-donor     20   small-model non-checkpoint mean-donor runs
+6-7b-models     4   Pythia-6.9B / Qwen2-7B scale runs
+mean            8   small-model mean-replacement runs
+checkpoints    24   Grammar/HANS-NLI/Random-FSM Pythia-1B trajectories
+-----------------
+all            56
 ```
 
-Execute only the two Qwen2-1.5B Random-FSM coverage runs with:
+The checkpoint set is `step0 -> step48000 -> step96000 -> EleutherAI/pythia-1b`, in both I+O and output-only phases, for Grammar, HANS-NLI, and Random FSM. `EleutherAI/pythia-1b` is the final/all-steps checkpoint. Arithmetic is not checkpointed.
+
+These four sets are pairwise disjoint at exact RunSpec level. Reclassifying a run changes only its `suite` metadata: persistent Stage-5/Stage-7 paths and pipeline commands do not depend on `suite`, so existing caches/results are reused. Historical registries remain private compatibility/address-validation views only.
+
+Examples:
 
 ```bash
-python -m studies.overtopping.experiments.run_experiments --suite qwen-small-completion
+python -m studies.overtopping.experiments.run_experiments --suite mean-donor --dry-run
+python -m studies.overtopping.experiments.run_experiments --suite 6-7b-models --dry-run
+python -m studies.overtopping.experiments.run_experiments --suite mean --dry-run
+python -m studies.overtopping.experiments.run_experiments --suite checkpoints --dry-run
 ```
-
-The additional Pythia checkpoint cells are part of the configured study because completed runs can validly yield zero candidate channels. Existing artifacts remain at their established `RunSpec` paths.
 
 Inspect the registry from `code/` without running model-backed stages:
 

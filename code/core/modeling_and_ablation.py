@@ -1542,7 +1542,9 @@ class LMWrapper:
 		tokens_chunk = torch.empty((B, 1), dtype=dtype, device=device)
 		attn_mask_chunk = torch.ones((B, 1), dtype=base_mask.dtype, device=device)
 
+		steps_run = 0
 		for i in range(max_new_tokens):
+			steps_run = i + 1
 			next_tokens = torch.argmax(logits_last, dim=-1)#.to(dtype)  # [B]
 
 			if eos_tensor is not None:
@@ -1567,7 +1569,7 @@ class LMWrapper:
 			if cleanup_every and (i + 1) % cleanup_every == 0:
 				self.cleanup_after_generate()
 
-		if cleanup_every and (i + 1) % cleanup_every != 0:
+		if cleanup_every and steps_run % cleanup_every != 0:
 			self.cleanup_after_generate()
 
 		return all_tokens[:, :cur_len]
@@ -1585,7 +1587,9 @@ class LMWrapper:
 			stop_at_eos, eos_token_id, batch_size=B, dtype=dtype, device=device
 		)
 
+		steps_run = 0
 		for i in range(max_new_tokens):
+			steps_run = i + 1
 			logits_last = self._last_logits(
 				all_tokens[:, :cur_len],
 				attn_mask[:, :cur_len],
@@ -1609,7 +1613,7 @@ class LMWrapper:
 			if eos_tensor is not None and finished.all():
 				break
 		
-		if cleanup_every and (i + 1) % cleanup_every != 0:
+		if cleanup_every and steps_run % cleanup_every != 0:
 			self.cleanup_after_generate()
 
 		return all_tokens[:, :cur_len]
@@ -2610,7 +2614,13 @@ def get_circuit_neurons_dict(circuit_manifest_path, args, quiet=False):
 	circuit_entries = {}
 	for entry in manifest:
 		entry_status = entry['status']
-		if entry_status != 'ok' and entry_status != 'full_network_fallback':
+		if entry_status == 'full_network_fallback' or bool((entry.get('metadata_topn') or {}).get('fallback_full_network')):
+			raise RuntimeError(
+				f"Refusing Stage-6 analysis of a legacy full-network fallback in {circuit_manifest_path}. "
+				"Re-run Stage 5 with the variable-length PairDataset collator fix; failed EAP attribution must remain incomplete, "
+				"not be converted into a synthetic full-network circuit."
+			)
+		if entry_status != 'ok':
 			continue
 
 		rid = entry.get("circuit_id", entry.get("rule_id", entry.get("cluster_index")))
@@ -2785,6 +2795,7 @@ def get_circuit_neurons_dict(circuit_manifest_path, args, quiet=False):
 
 		circuit_entries[(rule, rule_target)] = {
 			"circuit_id": int(rid),
+			"stage5_pair_collation_schema": entry.get("eap_pair_collation_schema"),
 			"circuit_label": rule,
 			"rule_direction": rule_direction,
 			"rule_target": rule_target,
@@ -2795,5 +2806,7 @@ def get_circuit_neurons_dict(circuit_manifest_path, args, quiet=False):
 			"mlp_neurons": mlp_neurons,
 			"attn_neurons": attn_neurons,
 			"_neurons_inferred_from_level": bool(inferred),
+			"source_explicit_full_network_ablation": bool(meta.get("explicit_full_network_ablation")),
+			"source_candidate_space_semantics": meta.get("candidate_space_semantics"),
 		}
 	return circuit_entries

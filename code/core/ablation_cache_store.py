@@ -23,7 +23,6 @@ Already-created ``pickle+zlib1`` SQLite rows remain fully readable. Legacy
 from __future__ import annotations
 
 import atexit
-import hashlib
 import os
 import pickle
 import sqlite3
@@ -33,68 +32,16 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from core.sqlite_cache_paths import resolve_sqlite_cache_path
+
 DB_FILENAME = "ablation_cache.sqlite3"
 SCHEMA_VERSION = 2
 DEFAULT_COMMIT_EVERY = 1000
 DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 16384  # ~64 MiB at the usual 4 KiB page size.
-SQLITE_UNIX_MAX_PATH_BYTES = 512
-SQLITE_AUX_SUFFIXES = ("", "-wal", "-shm", "-journal")
-
-
-
-
-def _sqlite_path_fits(db_path: Path) -> bool:
-    """Return whether SQLite's Unix VFS can address DB + auxiliary files.
-
-    SQLite's stock Unix VFS uses a 512-byte maximum pathname.  Reserve room
-    for the longest automatically-created sidecar suffix (``-journal``).
-    The check is byte-based because the VFS limit applies to encoded path bytes.
-    """
-    absolute = os.path.abspath(os.fspath(db_path))
-    return all(
-        len(os.fsencode(absolute + suffix)) < SQLITE_UNIX_MAX_PATH_BYTES
-        for suffix in SQLITE_AUX_SUFFIXES
-    )
-
-
 def resolve_ablation_cache_db_path(cache_dir: str | os.PathLike[str]) -> Path:
-    """Choose a deterministic SQLite path that survives deeply nested trees.
-
-    Prefer the historical location inside ``ablation_cache`` when it is safe.
-    For paths near SQLite's Unix VFS pathname ceiling, place the DB one level
-    higher.  If even that is too long, walk upward until a short hashed sidecar
-    path fits. Existing DBs are preferred so upgrades remain transparent.
-    """
-    cache_dir = Path(cache_dir)
-    primary = cache_dir / DB_FILENAME
-    parent_sidecar = cache_dir.parent / DB_FILENAME
-
-    for candidate in (primary, parent_sidecar):
-        if candidate.exists() and _sqlite_path_fits(candidate):
-            return candidate
-
-    if _sqlite_path_fits(primary):
-        return primary
-    if _sqlite_path_fits(parent_sidecar):
-        return parent_sidecar
-
-    # Extremely deep path: use the nearest ancestor that can host a uniquely
-    # named sidecar. The digest is based on the path relative to that ancestor,
-    # making the choice deterministic without a global registry.
-    for ancestor in cache_dir.parents:
-        try:
-            rel = cache_dir.relative_to(ancestor).as_posix()
-        except ValueError:
-            continue
-        digest = hashlib.sha256(rel.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-        candidate = ancestor / f".ablation_cache_{digest}.sqlite3"
-        if candidate.exists() and _sqlite_path_fits(candidate):
-            return candidate
-        if _sqlite_path_fits(candidate):
-            return candidate
-
-    raise OSError(
-        f"Could not choose an SQLite cache path below {SQLITE_UNIX_MAX_PATH_BYTES} bytes for {cache_dir}"
+    """Choose a deterministic SQLite path that survives deeply nested trees."""
+    return resolve_sqlite_cache_path(
+        cache_dir, DB_FILENAME, fallback_prefix="ablation_cache"
     )
 
 
@@ -381,16 +328,28 @@ def get_ablation_cache_store(cache_dir: str | os.PathLike[str]) -> AblationCache
 
 
 def flush_all_ablation_cache_stores(*, checkpoint: bool = False) -> None:
-    """Commit pending cache batches without closing persistent connections."""
+    """Commit pending cache batches without closing persistent connections.
+
+    Explicit flushes are durability boundaries.  Do not silently discard commit
+    failures: callers use this function before treating cache-backed work as
+    materialized.
+    """
     with _STORES_LOCK:
         stores = list(_STORES.values())
+    failures: list[tuple[Path, Exception]] = []
     for store in stores:
         try:
             store.commit()
             if checkpoint:
                 store.checkpoint()
-        except Exception:
-            pass
+        except Exception as exc:
+            failures.append((store.db_path, exc))
+    if failures:
+        paths = ", ".join(str(path) for path, _ in failures[:3])
+        suffix = "" if len(failures) <= 3 else f" (+{len(failures) - 3} more)"
+        raise RuntimeError(
+            f"Failed to flush {len(failures)} ablation cache store(s): {paths}{suffix}"
+        ) from failures[0][1]
 
 
 def close_all_ablation_cache_stores() -> None:

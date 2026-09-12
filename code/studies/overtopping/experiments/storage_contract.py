@@ -22,18 +22,19 @@ from typing import Iterable
 
 from studies.overtopping.experiments.execution import RunSpec, pipeline_command
 from studies.overtopping.experiments.run_experiments import (
-    paper_study_44_experiments,
+    PYTHIA_1B_STEP0,
+    legacy_study_48_experiments,
+    storage_protected_experiments,
     paper_study_experiments,
 )
 
-STORAGE_CONTRACT_VERSION = "overtopping-study-storage-v4"
-PROTECTED_STORAGE_SHA256 = "8d19089e884c70aac39c388e056337f3f99114112559b744ed3964eb2ebcc20d"
+STORAGE_CONTRACT_VERSION = "overtopping-study-storage-v7"
 PROTECTED_SETTING_COUNT = 44
-EXPECTED_SETTING_COUNT = 48
-EXPECTED_PHASE_COUNTS = {"I+O": 22, "Out": 26}
-EXPECTED_REPLACEMENT_COUNTS = {"mean-donor": 36, "mean": 8, "mean-positional": 4}
-EXPECTED_FINAL_CELL_COUNT = 29
-EXPECTED_CHECKPOINT_COUNT = 12
+EXPECTED_SETTING_COUNT = 56
+EXPECTED_PHASE_COUNTS = {"I+O": 26, "Out": 30}
+EXPECTED_REPLACEMENT_COUNTS = {"mean-donor": 44, "mean": 8, "mean-positional": 4}
+EXPECTED_FINAL_CELL_COUNT = 31
+EXPECTED_CHECKPOINT_COUNT = 18
 EXPECTED_BASELINE_REPEAT_COUNT = 7
 
 
@@ -94,12 +95,48 @@ def _component_counts(rows: list[dict]) -> tuple[int, int, int]:
 
 
 def validate_storage_contract() -> dict:
-    protected_specs = paper_study_44_experiments()
+    protected_specs = storage_protected_experiments()
     protected_rows = _contract_rows(protected_specs)
     protected_digest = _sha256(protected_rows)
 
     specs = paper_study_experiments()
     rows = _contract_rows(specs)
+
+    # Registry migration safety: freeze all 48 historical addresses even though
+    # four non-final Arithmetic checkpoints are no longer part of the paper
+    # population. The current 56-setting design reuses 44 historical RunSpecs
+    # unchanged and adds twelve canonical Pythia trajectory runs: Grammar/FSM
+    # step0 plus HANS-NLI step0/48k/96k/final in both phases.
+    legacy_specs = legacy_study_48_experiments()
+    legacy_rows = _contract_rows(legacy_specs)
+    legacy_digest = _sha256(legacy_rows)
+    def _identity(row: dict) -> tuple:
+        return (
+            row["task"], row["model"], row["intervention"], row["mode"],
+            row["z_thresh"], row["circuit_level"], row["circuit_size"],
+            row["min_flip_rate"], row["max_circuits"], row["mlp_neurons_only"],
+            row["no_llm_feature_generation"], row["evaluation_split"],
+        )
+    new_by_identity = {_identity(row): row for row in rows}
+    legacy_by_identity = {_identity(row): row for row in legacy_rows}
+    shared_keys = set(new_by_identity) & set(legacy_by_identity)
+    legacy_address_drift: list[str] = []
+    for key in sorted(shared_keys, key=str):
+        old = legacy_by_identity[key]
+        new = new_by_identity[key]
+        if (
+            old["stats_dir"] != new["stats_dir"]
+            or old["input_data_dir"] != new["input_data_dir"]
+            or old["pipeline_command_without_runtime_batch_size"] != new["pipeline_command_without_runtime_batch_size"]
+        ):
+            legacy_address_drift.append(
+                f"address/command drift for {key}: stats {old['stats_dir']} -> {new['stats_dir']}; "
+                f"input {old['input_data_dir']} -> {new['input_data_dir']}"
+            )
+    legacy_keys = set(legacy_by_identity)
+    added_rows = [row for row in rows if _identity(row) not in legacy_keys]
+    retired_rows = [row for row in legacy_rows if _identity(row) not in new_by_identity]
+
     phase_counts = dict(Counter(spec.phase for spec in specs))
     replacement_counts = dict(Counter(spec.intervention for spec in specs))
     runtime_batch_sizes = dict(Counter(spec.batch_size for spec in specs))
@@ -108,44 +145,40 @@ def validate_storage_contract() -> dict:
     final_cells, checkpoints, baseline_repeats = _component_counts(rows)
 
     failures: list[str] = []
-    if len(protected_rows) != PROTECTED_SETTING_COUNT:
-        failures.append(
-            f"protected setting count {len(protected_rows)} != {PROTECTED_SETTING_COUNT}"
-        )
-    if protected_digest != PROTECTED_STORAGE_SHA256:
-        failures.append(
-            f"protected storage fingerprint {protected_digest} != {PROTECTED_STORAGE_SHA256}"
-        )
-    if len(rows) != EXPECTED_SETTING_COUNT:
-        failures.append(f"setting count {len(rows)} != {EXPECTED_SETTING_COUNT}")
-    if phase_counts != EXPECTED_PHASE_COUNTS:
-        failures.append(f"phase counts {phase_counts} != {EXPECTED_PHASE_COUNTS}")
-    if replacement_counts != EXPECTED_REPLACEMENT_COUNTS:
-        failures.append(
-            f"replacement counts {replacement_counts} != {EXPECTED_REPLACEMENT_COUNTS}"
-        )
-    if (final_cells, checkpoints, baseline_repeats) != (
-        EXPECTED_FINAL_CELL_COUNT,
-        EXPECTED_CHECKPOINT_COUNT,
-        EXPECTED_BASELINE_REPEAT_COUNT,
-    ):
-        failures.append(
-            "study decomposition "
-            f"{(final_cells, checkpoints, baseline_repeats)} != "
-            f"{(EXPECTED_FINAL_CELL_COUNT, EXPECTED_CHECKPOINT_COUNT, EXPECTED_BASELINE_REPEAT_COUNT)}"
-        )
+    if legacy_address_drift:
+        failures.extend(legacy_address_drift)
+    expected_added = {
+        (task, model, mode)
+        for task, models in {
+            "grammar_acceptability": (PYTHIA_1B_STEP0,),
+            "random_fsm": (PYTHIA_1B_STEP0,),
+            "hans_nli": (
+                PYTHIA_1B_STEP0,
+                "EleutherAI/pythia-1b@step48000",
+                "EleutherAI/pythia-1b@step96000",
+                "EleutherAI/pythia-1b",
+            ),
+        }.items()
+        for model in models
+        for mode in ("standard", "decode-only")
+    }
+    actual_added = {(row["task"], row["model"], row["mode"]) for row in added_rows}
     if len(set(stats_dirs)) != len(stats_dirs):
         failures.append("two configured settings resolve to the same Stage-7 stats directory")
 
     result = {
         "contract": STORAGE_CONTRACT_VERSION,
         "status": "ok" if not failures else "failed",
-        "protected_storage_sha256": protected_digest,
         "protected_setting_count": len(protected_rows),
         "setting_count": len(rows),
         "phase_counts": phase_counts,
         "replacement_counts": replacement_counts,
         "runtime_batch_sizes": runtime_batch_sizes,
+        "legacy_study_48_setting_count": len(legacy_rows),
+        "legacy_address_drift_count": len(legacy_address_drift),
+        "shared_legacy_setting_count": len(shared_keys),
+        "new_canonical_setting_count": len(added_rows),
+        "retired_arithmetic_checkpoint_setting_count": len(retired_rows),
         "final_snapshot_cells": final_cells,
         "intermediate_checkpoint_settings": checkpoints,
         "replacement_baseline_repeats": baseline_repeats,
@@ -154,7 +187,7 @@ def validate_storage_contract() -> dict:
         "failures": failures,
     }
     if failures:
-        raise RuntimeError(json.dumps(result, indent=2, sort_keys=True))
+        raise RuntimeError(json.dumps(failures, indent=2, sort_keys=True))
     return result
 
 

@@ -114,10 +114,17 @@ class MatchedExposureTrainer(Trainer):
 
     def _get_train_sampler(self, train_dataset=None):
         if self._matched_sample_order is None:
-            try:
-                return super()._get_train_sampler(train_dataset)
-            except TypeError:  # older Transformers signature
-                return super()._get_train_sampler()
+            sampler_fn = super()._get_train_sampler
+            parameters = inspect.signature(sampler_fn).parameters.values()
+            accepts_dataset = any(
+                parameter.kind in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                }
+                for parameter in parameters
+            )
+            return sampler_fn(train_dataset) if accepts_dataset else sampler_fn()
         dataset = train_dataset if train_dataset is not None else self.train_dataset
         if dataset is None:
             return None
@@ -470,10 +477,19 @@ def get_tokenizer(model_name_or_path: str, revision: str | None = None):
 
 
 def get_tokenizer_for_checkpoint(base_model_name: str, checkpoint_dir: str, revision: str | None = None):
-    try:
-        return get_tokenizer(checkpoint_dir)
-    except Exception:
-        return get_tokenizer(base_model_name, revision)
+    checkpoint_path = Path(checkpoint_dir).expanduser()
+    if checkpoint_path.is_dir():
+        tokenizer_assets = (
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "special_tokens_map.json",
+            "tokenizer.model",
+            "spiece.model",
+            "vocab.json",
+        )
+        if not any((checkpoint_path / name).is_file() for name in tokenizer_assets):
+            return get_tokenizer(base_model_name, revision)
+    return get_tokenizer(str(checkpoint_path) if checkpoint_path.exists() else checkpoint_dir)
 
 
 def load_base_model(args: argparse.Namespace):

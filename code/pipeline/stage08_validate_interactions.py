@@ -122,13 +122,13 @@ def parse_args() -> argparse.Namespace:
         help="Skip dominant-secondary pair interventions and example-level preemption outputs.",
     )
     parser.add_argument(
-        "--preemption_min_discovery_score", "--preemption_min_singleton_rate",
+        "--preemption_min_discovery_score",
         dest="preemption_min_discovery_score",
         type=float,
         default=0.05,
         help=(
             "Minimum frozen Stage-6 discovery |max_effect| score for dominant/secondary pair selection. "
-            "The legacy --preemption_min_singleton_rate spelling is accepted as an alias. Default: 0.05."
+            "Default: 0.05."
         ),
     )
     parser.add_argument(

@@ -18,6 +18,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/bash_compat.sh
 source "$SCRIPT_DIR/lib/bash_compat.sh"
+# shellcheck source=poisoning_runtime_config.sh
+# This helper can also be invoked directly, so load the same poisoning execution
+# policies as the parent checkpoint workflow.
+source "$SCRIPT_DIR/poisoning_runtime_config.sh"
 CODE_ROOT="${CODE_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$CODE_ROOT/.." && pwd)}"
 cd "$CODE_ROOT"
@@ -248,24 +252,57 @@ PYACPLAN
       --max_number_of_circuits_to_analyze 1 --evaluation_split test
       --no_llm_feature_generation --skip_stage1 --evaluation_baseline_subset all)
     if [[ "$PHASE_LABEL" == "output_only" ]]; then AC_CMD+=(--decode_only); fi
+    AC_FIRST_PASS_SKIP_DOWNSTREAM="$SKIP_DOWNSTREAM_IF_NO_CIRCUIT"
+    if poisoning_is_true "$POISONING_SKIP_CIRCUIT_DISCOVERY"; then
+      AC_CMD+=(--full_network_ablation)
+      AC_FIRST_PASS_SKIP_DOWNSTREAM=false
+      echo "[attack-control-cha] skipping EAP discovery; using explicit full-network ablation candidate space."
+    elif poisoning_is_true "$POISONING_FULL_ABLATION_IF_NO_CIRCUIT"; then
+      AC_FIRST_PASS_SKIP_DOWNSTREAM=true
+    fi
     printf '[cmd-attack-control-cha]'; printf ' %q' "${AC_CMD[@]}"; printf '\n'
     env \
+      SKIP_IF_NO_CIRCUIT=false SKIP_DOWNSTREAM_IF_NO_CIRCUIT="$AC_FIRST_PASS_SKIP_DOWNSTREAM" \
       MAX_POINTS_PER_ABLATION="$AC_N_SIDE" MAX_POINTS_PER_CIRCUIT="$AC_N_PAIRS" \
       SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" \
       EVALUATION_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" REFINE_SAMPLING_MAX_POINTS=0 \
       ANALYZE_BASELINE_SUBSETS=positive SPECTRAL_CLUSTER_BASE_SUBSET=positive \
       EVALUATION_BASELINE_SUBSET=all PIPELINE_EVALUATION_BASELINE_SUBSET=all \
-      RUN_SINGLETON_CAUSAL_EVALUATION=false RUN_GRADED_AGONIST_INTERVENTION=false \
+      RUN_SINGLETON_CAUSAL_EVALUATION=false RUN_GRADED_AGONIST_INTERVENTION=false RUN_TEMPORAL_CUTOFF_INTERVENTION=false \
       RUN_THRESHOLD_EVENT_POSTHOC=false RUN_PREEMPTION=false REFINE_USE_SPECTRAL_SAMPLING=false \
       REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=false RUN_INTERACTION_VALIDATION=false \
       RUN_CMC=false SKIP_AGONIST_METRIC_STATS=true HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
       "${AC_CMD[@]}"
 
-    python3 -m studies.poisoning.stage03_freeze_observed_mixture_candidates \
-      --endpoint_dir "$ATTACK_CONTROL_OUTPUT_DATA_DIR" \
-      --search_epsilon "$MIN_FLIP_RATE" \
-      --source_label attack_cohort_control_correctness \
-      --oracle_cohort_definition_used
+    if poisoning_pipeline_skipped_no_circuit "$ATTACK_CONTROL_OUTPUT_DATA_DIR"; then
+      if poisoning_is_true "$POISONING_FULL_ABLATION_IF_NO_CIRCUIT" && ! poisoning_is_true "$POISONING_SKIP_CIRCUIT_DISCOVERY"; then
+        echo "[attack-control-cha] no discovered circuit; rerunning with explicit full-network ablation candidate space."
+        AC_CMD_FULL=("${AC_CMD[@]}" --full_network_ablation)
+        printf '[cmd-attack-control-full-ablation]'; printf ' %q' "${AC_CMD_FULL[@]}"; printf '\n'
+        env \
+          SKIP_IF_NO_CIRCUIT=false SKIP_DOWNSTREAM_IF_NO_CIRCUIT=false \
+          MAX_POINTS_PER_ABLATION="$AC_N_SIDE" MAX_POINTS_PER_CIRCUIT="$AC_N_PAIRS" \
+          SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" \
+          EVALUATION_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" REFINE_SAMPLING_MAX_POINTS=0 \
+          ANALYZE_BASELINE_SUBSETS=positive SPECTRAL_CLUSTER_BASE_SUBSET=positive \
+          EVALUATION_BASELINE_SUBSET=all PIPELINE_EVALUATION_BASELINE_SUBSET=all \
+          RUN_SINGLETON_CAUSAL_EVALUATION=false RUN_GRADED_AGONIST_INTERVENTION=false RUN_TEMPORAL_CUTOFF_INTERVENTION=false \
+          RUN_THRESHOLD_EVENT_POSTHOC=false RUN_PREEMPTION=false REFINE_USE_SPECTRAL_SAMPLING=false \
+          REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=false RUN_INTERACTION_VALIDATION=false \
+          RUN_CMC=false SKIP_AGONIST_METRIC_STATS=true HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
+          "${AC_CMD_FULL[@]}"
+      else
+        echo "[attack-control-cha] Stage 5 found no valid circuit; candidate freeze is intentionally skipped."
+      fi
+    fi
+
+    if ! poisoning_pipeline_skipped_no_circuit "$ATTACK_CONTROL_OUTPUT_DATA_DIR"; then
+      python3 -m studies.poisoning.stage03_freeze_observed_mixture_candidates \
+        --endpoint_dir "$ATTACK_CONTROL_OUTPUT_DATA_DIR" \
+        --search_epsilon "$MIN_FLIP_RATE" \
+        --source_label attack_cohort_control_correctness \
+        --oracle_cohort_definition_used
+    fi
   else
     echo "[attack-control-cha] CHA not run: $AC_LOW_DATA_REASON"
   fi
@@ -432,9 +469,19 @@ else
     --skip_stage1
     --evaluation_baseline_subset all)
   if [[ "$PHASE_LABEL" == "output_only" ]]; then MIX_CMD+=(--decode_only); fi
+  MIX_FIRST_PASS_SKIP_DOWNSTREAM="$SKIP_DOWNSTREAM_IF_NO_CIRCUIT"
+  if poisoning_is_true "$POISONING_SKIP_CIRCUIT_DISCOVERY"; then
+    MIX_CMD+=(--full_network_ablation)
+    MIX_FIRST_PASS_SKIP_DOWNSTREAM=false
+    echo "[observed-mixture] skipping EAP discovery; using explicit full-network ablation candidate space."
+  elif poisoning_is_true "$POISONING_FULL_ABLATION_IF_NO_CIRCUIT"; then
+    MIX_FIRST_PASS_SKIP_DOWNSTREAM=true
+  fi
 
   printf '[cmd-observed-mixture-cha]'; printf ' %q' "${MIX_CMD[@]}"; printf '\n'
   env \
+    SKIP_IF_NO_CIRCUIT=false \
+    SKIP_DOWNSTREAM_IF_NO_CIRCUIT="$MIX_FIRST_PASS_SKIP_DOWNSTREAM" \
     POISONING_RUN_DIR="$RUN_DIR" \
     OBSERVED_MIXTURE_SCAN_MAX_ROWS="$OBSERVED_MIXTURE_SCAN_MAX_ROWS" \
     OBSERVED_MIXTURE_CANDIDATE_SEED="$OBSERVED_MIXTURE_CANDIDATE_SEED" \
@@ -449,7 +496,7 @@ else
     PIPELINE_EVALUATION_BASELINE_SUBSET=all \
     SPECTRAL_CLUSTER_BASE_SUBSET=all \
     RUN_SINGLETON_CAUSAL_EVALUATION=false \
-    RUN_GRADED_AGONIST_INTERVENTION=false \
+    RUN_GRADED_AGONIST_INTERVENTION=false RUN_TEMPORAL_CUTOFF_INTERVENTION=false \
     RUN_THRESHOLD_EVENT_POSTHOC=false \
     RUN_PREEMPTION=false \
     REFINE_USE_SPECTRAL_SAMPLING=false \
@@ -460,12 +507,40 @@ else
     HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
     "${MIX_CMD[@]}"
 
-  # Candidate order is a pure Stage-6 discovery artifact. Freeze it without
-  # running the generic held-out singleton evaluator; Stage 07 evaluates the
-  # frozen union once on the scientifically relevant paired endpoints.
-  python3 -m studies.poisoning.stage03_freeze_observed_mixture_candidates \
-    --endpoint_dir "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR" \
-    --search_epsilon "$MIN_FLIP_RATE"
+  if poisoning_pipeline_skipped_no_circuit "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR"; then
+    if poisoning_is_true "$POISONING_FULL_ABLATION_IF_NO_CIRCUIT" && ! poisoning_is_true "$POISONING_SKIP_CIRCUIT_DISCOVERY"; then
+      echo "[observed-mixture] no discovered circuit; rerunning with explicit full-network ablation candidate space."
+      MIX_CMD_FULL=("${MIX_CMD[@]}" --full_network_ablation)
+      printf '[cmd-observed-mixture-full-ablation]'; printf ' %q' "${MIX_CMD_FULL[@]}"; printf '\n'
+      env \
+        SKIP_IF_NO_CIRCUIT=false \
+        SKIP_DOWNSTREAM_IF_NO_CIRCUIT=false \
+        POISONING_RUN_DIR="$RUN_DIR" \
+        OBSERVED_MIXTURE_SCAN_MAX_ROWS="$OBSERVED_MIXTURE_SCAN_MAX_ROWS" \
+        OBSERVED_MIXTURE_CANDIDATE_SEED="$OBSERVED_MIXTURE_CANDIDATE_SEED" \
+        MAX_POINTS_PER_ABLATION="$MIX_N_SIDE" MAX_POINTS_PER_CIRCUIT="$MIX_N_PAIRS" \
+        SEARCH_EPSILON_REFERENCE_N="$REFERENCE_CHA_SIDE" CHA_PRUNE_ALPHA="$CHA_PRUNE_ALPHA" \
+        EVALUATION_CONFIDENCE_ALPHA="$EVAL_CONFIDENCE_ALPHA" REFINE_SAMPLING_MAX_POINTS=0 \
+        ANALYZE_BASELINE_SUBSETS=positive,negative EVALUATION_BASELINE_SUBSET=all \
+        PIPELINE_EVALUATION_BASELINE_SUBSET=all SPECTRAL_CLUSTER_BASE_SUBSET=all \
+        RUN_SINGLETON_CAUSAL_EVALUATION=false RUN_GRADED_AGONIST_INTERVENTION=false RUN_TEMPORAL_CUTOFF_INTERVENTION=false \
+        RUN_THRESHOLD_EVENT_POSTHOC=false RUN_PREEMPTION=false REFINE_USE_SPECTRAL_SAMPLING=false \
+        REFINE_EXCLUDE_DISCOVERY_ROWS_FROM_FINAL_STATS=false RUN_INTERACTION_VALIDATION=false \
+        RUN_CMC=false SKIP_AGONIST_METRIC_STATS=true HF_MODEL_CACHE_DIR="$HF_MODEL_CACHE_DIR" \
+        "${MIX_CMD_FULL[@]}"
+    else
+      echo "[observed-mixture] Stage 5 found no valid circuit; candidate freeze is intentionally skipped."
+    fi
+  fi
+
+  if ! poisoning_pipeline_skipped_no_circuit "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR"; then
+    # Candidate order is a pure Stage-6 discovery artifact. Freeze it without
+    # running the generic held-out singleton evaluator; Stage 07 evaluates the
+    # frozen union once on the scientifically relevant paired endpoints.
+    python3 -m studies.poisoning.stage03_freeze_observed_mixture_candidates \
+      --endpoint_dir "$OBSERVED_MIXTURE_OUTPUT_DATA_DIR" \
+      --search_epsilon "$MIN_FLIP_RATE"
+  fi
 fi
 else
   echo "[observed-mixture] endpoint skipped entirely (RUN_OBSERVED_MIXTURE_ENDPOINT=0)."

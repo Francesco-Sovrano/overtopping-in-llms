@@ -102,17 +102,6 @@ def _progress(checkpoint: Path) -> tuple[float, int] | None:
     return int(m.group(1)) / 100.0, int(m.group(2))
 
 
-def _choose_stats_dir(root: Path, *, baseline_positive: bool = False) -> Path | None:
-    candidates = sorted({p.parent for p in root.rglob("singleton_set_metrics.csv")})
-    candidates = [p for p in candidates if "tau0.3" in p.name]
-    if baseline_positive:
-        preferred = [p for p in candidates if "baseline_positive" in p.name]
-    else:
-        preferred = [p for p in candidates if "heldout_test" in p.name and "cap0" in p.name]
-    pool = preferred or candidates
-    return pool[-1] if pool else None
-
-
 def _fixed_control_correctness_materialization(run_dir: Path, phase_dir: str) -> pd.DataFrame:
     """Load Stage-07 fixed-union control-correctness singleton evaluations when available.
 

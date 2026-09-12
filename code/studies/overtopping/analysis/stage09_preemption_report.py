@@ -181,8 +181,6 @@ def main() -> None:
     frame=load_all(root,args,out); frame.to_csv(out/"preemption_all_pairs.csv",index=False)
     condition = _condition_summary(frame)
     condition.to_csv(out/"preemption_by_condition.csv", index=False)
-    # Backward-compatible alias; inference is condition-level, not pair-level.
-    condition.to_csv(out/"preemption_by_setting.csv", index=False)
     if frame.empty:
         audit_path = out / "preemption_population_audit.csv"
         audit_df = pd.read_csv(audit_path) if audit_path.is_file() else pd.DataFrame()

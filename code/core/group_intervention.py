@@ -778,7 +778,7 @@ def evaluate_groups(
             outputs[group.key][start:end] = post
 
         _write_batch_cache(
-            batch_cache_path,
+            cache_dir,
             start=start,
             end=end,
             outputs=batch_outputs,

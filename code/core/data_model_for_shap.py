@@ -877,7 +877,7 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 					selected_rules_test.to_csv(os.path.join(out_dir, f"optimal_rule_set_test_selected_{metric}.csv"), index=False)
 		if bool(getattr(args, "emit_all_fit_rules", True)):
 			all_fit_path = os.path.join(out_dir, f"rule_combo_all_fit_{metric}.csv")
-			if force_rule_recompute or force_all_fit_recompute or (not _all_fit_combo_cache_current(all_fit_path)):
+			if force_rule_recompute or force_all_fit_recompute or (not all_fit_cache_current):
 				# ALL-FIT is the final descriptive fit on all observed rows available for
 				# this target (TRAIN + held-out TEST/EVAL, after target-specific NA removal).
 				# Apply --only_unique_datapoints_in_rule_extraction here too, so ALL-FIT

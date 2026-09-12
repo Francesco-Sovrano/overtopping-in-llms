@@ -7,7 +7,7 @@ from transformer_lens import HookedTransformer
 from tqdm import tqdm
 from einops import einsum
 
-from .utils import forward_no_cache_optional, tokenize_plus, tokenize_pairs_same_width, make_hooks_and_matrices, compute_mean_activations, model_device_expr, clean_memory_cache
+from .utils import forward_no_cache_optional, tokenize_plus, tokenize_pairs_same_width, make_hooks_and_matrices, compute_mean_activations, align_mean_activations_to_positions, model_device_expr, clean_memory_cache
 from .graph import Graph, AttentionNode
 
 
@@ -244,23 +244,8 @@ def evaluate_graph(model: HookedTransformer, graph: Graph, dataloader: DataLoade
 				# In the case of zero or mean ablation, we skip the adding in corrupted activations
 				# but in mean ablations, we need to add the mean in
 				if 'mean' in intervention:
-					T_batch = activation_difference.size(1)
-					if means.size(1) != 1:
-						# per_position = True → match T_batch
-						T_means = means.size(1)
-						if T_means > T_batch:
-							means = means[:, :T_batch, ...]
-						elif T_means < T_batch:
-							pad = torch.zeros(
-								means.size(0),
-								T_batch - T_means,
-								means.size(2),
-								means.size(3),
-								device=means.device,
-								dtype=means.dtype,
-							)
-							means = torch.cat([means, pad], dim=1)
-					activation_difference += means
+					batch_means = align_mean_activations_to_positions(means, activation_difference.size(1))
+					activation_difference += batch_means
 
 			# For some metrics (e.g. accuracy or KL), we need the clean logits
 			clean_logits = None if skip_clean else model(clean_tokens, attention_mask=attention_mask_clean)

@@ -148,12 +148,42 @@ def _resolve_stage6_bucket_files(
     by_config: dict[Path, list[Path]] = defaultdict(list)
     for bucket in matching:
         by_config[bucket.parent.parent].append(bucket)
+
     if len(by_config) != 1:
-        raise RuntimeError(
-            "Ambiguous Stage-6 discovery outputs. Refusing to merge stale/configuration variants. "
-            "Remove stale variants or pass --discovery_root explicitly. Configurations: "
-            + "; ".join(str(p) for p in sorted(by_config)[:8])
-        )
+        # Explicit poisoning full-network ablation lives in a separate
+        # neural_circuit_discovery_results*_full_ablation namespace. Prefer it
+        # only when the endpoint status says the latest causal pass explicitly
+        # selected that mode; otherwise prefer a unique ordinary-discovery
+        # configuration. This prevents a historical fallback artifact from
+        # silently displacing a real discovered circuit, while also letting an
+        # intentional fallback coexist with old Stage-6 outputs.
+        status_path = endpoint / "pipeline_status.json"
+        latest_full_ablation = False
+        if status_path.is_file():
+            try:
+                status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+                latest_full_ablation = status_payload.get("status") == "explicit_full_network_ablation"
+            except Exception:
+                latest_full_ablation = False
+
+        full_configs = {
+            root: paths for root, paths in by_config.items()
+            if "full_ablation" in str(root)
+        }
+        ordinary_configs = {
+            root: paths for root, paths in by_config.items()
+            if "full_ablation" not in str(root)
+        }
+        preferred = full_configs if latest_full_ablation else ordinary_configs
+        if len(preferred) == 1:
+            by_config = preferred
+        else:
+            raise RuntimeError(
+                "Ambiguous Stage-6 discovery outputs. Refusing to merge stale/configuration variants. "
+                "Remove stale variants or pass --discovery_root explicitly. Configurations: "
+                + "; ".join(str(p) for p in sorted(by_config)[:8])
+            )
+
     config_root, paths = next(iter(by_config.items()))
     return config_root, sorted(paths)
 
