@@ -31,7 +31,9 @@ Reusable model-backed workflow:
 6. candidate and rule analysis;
 7. held-out singleton causal evaluation;
 7b. graded agonist intervention;
-7c. threshold-event diagnostics;
+7c. temporal prefix intervention;
+7d. temporal suffix intervention;
+post-Stage-7 threshold-event diagnostics;
 8. simultaneous-set, matched-set, conditional-marginal, and optional preemption validation.
 
 The pipeline writes persistent experiment artifacts under `data/` and uses compatible caches when available.
@@ -59,7 +61,7 @@ Study-specific ownership for:
 
 ### `reporting/`
 
-`reporting.generate_final_results` reads persistent study outputs, builds analysis manifests, runs metric audits, computes cross-setting statistics, and writes manuscript products under `results/`.
+`reporting.generate_final_results` reads persistent study outputs, builds analysis manifests, runs metric audits, computes cross-setting statistics, and writes derived analysis products under `results/`.
 
 The standard reporting path is model-free. Model-backed recovery utilities are separate commands.
 

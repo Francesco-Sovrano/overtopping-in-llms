@@ -1,23 +1,23 @@
-# Experiments
+# Experiment families
 
-The repository contains two experiment families with separate scientific populations and persistent artifact roots.
+The repository contains two experiment families with independent scientific populations and persistent artifact roots.
 
 ## Overtopping
 
-The overtopping study performs discovery and held-out causal evaluation across an explicit configurable registry of tasks, model snapshots, intervention phases, and replacement baselines.
+The overtopping study applies the shared causal-intervention pipeline to an explicit registry of task, model snapshot, intervention phase, replacement baseline, and discovery/evaluation parameters.
 
-The registry contains 31 final-snapshot task×model×phase cells, 18 non-final Grammar/HANS-NLI/FSM Pythia checkpoint settings, and 7 matched replacement-baseline repeats. See [Overtopping experiment design](overtopping.md) for the exact configured cells and analysis populations.
+The current `all` selection contains 50 unique scientific settings after cross-suite deduplication. Registry membership is defined in code and can be inspected with:
 
-RQ1–RQ3 use overtopping settings. RQ4 additionally uses the configured Pythia checkpoint trajectories.
+```bash
+./run_overtopping_experiments.sh --list
+```
+
+RQ1–RQ3 use overtopping settings. RQ4 also uses the configured Pythia checkpoint trajectory view. See [Overtopping experiment design](overtopping.md).
 
 ## Poisoning
 
-The poisoning study trains matched clean and poisoned trajectories, evaluates behavior at aligned checkpoints, and measures checkpoint causal organization and poisoning-example detectability.
+The poisoning study trains matched clean and poisoned trajectories, evaluates aligned checkpoints, performs configured causal localization, freezes candidate unions, evaluates longitudinal causal effects, scores training examples, and aggregates across training seeds.
 
-Read:
+The default launcher uses Grammar, `Qwen/Qwen2-1.5B-Instruct`, and seeds 13, 37, and 101.
 
-1. [Poisoning protocol](poisoning/) — experimental unit, training trajectories, markers, behavioral endpoints, checkpoint causal analysis, and replication unit.
-2. [Poisoning configuration](poisoning/configuration.md) — launcher-defined study values and execution controls.
-3. [Poisoning outputs](poisoning/outputs.md) — stage-numbered run tree, tables, figures, and cache locations.
-
-Poisoning data live under `data/poisoning/` and are not included in the RQ1–RQ3 overtopping populations.
+See [Poisoning protocol](poisoning/README.md), [configuration](poisoning/configuration.md), and [outputs](poisoning/outputs.md).

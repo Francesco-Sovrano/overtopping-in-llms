@@ -3361,7 +3361,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trend-mask-gap-px", type=float, default=4.5, help="Extra display-space gap, in pixels, reserved around markers when drawing regression trend lines. Default 4.5.")
     parser.add_argument("--show-r2", action="store_true", help="Include R^2 values in trend-line legend labels. Default hides them to keep legends compact.")
     parser.add_argument("--no-fit-stats", action="store_true", help="Hide the in-panel regression statistics annotation. By default, each competence-vs-coverage panel reports n, Pearson r, p-value, OLS equation, and R^2. Finite-answer output-only x-values are chance-normalized; input+output x-values are raw parsed task scores. Jailbreak/refusal x-values are safe-refusal rates, with stored jailbreak rates flipped before plotting.")
-    parser.add_argument("--fit-stats-size", type=float, default=5.6, help="Font size for the in-panel regression statistics annotation.")
+    parser.add_argument("--fit-stats-size", type=float, default=7.4, help="Font size for the in-panel regression statistics annotation.")
     parser.add_argument("--fit-stats-obstacle-pad-px", type=float, default=9.0, help="Display-space clearance reserved around the regression statistics box when placing model labels.")
     parser.add_argument("--size-mode", choices=["fixed", "neurons"], default="fixed", help="Use fixed marker sizes or scale by number of localized neurons.")
     parser.add_argument("--marker-size", type=float, default=24.0, help="Marker area in pt^2 for --size-mode fixed. Default 24 for the recommended compact figure.")

@@ -36,7 +36,7 @@ core/group_intervention.py
 
 ## Relationship to causal intervention
 
-EAP/EAP-IG is used for attribution and candidate discovery. The causal claims in later stages come from explicit model interventions and behavioral endpoint changes, not from attribution magnitude alone.
+EAP/EAP-IG is used for attribution and candidate discovery. Later causal-effect estimates are computed from explicit model interventions and behavioral endpoint changes.
 
 ## Import check
 

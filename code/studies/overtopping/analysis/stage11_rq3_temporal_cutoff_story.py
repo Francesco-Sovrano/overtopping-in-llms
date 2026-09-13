@@ -52,7 +52,7 @@ from studies.overtopping.analysis.stage10_rq3_spiking_story_figures import (
 )
 
 BOOTSTRAP_SEED = 20260911
-SCHEMA = "rq3-temporal-cutoff-story-v4"
+SCHEMA = "rq3-temporal-cutoff-story-v5"
 
 
 def parse_args() -> argparse.Namespace:
@@ -547,7 +547,7 @@ def _plot_cross_sweep_event_validation(
                 transform=ax.transAxes,
                 ha="right",
                 va="top",
-                fontsize=6.5,
+                fontsize=9.0,
             )
             _clean(ax)
         axes[row_idx, 1].text(
@@ -562,6 +562,111 @@ def _plot_cross_sweep_event_validation(
         y=1.01,
     )
     _save(fig, path)
+
+
+def _plot_cross_sweep_event_validation_by_phase(
+    phase_results: dict[str, dict],
+    path: Path,
+) -> None:
+    """Cross-sweep EVENT validation stratified by intervention phase.
+
+    Each phase gets two rows: suffix-defined EVENT validated by prefix, then the
+    reciprocal prefix-defined EVENT validated by suffix.  This keeps Out and
+    I+O visible separately even when the top-level analysis pools both phases.
+    """
+    available = [phase for phase in ("Out", "I+O") if phase in phase_results]
+    if not available:
+        path.unlink(missing_ok=True)
+        return
+
+    scopes = [("1to0", "1→0"), ("0to1", "0→1"), (None, "All directions")]
+    fig, axes = plt.subplots(2 * len(available), 3, figsize=(12.3, 3.25 * len(available) * 2), sharex=True)
+    if len(available) == 1:
+        axes = np.asarray(axes).reshape(2, 3)
+
+    any_profile = False
+    for phase_idx, phase in enumerate(available):
+        result = phase_results[phase]
+        rows = [
+            (
+                result["suffix_event_prefix_aligned"],
+                result["suffix_event_prefix_stats"],
+                "Suffix-only defines EVENT; prefix-only validates",
+            ),
+            (
+                result["prefix_event_suffix_aligned"],
+                result["prefix_event_suffix_stats"],
+                "Prefix-only defines EVENT; suffix-only validates",
+            ),
+        ]
+        for within_phase_row, (aligned, cond_stats, sweep_title) in enumerate(rows):
+            row_idx = 2 * phase_idx + within_phase_row
+            for col_idx, (direction, direction_title) in enumerate(scopes):
+                ax = axes[row_idx, col_idx]
+                profile = _cross_sweep_aligned_profile(aligned, direction=direction, max_abs_offset=4)
+                stats = _cross_sweep_scope_stats(cond_stats, direction=direction)
+                if profile.empty:
+                    ax.text(.5, .5, "No paired cross-sweep conditions", transform=ax.transAxes, ha="center", va="center")
+                    _clean(ax)
+                else:
+                    any_profile = True
+                    _whisker_curve(ax, profile, "event_offset")
+                    ax.axvline(0, linestyle=":", linewidth=1.0)
+                    ax.axhline(0, linestyle=":", linewidth=.8)
+                    offsets = profile["event_offset"].astype(int).tolist()
+                    ax.set_xticks(offsets, ["EVENT" if x == 0 else f"{x:+d}" for x in offsets])
+                    ci = stats.get("median_event_minus_adjacent_gain_ci95", [math.nan, math.nan])
+                    ax.text(
+                        .97, .97,
+                        f"EVENT−adjacent={stats.get('median_event_minus_adjacent_gain', math.nan):+.2f}\n"
+                        f"95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]\n"
+                        f"{_format_p(stats.get('event_minus_adjacent_wilcoxon_one_sided_p', math.nan))}; "
+                        f"n={stats.get('n_event_enrichment_conditions', 0)}\n"
+                        f"same peak={100*stats.get('same_peak_transition_rate', math.nan):.0f}%",
+                        transform=ax.transAxes,
+                        ha="right", va="top", fontsize=8.8,
+                    )
+                    _clean(ax)
+                if row_idx == 0:
+                    ax.set_title(direction_title)
+                if col_idx == 0:
+                    ax.set_ylabel(f"{phase}\nIncremental normalized causal effect\nin held-out sweep")
+                if row_idx == 2 * len(available) - 1:
+                    ax.set_xlabel("Decode transition relative to EVENT\ndefined by the other sweep")
+            axes[row_idx, 1].text(
+                .5, 1.08, f"{phase}: {sweep_title}",
+                transform=axes[row_idx, 1].transAxes,
+                ha="center", va="bottom", fontsize=8.2, fontweight="bold",
+            )
+
+    if not any_profile:
+        plt.close(fig)
+        path.unlink(missing_ok=True)
+        return
+    fig.suptitle("Cross-sweep temporal EVENT validation stratified by intervention phase", fontsize=10.2, y=1.002)
+    _save(fig, path)
+
+
+def _cross_sweep_phase_table(phase_results: dict[str, dict]) -> pd.DataFrame:
+    rows: list[dict] = []
+    for phase in ("Out", "I+O"):
+        if phase not in phase_results:
+            continue
+        result = phase_results[phase]
+        for analysis_key, label in (
+            ("suffix_event_prefix_stats", "suffix_defines_prefix_validates"),
+            ("prefix_event_suffix_stats", "prefix_defines_suffix_validates"),
+        ):
+            frame = result[analysis_key]
+            for direction in ("1to0", "0to1", None):
+                stats = _cross_sweep_scope_stats(frame, direction=direction)
+                rows.append({
+                    "phase": phase,
+                    "validation_design": label,
+                    "direction": direction or "all",
+                    **stats,
+                })
+    return pd.DataFrame(rows)
 
 def _profile(df: pd.DataFrame, *, xcol: str, ycol: str) -> pd.DataFrame:
     if df.empty:
@@ -773,7 +878,7 @@ def _plot_temporal_main(capture: pd.DataFrame, gain: pd.DataFrame, stats: dict, 
         transform=ax.transAxes,
         ha="right",
         va="bottom",
-        fontsize=8.6,
+        fontsize=9.2,
         linespacing=1.18,
     )
     ax.set_ylim(min(-.08, float(np.nanmin(capture["q25"])) * 1.1), max(1.08, float(np.nanmax(capture["q75"])) * 1.1))
@@ -797,16 +902,11 @@ def _plot_temporal_main(capture: pd.DataFrame, gain: pd.DataFrame, stats: dict, 
         transform=ax.transAxes,
         ha="right",
         va="top",
-        fontsize=8.6,
+        fontsize=9.2,
         linespacing=1.18,
     )
     _clean(ax)
 
-    for label, ax in zip(["(a)", "(b)"], axes):
-        ax.text(
-            .01, .99, label, transform=ax.transAxes, fontsize=11.0,
-            fontweight="bold", ha="left", va="top",
-        )
     _save(fig, path)
 
 
@@ -815,18 +915,25 @@ def _plot_fig4e_event_strength_temporal(
     event_stats: dict,
     strength: pd.DataFrame,
     strength_stats: dict,
-    capture: pd.DataFrame,
-    temporal_stats: dict,
+    prefix_event_suffix_aligned: pd.DataFrame,
+    prefix_event_suffix_stats: pd.DataFrame,
     path: Path,
 ) -> None:
-    """Assemble Fig. 4e: event localization, strength sharpening, temporal capture."""
-    if event_profile.empty or strength.empty or capture.empty:
+    """Assemble Fig. 4e as a three-view main-text summary.
+
+    The first two views are population EVENT localization and causal-strength
+    sharpening.  The third view is exactly the all-direction bottom-right view
+    of the cross-sweep validation figure: prefix-only defines EVENT and the
+    complementary suffix-only sweep supplies the held-out validation profile.
+    """
+    if event_profile.empty or strength.empty:
         path.unlink(missing_ok=True)
         return
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.75))
+    fig, axes = plt.subplots(1, 3, figsize=(13.6, 4.15))
+    stats_font = 9.0
 
-    # (a) Population event localization.
+    # Population event localization.
     ax = axes[0]
     x = event_profile["offset"].to_numpy(float)
     med = 100 * event_profile["median"].to_numpy(float)
@@ -852,12 +959,12 @@ def _plot_fig4e_event_strength_temporal(
         f"95% CI [{100*ci[0]:.1f}, {100*ci[1]:.1f}]\n"
         f"paired Wilcoxon {_format_p(event_stats.get('wilcoxon_one_sided_p', math.nan))}; "
         f"n={event_stats.get('n_conditions', 0)}",
-        transform=ax.transAxes, ha="right", va="top", fontsize=6.9,
+        transform=ax.transAxes, ha="right", va="top", fontsize=stats_font,
     )
     ax.set_ylim(0, max(32.0, float(np.nanmax(q75)) * 1.18))
     _clean(ax)
 
-    # (b) Strength sharpening (the former Fig. 4e panel c).
+    # Strength sharpening.
     ax = axes[1]
     xx = np.arange(len(strength))
     smed = strength["median"].to_numpy(float)
@@ -880,37 +987,45 @@ def _plot_fig4e_event_strength_temporal(
         f"95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]\n"
         f"paired Wilcoxon {_format_p(strength_stats.get('wilcoxon_one_sided_p', math.nan))}; "
         f"n={strength_stats.get('n_paired_tertile_groups', 0)}",
-        transform=ax.transAxes, ha="left", va="top", fontsize=6.9,
+        transform=ax.transAxes, ha="left", va="top", fontsize=stats_font,
     )
     ax.set_ylim(.8, max(3.6, float(np.nanmax(sq75)) * 1.18))
     _clean(ax)
 
-    # (c) Temporal-cutoff capture profile, matching standalone Fig. S15.
+    # Cross-sweep validation: same data and scope as the bottom-right Fig. S16 view.
     ax = axes[2]
-    _whisker_curve(ax, capture, "active_decode_steps")
-    ax.axhline(.5, linestyle=":", linewidth=1.0)
-    ax.axhline(1.0, linestyle=":", linewidth=1.0)
-    ci = temporal_stats.get("median_half_horizon_capture_ci95", [math.nan, math.nan])
-    ax.text(
-        .97, .07,
-        f"Half-horizon capture={temporal_stats.get('median_half_horizon_capture', math.nan):.2f}\n"
-        f"95% CI [{ci[0]:.2f}, {ci[1]:.2f}]\n"
-        f"vs 0.5 {_format_p(temporal_stats.get('half_horizon_capture_vs_half_wilcoxon_one_sided_p', math.nan))}; "
-        f"n={temporal_stats.get('n_half_horizon_conditions', 0)}",
-        transform=ax.transAxes, ha="right", va="bottom", fontsize=7.2, linespacing=1.15,
-    )
-    ax.set_xlabel("Active autoregressive decode transitions")
-    ax.set_ylabel("Normalized capture of full held-out flip effect")
-    ax.set_ylim(
-        min(-.08, float(np.nanmin(capture["q25"])) * 1.1),
-        max(1.08, float(np.nanmax(capture["q75"])) * 1.1),
-    )
-    _clean(ax)
+    profile = _cross_sweep_aligned_profile(prefix_event_suffix_aligned, direction=None, max_abs_offset=4)
+    cross_stats = _cross_sweep_scope_stats(prefix_event_suffix_stats, direction=None)
+    if profile.empty:
+        ax.text(.5, .5, "No paired cross-sweep conditions", transform=ax.transAxes,
+                ha="center", va="center", fontsize=10.0)
+        _clean(ax)
+    else:
+        _whisker_curve(ax, profile, "event_offset")
+        ax.axvline(0, linestyle=":", linewidth=1.0)
+        ax.axhline(0, linestyle=":", linewidth=.8)
+        offsets = profile["event_offset"].astype(int).tolist()
+        ax.set_xticks(offsets, ["EVENT" if value == 0 else f"{value:+d}" for value in offsets])
+        ci = cross_stats.get("median_event_minus_adjacent_gain_ci95", [math.nan, math.nan])
+        ax.text(
+            .97, .97,
+            f"EVENT−adjacent={cross_stats.get('median_event_minus_adjacent_gain', math.nan):+.2f}\n"
+            f"95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]\n"
+            f"{_format_p(cross_stats.get('event_minus_adjacent_wilcoxon_one_sided_p', math.nan))}; "
+            f"n={cross_stats.get('n_event_enrichment_conditions', 0)}\n"
+            f"same peak={100*cross_stats.get('same_peak_transition_rate', math.nan):.0f}%",
+            transform=ax.transAxes, ha="right", va="top", fontsize=stats_font,
+            linespacing=1.15,
+        )
+        # Prefix sweep selects EVENT; suffix sweep is the held-out validation.
+        # Keep the direction explicit inside the axes so it costs no vertical space.
+        ax.text(.03, .97, "prefix → suffix", transform=ax.transAxes,
+                ha="left", va="top", fontsize=stats_font, fontweight="semibold")
+        ax.set_xlabel("Transition relative to prefix-defined EVENT")
+        ax.set_ylabel("Suffix held-out causal effect")
+        _clean(ax)
 
-    for label, ax in zip(["(a)", "(b)", "(c)"], axes):
-        ax.text(-.12, 1.03, label, transform=ax.transAxes, fontweight="bold", ha="left", va="bottom")
     _save(fig, path)
-
 
 def _load_stage10_fig4e_inputs(graded: Path) -> tuple[pd.DataFrame, dict, pd.DataFrame, dict]:
     """Load stage10 outputs required for the revised paper-facing Fig. 4e."""
@@ -953,7 +1068,7 @@ def _plot_capture(capture: pd.DataFrame, stats: dict, path: Path) -> None:
         transform=ax.transAxes,
         ha="right",
         va="bottom",
-        fontsize=9.0,
+        fontsize=9.4,
         linespacing=1.18,
     )
     ax.set_xlabel("Active autoregressive decode transitions", fontsize=10.5)
@@ -1120,20 +1235,25 @@ def main() -> None:
         phase_results[phase] = _analyze_phase_rows(prefix_phase, suffix_phase, phase_dir)
         phase_output_dirs[phase] = str(phase_dir)
 
-    # Preserve the historical top-level products as the output-only analysis so
-    # existing manuscript paths and consumers keep their old meaning. The I+O
-    # analysis is emitted independently under by_phase/input_output/.
-    output_only_rows = _phase_subset(all_rows, "Out")
-    output_only_suffix = _phase_subset(all_suffix_rows, "Out")
-    legacy = _analyze_phase_rows(output_only_rows, output_only_suffix, out)
+    # Top-level temporal products now include both intervention phases.  The
+    # phase-specific analyses above remain the authoritative stratified view, so
+    # pooled top-level estimates can always be audited against Out and I+O.
+    combined = _analyze_phase_rows(all_rows, all_suffix_rows, out)
 
-    stats = legacy["stats"]
-    capture_profile = legacy["capture_profile"]
-    gain_profile = legacy["gain_profile"]
-    suffix_event_prefix_aligned = legacy["suffix_event_prefix_aligned"]
-    suffix_event_prefix_stats = legacy["suffix_event_prefix_stats"]
-    prefix_event_suffix_aligned = legacy["prefix_event_suffix_aligned"]
-    prefix_event_suffix_stats = legacy["prefix_event_suffix_stats"]
+    stats = combined["stats"]
+    capture_profile = combined["capture_profile"]
+    gain_profile = combined["gain_profile"]
+    suffix_event_prefix_aligned = combined["suffix_event_prefix_aligned"]
+    suffix_event_prefix_stats = combined["suffix_event_prefix_stats"]
+    prefix_event_suffix_aligned = combined["prefix_event_suffix_aligned"]
+    prefix_event_suffix_stats = combined["prefix_event_suffix_stats"]
+
+    phase_table = _cross_sweep_phase_table(phase_results)
+    phase_table.to_csv(out / "temporal_cross_sweep_event_validation_by_phase.csv", index=False)
+    _plot_cross_sweep_event_validation_by_phase(
+        phase_results,
+        out / "temporal_cross_sweep_event_validation_by_phase.pdf",
+    )
 
     phase_summaries: dict[str, dict] = {}
     for phase, result in phase_results.items():
@@ -1166,7 +1286,7 @@ def main() -> None:
             "output_dir": phase_output_dirs.get(phase),
         }
 
-    legacy_cross = legacy["cross_sweep"]
+    combined_cross = combined["cross_sweep"]
     summary = {
         "schema": SCHEMA,
         "all_phase_input_rows": int(len(all_rows)),
@@ -1175,14 +1295,19 @@ def main() -> None:
         "suffix_n_audit_rows": int(len(suffix_audit)),
         "phase_output_dirs": phase_output_dirs,
         "phase_summaries": phase_summaries,
-        # Backward-compatible top-level fields remain explicitly output-only.
-        "input_rows": int(len(output_only_rows)),
-        "eligible_decode_only_conditions": _condition_count(output_only_rows),
-        "suffix_input_rows": int(len(output_only_suffix)),
-        "suffix_eligible_decode_only_conditions": _condition_count(output_only_suffix),
-        "cross_sweep_peak_agreement_conditions": int(len(legacy_cross)),
-        "cross_sweep_same_transition_rate": float(pd.to_numeric(legacy_cross.get("same_transition"), errors="coerce").mean()) if not legacy_cross.empty else math.nan,
-        "cross_sweep_within_one_transition_rate": float(pd.to_numeric(legacy_cross.get("within_one_transition"), errors="coerce").mean()) if not legacy_cross.empty else math.nan,
+        # Top-level fields now represent both phases; phase_summaries preserves
+        # the Out versus I+O stratification.
+        "input_rows": int(len(all_rows)),
+        "eligible_conditions": _condition_count(all_rows),
+        "eligible_decode_only_conditions": _condition_count(_phase_subset(all_rows, "Out")),
+        "eligible_input_output_conditions": _condition_count(_phase_subset(all_rows, "I+O")),
+        "suffix_input_rows": int(len(all_suffix_rows)),
+        "suffix_eligible_conditions": _condition_count(all_suffix_rows),
+        "suffix_eligible_decode_only_conditions": _condition_count(_phase_subset(all_suffix_rows, "Out")),
+        "suffix_eligible_input_output_conditions": _condition_count(_phase_subset(all_suffix_rows, "I+O")),
+        "cross_sweep_peak_agreement_conditions": int(len(combined_cross)),
+        "cross_sweep_same_transition_rate": float(pd.to_numeric(combined_cross.get("same_transition"), errors="coerce").mean()) if not combined_cross.empty else math.nan,
+        "cross_sweep_within_one_transition_rate": float(pd.to_numeric(combined_cross.get("within_one_transition"), errors="coerce").mean()) if not combined_cross.empty else math.nan,
         "cross_sweep_suffix_event_prefix_validation": {
             "1to0": _cross_sweep_scope_stats(suffix_event_prefix_stats, direction="1to0"),
             "0to1": _cross_sweep_scope_stats(suffix_event_prefix_stats, direction="0to1"),
@@ -1195,11 +1320,10 @@ def main() -> None:
         },
         "stats": stats,
         "interpretation": (
-            "Temporal prefix/suffix results are now computed for both intervention phases and are never pooled across phase. "
-            "Output-only keeps clean prompt prefill; input+output includes the Stage-7 intervention during prompt prefill. "
-            "The historical top-level temporal products remain output-only for backward compatibility, while phase-specific "
-            "products are written under by_phase/output_only and by_phase/input_output. "
-            "No suffix values are reconstructed as full-minus-prefix."
+            "Temporal prefix/suffix results are computed for both intervention phases. "
+            "Top-level products pool all available phases, while phase-specific products under by_phase/output_only and "
+            "by_phase/input_output provide the required Out versus I+O stratification. Output-only keeps clean prompt prefill; "
+            "input+output includes the Stage-7 intervention during prompt prefill. No suffix values are reconstructed as full-minus-prefix."
         ),
     }
     (out / "temporal_cutoff_summary.json").write_text(json.dumps(summary, indent=2, allow_nan=True), encoding="utf-8")
@@ -1207,10 +1331,11 @@ def main() -> None:
     if paper is not None:
         paper.mkdir(parents=True, exist_ok=True)
         event_profile, event_stats, strength, strength_stats = _load_stage10_fig4e_inputs(graded)
-        # Preserve manuscript semantics: these legacy figure names remain the
-        # output-only temporal analysis. I+O phase figures live in by_phase/.
+        # Manuscript-facing temporal figures now use the combined population;
+        # Fig. 4S16b exposes the phase stratification explicitly.
         _plot_fig4e_event_strength_temporal(
-            event_profile, event_stats, strength, strength_stats, capture_profile, stats,
+            event_profile, event_stats, strength, strength_stats,
+            prefix_event_suffix_aligned, prefix_event_suffix_stats,
             paper / "fig4e_population_event_and_strength.pdf",
         )
         _plot_temporal_main(capture_profile, gain_profile, stats, paper / "fig4s14_temporal_cutoff_spiking.pdf")
@@ -1221,6 +1346,10 @@ def main() -> None:
             prefix_event_suffix_aligned,
             prefix_event_suffix_stats,
             paper / "fig4s16_temporal_cross_sweep_event_validation.pdf",
+        )
+        _plot_cross_sweep_event_validation_by_phase(
+            phase_results,
+            paper / "fig4s16b_temporal_cross_sweep_event_validation_by_phase.pdf",
         )
 
     print(json.dumps(summary, indent=2, allow_nan=True))

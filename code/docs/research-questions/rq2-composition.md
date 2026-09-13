@@ -18,11 +18,11 @@ RQ2 starts from the complete configured overtopping manifest and applies two rul
 First, replacement regimes are analyzed separately:
 
 ```text
-mean-donor regime: 27 configured settings
-mean regime:       12 configured settings after grouping mean-positional with mean
+mean-donor regime: 39 configured settings
+mean regime:       11 configured settings after grouping mean-positional with mean
 ```
 
-The 12 mean-family settings consist of eight `mean` settings and four large-model `mean-positional` settings. Mean-donor and mean-family results are not pooled.
+The 11 mean-family settings consist of eight `mean` settings and three `mean-positional` large-model settings. Mean-donor and mean-family results are analyzed separately.
 
 Second, joint composition is applicable only when discovery yields a nonempty candidate set. A setting is evaluable for the aggregate composition-gap analysis when both singleton-union reach `U(J)` and the genuine simultaneous-set effect `E(J)` are available. The regime reporter starts from the complete configured study table, computes the denominator from these applicability and availability rules, and writes every configured row with an explicit `rq2_status`. A missing joint-effect artifact therefore remains visible in the population audit rather than changing the study manifest.
 
@@ -66,7 +66,7 @@ Its sign is descriptive:
 - zero: simultaneous effect equals singleton-union reach;
 - positive: the full set reaches behavior not reached by any singleton.
 
-The sign alone does not identify a specific mechanism.
+The sign is a composition summary, not a mechanism classifier.
 
 ## Example-level decomposition
 
@@ -161,6 +161,6 @@ The regime reporter reads `results/analysis/primary_matrix/tables/primary_table.
 
 ## Interpretation
 
-A predominantly negative `E(J)-U(J)` indicates that simultaneous intervention preserves less behavior than the union of singleton interventions. Example-level suppression and coalition-only rates identify which event classes generate that gap. These quantities characterize composition; they do not by themselves establish necessity or a unique circuit mechanism.
+A predominantly negative `E(J)-U(J)` indicates that simultaneous intervention preserves less behavior than the union of singleton interventions. Example-level suppression and coalition-only rates identify which event classes generate that gap. Necessity and circuit-mechanism identification use separate estimands.
 
 RQ3 asks a separate question: how the behavior of a fixed candidate changes as intervention strength varies continuously.

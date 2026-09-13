@@ -196,12 +196,13 @@ def checkpoint_experiments() -> list[RunSpec]:
     steps ``EleutherAI/pythia-1b``. Arithmetic is intentionally absent.
     """
     specs: list[RunSpec] = []
-    for task in ("grammar_acceptability", "hans_nli", "random_fsm"):
+    for task in ("grammar_acceptability", "hans_nli", "random_fsm", ):
         for model in (PYTHIA_1B_STEP0, PYTHIA_1B_48K, PYTHIA_1B_96K, PYTHIA_1B):
-            if task in ("grammar_acceptability", "hans_nli"): # these two tasks don't really have much useful at decode-only!
-                mode = "standard"
-            else:
-                mode = "decode-only" # decode-only is the fastest, so it's our default
+            mode = "standard"
+            # if task in ("grammar_acceptability", "hans_nli"): # these two tasks don't really have much useful at decode-only!
+            #     mode = "standard"
+            # else:
+            #     mode = "decode-only" # decode-only is the fastest, so it's our default
             specs.append(_small(task, model, "mean-donor", mode, suite="checkpoints"))
     specs = deduplicate(specs)
     return specs

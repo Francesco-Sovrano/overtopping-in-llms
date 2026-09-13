@@ -1,70 +1,110 @@
-# Overtopping experiment design
+# Overtopping experiment configuration
 
-## Unit of configuration
+## Scientific setting
 
-An overtopping **setting** is a specific combination of:
+An overtopping setting is the resolved `RunSpec` for a specific task, model snapshot, intervention/replacement rule, intervention phase, discovery configuration, and evaluation split. Suite membership and runtime batch size are execution metadata rather than scientific identity fields.
 
-```text
-task × model snapshot × intervention phase × replacement baseline
-```
-
-The registry is explicit rather than a complete Cartesian product, and it intentionally has **no fixed required setting count**. Settings can be added or removed by editing the `RunSpec` lists in:
+The registry is defined in:
 
 ```text
 code/studies/overtopping/experiments/run_experiments.py
 ```
 
-Use the runner as the source of truth for the current population:
+Inspect the effective registry from the repository root:
 
 ```bash
 ./run_overtopping_experiments.sh --list
 ./run_overtopping_experiments.sh --dry-run
 ```
 
-Reporting uses the current registry, or the exact `configured_experiments.json` written by a filtered runner invocation, and derives total/phase/replacement counts from that manifest. It does not require a historical experiment count.
+## Current registry
 
-## Registry structure
+For the repository state represented by this documentation, the `all` selection resolves to 50 unique settings. The storage contract reports:
 
-The registry is organized into four execution suites:
+| Dimension | Value | Count |
+|---|---|---:|
+| intervention phase | input+output (`I+O`) | 29 |
+| intervention phase | output-only (`Out`) | 21 |
+| replacement | `mean-donor` | 39 |
+| replacement | `mean` | 8 |
+| replacement | `mean-positional` | 3 |
 
-- `mean-donor` — configured small/final-snapshot mean-donor settings;
-- `6-7b-models` — selected larger-model settings;
-- `mean` — matched mean/mean-positional replacement settings;
-- `checkpoints` — configured longitudinal Pythia checkpoint trajectories.
+Public suite selections before cross-suite deduplication are:
 
-Suite membership is execution/reporting metadata. It does not create a distinct scientific setting, and changing a suite label or runtime batch size does not justify a duplicate persistent experiment. Registry construction deduplicates identical scientific settings and rejects only cases where two scientifically different settings would write to the same persistent evaluation address.
+| Suite | Entries | Scope |
+|---|---:|---|
+| `mean-donor` | 30 | five tasks × Pythia-1B/Qwen2-1.5B/Qwen2.5-1.5B × two phases |
+| `6-7b-models` | 3 | selected Qwen2-7B settings |
+| `mean` | 8 | selected small-model mean-replacement settings |
+| `checkpoints` | 12 | Grammar/HANS-NLI/Random-FSM × four Pythia-1B checkpoints, input+output phase |
 
-## Checkpoint and replacement views
+The final `EleutherAI/pythia-1b` input+output settings for Grammar, HANS-NLI, and Random FSM are present in both the `mean-donor` and `checkpoints` selections. The `all` selection deduplicates those scientific settings, producing 50 unique settings rather than the arithmetic sum of suite entry counts.
 
-Checkpoint trajectories may overlap final/all-steps model endpoints by design. The same scientific setting is stored once even if it participates in multiple analytical views. Replacement-baseline repeats likewise create distinct causal counterfactuals only when the replacement intervention differs; they are not inferred from a fixed population decomposition.
+## Suite contents
 
-`mean-positional` is grouped with the mean-family reporting regime, while `mean-donor` is analyzed separately where required. The exact current replacement and phase counts are emitted by `--list` and by the optional storage-address diagnostic.
+### `mean-donor`
 
-## Discovery/intervention configuration
-
-Small-model settings use the standard neuron search configuration unless specified in the registry:
+Tasks:
 
 ```text
-circuit_size = 200000
-min_flip_rate = 0.3
+arithmetic
+grammar_acceptability
+random_fsm
+hans_nli
+bon_jailbreaking
 ```
 
-Large-model scale settings use:
+Models:
 
 ```text
-MLP-only coordinates
-circuit_size = 100000
-min_flip_rate = 0.2
-replacement = mean-positional
+EleutherAI/pythia-1b
+Qwen/Qwen2-1.5B-Instruct
+Qwen/Qwen2.5-1.5B-Instruct
 ```
 
-Task-specific `z_thresh`, batch size, and maximum-circuit values are encoded directly in each `RunSpec`.
+Each task/model cell has input+output and output-only settings.
+
+### `6-7b-models`
+
+Current entries:
+
+```text
+arithmetic       Qwen/Qwen2-7B-Instruct  output-only
+bon_jailbreaking Qwen/Qwen2-7B-Instruct  output-only
+hans_nli         Qwen/Qwen2-7B-Instruct  input+output
+```
+
+These settings use `mean-positional`, MLP-only coordinates, `circuit_size=100000`, and `min_flip_rate=0.2`. Task-specific thresholds and batch sizes are encoded in the registry.
+
+### `mean`
+
+Current entries use `mean` replacement for:
+
+```text
+arithmetic            Qwen/Qwen2-1.5B-Instruct       input+output, output-only
+grammar_acceptability Qwen/Qwen2.5-1.5B-Instruct     input+output, output-only
+hans_nli              Qwen/Qwen2.5-1.5B-Instruct     input+output, output-only
+random_fsm            Qwen/Qwen2.5-1.5B-Instruct     input+output, output-only
+```
+
+### `checkpoints`
+
+The checkpoint trajectory is defined for Grammar, HANS-NLI, and Random FSM in the input+output phase:
+
+```text
+EleutherAI/pythia-1b@step0
+EleutherAI/pythia-1b@step48000
+EleutherAI/pythia-1b@step96000
+EleutherAI/pythia-1b
+```
+
+Arithmetic is not included in the checkpoint suite.
 
 ## Evaluation split
 
-The manuscript-facing overtopping analyses use the held-out `test` split. The runner also accepts `train` and `all` for explicit non-manuscript analyses.
+The repository launcher defaults to the held-out `test` split. Explicit alternatives are `train` and `all`.
 
-Evaluation suffixes are generated by `RunSpec.evaluation_suffix()`:
+`RunSpec.evaluation_suffix()` uses:
 
 ```text
 test   -> -heldout_test
@@ -72,43 +112,33 @@ train  -> -eval_train
 all    -> no evaluation suffix
 ```
 
-## Analysis populations
+The evaluation split is part of persistent experiment identity when multiple split variants coexist.
 
-The current configured registry is materialized before metric-specific filtering; its size is derived from the manifest.
+## Filters and phases
 
-- **RQ1:** configured settings with the required metric; correlations are fit separately for I+O and Out.
-- **RQ1 final-snapshot sensitivity:** intermediate checkpoints are removed and one replacement condition is retained per repeated task×model×phase cell.
-- **RQ2:** settings for which a nonempty candidate set and simultaneous-set outputs make composition applicable; replacement regimes are analyzed separately.
-- **RQ3:** all configured settings are in the manifest; each threshold/graded analysis retains settings with its required compatible artifacts and reports the resulting denominator.
-- **RQ4:** configured Pythia checkpoint trajectories and controlled poisoning trajectories.
+The runner accepts scientific filters for:
 
-A completed zero-candidate setting remains a configured observation for analyses such as RQ1 where `U(J)=0` is defined. Joint composition of an empty set is not treated as an ordinary RQ2 composition observation.
-
-## Execution sets
-
-The runner exposes exactly four disjoint execution sets:
-
-```bash
-./run_overtopping_experiments.sh --suite mean-donor
-./run_overtopping_experiments.sh --suite 6-7b-models
-./run_overtopping_experiments.sh --suite mean
-./run_overtopping_experiments.sh --suite checkpoints
+```text
+--task
+--model
+--intervention
+--mode
+--evaluation-split
 ```
 
-The checkpoint set contains Grammar, HANS-NLI, and Random FSM at Pythia-1B step0, step48000, step96000, and final/all-steps `EleutherAI/pythia-1b`, in both phases. Arithmetic is not checkpointed. Suite membership is execution metadata only and does not alter persistent result/cache addresses.
+Execution phase is selected with:
 
-## Inspect the registry
-
-From the repository root:
-
-```bash
-./run_overtopping_experiments.sh --list
-./run_overtopping_experiments.sh --dry-run
+```text
+--phase pipeline
+--phase analysis
+--phase all
 ```
 
-Target a subset by scientific fields:
+Examples:
 
 ```bash
+./run_overtopping_experiments.sh --suite checkpoints --dry-run
+
 ./run_overtopping_experiments.sh \
   --task arithmetic \
   --model Qwen/Qwen2-1.5B-Instruct \
@@ -116,20 +146,9 @@ Target a subset by scientific fields:
   --dry-run
 ```
 
-Available filters include:
+## Persistent addressing
 
-```text
---task
---model
---intervention
---mode
---phase
---evaluation-split
-```
-
-## Persistent paths
-
-Each `RunSpec` resolves persistent experiment locations through the shared path constructors:
+`RunSpec` owns persistent paths through:
 
 ```text
 circuit_label()
@@ -139,29 +158,35 @@ input_data_dir(data_root)
 stats_dir(data_root)
 ```
 
-Analysis code uses these constructors rather than defining the study population by recursive filesystem discovery.
+`mean` and `mean-positional` share the mean-family circuit-path convention. `mean-donor` uses the donor-specific suffix. The resolved intervention remains available in the registry and pipeline arguments.
 
-`mean` and `mean-positional` use the unsuffixed mean-family circuit path convention; their exact intervention is carried by the registry and pipeline arguments. Mean-donor paths include the donor intervention suffix.
-
-Validate the full registry's storage/addressing contract with:
+Validate address uniqueness and the registry fingerprint with:
 
 ```bash
 cd code
 python -m studies.overtopping.experiments.storage_contract
 ```
 
-## Runner outputs
+The check is read-only with respect to scientific artifacts.
 
-The runner records the selected configurations under:
+## Analysis populations
+
+The configured manifest is established before metric-specific filtering.
+
+- RQ1 uses configured settings with the required directional singleton metrics and analyzes intervention phases separately.
+- RQ2 requires a nonempty frozen candidate set and compatible simultaneous-set outputs; replacement regimes are analyzed separately.
+- RQ3 uses the configured settings with the artifacts required by each threshold, graded, margin, or temporal analysis.
+- RQ4 uses the Pythia checkpoint trajectory view and the controlled poisoning trajectories.
+
+A completed zero-candidate setting remains a measured observation for metrics that define a zero value. Set-level composition is not applicable when the candidate set is empty.
+
+## Runner control outputs
+
+Selected configurations and failures are written under the results root:
 
 ```text
 results/configured_experiments.json
-```
-
-Pipeline failures are recorded under:
-
-```text
 results/pipeline_failures.json
 ```
 
-These are reporting/control products. Model-backed experiment outputs remain under `data/`.
+Model-backed scientific artifacts are stored under `data/`.

@@ -1,8 +1,8 @@
 # Analysis and reporting pipeline
 
-The reporting layer converts persistent experiment artifacts under `data/` into validated analysis tables, population audits, statistical summaries, machine-readable figure data, and manuscript-facing products under `results/`.
+The reporting layer reads persistent model-backed artifacts from `data/`, constructs configured analysis populations, audits metric availability, computes aggregate statistics, and writes derived outputs under `results/`.
 
-The standard repository entry point is:
+Standard entry point:
 
 ```bash
 ./generate_results.sh
@@ -17,43 +17,41 @@ python -m reporting.generate_final_results \
   --primary-profile configured
 ```
 
-Reporting uses measured model-backed causal outputs. Metric applicability and artifact availability are recorded separately; strict builds fail when an applicable required measurement is unavailable.
+## Population construction
 
-## Declared analysis populations
+The configured overtopping manifest is constructed before metric-specific filtering.
 
-| Analysis | Population |
+| Analysis | Population rule |
 |---|---|
-| Configured study table | every setting in the current manifest; metric availability is recorded per setting |
-| RQ1 Figure 2 | configured settings with the required metric, fit separately by intervention phase |
-| RQ2 composition and singleton-versus-joint decomposition | all evaluable settings within replacement regime; mean-donor main, mean/mean-positional separate |
-| RQ3 threshold-event reporting | every configured setting with compatible threshold-event inputs |
-| RQ3 graded support-specific report | every configured setting with compatible graded outputs |
-| RQ4 Pythia | configured checkpoint runs |
+| Configured study table | every unique setting in the selected manifest |
+| RQ1 | settings with the required singleton metrics, analyzed separately by intervention phase |
+| RQ2 | settings with nonempty frozen candidate sets and compatible set-level outputs, separated by replacement regime |
+| RQ3 threshold | settings with compatible threshold diagnostics |
+| RQ3 graded/margin/temporal | settings with the corresponding model-backed artifacts |
+| RQ4 Pythia | configured checkpoint settings |
 | Poisoning | configured task/model/seed runs under `data/poisoning/` |
 
-Poisoning runs do not enter the RQ1–RQ3 overtopping populations.
+Poisoning runs are outside the RQ1–RQ3 overtopping population.
 
-## Main reporting sequence
+## Orchestration sequence
 
-`reporting.generate_final_results` orchestrates the following analysis modules.
-
-### 1. Completed-experiment summary
+### Completed-run summary
 
 ```text
 studies.overtopping.analysis.stage01_visualize_experiment_results
 ```
 
-When a runner manifest is supplied, this optional descriptive stage summarizes the completed runs named by that manifest. Its output is not used to define the RQ1--RQ3 study populations; those populations are constructed from the configured study table in Stage 02.
+When a runner manifest is supplied, this stage summarizes completed entries from that manifest. It does not define the configured analysis population.
 
-### 2. Configured study table
+### Configured study table
 
 ```text
 studies.overtopping.analysis.stage02_overtopping_latex_tables
 ```
 
-Builds the configured study table using the manifest-derived row count and materializes pooled, directional, concentration, redundancy, joint-effect, and matched-null fields when available. Missing derived metrics remain explicit missing values/statuses; they do not remove settings from the manifest.
+The table includes configured rows and materializes available pooled, directional, concentration, redundancy, simultaneous-set, and matched-null metrics. Missing derived values remain explicit missing values or statuses.
 
-Representative directional fields:
+Directional fields:
 
 ```text
 U_J_i2c   singleton-union reach on B(x)=0 rows, 0→1
@@ -62,56 +60,44 @@ s_1_i2c   strongest 0→1 singleton effect
 s_1_c2i   strongest 1→0 singleton effect
 ```
 
-Directional fields retain their own eligible denominators.
-
-### 3. Required-metric audit
+### Required-metric audit
 
 ```text
 studies.overtopping.analysis.stage03_audit_required_metrics
 ```
 
-Checks required fields and compatible schemas for the configured study profile. RQ1 singleton requirements apply to all configured settings. RQ2 simultaneous-set, matched-set, composition-decomposition, and optional CMC requirements apply when the frozen candidate set is nonempty.
+The audit checks schema compatibility and required metrics for the selected profile. Singleton requirements apply to configured settings where the corresponding RQ1 metric is defined. Set-level requirements apply when the frozen candidate set is nonempty. CMC completeness can be disabled with `--skip-cmc-requirement`.
 
-### 4. Configured-study statistics
+### Configured-study statistics
 
 ```text
 studies.overtopping.analysis.stage04_analyze_primary_metrics
 ```
 
-Computes cross-setting diagnostics over the configured study table, with metric-specific complete cases, including raw correlations, bootstrap intervals, task/phase analyses, and configured adjusted models.
+This stage computes metric-specific complete-case cross-setting summaries, including correlations, bootstrap intervals, task/phase analyses, and configured adjusted models.
 
-Fields named `N_t_*_density` or `N_t_*_per_1k_layer` are normalized by model `d_model`. They are width-normalized discovered-candidate counts.
+Fields named `N_t_*_density` or `N_t_*_per_1k_layer` are width-normalized discovered-candidate counts based on model `d_model`.
 
-### 5. Manuscript tables and sidecars
+### Derived tables and sidecars
 
 ```text
 studies.overtopping.analysis.stage05_generate_manuscript_outputs
 ```
 
-Builds manuscript tables and machine-readable sidecars from the validated configured-study and interaction products.
+The module name is part of the implementation interface. It writes derived tables and machine-readable sidecars from validated analysis products.
 
-### 6. RQ1, RQ2, and Pythia figures
+### RQ1, RQ2, and checkpoint rendering
 
 ```text
 studies.overtopping.analysis.stage06_competence_vs_overtopping_figures
 studies.overtopping.analysis.stage06_manuscript_story_figures
 ```
 
-These modules generate:
+These modules consume validated analysis tables to produce RQ1 summaries, RQ2 composition outputs, and Pythia checkpoint trajectories.
 
-- RQ1 competence versus directional reach/high-effect-count figures;
-- RQ2 composition, matched-set, and singleton-versus-joint decomposition figures;
-- Pythia checkpoint trajectories used by RQ4.
+## RQ3 threshold diagnostics
 
-RQ1 Figure 2 resolves the current configured manifest and derives its input+output / output-only phase counts dynamically.
-
-## RQ3 reporting
-
-RQ3 combines threshold-event diagnostics, same-candidate graded positive/non-flip support, and continuous endpoint-margin geometry. Stage-8 preemption is aggregated separately as a secondary subtype analysis.
-
-### Threshold diagnostics source resolution
-
-The reporting driver accepts an explicit source:
+An explicit aggregate threshold source can be supplied with:
 
 ```bash
 python -m reporting.generate_final_results \
@@ -121,40 +107,38 @@ python -m reporting.generate_final_results \
   --spiking-source /path/to/threshold_diagnostics
 ```
 
-Without `--spiking-source`, it searches compatible locations under `data/` for an aggregate threshold payload.
-
-A directory is recognized as a basic threshold source when it contains:
+A basic threshold source contains:
 
 ```text
 aggregate_flip_stats.csv
 aggregate_unit_tests.csv
 ```
 
-Full threshold-shape validation additionally requires:
+Threshold-shape validation additionally uses:
 
 ```text
 aggregate_activation_flip_rows.csv
 ```
 
-The descriptive oriented-bin panel uses:
+Oriented-bin summaries use:
 
 ```text
 aggregate_binned_curves.csv
 ```
 
-### Aggregate candidate/control report
+Aggregate threshold reporting:
 
 ```text
 studies.overtopping.analysis.stage07_overtopping_spiking_report
 ```
 
-Principal outputs under:
+Primary output directory:
 
 ```text
 results/analysis/rq3_threshold_event/spiking_diagnostics/
 ```
 
-include:
+Generated files:
 
 ```text
 statistical_results.json
@@ -164,21 +148,19 @@ population_audit.csv
 population_coverage.json
 ```
 
-This module computes aggregate candidate/control causal-strength and threshold-testability summaries and writes the descriptive oriented-bin response used by S4.
-
-### Nested threshold-shape validation
+## Nested threshold-shape validation
 
 ```text
 studies.overtopping.analysis.stage08_threshold_shape_validation
 ```
 
-Outputs are written under:
+Output directory:
 
 ```text
 results/analysis/rq3_threshold_event/spiking_diagnostics/threshold_shape_validation/
 ```
 
-Principal files include:
+Generated files:
 
 ```text
 threshold_shape_model_comparison.csv
@@ -191,27 +173,27 @@ threshold_shape_statistical_results.json
 threshold_shape_status.json
 ```
 
-This module performs nested feature selection and held-out model evaluation and writes the canonical threshold-event manuscript panels.
+The procedure performs feature selection and model fitting inside training folds and evaluates predictive performance on untouched holdout folds.
 
-### Graded agonist aggregation
+## Graded intervention aggregation
 
 ```text
 studies.overtopping.analysis.stage08_graded_agonist_report
 ```
 
-The report resolves each expected run's:
+Per-run source directory:
 
 ```text
 <stage7 stats dir>/graded_agonist_intervention/
 ```
 
-and writes:
+Aggregate output directory:
 
 ```text
 results/analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist/
 ```
 
-Principal files:
+Generated files:
 
 ```text
 graded_agonist_population_audit.csv
@@ -223,70 +205,64 @@ graded_agonist_dose_support_contrast.csv
 graded_agonist_report_status.json
 ```
 
-### Continuous-margin and population event analysis
+## Continuous endpoint-margin aggregation
 
-When Stage 7b recorded endpoint margins, each run contains:
+When Stage 07b records endpoint margins, per-run diagnostics are stored under:
 
 ```text
 <stage7 stats dir>/graded_agonist_intervention/margin_mechanism_test/
 ```
 
-`stage08_graded_agonist_report` aggregates the per-example margin diagnostics into condition- and direction-level tables, including `graded_margin_all_examples.csv`, `graded_margin_by_condition.csv`, and `graded_margin_by_direction.csv`.
+Cross-run tables include:
 
-Population event-localization and causal-strength figures are generated by:
+```text
+graded_margin_all_examples.csv
+graded_margin_by_condition.csv
+graded_margin_by_direction.csv
+```
+
+Population event-localization and strength summaries are generated by:
 
 ```text
 studies.overtopping.analysis.stage10_rq3_spiking_story_figures
 ```
 
-This stage uses paper-standard 11-dose, endpoint-reproduced divergence-margin trajectories and writes its machine-readable summaries into the graded-analysis directory.
+The population margin aggregation uses 11-dose trajectories that reproduce the configured natural and full-intervention endpoints.
 
-### Secondary preemption aggregation
+## Temporal-cutoff aggregation
+
+Per-run prefix and suffix intervention sweeps are aggregated by:
+
+```text
+studies.overtopping.analysis.stage11_rq3_temporal_cutoff_story
+```
+
+The aggregate includes cumulative-effect capture, transition-level incremental gain, T50/T80 summaries, cross-sweep EVENT validation, and phase-specific tables when compatible temporal artifacts are available.
+
+## Preemption aggregation
 
 ```text
 studies.overtopping.analysis.stage09_preemption_report
 ```
 
-This reporter reads exact-manifest per-run `interaction_validation/preemption_pair_summary.csv` files. Only the corrected schema is aggregated. Incompatible rows are excluded through the population audit. The output is analysis-only under `results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/` and is not required for the primary RQ3 claim.
-
-## Figure 4 output set
+The reporter reads compatible per-run `interaction_validation/preemption_pair_summary.csv` files and writes aggregate outputs under:
 
 ```text
-results/paper/figures/04_rq3_spiking_cut/
-├── fig4a_candidate_control_spiking_cut_summary.pdf
-├── fig4b_threshold_shape_model_comparison_by_direction.pdf
-├── fig4c_graded_agonist_dose_response.pdf
-├── fig4d_graded_margin_affine_null.pdf
-├── fig4e_population_event_and_strength.pdf
-├── fig4s1_threshold_testability_by_condition.pdf
-├── fig4s2_strength_matched_thresholdability.pdf
-├── fig4s3_nested_tecs_lower_bound_ecdf.pdf
-├── fig4s4_threshold_tail_response_by_direction.pdf
-├── fig4s5_graded_agonist_single_crossing.pdf
-├── fig4s6_graded_margin_condition_diagnostics.pdf
-├── fig4s7_graded_margin_condition_heatmap.pdf
-├── fig4s8_graded_behavior_competence_reach_io.pdf
-├── fig4s8_graded_behavior_competence_reach_out.pdf
-├── fig4s9_graded_margin_competence_reach_io.pdf
-├── fig4s9_graded_margin_competence_reach_out.pdf
-├── fig4s10_population_event_localization.pdf
-├── fig4s11_strength_concentration_paired.pdf
-├── fig4s12_arithmetic_competence_concentration.pdf
-└── fig4s13_affine_null_transient_events.pdf
+results/analysis/rq3_threshold_event/spiking_diagnostics/preemption/
 ```
 
-Availability is analysis-specific. Threshold diagnostics are required for Figure 4a, Figure 4b, and S1–S4. Graded behavioral outputs are required for Figure 4c and S5. Endpoint-margin outputs are required for Figure 4d and the continuous-margin supplements. Figure 4e and S10–S13 additionally require the paper-standard 11-dose endpoint-reproduced margin population.
+Preemption is a separate optional interaction endpoint.
 
 ## Poisoning aggregation
 
-When poisoning runs are available, final reporting invokes:
+When compatible poisoning runs are available, reporting can invoke:
 
 ```text
 studies.poisoning.stage08_aggregate_cross_seed
 studies.poisoning.stage08_plot_cross_seed
 ```
 
-and publishes configured per-run poisoning visuals. Training seed is the trajectory-level replication unit.
+The training run/seed is the cross-seed replicate unit.
 
 ## Result tree
 
@@ -295,40 +271,31 @@ results/
 ├── analysis/
 │   ├── primary_matrix/
 │   ├── figure_data/
+│   ├── table_data/
 │   ├── reproducibility/
+│   ├── rq2_composition/
 │   ├── rq3_threshold_event/
-│   │   └── spiking_diagnostics/
-│   │       ├── statistical_results.json
-│   │       ├── threshold_testability_audit.csv
-│   │       ├── binned_curve_aggregate.csv
-│   │       ├── threshold_shape_validation/
-│   │       ├── graded_agonist/
-│   │       └── report_status.json
 │   └── rq4_learning/
 └── paper/
     ├── figures/
-    │   ├── 02_rq1_prevalence/
-    │   ├── 03_rq2_composition/
-    │   ├── 04_rq3_spiking_cut/
-    │   └── 05_rq4_learning/
     └── tables/
 ```
 
-Machine-readable source data belong under `results/analysis/`. Manuscript-facing PDFs and tables belong under `results/paper/`.
+`results/paper/` stores rendered outputs and `results/analysis/` stores machine-readable analysis products.
 
 ## Reproducibility audits
 
-Population and output audits are written under:
+Population, metric-completeness, and output audits are written under:
 
 ```text
 results/analysis/reproducibility/
 ```
 
-The final reporting driver uses the `configured` profile and validates required manuscript outputs against the current manifest before completing a standard build.
+A verified Stage-06 empty candidate set is recorded as a completed zero-candidate outcome where applicable. Missing required artifacts are reported separately.
 
-## Reporting controls
+## Command-line controls
 
-Direct reporting options include:
+`reporting.generate_final_results` accepts:
 
 ```text
 --data-root
@@ -345,4 +312,4 @@ Direct reporting options include:
 --skip-cmc-requirement
 ```
 
-Repository wrappers can expose additional environment-level convenience controls. The standard manuscript build uses the current configured registry and records metric-specific completeness across those settings. Verified Stage-6 empty candidate sets are counted as completed zero-candidate observations rather than incomplete experiments. The resolver accepts the current Stage-6 bag layout and the two alternate export layouts (`bag_of_rules/<bag>` and `neural_circuits/<bag>`). The metric audit prints verified zero-candidate settings separately from genuinely incomplete settings.
+`--catalogue-json` selects an explicit saved configured population. Without it, the `configured` profile is derived from the current code registry.

@@ -1,41 +1,34 @@
 # Overtopping experiment execution
 
-This package defines the overtopping experiment registry and translates each configured `RunSpec` into the shared causal-intervention pipeline.
+This package defines the overtopping `RunSpec` registry and translates selected settings into shared pipeline commands.
 
-The canonical registry contains 56 RunSpecs in exactly four public execution sets:
+## Current suite selections
 
 ```text
-mean-donor     20   small-model non-checkpoint mean-donor runs
-6-7b-models     4   Pythia-6.9B / Qwen2-7B scale runs
-mean            8   small-model mean-replacement runs
-checkpoints    24   Grammar/HANS-NLI/Random-FSM Pythia-1B trajectories
------------------
-all            56
+mean-donor     30
+6-7b-models     3
+mean            8
+checkpoints    12
 ```
 
-The checkpoint set is `step0 -> step48000 -> step96000 -> EleutherAI/pythia-1b`, in both I+O and output-only phases, for Grammar, HANS-NLI, and Random FSM. `EleutherAI/pythia-1b` is the final/all-steps checkpoint. Arithmetic is not checkpointed.
+The `all` selection deduplicates by scientific identity and currently resolves to 50 unique settings. Three final Pythia-1B input+output settings for Grammar, HANS-NLI, and Random FSM occur in both `mean-donor` and `checkpoints`.
 
-These four sets are pairwise disjoint at exact RunSpec level. Reclassifying a run changes only its `suite` metadata: persistent Stage-5/Stage-7 paths and pipeline commands do not depend on `suite`, so existing caches/results are reused. Historical registries remain private compatibility/address-validation views only.
+The checkpoint suite is:
 
-Examples:
-
-```bash
-python -m studies.overtopping.experiments.run_experiments --suite mean-donor --dry-run
-python -m studies.overtopping.experiments.run_experiments --suite 6-7b-models --dry-run
-python -m studies.overtopping.experiments.run_experiments --suite mean --dry-run
-python -m studies.overtopping.experiments.run_experiments --suite checkpoints --dry-run
+```text
+Grammar/HANS-NLI/Random-FSM
+× {step0, step48000, step96000, final EleutherAI/pythia-1b}
+× input+output phase
 ```
 
-Inspect the registry from `code/` without running model-backed stages:
+Arithmetic is not included in the checkpoint suite.
+
+Inspect or filter the registry from `code/`:
 
 ```bash
 python -m studies.overtopping.experiments.run_experiments --list
 python -m studies.overtopping.experiments.run_experiments --dry-run
-```
-
-Filter by scientific fields when inspecting or executing a subset:
-
-```bash
+python -m studies.overtopping.experiments.run_experiments --suite checkpoints --dry-run
 python -m studies.overtopping.experiments.run_experiments \
   --task arithmetic \
   --model Qwen/Qwen2-1.5B-Instruct \
@@ -43,17 +36,15 @@ python -m studies.overtopping.experiments.run_experiments \
   --dry-run
 ```
 
-Validate persistent experiment addressing without reading or writing model-backed artifacts:
+Validate persistent addressing:
 
 ```bash
 python -m studies.overtopping.experiments.storage_contract
 ```
 
-The storage-contract check validates the configured scientific fields, phase and replacement counts, unique persistent Stage-7 locations, and pipeline-command fingerprint.
-
 References:
 
-- [Experiment design](../../../docs/experiments/overtopping.md)
+- [Experiment configuration](../../../docs/experiments/overtopping.md)
 - [Getting started](../../../docs/getting-started/README.md)
 - [Pipeline](../../../docs/methods/pipeline.md)
 - [Operations](../../../docs/operations/README.md)

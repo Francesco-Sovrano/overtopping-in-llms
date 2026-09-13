@@ -932,7 +932,7 @@ def plot_manuscript_spiking_cut(
             ax.grid(axis="x", alpha=0.25, linewidth=0.45)
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
-            ax.text(0.98, 0.06, f"Holm p={fmt(p_adj)}", transform=ax.transAxes, ha="right", va="bottom", fontsize=7.2)
+            ax.text(0.98, 0.06, f"Holm p={fmt(p_adj)}", transform=ax.transAxes, ha="right", va="bottom", fontsize=8.2)
         fig_obj.subplots_adjust(left=0.115, right=0.995, bottom=0.22, top=0.90, wspace=0.36)
         save_pdf_only(fig_obj, paper_dir / "fig4a_candidate_control_spiking_cut_summary.pdf")
         plt.close(fig_obj)

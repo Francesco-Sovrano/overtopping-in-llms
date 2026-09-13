@@ -1,6 +1,6 @@
 # Research questions
 
-The overtopping study is organized around four research questions. Each question declares its analysis population, estimand, and statistical unit.
+The analysis is organized into four research questions. Each page defines its population, estimand, required artifacts, and statistical unit.
 
 | RQ | Question | Main population | Document |
 |---|---|---|---|
@@ -12,7 +12,7 @@ The overtopping study is organized around four research questions. Each question
 ## Common conventions
 
 - The overtopping registry has no fixed required size; its current structure is documented in [Overtopping experiment design](../experiments/overtopping.md).
-- Manuscript-facing overtopping evaluation uses the held-out `test` split.
+- The standard overtopping analyses use the held-out `test` split.
 - Candidate identity, ranking, intervention direction, and replacement values are frozen before held-out causal evaluation.
 - Directional statistics condition on the unmodified source state.
 - `U(J)` is a union of singleton flip masks, not a sum of singleton effects.

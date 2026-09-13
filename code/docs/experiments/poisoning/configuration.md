@@ -10,29 +10,42 @@
 POISONING_FAST_TEST=1 ./run_poisoning_experiments.sh
 ```
 
-## Launcher-defined study values
+## Launcher configuration
 
-At the top of `run_poisoning_experiments.sh`, the launcher assigns the following study values before building the run matrix:
+`run_poisoning_experiments.sh` pins these values in the default study launcher:
 
 ```text
 MODEL_NAMES=Qwen/Qwen2-1.5B-Instruct
 POISONING_TASKS=grammar
-POISONING_HOLDOUT_SEED=13
 POISON_RATE=0.1
 POISON_RATE_BASIS=eligible_gold_non_target
 CONTROL_MARKER=" "
 TRIGGER_MARKER="[id=74291]"
 SHAM_MARKER="  "
-RUN_OBSERVED_MIXTURE_OVERTOPPING=1
 RUN_TRIGGER_LIFT_CHA=0
 RUN_INTERACTION_VALIDATION=false
-INTERACTION_NULL_DRAWS=30
+RUN_GRADED_AGONIST_INTERVENTION=false
+RUN_TEMPORAL_CUTOFF_INTERVENTION=false
+RUN_THRESHOLD_EVENT_POSTHOC=false
+RUN_PREEMPTION=false
+RUN_CMC=false
 CHA_REFERENCE_N_PER_SIDE=64
 CHA_TAU=0.3
 CHA_LOW_DATA_POLICY=skip
 ```
 
-The explicit `export` assignments at the top of the launcher are study-definition values and replace same-named incoming environment variables. Other values that are resolved later with `${NAME:-default}` remain environment-overridable. In particular, `SEEDS` defaults to `13,37,101` unless set by the caller.
+The launcher supplies defaults, while preserving an incoming environment value, for:
+
+```text
+POISONING_HOLDOUT_SEED=13
+RUN_OBSERVED_MIXTURE_OVERTOPPING=1
+POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=observed_training_mixture_correctness
+ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS=all
+SEEDS=13,37,101
+POISONING_RUN_NAME=confirmatory
+```
+
+`POISONING_FAST_TEST=1` applies the reduced defaults described below. Other runtime defaults are resolved in `studies/poisoning/scripts/poisoning_runtime_config.sh` and `run_checkpoint_causal_workflow.sh`.
 
 ## Run identity
 
@@ -98,7 +111,7 @@ DETECTION_WANDA_BATCH_SIZE=8
 
 ## Population caps
 
-The main caps are independent:
+The following caps are independent:
 
 ```text
 NORMAL_TASK_SCAN_MAX_ROWS=10000
@@ -108,7 +121,7 @@ REFINE_SAMPLING_MAX_POINTS=10000
 ```
 
 - `NORMAL_TASK_SCAN_MAX_ROWS`: deterministic proportional-stratified normal-task cohort; `0` requests the complete held-out population.
-- `OBSERVED_MIXTURE_SCAN_MAX_ROWS`: attack-agnostic sample of the defender-visible fine-tuning prompts/labels; `0` requests the complete observed training stream. Selection is uniform/complete and never uses poison/attack annotations.
+- `OBSERVED_MIXTURE_SCAN_MAX_ROWS`: attack-agnostic sample of the defender-visible fine-tuning prompts/labels; `0` requests the complete observed training stream. Selection is uniform or complete and is based on observed prompts and labels rather than hidden poison/attack annotations.
 - `TRIGGER_LIFT_SCAN_MAX_ROWS`: trigger/control behavioral scan.
 - `REFINE_SAMPLING_MAX_POINTS`: Stage-7 refinement/evaluation cap.
 
@@ -142,7 +155,7 @@ LIFT_INDICES=all
 PAIR_CHECKPOINT_CONDITIONS=1
 ```
 
-`CHA_LOW_DATA_POLICY=skip` records an explicit low-data result rather than fabricating a causal estimate.
+`CHA_LOW_DATA_POLICY=skip` records a low-data status and omits the causal estimate.
 
 `PAIR_CHECKPOINT_CONDITIONS=1` evaluates clean and poisoned checkpoints as matched pairs.
 
@@ -163,7 +176,7 @@ RUN_TRIGGER_LIFT=1
 RUN_TRIGGER_LIFT_CHA=0
 ```
 
-Trigger/control behavior can be measured without running trigger-specific circuit discovery. When `RUN_TRIGGER_LIFT_CHA=0`, trigger-conditioned causal panels are absent because that endpoint was not computed.
+Trigger/control behavior can be measured without trigger-specific circuit discovery. When `RUN_TRIGGER_LIFT_CHA=0`, trigger-conditioned causal outputs are not computed.
 
 ## Optional stages
 
@@ -174,10 +187,9 @@ RUN_BEHAVIOR_COMPARISON=1
 RUN_BEHAVIOR_VISUALIZATIONS=1
 RUN_OVERTOPPING_INTERPRETATION=1
 RUN_INTERACTION_VALIDATION=false
-INTERACTION_NULL_DRAWS=30
 ```
 
-These switches control optional or expensive analyses after the matched training/checkpoint data exist.
+When interaction validation is enabled, `pipeline/run_pipeline.sh` defaults `INTERACTION_NULL_DRAWS` to `30`. These switches control analyses executed after matched training/checkpoint data exist.
 
 ## Task targets
 
@@ -222,7 +234,7 @@ Relative overrides are resolved against the repository root.
 
 ## Fast execution-path test
 
-`POISONING_FAST_TEST=1` reduces training/evaluation sizes, uses the 0% and 100% checkpoints by default, reduces batch size, caps trigger and Stage-7 scans at 512 rows, and defaults to behavior-only validation. It is intended to verify the execution path rather than provide the full study population.
+`POISONING_FAST_TEST=1` uses reduced training/evaluation sizes, the 0% and 100% checkpoints by default, a smaller batch size, 512-row trigger and Stage-7 caps, and behavior-only validation by default.
 
 ## Direct detector invocation
 
@@ -245,9 +257,9 @@ For grammar, use the run's configured phase, normally `input_output`.
 
 `POISONING_CANDIDATE_LOCALIZATION_ENDPOINT` selects the Stage-03 CHA source used by Stage 07:
 
-- `observed_training_mixture_correctness` (default): attack-agnostic, defender-visible fine-tuning prompts/labels.
-- `attack_cohort_control_correctness`: control/no-trigger CHA on the fixed gold-non-target attack-eligible cohort. This endpoint uses the experimenter's target knowledge to define the cohort and cannot expose trigger-only channels because the trigger prompt is not shown during localization.
-- `both`: union checkpoint-local candidates from `observed_training_mixture_correctness` and `attack_cohort_control_correctness` before Stage-07 attack evaluation. This combined source is not strictly attack-agnostic because one component uses the oracle-defined non-target cohort.
+- `observed_training_mixture_correctness` (default): localization on defender-visible fine-tuning prompts and observed labels.
+- `attack_cohort_control_correctness`: control/no-trigger localization on the fixed gold-non-target attack-eligible cohort; cohort construction uses the configured attack target.
+- `both`: union of checkpoint-local candidates from the two localization sources before Stage-07 attack evaluation.
 
 When using the attack-cohort endpoint, `ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS` may restrict expensive CHA to selected checkpoint percentages. Example:
 
@@ -256,40 +268,20 @@ export POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=both
 export ATTACK_COHORT_CONTROL_CHA_PROGRESS_PCTS=0,10,25,100
 ```
 
-Use `all` to localize at every saved checkpoint. Checkpoints omitted from the schedule have no checkpoint-local rediscovery result; Stage 07 still evaluates the frozen union on all matched checkpoints, but prospective plots that require a localization at an omitted checkpoint may contain gaps rather than silently borrowing future information.
+Use `all` to localize at every saved checkpoint. Omitted checkpoints have no checkpoint-local rediscovery result. Stage 07 can still evaluate the frozen union on matched checkpoints; outputs that require checkpoint-local localization record gaps for omitted checkpoints.
 
 
-### No-circuit checkpoint and explicit full-ablation policies
+### No-circuit checkpoint and full-network policies
 
-Poisoning checkpoint workflows default to `POISONING_SKIP_IF_NO_CIRCUIT=1`.
-Discovery is still allowed to run. After Stage 5, a checkpoint with no valid
-discovered circuit is retained as a scientific no-circuit observation, but
-Stages 6+ are not launched for that endpoint. Internally this maps to
-`SKIP_DOWNSTREAM_IF_NO_CIRCUIT`; it is intentionally distinct from the generic
-`SKIP_IF_NO_CIRCUIT`, which is now a reuse-only preflight policy that refuses to
-run Stage-5 discovery when no circuit is already cached.
+Poisoning checkpoint workflows default to `POISONING_SKIP_IF_NO_CIRCUIT=1`. Stage 5 discovery runs normally. If no valid circuit is available after Stage 5, the endpoint is recorded as a no-circuit outcome and Stages 6+ are skipped. This post-discovery behavior maps to `SKIP_DOWNSTREAM_IF_NO_CIRCUIT`.
 
-Two explicit poisoning alternatives are available. They are mutually exclusive:
+The generic `SKIP_IF_NO_CIRCUIT` variable is a separate reuse-only preflight policy: it requires an existing valid Stage-5 circuit before the discovery stage is entered.
 
-- `--skip-circuit-discovery` (or `POISONING_SKIP_CIRCUIT_DISCOVERY=1`) bypasses
-  EAP entirely and exposes the full model-neuron space as the Stage-6 ablation
-  candidate space.
-- `--full-ablation-if-no-circuit` (or
-  `POISONING_FULL_ABLATION_IF_NO_CIRCUIT=1`) first attempts ordinary discovery;
-  if Stage 5 completes with no usable circuit, that endpoint is rerun using the
-  explicit full-network candidate space.
+Two mutually exclusive full-network policies are available:
 
-The explicit full-network path is stored under a separate
-`neural_circuit_discovery_results*_full_ablation` namespace and its Stage-7
-statistics use a separate `*-full_ablation` label. It is provenance marked and
-never overwrites or masquerades as a discovered circuit. If a full-ablation
-artifact is found in a normal discovered-circuit namespace, execution fails
-with a mode-mismatch error instead of reusing it. Re-running with full-ablation
-disabled therefore performs/reuses ordinary circuit discovery independently. This mode
-means **search the full model-neuron candidate space with the existing Stage-6
-ablation procedure**; it is not a single intervention that jointly ablates every
-neuron at once.
+- `--skip-circuit-discovery` or `POISONING_SKIP_CIRCUIT_DISCOVERY=1`: bypass EAP discovery and use the full model-neuron space as the Stage-6 ablation candidate space.
+- `--full-ablation-if-no-circuit` or `POISONING_FULL_ABLATION_IF_NO_CIRCUIT=1`: run ordinary discovery first and use the full model-neuron space only when no usable circuit is found.
 
-Set `POISONING_SKIP_IF_NO_CIRCUIT=0` to disable the default post-discovery skip.
-The pipeline writes/refreshes `pipeline_status.json` so normal no-circuit and
-explicit full-ablation outcomes remain distinguishable.
+Full-network artifacts use the separate `neural_circuit_discovery_results*_full_ablation` namespace and a `*-full_ablation` Stage-7 label. Mode metadata are checked before reuse. The full-network mode searches the complete model-neuron candidate space with the Stage-6 ablation procedure; it is not a joint intervention on every neuron.
+
+Set `POISONING_SKIP_IF_NO_CIRCUIT=0` to continue downstream processing after a no-circuit discovery result. `pipeline_status.json` records the resolved execution mode and outcome.

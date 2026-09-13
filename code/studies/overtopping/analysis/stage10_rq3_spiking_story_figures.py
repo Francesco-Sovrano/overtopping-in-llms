@@ -534,13 +534,13 @@ def _plot_event_profile(profile: pd.DataFrame, stats: dict, path: Path) -> None:
         ax.scatter([0], [med[int(zero[0])]], s=90, zorder=5)
     ax.axvline(0, linestyle=":", linewidth=1.1)
     ax.text(.03, .97, "thin whisker = IQR\nthick whisker = 95% condition-bootstrap CI",
-            transform=ax.transAxes, ha="left", va="top", fontsize=7.3)
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.3)
     ci = stats.get("median_event_minus_adjacent_ci95", [math.nan, math.nan])
     ax.text(.98, .97,
             f"EVENT − adjacent bins\nmedian +{100*stats.get('median_event_minus_adjacent', math.nan):.1f} pp "
             f"[{100*ci[0]:.1f}, {100*ci[1]:.1f}]\n"
             f"paired Wilcoxon {_format_p(stats.get('wilcoxon_one_sided_p', math.nan))}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=7.3)
+            transform=ax.transAxes, ha="right", va="top", fontsize=8.3)
     ax.set_xticks([-4, -2, 0, 2, 4], ["−4", "−2", "EVENT", "+2", "+4"])
     ax.set_xlabel("Largest margin-change interval relative to behavioral crossing")
     ax.set_ylabel("Condition-median trajectories (%)")
@@ -570,13 +570,13 @@ def _plot_local_enrichment_profile(profile: pd.DataFrame, stats: dict, path: Pat
     ax.axvline(0, linestyle=":", linewidth=1.1)
     ax.axhline(1.0, linestyle=":", linewidth=1.1)
     ax.text(.03, .97, "thin whisker = IQR\nthick whisker = 95% condition-bootstrap CI",
-            transform=ax.transAxes, ha="left", va="top", fontsize=7.3)
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.3)
     ci = stats.get("median_event_over_adjacent_ci95", [math.nan, math.nan])
     ax.text(.98, .97,
             f"EVENT / adjacent bins\nmedian {stats.get('median_event_over_adjacent', math.nan):.2f}× "
             f"[{ci[0]:.2f}, {ci[1]:.2f}]\n"
             f"paired Wilcoxon {_format_p(stats.get('wilcoxon_one_sided_p', math.nan))}; n={stats.get('n_conditions', 0)}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=7.3)
+            transform=ax.transAxes, ha="right", va="top", fontsize=8.3)
     ax.set_xticks([-4, -2, 0, 2, 4], ["−4", "−2", "EVENT", "+2", "+4"])
     ax.set_xlabel("Largest margin-change interval relative to behavioral crossing")
     ax.set_ylabel("Local enrichment relative to adjacent offsets\n(adjacent offsets −1/+1 mean = 1)")
@@ -609,8 +609,8 @@ def _plot_strength_tertiles(summary: pd.DataFrame, stats: dict, path: Path) -> N
             f"95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]\n"
             f"{stats.get('n_pairs_high_greater_low', 0)}/{stats.get('n_paired_tertile_groups', 0)} > 0; "
             f"paired Wilcoxon {_format_p(stats.get('wilcoxon_one_sided_p', math.nan))}",
-            transform=ax.transAxes, ha="left", va="top", fontsize=7.3)
-    ax.text(.97, .08, "thin = IQR\nthick = 95% CI", transform=ax.transAxes, ha="right", va="bottom", fontsize=7.1)
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.3)
+    ax.text(.97, .08, "thin = IQR\nthick = 95% CI", transform=ax.transAxes, ha="right", va="bottom", fontsize=8.1)
     ax.set_xticks(x, [str(v) for v in summary["strength_tertile"]])
     ax.set_xlabel("Held-out singleton causal strength\n(within-run/direction tertile)")
     ax.set_ylabel("Margin-change concentration (C)")
@@ -651,7 +651,7 @@ def _plot_strength_pairs(pairs: pd.DataFrame, margin_joined: pd.DataFrame, stats
             f"median ΔC={stats.get('median_high_minus_low', math.nan):+.2f} "
             f"[95% CI {ci[0]:+.2f}, {ci[1]:+.2f}]\n"
             f"one-sided paired Wilcoxon {_format_p(stats.get('wilcoxon_one_sided_p', math.nan))}",
-            transform=ax.transAxes, ha="right", va="bottom", fontsize=7.3)
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=8.3)
     ax.legend(frameon=False, fontsize=8, loc="lower left")
     _clean(ax, xgrid=True)
     _save(fig, path)
@@ -677,7 +677,7 @@ def _plot_arithmetic_competence(d: pd.DataFrame, stats: dict, path: Path) -> Non
             f"Spearman ρ={stats['spearman_rho']:.2f}; exact two-sided {_format_p(stats['spearman_exact_two_sided_p'])}; n={stats['n']}\n"
             f"leave-one-out ρ range [{stats['leave_one_out_rho_min']:.2f}, {stats['leave_one_out_rho_max']:.2f}]\n"
             f"directional reach {stats['min_directional_reach']:.2f}–{stats['max_directional_reach']:.2f}",
-            transform=ax.transAxes, ha="left", va="top", fontsize=7.3)
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.3)
     _clean(ax)
     _save(fig, path)
 
@@ -698,7 +698,7 @@ def _plot_transient_affine_null(d: pd.DataFrame, path: Path) -> None:
                 va="center", fontsize=8)
     ax.axvline(0, linestyle=":", linewidth=1.1)
     ax.text(.01, .04, "affine endpoint-preserving null: 0%",
-            transform=ax.transAxes, ha="left", va="bottom", fontsize=7.3)
+            transform=ax.transAxes, ha="left", va="bottom", fontsize=8.3)
     ax.set_yticks(y, d["group"])
     ax.set_xlabel("Interior flip-and-return rate (%) with condition-cluster 95% CI")
     ax.set_ylabel("")
@@ -722,7 +722,7 @@ def _plot_main_pair(
         return
     fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.75))
 
-    # (a) Original/raw event localization.
+    # Original/raw event localization.
     ax = axes[0]
     x = profile["offset"].to_numpy(float)
     med = 100 * profile["median"].to_numpy(float)
@@ -746,11 +746,11 @@ def _plot_main_pair(
             f"EVENT−adjacent +{100*event_stats.get('median_event_minus_adjacent', math.nan):.1f} pp\n"
             f"95% CI [{100*ci[0]:.1f}, {100*ci[1]:.1f}]\n"
             f"paired Wilcoxon {_format_p(event_stats.get('wilcoxon_one_sided_p', math.nan))}; n={event_stats.get('n_conditions', 0)}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=6.9)
+            transform=ax.transAxes, ha="right", va="top", fontsize=8.2)
     ax.set_ylim(0, max(32.0, float(np.nanmax(q75)) * 1.18))
     _clean(ax)
 
-    # (b) Same event localization normalized to the two adjacent offsets.
+    # Same event localization normalized to the two adjacent offsets.
     ax = axes[1]
     x = local_profile["offset"].to_numpy(float)
     med = local_profile["median"].to_numpy(float)
@@ -775,11 +775,11 @@ def _plot_main_pair(
             f"EVENT / adjacent={local_stats.get('median_event_over_adjacent', math.nan):.2f}×\n"
             f"95% CI [{ci[0]:.2f}, {ci[1]:.2f}]\n"
             f"paired Wilcoxon {_format_p(local_stats.get('wilcoxon_one_sided_p', math.nan))}; n={local_stats.get('n_conditions', 0)}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=6.9)
+            transform=ax.transAxes, ha="right", va="top", fontsize=8.2)
     ax.set_ylim(0, max(3.2, float(np.nanmax(q75)) * 1.18))
     _clean(ax)
 
-    # (c) Strength sharpening.
+    # Strength sharpening.
     ax = axes[2]
     xx = np.arange(len(strength))
     smed = strength["median"].to_numpy(float)
@@ -800,12 +800,10 @@ def _plot_main_pair(
             f"High−Low ΔC={strength_stats.get('median_high_minus_low', math.nan):+.2f}\n"
             f"95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]\n"
             f"paired Wilcoxon {_format_p(strength_stats.get('wilcoxon_one_sided_p', math.nan))}; n={strength_stats.get('n_paired_tertile_groups', 0)}",
-            transform=ax.transAxes, ha="left", va="top", fontsize=6.9)
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.2)
     ax.set_ylim(.8, max(3.6, float(np.nanmax(sq75)) * 1.18))
     _clean(ax)
 
-    for label, ax in zip(["(a)", "(b)", "(c)"], axes):
-        ax.text(-.12, 1.03, label, transform=ax.transAxes, fontweight="bold", ha="left", va="bottom")
     _save(fig, path)
 
 
@@ -932,9 +930,8 @@ def main() -> None:
 
     if paper is not None:
         paper.mkdir(parents=True, exist_ok=True)
-        # Figure 4e is assembled by stage11 after the temporal-cutoff capture
-        # profile is available: (a) event localization, (b) strength
-        # sharpening, (c) temporal-cutoff capture.
+        # Figure 4e is assembled by stage11 after cross-sweep temporal validation
+        # is available: event localization, strength sharpening, and reciprocal validation.
         _plot_event_profile(profile, event_stats, paper / "fig4s10_population_event_localization.pdf")
         _plot_strength_pairs(pairs, margin_joined, strength_stats, paper / "fig4s11_strength_concentration_paired.pdf")
         _plot_arithmetic_competence(arithmetic, arithmetic_stats, paper / "fig4s12_arithmetic_competence_concentration.pdf")

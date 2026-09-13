@@ -80,7 +80,7 @@ Principal trajectory table:
 
 It joins normal-task behavior and paired trigger/control behavior. The matched control-correctness behavioral summary is derived from the backdoor feature report and does not require a separate attack-cohort localization run. If `attack_cohort_control_correctness` localization is enabled, that CHA output is a distinct Stage-03 candidate source rather than the source of this behavioral summary. Post-discovery singleton causal metrics are materialized in Stage 07. Missing endpoints remain missing rather than being filled with zero.
 
-`backdoor_overtopping_dashboard.pdf` creates panels only for metrics with finite values.
+`backdoor_overtopping_dashboard.pdf` is emitted from the finite dashboard metrics available for the run.
 
 ## Stage 06 — circuit overlap
 
@@ -95,7 +95,7 @@ defense_valid_candidate_union.csv
 defense_valid_candidate_localization_by_checkpoint.csv
 ```
 
-Under the default `observed_training_mixture_correctness` configuration, candidate membership is localized from the defender-visible fine-tuning prompt/label mixture, in its natural observed proportions, across matched checkpoints; hidden poison/attack annotations are excluded from selection. When the localization endpoint is `attack_cohort_control_correctness` or `both`, the frozen union follows that configured source contract instead. The checkpoint table records source-specific local discovery information used by downstream prospective plots.
+Under the default `observed_training_mixture_correctness` configuration, candidate membership is localized from the defender-visible fine-tuning prompt/label mixture, in its natural observed proportions, across matched checkpoints; hidden poison/attack annotations are excluded from selection. When the localization endpoint is `attack_cohort_control_correctness` or `both`, the frozen union follows that configured source contract instead. The checkpoint table records source-specific local discovery information used by downstream analyses.
 
 ### Paired fixed-union materialization
 
@@ -144,7 +144,7 @@ detection_summary.json
 
 The behavioral attack endpoint used for association is `conditional_conversion_rate`.
 
-### Checkpoint story figures
+### Checkpoint renderings
 
 ```text
 01_clean_vs_poisoned_overtopping_development.pdf
@@ -155,9 +155,7 @@ The behavioral attack endpoint used for association is `conditional_conversion_r
 04_clean_vs_poisoned_checkpoint_overtopping.pdf
 ```
 
-Figure 01 contains aggregate checkpoint-level quantities. Figure 02 distinguishes checkpoint-local and fixed-union channel measurements. Figure 03 compares the checkpoint-0 locked and one-checkpoint-ahead prospective screens. Figure 03b evaluates an attack-blind clean-reference screen subject to an explicit benign-damage budget; attack outcomes are joined only after target selection. Figure 03c isolates the one-checkpoint-ahead screen. Figure 04 requires complete fixed-union materialization across all displayed matched checkpoints and conditions.
-
-Machine-readable story and defense-screen files include:
+The corresponding machine-readable checkpoint and defense-screen files include:
 
 ```text
 defense_screen_comparison.csv
@@ -174,9 +172,9 @@ story_figure_status.csv
 
 `stage07_plot_overtopping_poisoning_story.py --figure6_from_story_dir <dir>` regenerates the clean-reference defense figure from the cached `clean_reference_benign_budget_screen.csv` and `clean_reference_benign_budget_curve.csv` files without model access.
 
-### Additional interpretation outputs
+### Additional derived outputs
 
-`overtopping_interpretation/` contains analyses of causal-role location, support persistence, clean-versus-poisoned causal drift, update geometry, poison-detection implications, and attack-growth relationships.
+`overtopping_interpretation/` contains causal-role location, support-persistence, clean-versus-poisoned causal-drift, update-geometry, poison-detection, and attack-growth analyses.
 
 ## Stage 08 — cross-seed aggregation
 

@@ -1,6 +1,6 @@
 # Reporting code
 
-This package aggregates persistent experiment outputs into configured-study tables, metric-availability audits, statistical summaries, machine-readable sidecars, and manuscript-facing products.
+This package aggregates persistent experiment artifacts into configured-study tables, metric-availability audits, statistical summaries, machine-readable sidecars, and rendered outputs.
 
 Main entry point from `code/`:
 
@@ -11,15 +11,12 @@ python -m reporting.generate_final_results \
   --primary-profile configured
 ```
 
-The standard reporting path is model-free. It reads model-backed scientific artifacts from `data/`, does not use filesystem presence to define the configured population, and writes derived outputs under `results/`. The driver rejects a results root located inside `data/` or the repository `cache/` tree.
-
-Overtopping reporting begins from the current configured registry; its size is derived at runtime. Each analysis then applies its own applicability and artifact-availability rules and records its denominator. Mean-donor and mean-family RQ2 regimes are analyzed separately; `mean-positional` belongs to the mean-family reporting regime.
+The standard reporting path is model-free. It reads scientific artifacts from `data/`, derives the configured overtopping population from the registry or an explicit catalogue, and writes outputs under `results/`. Metric-specific applicability and availability are recorded after the configured population is established.
 
 References:
 
 - [Reporting overview](../docs/reporting/README.md)
-- [Experiment design](../docs/experiments/overtopping.md)
 - [Analysis pipeline](../docs/reporting/analysis-pipeline.md)
-- [Figure map](../docs/reporting/figures.md)
-- [Interpretation](../docs/reporting/interpretation.md)
+- [Generated outputs](../docs/reporting/figures.md)
+- [Metric semantics](../docs/reporting/interpretation.md)
 - [Operations](../docs/operations/README.md)

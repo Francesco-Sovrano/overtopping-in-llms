@@ -1058,6 +1058,8 @@ run_analyze() {
 	local baseline_subset="$1"
 	local out_dir="$2"
 
+	echo "[Stage6] baseline_subset=$baseline_subset -> $out_dir"
+
 	if [[ "$SPLITS" == "spectral" ]]; then
 		python3 -m pipeline.stage06_analyze_bag_of_rules \
 			--spectral_cache_dir "$CACHE_DIR" \
@@ -1132,6 +1134,104 @@ if [[ ",$ANALYZE_BASELINE_SUBSETS," == *",negative,"* ]]; then
 	run_analyze "negative" "$DISCOVERY_OUT_DIR/$BAG_LABEL/negative_baseline"
 fi
 
+# Stage 6 may complete successfully while producing no usable agonist candidates
+# (for example because one or both requested spectral splits are infeasible).
+# Run every requested baseline first: low data in positive must not suppress a
+# potentially feasible negative baseline, and vice versa.  Only after both have
+# been attempted do we decide whether Stage 7+ has any scientific input.
+STAGE6_ELIGIBLE_CANDIDATES="$(python3 - "$DISCOVERY_OUT_DIR/$BAG_LABEL" "$MIN_FLIP_RATE" "$ANALYZE_BASELINE_SUBSETS" <<'PYSTAGE6CAND'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+tau = float(sys.argv[2])
+requested = [x.strip() for x in sys.argv[3].split(",") if x.strip()]
+all_units = set()
+baseline_rows = []
+
+for baseline in requested:
+    bdir = root / f"{baseline}_baseline"
+    units = set()
+    for fp in bdir.rglob("neuron_buckets.json") if bdir.is_dir() else []:
+        try:
+            buckets = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        nc = buckets.get("non_catastrophic_agonists", {})
+        if not isinstance(nc, dict):
+            continue
+        bad = set()
+        cz = buckets.get("catastrophic_zero", {})
+        if isinstance(cz, dict):
+            for name in ("confirmed", "not_always", "candidates"):
+                block = cz.get(name, {})
+                if isinstance(block, dict):
+                    bad.update(block.keys())
+        for key, entry in nc.items():
+            if key in bad or not isinstance(entry, dict):
+                continue
+            rec = entry.get("last_record") or {}
+            try:
+                effect = abs(float(rec.get("max_effect")))
+                layer = str(rec.get("layer_label"))
+                neuron_id = int(rec.get("neuron_id"))
+            except Exception:
+                continue
+            if effect < tau:
+                continue
+            units.add((layer, neuron_id))
+
+    statuses = []
+    reasons = []
+    rule_path = bdir / "rule_knockout.json"
+    if rule_path.is_file():
+        try:
+            payload = json.loads(rule_path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                for row in payload:
+                    if not isinstance(row, dict):
+                        continue
+                    statuses.append(str(row.get("status", "unknown")))
+                    if row.get("reason"):
+                        reasons.append(str(row["reason"]))
+        except Exception as exc:
+            reasons.append(f"unreadable_rule_knockout:{type(exc).__name__}")
+    else:
+        reasons.append("missing_rule_knockout")
+
+    all_units.update(units)
+    baseline_rows.append({
+        "baseline_subset": baseline,
+        "stage6_dir": str(bdir),
+        "eligible_agonist_candidates": len(units),
+        "n_circuits": len(statuses),
+        "n_ok": sum(x == "ok" for x in statuses),
+        "n_skipped": sum(x == "skipped" for x in statuses),
+        "reasons": sorted(set(reasons)),
+    })
+
+availability = {
+    "schema": "stage6-downstream-availability-v2",
+    "requested_baseline_subsets": requested,
+    "search_epsilon": tau,
+    "baselines": baseline_rows,
+    "eligible_stage6_agonist_candidates": len(all_units),
+    "downstream_ready": bool(all_units),
+}
+root.mkdir(parents=True, exist_ok=True)
+(root / "stage6_downstream_availability.json").write_text(
+    json.dumps(availability, indent=2), encoding="utf-8"
+)
+for row in baseline_rows:
+    reason = "; ".join(row["reasons"]) if row["reasons"] else "none"
+    print(
+        f"[stage6-guard] {row['baseline_subset']}: candidates={row['eligible_agonist_candidates']} "
+        f"circuits(ok={row['n_ok']}, skipped={row['n_skipped']}); reasons={reason}",
+        file=sys.stderr,
+    )
+print(len(all_units))
+PYSTAGE6CAND
+)"
+echo "[stage6-guard] Unique eligible Stage-6 agonist candidates across requested baselines: $STAGE6_ELIGIBLE_CANDIDATES"
+
 CIRCUIT_BAG_LABEL="$CIRCUIT_LABEL-$BAG_LABEL"
 if [[ "$INCORRECT_RULES" == "true" ]]; then
 	CIRCUIT_BAG_LABEL+="-fake_targets"
@@ -1158,6 +1258,32 @@ SINGLETON_SCHEMA_OK=false
 UNCERTAINTY_SCHEMA_OK=false
 STAGE7_COMPLETE=false
 STATS_DIR="$RULES_DIR/neuron_flip_rules/stats/$CIRCUIT_BAG_LABEL"
+if [[ "$STAGE6_ELIGIBLE_CANDIDATES" -eq 0 ]]; then
+	echo "[stage6-guard] No eligible Stage-6 agonists; skipping Stage 7 and all downstream intervention/validation stages."
+	# Any pre-existing Stage-7+ files under this exact analysis identity are stale
+	# relative to the current zero-candidate Stage-6 result and must not be reused
+	# by this pipeline or by manuscript aggregation.
+	if [[ -d "$STATS_DIR" ]]; then
+		echo "[stage6-guard] Removing stale downstream artifacts: $STATS_DIR"
+		rm -rf "$STATS_DIR"
+	fi
+	mkdir -p "$STATS_DIR"
+	python3 - "$STATS_DIR/stage6_no_candidates.json" "$DISCOVERY_OUT_DIR/$BAG_LABEL" "$ANALYZE_BASELINE_SUBSETS" <<'PYSTAGE6STATUS'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+payload = {
+    "schema": "stage6-downstream-skip-v2",
+    "status": "skipped_no_stage6_agonists",
+    "stage6_discovery_dir": sys.argv[2],
+    "requested_baseline_subsets": [x for x in sys.argv[3].split(",") if x],
+    "eligible_stage6_agonist_candidates": 0,
+    "downstream_stages_skipped": True,
+    "availability_manifest": str(pathlib.Path(sys.argv[2]) / "stage6_downstream_availability.json"),
+}
+out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+PYSTAGE6STATUS
+	exit 0
+fi
 if [[ -s "$STATS_DIR/flip_stats_global.json" ]]; then
 	if python3 -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); need=("n_evaluated_rows","union_flip_any_unique_ci_low","union_flip_any_unique_ci_high","confidence_level"); raise SystemExit(0 if all(k in p for k in need) else 1)' "$STATS_DIR/flip_stats_global.json"; then
 		UNCERTAINTY_SCHEMA_OK=true

@@ -2384,7 +2384,7 @@ if len(scores_df) == 0:
 			"baseline_acc_unrelated": 0.0,
 			"baseline_gap_neg_minus_pos": 0.0,
 			"sampling_strategy_used": args.sampling_strategy,
-			"status": "ok",
+			"status": "skipped",
 			"reason": f"empty_{args.baseline_subset}_baseline_subset",
 			"ablations": [],
 		}
@@ -2398,6 +2398,90 @@ if len(scores_df) == 0:
 	)
 	_write_bucket_outputs(rule_out_root, buckets, buckets_path)
 	raise SystemExit(0)
+
+# Spectral clustering needs at least two disjoint clusters, and the constrained
+# assignment requires each cluster to contain at least the requested per-side
+# sample size.  If the baseline-filtered dataset cannot satisfy that structural
+# requirement, this is a low-data circuit, not a pipeline error.  Record the
+# affected circuits as skipped without changing any requested input sizes.
+if args.cluster_by_spectral and circuits_requiring_ablation:
+	n_points = int(len(scores_df))
+	min_size = max(int(args.n_associated), int(args.n_unrelated))
+	k_cap_by_points = n_points
+	k_cap_by_min_size = max(1, n_points // max(1, min_size))
+	feasible_k = min(
+		max(2, int(args.global_n_clusters)),
+		k_cap_by_points,
+		k_cap_by_min_size,
+	)
+
+	if feasible_k < 2:
+		reason = (
+			f"Insufficient rows for spectral split (baseline_subset={args.baseline_subset}): n_points={n_points}, "
+			f"requested_associated={int(args.n_associated)}, "
+			f"requested_unrelated={int(args.n_unrelated)}, "
+			f"global_n_clusters={int(args.global_n_clusters)}, feasible_clusters={feasible_k}."
+		)
+		print(f"[Spectral] Skipping infeasible Stage-6 split: {reason}")
+
+		remaining_circuits = []
+		for info in circuits_to_process:
+			# Diagnostics-only backfills already have sampled indices and do not
+			# require reconstructing the spectral split.
+			if info.get("_resume_mode") == "backfill_agonist_activation_stats":
+				remaining_circuits.append(info)
+				continue
+
+			rid = int(info["circuit_id"])
+			analysis_mode = info.get(
+				"analysis_mode",
+				("spectral_cluster" if args.cluster_by_spectral else "rule"),
+			)
+			cluster_index = info.get("cluster_index")
+			rule_detail = {
+				"circuit_id": rid,
+				"source_stage5_pair_collation_schema": info.get("stage5_pair_collation_schema"),
+				"circuit_label": info.get("circuit_label"),
+				"analysis_mode": analysis_mode,
+				"cluster_index": (
+					int(cluster_index)
+					if analysis_mode == "spectral_cluster" and cluster_index is not None
+					else (rid if analysis_mode == "spectral_cluster" else None)
+				),
+				"rule_target": info.get("target", info.get("rule_target")),
+				"rule_direction": (
+					None
+					if analysis_mode == "spectral_cluster"
+					else info.get("coefficient_sign", info.get("rule_direction"))
+				),
+				"intervention": args.intervention,
+				"decode_only": bool(args.decode_only),
+				"baseline_subset": args.baseline_subset,
+				"n_associated_positive": 0,
+				"n_unrelated_positive": 0,
+				"n_associated_tested": 0,
+				"n_unrelated_tested": 0,
+				"sampling_strategy_used": args.sampling_strategy,
+				"status": "skipped",
+				"reason": reason,
+				"cha_low_data_policy": args.cha_low_data_policy,
+				"ablations": [],
+			}
+			_circuit_output_json_path(info, rule_out_root, args).write_text(
+				json.dumps(rule_detail, indent=4)
+			)
+			summary_rule_knockout.append(_summary_entry_from_rule_detail(rule_detail))
+
+		circuits_to_process = remaining_circuits
+		circuits_requiring_ablation = []
+		(rule_out_root / "rule_knockout.json").write_text(
+			json.dumps(summary_rule_knockout, indent=4)
+		)
+		_write_bucket_outputs(rule_out_root, buckets, buckets_path)
+
+		if not circuits_to_process:
+			print("[Spectral] No feasible Stage-6 spectral circuits remain; completed with skips.")
+			raise SystemExit(0)
 
 # Model
 device = get_device()

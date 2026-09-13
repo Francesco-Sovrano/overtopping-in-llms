@@ -21,7 +21,7 @@ Phase is part of the scientific configuration and is retained in analysis tables
 
 ## Evaluation split
 
-`test` is the paper-facing overtopping evaluation split. `train` and `all` are explicit alternatives. Evaluation split is part of the experiment identity when multiple variants coexist.
+`test` is the standard overtopping evaluation split. `train` and `all` are explicit alternatives. Evaluation split is part of the experiment identity when multiple variants coexist.
 
 ## Directional source-state populations
 
@@ -84,7 +84,7 @@ U_J_c2i = P(any singleton flips | B = 1)
 Delta_comp = E(J) - U(J)
 ```
 
-The sign identifies only the net difference between singleton-union reach and the full-set effect. It does not identify a unique interaction mechanism.
+The sign is the net difference between singleton-union reach and the full-set effect; interaction mechanism is a separate quantity.
 
 ### Example-level decomposition
 
@@ -105,7 +105,7 @@ E(J) = P(preserved) + P(coalition_only)
 Delta_comp = P(coalition_only) - P(suppressed)
 ```
 
-This identity is checked by Stage 8. High preservation with low suppression is compatible with a monotone saturating high-leverage regime. Substantial suppression indicates that singleton-reachable effects are lost under the simultaneous intervention. Coalition-only effects identify joint effects absent from singleton reach. These observations describe interaction structure; they do not by themselves establish a unique internal mechanism or prove that a coordinate is a necessary natural bottleneck.
+This identity is checked by Stage 8. High preservation with low suppression is compatible with a monotone saturating high-leverage regime. Substantial suppression indicates that singleton-reachable effects are lost under the simultaneous intervention. Coalition-only effects identify joint effects absent from singleton reach. These quantities describe interaction structure. Necessity and natural-bottleneck status require separate estimands.
 
 ## Matched-set specificity and conditional marginal contribution
 
@@ -155,7 +155,7 @@ The analysis separates causal reach from structural organization:
 - top-contribution and effective-support quantities: how concentrated the reachable mass is among candidates;
 - redundancy quantities: how often multiple candidates cover the same examples.
 
-These quantities answer different questions and should be interpreted separately.
+These quantities measure different properties and are reported separately.
 
 ## RQ3 threshold-event quantities
 
@@ -183,7 +183,7 @@ Threshold-event causal score combines causal strength with held-out threshold vi
 TECS(j) = s_j * |MCC_j|
 ```
 
-The manuscript analysis uses a nested TECS lower bound. Units with zero causal strength can have a defined zero lower bound; units whose threshold visibility is not estimable are handled according to the analysis status rather than assigned an arbitrary fitted score.
+The aggregate analysis uses a nested TECS lower bound. Units with zero causal strength can have a defined zero lower bound; units whose threshold visibility is not estimable are handled according to the analysis status rather than assigned an arbitrary fitted score.
 
 ### Threshold-shape model comparison
 

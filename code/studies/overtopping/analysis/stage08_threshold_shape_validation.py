@@ -1066,7 +1066,7 @@ def _plot_main_summary(units: pd.DataFrame, robust: dict, paper_dir: Path) -> No
                 ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
                 n_pairs = int(effect.get("n_pairs", 0) or 0)
                 p_text = f"Holm p={p_adj:.3g}" if np.isfinite(p_adj) else "Holm p=n/a"
-                ax.text(.98,.04,f"n={n_pairs}; {p_text}",transform=ax.transAxes,ha="right",va="bottom",fontsize=6.8)
+                ax.text(.98,.04,f"n={n_pairs}; {p_text}",transform=ax.transAxes,ha="right",va="bottom",fontsize=8.0)
         fig.suptitle("RQ3: discovery-direction causal-threshold phenotype vs same-layer/head controls", fontsize=9.4)
         fig.subplots_adjust(left=.11,right=.995,bottom=.11,top=.88,wspace=.46,hspace=.42)
         save_pdf_only(fig,target); plt.close(fig)

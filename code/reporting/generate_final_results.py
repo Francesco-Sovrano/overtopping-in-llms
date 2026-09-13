@@ -218,6 +218,107 @@ def relocate_paper_sidecars(results_root: Path) -> None:
         )
 
 
+def build_rq1_combined_paper_figure(results_root: Path) -> Path | None:
+    """Build the main RQ1 figure in the manuscript's established 2x2 style."""
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    data_dir = figure_data(results_root) / "02_rq1_prevalence"
+    specs = [
+        ("0to1", data_dir / "fig2a_competence_vs_U_0to1.csv", data_dir / "fig2a_competence_vs_U_0to1_stats.csv"),
+        ("1to0", data_dir / "fig2b_competence_vs_U_1to0.csv", data_dir / "fig2b_competence_vs_U_1to0_stats.csv"),
+    ]
+    if not all(a.is_file() and b.is_file() for _d, a, b in specs):
+        return None
+
+    task_order = ["arithmetic", "grammar", "hans_nli", "random_fsm", "bon_jailbreaking"]
+    task_labels = {
+        "arithmetic": "Arithmetic", "grammar": "grammar", "hans_nli": "HANS NLI",
+        "random_fsm": "Random FSM", "bon_jailbreaking": "Jailbreak",
+    }
+    frames = {}
+    stats = {}
+    for direction, data_path, stats_path in specs:
+        d = pd.read_csv(data_path)
+        st = pd.read_csv(stats_path)
+        d["score"] = pd.to_numeric(d["score"], errors="coerce")
+        d["union_rate"] = pd.to_numeric(d["union_rate"], errors="coerce")
+        frames[direction] = d
+        stats[direction] = st
+
+    with plt.rc_context({
+        "font.size": 9.6, "axes.labelsize": 10.8, "xtick.labelsize": 8.8,
+        "ytick.labelsize": 8.8, "legend.fontsize": 8.0, "axes.linewidth": .72,
+        "lines.linewidth": 1.0, "xtick.major.width": .65, "ytick.major.width": .65,
+        "pdf.fonttype": 42, "ps.fonttype": 42,
+    }):
+        fig, axes = plt.subplots(2, 2, figsize=(7.6, 4.2), sharex="col", sharey="row")
+        cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        colors = {task: cycle[i % len(cycle)] for i, task in enumerate(task_order)}
+        phases = [("input+output", 0), ("decode-only", 1)]
+        directions = [("0to1", 0), ("1to0", 1)]
+
+        for direction, row in directions:
+            d = frames[direction]
+            st = stats[direction]
+            for phase, col in phases:
+                ax = axes[row, col]
+                part = d.loc[d["phase"].astype(str).eq(phase)].copy()
+                for task in task_order:
+                    g = part.loc[part["task"].astype(str).eq(task)]
+                    if g.empty:
+                        continue
+                    for _, r in g.iterrows():
+                        if not np.isfinite(r["score"]) or not np.isfinite(r["union_rate"]):
+                            continue
+                        marker = "o" if str(r.get("baseline", "mean-donor")) == "mean-donor" else "s"
+                        ax.scatter(r["score"], r["union_rate"], s=48, marker=marker,
+                                   color=colors[task], edgecolor="black", linewidth=.45, zorder=3)
+
+                fit = part[["score", "union_rate"]].dropna()
+                if len(fit) >= 3 and fit["score"].nunique() > 1:
+                    coef = np.polyfit(fit["score"].to_numpy(float), fit["union_rate"].to_numpy(float), 1)
+                    xx = np.linspace(float(fit["score"].min()), float(fit["score"].max()), 100)
+                    ax.plot(xx, coef[0]*xx + coef[1], linestyle="--", color="0.30", linewidth=1.25)
+
+                sr = st.loc[st["phase"].astype(str).eq(phase)]
+                if not sr.empty:
+                    rr = sr.iloc[0]
+                    pval = float(rr["pearson_p"])
+                    ptxt = f"{pval:.4g}" if pval >= 1e-4 else f"{pval:.1e}"
+                    text = f"$n={int(rr['n'])}, r={float(rr['pearson_r']):.2f}$\n$p={ptxt}$"
+                    ax.text(.97, .95 if row == 0 else .08, text, transform=ax.transAxes,
+                            ha="right", va="top" if row == 0 else "bottom", fontsize=8.4,
+                            bbox={"boxstyle":"round,pad=.18", "facecolor":"white",
+                                  "edgecolor":"0.72", "linewidth":.6, "alpha":.92})
+
+                ax.set_xlim(-.01, 1.02)
+                ax.set_ylim(-.02, 1.03)
+                ax.grid(True, alpha=.20, linewidth=.45)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+
+        axes[0,0].set_ylabel(r"$0\!\to\!1$ reach $U^d(J)$")
+        axes[1,0].set_ylabel(r"$1\!\to\!0$ reach $U^d(J)$")
+        axes[1,0].set_xlabel("Raw task score")
+        axes[1,1].set_xlabel(r"Chance-normalized score $\kappa$")
+
+        handles = [Line2D([0],[0], marker="o", linestyle="none", markerfacecolor=colors[t],
+                          markeredgecolor="black", markeredgewidth=.4, markersize=6, label=task_labels[t])
+                   for t in task_order]
+        fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .005),
+                   ncol=5, frameon=False, handletextpad=.35, columnspacing=.9)
+        fig.subplots_adjust(left=.10, right=.995, bottom=.18, top=.99, hspace=.10, wspace=.12)
+        out = rq1_figures(results_root) / "rq1_competence_causal_reach.pdf"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, bbox_inches="tight", pad_inches=.02)
+        plt.close(fig)
+    return out
+
+
 def publish_manuscript_exact_figure_bundle(results_root: Path) -> dict[str, str]:
     """Copy canonical generated figures to stable manuscript-facing names.
 
@@ -229,9 +330,11 @@ def publish_manuscript_exact_figure_bundle(results_root: Path) -> dict[str, str]
     mapping = {
         rq1_figures(results_root) / "fig2a_competence_vs_U_0to1.pdf": dst_root / "rq1_competence_reach_0to1.pdf",
         rq1_figures(results_root) / "fig2b_competence_vs_U_1to0.pdf": dst_root / "rq1_competence_reach_1to0.pdf",
+        rq1_figures(results_root) / "rq1_competence_causal_reach.pdf": dst_root / "rq1_competence_causal_reach.pdf",
         rq2_figures(results_root) / "rq2_composition_boxplots.pdf": dst_root / "rq2_composition_boxplots.pdf",
         rq3_figures(results_root) / "fig4e_population_event_and_strength.pdf": dst_root / "rq3_population_event_and_strength.pdf",
         rq3_figures(results_root) / "fig4s16_temporal_cross_sweep_event_validation.pdf": dst_root / "rq3_temporal_cross_sweep_validation.pdf",
+        rq3_figures(results_root) / "fig4s16b_temporal_cross_sweep_event_validation_by_phase.pdf": dst_root / "rq3_temporal_cross_sweep_validation_by_phase.pdf",
         rq4_figures(results_root) / "fig5a_pythia_checkpoint_trajectory.pdf": dst_root / "rq4_pythia_checkpoint_trajectory.pdf",
         rq4_figures(results_root) / "rq4_grammar_clean_reference_defense.pdf": dst_root / "rq4_grammar_clean_reference_defense.pdf",
     }
@@ -1016,6 +1119,8 @@ def main() -> None:
                 "--no-paper-figures",
             ], allow_failure=allow_incomplete_population)
 
+        build_rq1_combined_paper_figure(results_root)
+
         # RQ4 has a dedicated stable entry point.  It generates the pooled-U(J)
         # main figure plus both directional companions from the same discovered
         # checkpoint population, including zero-candidate checkpoints.
@@ -1228,6 +1333,7 @@ def main() -> None:
             "fig4s14_temporal_cutoff_spiking.pdf",
             "fig4s15_temporal_cutoff_capture_profile.pdf",
             "fig4s16_temporal_cross_sweep_event_validation.pdf",
+            "fig4s16b_temporal_cross_sweep_event_validation_by_phase.pdf",
             "fig4s7_candidate_control_support_summary.pdf",
             "fig4s8_threshold_testability_support_by_condition.pdf",
             "fig4s9_threshold_tail_support_by_direction.pdf",
@@ -1296,14 +1402,15 @@ def main() -> None:
             "- `fig4s5_graded_agonist_single_crossing.pdf` - support-consistent graded trajectories, when available.\n"
             "- `fig4s6_graded_margin_condition_diagnostics.pdf` - condition-level affine-fit/concentration diagnostics, when available.\n"
             "- `fig4s7_graded_margin_condition_heatmap.pdf` - per-condition normalized margin trajectories, when available.\n"
-            "- `fig4e_population_event_and_strength.pdf` - main triptych: population event localization, within-condition causal-strength sharpening, and temporal-cutoff capture.\n"
+            "- `fig4e_population_event_and_strength.pdf` - main triptych: population event localization, within-condition causal-strength sharpening, and all-direction reciprocal cross-sweep EVENT validation.\n"
             "- `fig4s10_population_event_localization.pdf` - standalone population event-localization profile with interquartile ranges.\n"
             "- `fig4s11_strength_concentration_paired.pdf` - paired low-versus-high causal-strength tertile concentration within eligible run/direction groups.\n"
             "- `fig4s12_arithmetic_competence_concentration.pdf` - task-specific Arithmetic output-only 1-to-0 competence/concentration relation.\n"
             "- `fig4s13_affine_null_transient_events.pdf` - endpoint-preserving transient interior events against the one-dimensional affine-margin null.\n"
             "- `fig4s14_temporal_cutoff_spiking.pdf` - temporal cutoff summary: cumulative capture of the full held-out effect and incremental autoregressive gain.\n"
-            "- `fig4s15_temporal_cutoff_capture_profile.pdf` - standalone version of the temporal-cutoff capture profile used as Figure 4e panel c.\n"
-            "- `fig4s16_temporal_cross_sweep_event_validation.pdf` - cross-sweep EVENT validation: one temporal schedule defines EVENT and the complementary schedule supplies the held-out aligned profile.\n"
+            "- `fig4s15_temporal_cutoff_capture_profile.pdf` - standalone temporal-cutoff capture profile.\n"
+            "- `fig4s16_temporal_cross_sweep_event_validation.pdf` - cross-sweep EVENT validation over both output-only and input+output phases: one temporal schedule defines EVENT and the complementary schedule supplies the held-out aligned profile.\n"
+            "- `fig4s16b_temporal_cross_sweep_event_validation_by_phase.pdf` - the same cross-sweep validation stratified explicitly by output-only versus input+output intervention phase.\n"
             "\nIn partial-results mode each panel is generated from the completed/auditable configured subset. "
             "Missing settings are listed in the RQ3 population-audit files instead of suppressing Figure 4.\n"
         )
@@ -1334,7 +1441,23 @@ def main() -> None:
     # figure/table sidecars are kept under analysis/ with the same relative names.
     relocate_paper_sidecars(results_root)
 
-    manuscript_exact_figures = publish_manuscript_exact_figure_bundle(results_root)
+    # Regenerate the complete manuscript statistical-figure set from the final
+    # reporting tables using the established per-family manuscript style. This
+    # preserves the paper's native aspect ratios, labels, legends, annotations
+    # and chart encodings instead of normalizing unrelated panels to one generic
+    # template. This stage is plotting only: it never reruns experiments or
+    # changes an analysis population.
+    manuscript_exact_root = manuscript_figures(results_root) / "manuscript_exact"
+    manuscript_exact_supplement = manuscript_exact_root / "supplement"
+    run([
+        sys.executable, "-m", "reporting.generate_manuscript_figures",
+        "--results-root", str(results_root),
+        "--main-dir", str(manuscript_exact_root),
+        "--supp-dir", str(manuscript_exact_supplement),
+    ], allow_failure=allow_incomplete_population)
+    manuscript_exact_figures = {
+        p.name: str(p) for p in sorted(manuscript_exact_root.glob("*.pdf"))
+    }
     if manuscript_exact_figures:
         print("[final-results] manuscript-exact figures: " + json.dumps(manuscript_exact_figures, sort_keys=True), flush=True)
 

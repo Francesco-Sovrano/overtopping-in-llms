@@ -1,67 +1,67 @@
-# Repository documentation
+# Technical documentation
 
-This documentation is the reference for installing the project, understanding its scientific objects, running model-backed experiments, and regenerating analyses.
+The repository implements causal-intervention experiments over language-model internal coordinates. Scientific configuration, model-backed measurements, caches, and derived reporting outputs are stored separately.
 
-## What the repository measures
-
-The repository studies how internal model coordinates causally affect discrete behavioral endpoints. The overtopping study discovers candidate channels and evaluates their effects under singleton, simultaneous-set, graded, and threshold-oriented analyses. The poisoning study follows causal organization through matched clean and poisoned training trajectories and evaluates poisoning-example detection after causal quantities have been fixed.
-
-The main scientific distinction is between **configuration**, **measurement**, and **reporting**:
-
-- a configured experiment defines task, model state, intervention phase, replacement baseline, population, and discovery/evaluation parameters;
-- model-backed stages materialize scientific measurements under `data/`;
-- reporting consumes those measurements and writes derived products under `results/`.
-
-Cache contents never define study membership.
-
-## Recommended reading order
-
-1. [Getting started](getting-started/README.md) — installation, credentials, artifact roots, dry runs, execution, and reporting.
-2. [Architecture](methods/architecture.md) — package ownership, persistent storage, cache behavior, and scientific population ownership.
-3. [Core concepts](methods/concepts.md) — behavioral endpoints, directional singleton effects, `U(J)`, `E(J)`, composition, threshold metrics, and graded interventions.
-4. [Pipeline](methods/pipeline.md) — numbered model-backed stages and their persistent outputs.
-5. [Overtopping experiment design](experiments/overtopping.md) — current configurable registry and its non-factorial structure.
-6. [Poisoning protocol](experiments/poisoning/README.md) — matched training, checkpoint evaluation, candidate localization, detector construction, and cross-seed aggregation.
-7. [Research questions](research-questions/README.md) — RQ1–RQ4 populations, estimands, and statistical units.
-8. [Reporting](reporting/README.md) — analysis manifests, completeness audits, statistics, figures, and sidecars.
-9. [Operations](operations/README.md) — targeted regeneration and cache-preserving recovery workflows.
-
-## Repository layout
+## Repository model
 
 ```text
 repository/
 ├── code/
-│   ├── core/       shared tasks, model/intervention utilities, attribution, statistics, and caches
-│   ├── pipeline/   numbered model-backed causal-intervention stages
-│   ├── studies/    overtopping and poisoning study definitions and analyses
-│   ├── reporting/  aggregate reporting and manuscript-output generation
-│   └── docs/       documentation
+│   ├── core/       shared tasks, modeling, attribution, interventions, statistics, and caches
+│   ├── pipeline/   numbered model-backed overtopping stages
+│   ├── studies/    overtopping and poisoning study configuration and analysis
+│   ├── reporting/  aggregate analysis orchestration
+│   └── docs/       technical documentation
 ├── data/           persistent model-backed scientific outputs
 ├── cache/          reusable computation caches
-└── results/        derived analyses, audits, tables, and figures
+└── results/        derived analyses, audits, tables, and rendered figures
 ```
 
-## Overtopping study registry
+An overtopping setting is identified by its task, model snapshot, intervention/replacement rule, intervention phase, discovery parameters, and evaluation split. The poisoning study uses a separate run namespace containing matched clean and poisoned trajectories.
 
-The registry is explicit and intentionally has no required setting count. Add or remove `RunSpec` entries in the experiment registry as needed; reporting derives its configured population from the current registry or an explicit `configured_experiments.json` catalogue. `run_overtopping_experiments.sh --list` prints the current settings and totals.
+## Current overtopping registry
 
-Every configured setting remains represented in the study table. Each downstream metric applies its own applicability and artifact-availability rule and reports its denominator.
+The configured registry is constructed by `studies/overtopping/experiments/run_experiments.py`. The `all` selection is deduplicated by scientific identity before execution. In the current repository state it contains 50 unique settings:
 
-Validate the registry and persistent path contract with:
+```text
+phase              I+O  29
+phase              Out  21
+replacement mean-donor  39
+replacement mean         8
+replacement mean-positional 3
+```
+
+The public suite selections currently contain 30 `mean-donor`, 3 `6-7b-models`, 8 `mean`, and 12 `checkpoints` entries before cross-suite deduplication. Three final Pythia-1B input+output settings occur in both `mean-donor` and `checkpoints`, so the union contains 50 unique scientific settings.
+
+Inspect the effective registry with:
+
+```bash
+./run_overtopping_experiments.sh --list
+```
+
+Validate persistent addressing with:
 
 ```bash
 cd code
 python -m studies.overtopping.experiments.storage_contract
 ```
 
-The check is read-only and reports current counts and a fingerprint; it fails only on persistent-address collisions between distinct scientific settings.
+## Documentation map
+
+| Area | Document |
+|---|---|
+| Installation, execution, artifact roots | [Getting started](getting-started/README.md) |
+| Provider credentials | [Credentials](getting-started/credentials.md) |
+| Package and storage architecture | [Architecture](methods/architecture.md) |
+| Causal quantities and statistical units | [Core concepts](methods/concepts.md) |
+| EAP/EAP-IG attribution | [EAP / EAP-IG](methods/eap.md) |
+| Model-backed stages 01–08 | [Pipeline](methods/pipeline.md) |
+| Overtopping registry | [Overtopping experiment](experiments/overtopping.md) |
+| Poisoning protocol and configuration | [Poisoning experiment](experiments/poisoning/README.md) |
+| RQ1–RQ4 estimands and populations | [Research questions](research-questions/README.md) |
+| Aggregate analysis and output contracts | [Reporting](reporting/README.md) |
+| Regeneration and recovery commands | [Operations](operations/README.md) |
 
 ## Artifact semantics
 
-```text
-data/       measured scientific artifacts; preserve unless intentionally recomputing the experiment
-cache/      reusable acceleration state; reuse only when cache metadata matches the requested computation
-results/    derived outputs; safe to regenerate from compatible scientific inputs
-```
-
-Reporting does not use directory presence as a substitute for the configured population. A measured zero-candidate result is different from an unmeasured or incomplete setting.
+`data/` stores model-backed measurements. `cache/` stores reusable acceleration state. `results/` stores outputs computed from existing measurements. Registry manifests define configured study membership; cache or directory presence is not a population definition.

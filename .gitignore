@@ -26,6 +26,7 @@ __MACOSX/
 /cache/
 /results/
 _*
+!__init__.py
 *.zip
 
 # Local credentials. Keep the example file tracked.

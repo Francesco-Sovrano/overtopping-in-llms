@@ -137,7 +137,55 @@ graded_agonist_example_summary.csv
 graded_agonist_unit_summary.csv
 ```
 
-## Stage 07c — threshold-event diagnostics
+## Stage 07c — temporal prefix intervention
+
+Module:
+
+```text
+studies.overtopping.analysis.temporal_cutoff_intervention
+```
+
+Default control:
+
+```text
+RUN_TEMPORAL_CUTOFF_INTERVENTION=true
+```
+
+The prefix schedule applies the frozen singleton intervention during the first `t` autoregressive decode transitions and removes direct intervention afterward. Input+output runs also apply the Stage-07 intervention during prompt prefill; output-only runs leave prompt prefill unmodified.
+
+Per-run outputs are written to:
+
+```text
+<stage7 stats dir>/temporal_cutoff_intervention/
+```
+
+Principal controls:
+
+```text
+TEMPORAL_CUTOFF_ACTIVE_STEPS
+TEMPORAL_CUTOFF_MAX_UNITS_PER_DIRECTION
+TEMPORAL_CUTOFF_MAX_POSITIVE_SUPPORT
+TEMPORAL_CUTOFF_SEED
+FORCE_TEMPORAL_CUTOFF_INTERVENTION
+```
+
+## Stage 07d — temporal suffix intervention
+
+The same module runs with `--schedule suffix` when:
+
+```text
+RUN_TEMPORAL_SUFFIX_INTERVENTION=true
+```
+
+The suffix schedule applies the intervention during the final `t` decode transitions. Outputs are written to:
+
+```text
+<stage7 stats dir>/temporal_suffix_intervention/
+```
+
+`FORCE_TEMPORAL_SUFFIX_INTERVENTION` controls forced recomputation. Prefix and suffix sweeps use the same frozen candidate identities and support examples.
+
+## Post-Stage-07 threshold-event diagnostics
 
 Module:
 
@@ -163,8 +211,6 @@ aggregate_binned_curves.csv
 aggregate_activation_flip_rows.csv
 threshold_spiking_experiment_aggregate.json
 ```
-
-These files are persistent RQ3 analysis inputs used by the reporting pipeline.
 
 Principal runtime controls are:
 
@@ -201,7 +247,7 @@ Stage 8 evaluates the frozen candidate set and structurally matched comparison s
 2. the matched non-candidate `E(K_b)` distribution;
 3. the example-level singleton-union versus full-set decomposition;
 4. conditional marginal contribution when CMC is enabled;
-5. the retained dominant-secondary preemption assay when preemption is enabled.
+5. dominant-secondary preemption when preemption is enabled.
 
 ### Singleton-versus-joint decomposition
 
@@ -227,9 +273,9 @@ When CMC is enabled, matched background sets are evaluated jointly with the cand
 
 ### Secondary preemption assay
 
-The preemption experiment is an optional secondary Stage-8 analysis. Pair identity is frozen from Stage-6 discovery data only. Directional candidate provenance defines the 1→0 or 0→1 pool, and the frozen discovery score determines dominant-secondary ordering. Held-out singleton rates are descriptive and do not select pairs.
+The preemption experiment is an optional Stage-8 analysis. Pair identity is frozen from Stage-6 discovery data only. Directional candidate provenance defines the 1→0 or 0→1 pool, and the frozen discovery score determines dominant-secondary ordering. Held-out singleton rates are descriptive and do not select pairs.
 
-Preemption requires Stage-7c threshold diagnostics because the assay conditions the secondary binary marginal effect on an independently fitted endogenous dominant-event indicator. Runtime controls are:
+Preemption requires completed threshold-event diagnostics because the assay conditions the secondary binary marginal effect on an independently fitted endogenous dominant-event indicator. Runtime controls are:
 
 ```text
 PREEMPTION_MIN_DISCOVERY_SCORE=0.05
@@ -243,7 +289,7 @@ The group-intervention cache is incremental. A Stage-8 refresh can reuse compati
 
 ## Reporting after model-backed execution
 
-The numbered pipeline writes persistent experiment artifacts under `data/`. Manuscript aggregation is performed separately by:
+The numbered pipeline writes persistent experiment artifacts under `data/`. Aggregate reporting is performed separately by:
 
 ```text
 reporting.generate_final_results
@@ -259,7 +305,7 @@ studies.overtopping.analysis.stage08_graded_agonist_report
 studies.overtopping.analysis.stage09_preemption_report
 ```
 
-The composition reporter aggregates the RQ2 example-level decomposition. The threshold and graded reporters provide the primary RQ3 analyses. The preemption reporter is retained as a secondary subtype analysis.
+The composition reporter aggregates the RQ2 example-level decomposition. The threshold and graded reporters aggregate RQ3 threshold analyses. The preemption reporter aggregates the dominant-secondary subtype analysis.
 
 ## Cache and path rules
 
@@ -272,4 +318,4 @@ The composition reporter aggregates the RQ2 example-level decomposition. The thr
 
 ## Batch size
 
-Batch-size controls affect execution throughput and memory use. They should not change the selected scientific population. When reducing batch size for memory reasons, keep splits, row caps, candidate definitions, and intervention settings fixed.
+Batch-size controls affect execution throughput and memory use but do not define the scientific population. Splits, row caps, candidate definitions, and intervention settings determine the analysis population.

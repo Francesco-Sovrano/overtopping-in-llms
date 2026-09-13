@@ -1,14 +1,10 @@
 # Poisoning protocol
 
-This folder contains:
+The poisoning experiment trains matched clean and poisoned trajectories, evaluates aligned checkpoints, performs configured causal localization, freezes candidate identities, measures longitudinal causal effects, scores training examples, and aggregates compatible runs across seeds.
 
-- this document: scientific protocol and endpoints;
-- [Configuration](configuration.md): launcher-defined study values and execution controls;
-- [Outputs](outputs.md): stage-numbered artifact tree, tables, figures, and caches.
+**CHA** denotes the checkpoint candidate-localization workflow based on causal channel-ablation results at a configured operating threshold.
 
-The poisoning study compares matched clean and poisoned training trajectories and measures behavior, causal organization, and training-example detectability at aligned checkpoints.
-
-In the poisoning documentation, **CHA** refers to the repository's checkpoint candidate-localization workflow: it uses causal channel-ablation results to identify candidate channels at a configured operating threshold. The acronym is used in script and artifact names, so the documentation keeps that name while describing the endpoint and population explicitly.
+Configuration is defined in [Configuration](configuration.md). Persistent artifact layout is defined in [Outputs](outputs.md).
 
 ## Experimental unit
 
@@ -86,7 +82,7 @@ Trigger-specific CHA is optional and controlled independently from trigger behav
 
 ## Defender-visible observed-mixture causal localization
 
-`observed_training_mixture_correctness` remains the default attack-agnostic CHA localization endpoint. The workflow may instead use `attack_cohort_control_correctness`, or set `POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=both` to union candidates from both sources before any attack-side evaluation. The observed-mixture source probes clean and poisoned checkpoint models with the same reconstructed fine-tuning stream as observed by the defender: the natural mixture of ordinary and poisoned/marker-bearing prompts together with their observed training labels. It analyzes both observable baseline states (model matches vs does not match the observed label). Row selection never uses hidden poison status, trigger identity, attack eligibility, attack success, or the attacker target. The attack-cohort source is a controlled oracle-defined localization view because its non-target cohort is defined using the experimenter's attack target.
+`observed_training_mixture_correctness` remains the default attack-agnostic CHA localization endpoint. The workflow may instead use `attack_cohort_control_correctness`, or set `POISONING_CANDIDATE_LOCALIZATION_ENDPOINT=both` to union candidates from both sources before any attack-side evaluation. The observed-mixture source probes clean and poisoned checkpoint models with the same reconstructed fine-tuning stream as observed by the defender: the natural mixture of ordinary and poisoned/marker-bearing prompts together with their observed training labels. It analyzes both observable baseline states (model matches vs does not match the observed label). Row selection excludes hidden poison status, trigger identity, attack eligibility, attack success, and the attacker target. The attack-cohort source is a controlled oracle-defined localization view because its non-target cohort is defined using the experimenter's attack target.
 
 CHA contrasts model correctness with respect to the observed label. This is attack-agnostic localization, not an oracle attack-channel search: it gives marker-bearing rows an opportunity to influence discovery but does not label or isolate those rows as attacks.
 
@@ -102,7 +98,7 @@ Clean and poisoned checkpoints are evaluated at the configured fractions. Observ
 
 Longitudinal channel analysis freezes the union of attack-agnostic observed-mixture CHA candidates across matched checkpoints and explicitly evaluates that same candidate set at each relevant checkpoint. Candidate membership is determined before any post-hoc attack-effect measurement.
 
-This prevents checkpoint-local non-discovery from being interpreted as zero causal effect while keeping attack outcomes out of candidate selection.
+Checkpoint-local non-discovery and fixed-union causal evaluation are stored as distinct measurements. Attack outcomes are not candidate-selection inputs for the observed-mixture localization mode.
 
 ## Paired control/attack materialization and defense-leverage screening
 

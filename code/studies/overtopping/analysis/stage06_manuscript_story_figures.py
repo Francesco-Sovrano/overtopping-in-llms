@@ -303,7 +303,7 @@ def draw_phase_scatter(
                 ax.plot(xx, coef[0] * xx + coef[1], linestyle="--", linewidth=1.0, color="0.25", alpha=0.78, zorder=1)
             sample_text = f"n={n}" if n == n_total else f"n={n}/{n_total}"
             stat_artist = ax.text(0.025, 0.975, f"{sample_text}, Pearson r={r:+.2f}\np={p_text(p)}",
-                                  transform=ax.transAxes, ha="left", va="top", fontsize=6.9,
+                                  transform=ax.transAxes, ha="left", va="top", fontsize=8.0,
                                   bbox={"boxstyle": "square,pad=0.18", "facecolor": "white", "edgecolor": "0.72", "linewidth": 0.45, "alpha": 0.90}, zorder=8)
             fig.canvas.draw()
             setattr(ax, "_label_obstacles", [stat_artist.get_window_extent(fig.canvas.get_renderer()).expanded(1.06, 1.12)])

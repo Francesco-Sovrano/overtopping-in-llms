@@ -17,10 +17,10 @@ Repository-level artifact roots are:
 ```text
 data/       persistent model-backed experiment outputs
 cache/      reusable computation caches
-results/    derived analyses and manuscript products
+results/    derived analyses, audits, tables, and rendered outputs
 ```
 
-Scientific populations are defined by `RunSpec` registries, held-out row identities, and analysis manifests. Cache presence is never used to define study membership.
+Scientific populations are defined by `RunSpec` registries, held-out row identities, and analysis manifests rather than cache presence.
 
 ## Overtopping execution flow
 
@@ -33,7 +33,9 @@ Scientific populations are defined by `RunSpec` registries, held-out row identit
 06 candidate/rule analysis
 07 held-out singleton causal evaluation
 07b graded agonist intervention
-07c threshold-event diagnostics
+07c temporal prefix intervention
+07d temporal suffix intervention
+    threshold-event diagnostics
 08 simultaneous-set and interaction validation
 ```
 
@@ -70,7 +72,7 @@ From the repository root:
 ./generate_results.sh
 ```
 
-Reporting is best-effort while experiments are still running: every RQ is attempted from the completed/auditable subset, incomplete configured settings are listed in the corresponding audits, and missing settings do not suppress an otherwise renderable RQ. Verified zero-candidate runs remain explicit zero observations. To require complete required metrics for whatever settings are in the configured manifest, run:
+Reporting runs each RQ from the completed, auditable settings. The corresponding audits list incomplete configured settings, and reports are generated when their required inputs are available. Verified zero-candidate runs remain explicit zero observations. To require complete required metrics for settings in the configured manifest, run:
 
 ```bash
 ALLOW_INCOMPLETE_METRICS=false ./generate_results.sh

@@ -1,6 +1,6 @@
 # Operations and regeneration
 
-This document describes reporting regeneration, model-backed recovery, and cache handling.
+Operations cover reporting regeneration, model-backed recovery, and cache handling.
 
 ## 1. Inspect configuration before execution
 
@@ -142,7 +142,7 @@ Full threshold-shape reporting additionally requires:
 aggregate_activation_flip_rows.csv
 ```
 
-The oriented binned-response panel uses:
+The oriented binned-response output uses:
 
 ```text
 aggregate_binned_curves.csv

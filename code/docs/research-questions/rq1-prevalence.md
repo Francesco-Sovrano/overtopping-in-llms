@@ -6,7 +6,7 @@ RQ1 asks whether high-leverage singleton causal effects occur across the configu
 
 ## Population
 
-The main RQ1 analysis uses the current configured overtopping manifest; its total and per-phase counts are derived at runtime. Input+output and output-only settings are analyzed separately, with no fixed total or phase split required.
+RQ1 uses the configured overtopping manifest; its total and per-phase counts are derived at runtime. Input+output and output-only settings are analyzed separately, with no fixed total or phase split required.
 
 All configured settings enter because the estimand is the association between behavioral competence and causal reach across the intervention settings actually studied. Intermediate checkpoints are distinct model states, and replacement-baseline repeats are distinct causal counterfactuals. They are not pooled across phase.
 
@@ -68,7 +68,7 @@ studies/overtopping/analysis/lib/task_metrics.py
 
 Grammar and HANS NLI use `0.5`; Random FSM uses the configured average random-choice baseline unless an explicit empirical baseline is requested; arithmetic and jailbreak use the task-specific definitions implemented there. Jailbreak scores are oriented so higher values mean safer/refusal behavior.
 
-The I+O and Out competence scales are analyzed in separate panels and are not pooled into one correlation.
+The I+O and Out competence scales are analyzed separately and are not pooled into one correlation.
 
 ## Width-normalized candidate counts
 
@@ -87,11 +87,11 @@ These divide discovered-candidate counts by model `d_model`. They are not estima
 
 ## Statistical analyses
 
-The main RQ1 outputs include:
+RQ1 outputs include:
 
 - phase-specific Pearson associations across configured settings with the required metric;
 - phase-specific Spearman associations across configured settings with the required metric;
-- the 31-cell final-snapshot sensitivity;
+- the 29-cell final-snapshot sensitivity;
 - task/phase and structural diagnostics where the available setting count permits estimation.
 
 The cross-setting statistical unit is the configured setting. Eligible-example counts describe within-setting precision rather than additional independent replicates.
@@ -117,13 +117,13 @@ in `studies/overtopping/experiments/run_experiments.py`.
 
 ## Outputs
 
-Main figure directory:
+Rendered output directory:
 
 ```text
 results/paper/figures/02_rq1_prevalence/
 ```
 
-Machine-readable figure inputs and fit statistics:
+Machine-readable source tables and fit statistics:
 
 ```text
 results/analysis/figure_data/02_rq1_prevalence/
