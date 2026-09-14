@@ -325,7 +325,7 @@ def publish_manuscript_exact_figure_bundle(results_root: Path) -> dict[str, str]
     The manuscript uses these files directly, so rerunning final results cannot
     silently drift to a different visual style or a stale hand-composed figure.
     """
-    dst_root = manuscript_figures(results_root) / "manuscript_exact"
+    dst_root = Path(results_root) / "manuscript_exact" / "figures" / "main"
     dst_root.mkdir(parents=True, exist_ok=True)
     mapping = {
         rq1_figures(results_root) / "fig2a_competence_vs_U_0to1.pdf": dst_root / "rq1_competence_reach_0to1.pdf",
@@ -1447,19 +1447,17 @@ def main() -> None:
     # and chart encodings instead of normalizing unrelated panels to one generic
     # template. This stage is plotting only: it never reruns experiments or
     # changes an analysis population.
-    manuscript_exact_root = manuscript_figures(results_root) / "manuscript_exact"
-    manuscript_exact_supplement = manuscript_exact_root / "supplement"
+    manuscript_exact_root = Path(results_root) / "manuscript_exact" / "figures" / "main"
+    manuscript_exact_supplement = Path(results_root) / "manuscript_exact" / "figures" / "supplement"
+    manuscript_exact_tables = Path(results_root) / "manuscript_exact" / "tables"
     run([
         sys.executable, "-m", "reporting.generate_manuscript_figures",
         "--results-root", str(results_root),
-        "--main-dir", str(manuscript_exact_root),
-        "--supp-dir", str(manuscript_exact_supplement),
     ], allow_failure=allow_incomplete_population)
-    manuscript_exact_figures = {
-        p.name: str(p) for p in sorted(manuscript_exact_root.glob("*.pdf"))
-    }
+    manuscript_exact_figures = {p.name: str(p) for p in sorted(manuscript_exact_root.glob("*.pdf"))}
     if manuscript_exact_figures:
-        print("[final-results] manuscript-exact figures: " + json.dumps(manuscript_exact_figures, sort_keys=True), flush=True)
+        print("[final-results] manuscript-exact main figures: " + json.dumps(manuscript_exact_figures, sort_keys=True), flush=True)
+        print(f"[final-results] manuscript-exact supplement={len(list(manuscript_exact_supplement.glob('*.pdf')))} tables={len(list(manuscript_exact_tables.glob('*.tex')))}", flush=True)
 
     spiking_available = bool(
         not args.skip_spiking_report

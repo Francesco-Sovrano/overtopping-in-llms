@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.transforms import Bbox
 import numpy as np
 import pandas as pd
 
@@ -103,8 +104,9 @@ def save_exact(fig, path: str | Path):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--results-root", required=True)
-    p.add_argument("--main-dir", required=True)
-    p.add_argument("--supp-dir", required=True)
+    p.add_argument("--main-dir", default=None)
+    p.add_argument("--supp-dir", default=None)
+    p.add_argument("--tables-dir", default=None)
     return p.parse_args()
 
 
@@ -151,21 +153,133 @@ def _model_tag(model: object) -> str:
         return "P6.9"
     if "pythia-1b" in low:
         if "48000" in low or "48k" in low:
-            return "P48"
+            return "P1-48k"
         if "96000" in low or "96k" in low:
-            return "P96"
+            return "P1-96k"
         if "step0" in low or "@0" in low:
-            return "P0"
+            return "P1-0"
+        if "143000" in low or "143k" in low:
+            return "P1-143k"
         return "P1"
     return s.replace("-Instruct", "")
+
 
 
 # ---------------------------------------------------------------------------
 # Main figures
 # ---------------------------------------------------------------------------
 
+def _rq1_clustered_labels(fig, ax, records, *, fontsize=6.2):
+    """Place grouped model labels without text-text or text-point collisions."""
+    if not records:
+        return
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    pts = ax.transData.transform([(x, y) for x, y, _ in records])
+    parent = list(range(len(records)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        a, b = find(i), find(j)
+        if a != b:
+            parent[b] = a
+
+    # Combine only points that are close enough that separate labels would
+    # collide at manuscript scale.
+    for i in range(len(records)):
+        for j in range(i + 1, len(records)):
+            dx = pts[i, 0] - pts[j, 0]
+            dy = pts[i, 1] - pts[j, 1]
+            if dx * dx + dy * dy <= 38.0 ** 2:
+                union(i, j)
+
+    groups = {}
+    for i in range(len(records)):
+        groups.setdefault(find(i), []).append(i)
+
+    axes_box = ax.get_window_extent(renderer)
+    occupied = []
+    # Reserve marker neighborhoods.
+    for xdisp, ydisp in pts:
+        occupied.append(Bbox.from_extents(xdisp - 14, ydisp - 12, xdisp + 14, ydisp + 12))
+    # Reserve the statistics annotation and any other pre-existing text.
+    for t in ax.texts:
+        if t.get_text():
+            occupied.append(t.get_window_extent(renderer).expanded(1.05, 1.08))
+
+    directions = [(1,0), (1,1), (0,1), (-1,1), (-1,0), (-1,-1), (0,-1), (1,-1)]
+    candidates = []
+    for radius in (14, 22, 32, 46, 62, 82, 104):
+        for dx, dy in directions:
+            candidates.append((dx * radius, dy * radius))
+    candidates.extend([(120,0),(-120,0),(0,110),(0,-110),(92,44),(-92,44),(92,-44),(-92,-44)])
+
+    # Dense low-value clusters are the hardest, so place them first.
+    order = sorted(groups.values(), key=lambda ids: (min(records[i][1] for i in ids), -len(ids)))
+    for ids in order:
+        xs = [records[i][0] for i in ids]
+        ys = [records[i][1] for i in ids]
+        anchor = (float(np.mean(xs)), float(np.mean(ys)))
+        labels = []
+        for i in ids:
+            lab = str(records[i][2])
+            if lab not in labels:
+                labels.append(lab)
+        if len(labels) >= 4:
+            split = (len(labels) + 1) // 2
+            label = "/".join(labels[:split]) + "\n" + "/".join(labels[split:])
+        elif len(labels) == 3:
+            label = labels[0] + "/" + labels[1] + "\n" + labels[2]
+        else:
+            label = "/".join(labels)
+
+        best_off = candidates[0]
+        best_score = float("inf")
+        for off in candidates:
+            ann = ax.annotate(
+                label, anchor, xytext=off, textcoords="offset points",
+                fontsize=fontsize,
+                ha="left" if off[0] > 0 else ("right" if off[0] < 0 else "center"),
+                va="bottom" if off[1] > 0 else ("top" if off[1] < 0 else "center"),
+                color="0.10", linespacing=.92, zorder=8,
+                bbox={"boxstyle":"round,pad=.14", "facecolor":"white", "edgecolor":"0.70", "linewidth":.35, "alpha":0.72},
+                arrowprops={"arrowstyle":"-", "lw":.36, "color":"0.38", "alpha":.72,
+                            "shrinkA":1.5, "shrinkB":2.5},
+            )
+            bb = ann.get_window_extent(renderer).expanded(1.04, 1.10)
+            ann.remove()
+            outside = (
+                max(0.0, axes_box.x0 - bb.x0) + max(0.0, bb.x1 - axes_box.x1) +
+                max(0.0, axes_box.y0 - bb.y0) + max(0.0, bb.y1 - axes_box.y1)
+            )
+            n_overlap = sum(bb.overlaps(prev) for prev in occupied)
+            score = 10000.0 * outside + 1000.0 * n_overlap + (abs(off[0]) + abs(off[1])) / 50.0
+            if score < best_score:
+                best_score = score
+                best_off = off
+            if outside == 0 and n_overlap == 0:
+                break
+
+        off = best_off
+        ann = ax.annotate(
+            label, anchor, xytext=off, textcoords="offset points",
+            fontsize=fontsize,
+            ha="left" if off[0] > 0 else ("right" if off[0] < 0 else "center"),
+            va="bottom" if off[1] > 0 else ("top" if off[1] < 0 else "center"),
+            color="0.10", linespacing=.92, zorder=8,
+            bbox={"boxstyle":"round,pad=.18", "facecolor":"white", "edgecolor":"0.65", "linewidth":.4, "alpha":0.88},
+            arrowprops={"arrowstyle":"-", "lw":.36, "color":"0.38", "alpha":.72,
+                        "shrinkA":1.5, "shrinkB":2.5},
+        )
+        occupied.append(ann.get_window_extent(renderer).expanded(1.04, 1.10))
+
 def main_rq1(root: Path, out: Path) -> None:
-    """2x2 competence/reach panel matching the attached paper."""
+    """Current RQ1 data in the attached paper's 2x2 visual grammar."""
     base = root / "analysis/figure_data/02_rq1_prevalence"
     frames: dict[str, pd.DataFrame] = {}
     stats: dict[str, pd.DataFrame] = {}
@@ -186,26 +300,32 @@ def main_rq1(root: Path, out: Path) -> None:
         "random_fsm": "Random FSM",
         "bon_jailbreaking": "Jailbreak",
     }
+    # Keep the paper's stable task-color identity. HANS is green and grammar is
+    # orange; colors do not shift when a task/model condition is absent.
+    colors = {
+        "arithmetic": "#1f77b4",
+        "hans_nli": "#2ca02c",
+        "grammar_acceptability": "#ff7f0e",
+        "random_fsm": "#d62728",
+        "bon_jailbreaking": "#9467bd",
+    }
     phases = ["input+output", "decode-only"]
 
     with plt.rc_context({
-        "font.size": 10.5,
-        "axes.labelsize": 13.0,
-        "xtick.labelsize": 10.0,
-        "ytick.labelsize": 10.0,
-        "legend.fontsize": 8.6,
-        "axes.linewidth": .8,
-        "xtick.major.width": .8,
-        "ytick.major.width": .8,
+        "font.size": 8.2,
+        "axes.labelsize": 10.2,
+        "xtick.labelsize": 8.4,
+        "ytick.labelsize": 8.4,
+        "legend.fontsize": 7.4,
+        "axes.linewidth": .75,
+        "xtick.major.width": .7,
+        "ytick.major.width": .7,
         "xtick.major.size": 3.0,
         "ytick.major.size": 3.0,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
     }):
-        fig, axes = plt.subplots(2, 2, figsize=(7.68, 4.42), sharex="col", sharey="row")
-        cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-        colors = {t: cycle[i] for i, t in enumerate(task_order)}
-
+        fig, axes = plt.subplots(2, 2, figsize=FIGSIZE["main_rq1"], sharex="col", sharey="row")
         for ri, direction in enumerate(["0to1", "1to0"]):
             d = frames[direction].copy()
             d["score"] = _num(d["score"])
@@ -213,70 +333,54 @@ def main_rq1(root: Path, out: Path) -> None:
             for ci, phase in enumerate(phases):
                 ax = axes[ri, ci]
                 g = d[d["phase"].astype(str).eq(phase)].copy()
+                label_records=[]
                 for _, r in g.iterrows():
                     task = str(r.get("task", ""))
                     if task not in colors or not np.isfinite(r["score"]) or not np.isfinite(r["union_rate"]):
                         continue
                     marker = "o" if str(r.get("baseline", "mean-donor")) == "mean-donor" else "s"
-                    ax.scatter(
-                        float(r["score"]), float(r["union_rate"]), s=55, marker=marker,
-                        color=colors[task], edgecolor="black", linewidth=.65, zorder=4,
-                    )
-                    # The reference panel labels the plotted model at every point.
-                    label = _model_tag(r.get("model", ""))
-                    xoff = 4
-                    yoff = 4
-                    if float(r["union_rate"]) > .93:
-                        yoff = -11
-                    if float(r["score"]) > .88:
-                        xoff = -24
-                    ax.annotate(label, (float(r["score"]), float(r["union_rate"])),
-                                xytext=(xoff, yoff), textcoords="offset points",
-                                fontsize=7.7, ha="left", va="bottom", color="0.10", zorder=5)
+                    x=float(r["score"]); y=float(r["union_rate"])
+                    ax.scatter(x, y, s=37, marker=marker, color=colors[task],
+                               edgecolor="black", linewidth=.45, zorder=4)
+                    label_records.append((x,y,_model_tag(r.get("model", ""))))
 
                 fit = g[["score", "union_rate"]].dropna()
                 if len(fit) >= 3 and fit["score"].nunique() > 1:
                     coef = np.polyfit(fit["score"].to_numpy(float), fit["union_rate"].to_numpy(float), 1)
                     xx = np.linspace(float(fit["score"].min()), float(fit["score"].max()), 100)
-                    ax.plot(xx, coef[0] * xx + coef[1], "--", color="0.32", linewidth=1.45, zorder=2)
+                    ax.plot(xx, coef[0] * xx + coef[1], "--", color="0.32", linewidth=1.12, zorder=2)
+
+                ax.set_xlim(-.01, 1.02)
+                ax.set_ylim(-.02, 1.03)
+                ax.grid(True, alpha=.19, linewidth=.42)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
 
                 sr = stats[direction]
                 sr = sr[sr["phase"].astype(str).eq(phase)] if not sr.empty else sr
                 if not sr.empty:
                     q = sr.iloc[0]
-                    txt = f"$n={int(q['n'])},\\ r={float(q['pearson_r']):.2f}$\n$p={float(q['pearson_p']):.5f}$"
-                    # Match the reference placement: the dense top-left panel uses
-                    # the lower-right corner, the top-right uses upper-right.
-                    if ri == 0 and ci == 1:
-                        xy, va = (.98, .97), "top"
-                    else:
-                        xy, va = (.98, .07), "bottom"
-                    ax.text(*xy, txt, transform=ax.transAxes, ha="right", va=va, fontsize=8.2,
-                            bbox={"boxstyle": "round,pad=.20", "facecolor": "white",
-                                  "edgecolor": "0.72", "linewidth": .7, "alpha": .94}, zorder=8)
+                    pval=float(q["pearson_p"])
+                    ptxt=f"{pval:.5f}" if pval >= 1e-4 else f"{pval:.5f}"
+                    txt = f"$n={int(q['n'])},\\;r={float(q['pearson_r']):.2f}$\n$p={ptxt}$"
+                    xy=(.98,.95) if (ri==0 and ci==1) else (.98,.07)
+                    ax.text(*xy, txt, transform=ax.transAxes, ha="right",
+                            va="top" if (ri==0 and ci==1) else "bottom", fontsize=7.2,
+                            bbox={"boxstyle":"round,pad=.18","facecolor":"white",
+                                  "edgecolor":"0.72","linewidth":.55,"alpha":.94}, zorder=9)
+                _rq1_clustered_labels(fig, ax, label_records, fontsize=6.2)
 
-                ax.set_xlim(-.01, 1.02)
-                ax.set_ylim(-.02, 1.03)
-                ax.grid(True, alpha=.20, linewidth=.45)
-                ax.spines["top"].set_visible(False)
-                ax.spines["right"].set_visible(False)
-
-        axes[0, 0].set_ylabel(r"$0\!\to\!1$ reach $U^d(J)$")
-        axes[1, 0].set_ylabel(r"$1\!\to\!0$ reach $U^d(J)$")
-        axes[1, 0].set_xlabel("Raw task score")
-        axes[1, 1].set_xlabel(r"Chance-normalized score $\kappa$")
-
-        handles = [
-            Line2D([0], [0], marker="o", linestyle="none", markerfacecolor=colors[t],
-                   markeredgecolor="black", markeredgewidth=.55, markersize=5.5, label=task_labels[t])
-            for t in task_order
-        ]
-        fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .005), ncol=5,
-                   frameon=False, handletextpad=.35, columnspacing=.9)
-        fig.subplots_adjust(left=.095, right=.995, bottom=.18, top=.995, hspace=.11, wspace=.12)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out, bbox_inches="tight", pad_inches=.02)
-        plt.close(fig)
+        axes[0,0].set_ylabel(r"$0\!\to\!1$ reach $U^d(J)$")
+        axes[1,0].set_ylabel(r"$1\!\to\!0$ reach $U^d(J)$")
+        axes[1,0].set_xlabel("Raw task score")
+        axes[1,1].set_xlabel(r"Chance-normalized score $\kappa$")
+        handles=[Line2D([0],[0],marker="o",linestyle="none",markerfacecolor=colors[t],
+                        markeredgecolor="black",markeredgewidth=.4,markersize=5.1,label=task_labels[t])
+                 for t in task_order]
+        fig.legend(handles=handles,loc="lower center",bbox_to_anchor=(.5,.005),ncol=5,
+                   frameon=False,handletextpad=.35,columnspacing=.85)
+        fig.subplots_adjust(left=.095,right=.995,bottom=.16,top=.985,hspace=.10,wspace=.12)
+        save_exact(fig,out)
 
 
 def main_rq2(root: Path, out: Path) -> None:
@@ -403,7 +507,7 @@ def main_rq4_traj(root: Path, out: Path) -> None:
         "xtick.major.width": .8, "ytick.major.width": .8,
         "pdf.fonttype": 42, "ps.fonttype": 42,
     }):
-        fig, (ax_cov, ax_comp) = plt.subplots(2, 1, figsize=(5.35, 2.45), sharex=True,
+        fig, (ax_cov, ax_comp) = plt.subplots(2, 1, figsize=FIGSIZE["main_rq4_traj"], sharex=True,
                                               gridspec_kw={"height_ratios": [1, 1], "hspace": .018})
         ax_cov.set_facecolor("#f5f8fc")
         ax_comp.set_facecolor("#fcf8f3")
@@ -411,10 +515,11 @@ def main_rq4_traj(root: Path, out: Path) -> None:
         cov_ann = []
         comp_ann = []
         max_cov, max_comp = 0., 0.
+        task_colors = {"Grammar": "#1f77b4", "HANS NLI": "#ff7f0e", "Random FSM": "#2ca02c"}
         for _task, label, cov, comp in series:
+            color = task_colors.get(_task, "#1f77b4")
             line, = ax_cov.plot(steps, cov, marker="o", linewidth=1.35, markersize=4.2,
-                                markeredgewidth=.80, label=label)
-            color = line.get_color()
+                                markeredgewidth=.80, color=color, label=label)
             ax_comp.plot(steps, comp, marker="s", linestyle="--", linewidth=1.25, markersize=4.0,
                          markerfacecolor="white", markeredgewidth=.85, color=color, label=label)
             max_cov = max(max_cov, *[v for v in cov if np.isfinite(v)], 0)
@@ -446,9 +551,7 @@ def main_rq4_traj(root: Path, out: Path) -> None:
             _annotate_checkpoint_values(ax_comp, steps, comp, color, above=True)
         ax_cov.legend(handles=handles, frameon=False, loc="upper left", ncol=max(1, len(handles)),
                       handlelength=1.0, columnspacing=.48, borderaxespad=.05, fontsize=8.0)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out, bbox_inches="tight", pad_inches=.015)
-        plt.close(fig)
+        save_exact(fig, out)
 
 
 def _grammar_story(root: Path):
@@ -486,8 +589,10 @@ def main_rq4_defense(root: Path, out: Path) -> None:
         "xtick.major.width": .8, "ytick.major.width": .8,
         "pdf.fonttype": 42, "ps.fonttype": 42,
     }):
-        fig, (ax_line, ax_trade) = plt.subplots(1, 2, figsize=(12.82, 4.09))
+        fig, (ax_line, ax_trade) = plt.subplots(1, 2, figsize=FIGSIZE["main_rq4_defense"])
         fig.subplots_adjust(left=.075, right=.985, bottom=.20, top=.94, wspace=.28)
+        fig.text(.012, .965, "(a)", fontsize=9.0, fontweight="bold", ha="left", va="top")
+        fig.text(.515, .965, "(b)", fontsize=9.0, fontweight="bold", ha="left", va="top")
         x = 100 * operating["target_fraction"].to_numpy(float)
         attack = 100 * operating["mean_attack_suppression"].to_numpy(float)
         benign = 100 * operating["mean_poisoned_disruption"].to_numpy(float)
@@ -549,12 +654,7 @@ def main_rq4_defense(root: Path, out: Path) -> None:
         ax_trade.set_ylabel("Single-channel attack suppression (%)")
         ax_trade.grid(True, alpha=.18)
         ax_trade.legend(frameon=False, fontsize=6.8, loc="upper right")
-        for label, ax in zip(["(a)", "(b)"], [ax_line, ax_trade]):
-            ax.text(-.035, 1.025, label, transform=ax.transAxes, fontsize=10.5,
-                    fontweight="bold", ha="left", va="bottom")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out, bbox_inches="tight", pad_inches=.015)
-        plt.close(fig)
+        save_exact(fig, out)
 
 
 # ---------------------------------------------------------------------------
@@ -951,40 +1051,174 @@ def supp_cross(root: Path, out: Path) -> None:
         save_exact(fig, out)
 
 
+
+def main_overview(_root: Path, out: Path) -> None:
+    """Generate the paper overview figure directly, without cached reference PDFs."""
+    import matplotlib as mpl
+    from matplotlib.patches import Rectangle, FancyBboxPatch, Circle, FancyArrowPatch
+
+    W, H = 1490, 348
+    BLUE = '#1256F4'; RED = '#E92B3A'; GRAY = '#7B848C'; MID = '#A8ADB2'
+    LIGHT = '#ECEFF2'; PALE_BLUE = '#EAF2FF'; PALE_RED = '#FDECEE'
+    TEXT = '#22262A'; SUB = '#555D66'; WHITE = '#FFFFFF'
+    with plt.rc_context({"pdf.fonttype":42, "ps.fonttype":42, "font.family":"DejaVu Sans", "mathtext.fontset":"dejavusans"}):
+        fig = plt.figure(figsize=(13.2, 3.09), dpi=120, facecolor='white')
+        ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.axis('off')
+
+        def txt(x, y, s, size=10.5, weight='normal', color=TEXT, ha='left', va='center', z=6):
+            return ax.text(x, y, s, fontsize=size, fontweight=weight, color=color, ha=ha, va=va, zorder=z)
+        def box(x, y, w, h, ec='#4D5358', fc=WHITE, lw=.9, r=3.5, z=2):
+            p = FancyBboxPatch((x,y),w,h,boxstyle=f'round,pad=0,rounding_size={r}',edgecolor=ec,facecolor=fc,linewidth=lw,zorder=z); ax.add_patch(p); return p
+        def arrow(x1,y1,x2,y2,color=TEXT,lw=1.1,ms=8.5,z=5):
+            p=FancyArrowPatch((x1,y1),(x2,y2),arrowstyle='-|>',mutation_scale=ms,color=color,linewidth=lw,zorder=z); ax.add_patch(p); return p
+        def network(cx,cy,scale=.50):
+            pts=np.array([[-32,-12],[-16,-32],[0,-42],[18,-28],[32,-9],[0,-10],[-24,10],[-3,10],[22,8],[-16,29],[3,38],[22,26]],float)*scale
+            pts[:,0]+=cx; pts[:,1]+=cy
+            edges=[(0,1),(1,2),(2,3),(3,4),(4,8),(8,11),(11,10),(10,9),(9,6),(6,0),(0,5),(1,5),(2,5),(3,5),(4,5),(5,7),(5,8),(6,7),(7,8),(7,9),(7,10),(8,10)]
+            for i,j in edges: ax.add_line(Line2D([pts[i,0],pts[j,0]],[pts[i,1],pts[j,1]],color=TEXT,lw=.9,zorder=3))
+            for x,y in pts: ax.add_patch(Circle((x,y),4.5*scale,ec=TEXT,fc='#EEF6FA',lw=.9,zorder=4))
+        def small_axes(x,y,w,h): return fig.add_axes([x/W,(H-y-h)/H,w/W,h/H])
+
+        for x in [258,662,1012]: ax.add_line(Line2D([x,x],[15,H-14],color='#D5DADF',lw=.8,zorder=1))
+        SUBTITLE=9.2
+        L,R=10,246; cx=(L+R)/2
+        txt(L+2,20,'1. Setup',12.6,'bold'); txt(cx,42,'Frozen model, binary endpoint',SUBTITLE,color=SUB,ha='center')
+        txt(cx,61,'Prompt $x$',9.4,'bold',ha='center'); box(cx-54,72,108,38,fc='#F7F7F7',ec='#C4C8CC'); txt(cx,91,r'$23+12=?$',12.2,ha='center')
+        arrow(cx,112,cx,126,color=GRAY); box(cx-82,130,164,92,fc='#EAF4FA',ec='#B8C6D1'); txt(cx,147,'Frozen Transformer',9.7,'bold',ha='center'); txt(cx,166,r'$M(x)$',12.2,ha='center'); network(cx,194,.48); arrow(cx,224,cx,239,color=GRAY)
+        ocx=cx-14; txt(ocx,249,'Observed outcomes',9.4,'bold',ha='center'); txt(ocx-42,266,'numeric',8.4,color=SUB,ha='center'); txt(ocx+61,266,'binary',8.4,color=SUB,ha='center')
+        for yy,val,binary,col in [(287,'43','1 correct',BLUE),(320,'34','0 incorrect',RED)]:
+            box(ocx-72,yy-14,54,28,ec=col,lw=1.25); txt(ocx-45,yy,val,13.0,'bold',col,ha='center'); arrow(ocx-12,yy,ocx+8,yy,lw=.95,ms=7); box(ocx+11,yy-14,105,28,ec=col,lw=1.25); txt(ocx+63.5,yy,binary,10.0,'bold',col,ha='center')
+
+        L,R=278,646; cx=(L+R)/2
+        txt(L+2,20,'2. Intervention',12.6,'bold'); txt(cx,42,'Replace one channel and re-evaluate',SUBTITLE,color=SUB,ha='center')
+        for xx,fc,label in [(L+18,BLUE,'intact'),(L+96,GRAY,'replacement'),(L+206,WHITE,'untargeted')]:
+            ax.add_patch(Rectangle((xx,61),14,14,ec=TEXT if fc==WHITE else fc,fc=fc,lw=.85,zorder=3)); txt(xx+19,68,label,8.7,color=SUB)
+        box(L+5,94,92,35,ec='none',fc=PALE_BLUE,lw=0); txt(L+51,111,'Original',10.0,'bold',ha='center')
+        xs=[L+126,L+154,L+182,L+210,L+238,L+266]; labs=['1','2','…',r'$j$','…','N']
+        for x,lab in zip(xs,labs): txt(x,91,lab,9.0,ha='center')
+        for x,lab in zip(xs,labs):
+            if lab=='…': continue
+            fc=BLUE if lab==r'$j$' else WHITE; ec=BLUE if lab==r'$j$' else TEXT; ax.add_patch(Rectangle((x-7,101),14,20,ec=ec,fc=fc,lw=.85,zorder=3))
+        arrow(L+281,111,L+300,111,ms=7.5); txt(L+306,105,'43',12.4,'bold',BLUE); txt(L+306,118,'correct',8.5,color=BLUE)
+        box(L+5,151,92,35,ec='none',fc=PALE_RED,lw=0); txt(L+51,168,'Replace $j$',10.0,'bold',ha='center')
+        for x,lab in zip(xs,labs): txt(x,148,lab,9.0,ha='center')
+        for x,lab in zip(xs,labs):
+            if lab=='…': continue
+            fc=GRAY if lab==r'$j$' else WHITE; ax.add_patch(Rectangle((x-7,158),14,20,ec=TEXT,fc=fc,lw=.85,zorder=3))
+        xj=L+210; ax.add_line(Line2D([xj-6,xj+6],[150,162],color=RED,lw=1.8,zorder=5)); ax.add_line(Line2D([xj+6,xj-6],[150,162],color=RED,lw=1.8,zorder=5)); arrow(L+281,168,L+300,168,ms=7.5); txt(L+306,162,'34',12.4,'bold',RED); txt(L+306,175,'incorrect',8.5,color=RED); arrow(xj,180,xj,203,color=GRAY,lw=1.0,ms=7); txt(cx,208,'replacement value',8.7,color=SUB,ha='center')
+        box(L+38,225,118,58,ec='#8A9096',fc='#FBFBFB'); txt(L+59,254,r'$\mu$',24,ha='center'); txt(L+109,242,'Mean',10.0,'bold',ha='center'); txt(L+109,258,'reference',8.0,ha='center')
+        box(L+188,225,130,58,ec='#8A9096',fc='#FBFBFB')
+        for px,py in [(L+210,248),(L+225,237),(L+240,249),(L+216,264),(L+237,264)]: ax.add_patch(Circle((px,py),3.5,ec=TEXT,fc=TEXT,lw=.7,zorder=4))
+        for a,b in [((L+210,248),(L+225,237)),((L+225,237),(L+240,249)),((L+210,248),(L+216,264)),((L+240,249),(L+237,264)),((L+216,264),(L+237,264))]: ax.add_line(Line2D([a[0],b[0]],[a[1],b[1]],color=TEXT,lw=.8,zorder=3))
+        txt(L+282,242,'Donor',10.0,'bold',ha='center'); txt(L+282,258,'example',8.0,ha='center'); txt(cx,310,'Singleton replacement measures causal leverage',8.6,color=SUB,ha='center')
+
+        L,R=688,996; cx=(L+R)/2
+        txt(L+2,20,'3. Overtopping vs. diffuse',12.5,'bold'); txt(cx,42,'Concentrated vs. distributed support',SUBTITLE,color=SUB,ha='center')
+        box(L+4,61,142,23,ec='none',fc=PALE_BLUE,lw=0); txt(L+75,73,'OVERTOPPING',10.8,'bold',BLUE,ha='center'); box(L+158,61,142,23,ec='none',fc=PALE_RED,lw=0); txt(L+229,73,'DIFFUSE',10.8,'bold',RED,ha='center')
+        txt(L+12,101,r'$U(J)\approx \mathrm{str}(j^*)$',10.5,color=BLUE); txt(L+162,101,r'$U(J)>\max_j \mathrm{str}(j)$',10.0,color=RED)
+        p1=small_axes(L+20,135,118,165); v=[.12,.10,.09,1.0,.10,.12,.09,.11]; c=[MID]*len(v); c[3]=BLUE; p1.bar(range(len(v)),v,color=c,width=.74); p1.set_ylim(0,1.08); p1.set_yticks([0,.5,1]); p1.set_xticks([0,3,7],['1',r'$j^*$','N']); p1.set_xlabel('Channel $j$',fontsize=7.8); p1.set_ylabel('Effect',fontsize=7.8); p1.tick_params(labelsize=7); p1.spines[['top','right']].set_visible(False)
+        p2=small_axes(L+170,135,118,165); v=[.36,.28,.33,.40,.31,.39,.43,.49,.38,.60]; cols=[MID,MID,MID]+['#F6B2BA','#F29AA6','#F48896','#F27687','#ED5E72','#F27687',RED]; p2.bar(range(len(v)),v,color=cols,width=.74); p2.set_ylim(0,1.08); p2.set_yticks([0,.5,1]); p2.set_xticks([0,4,9],['1',r'$j$','N']); p2.set_xlabel('Channel $j$',fontsize=7.8); p2.set_ylabel('Effect',fontsize=7.8); p2.tick_params(labelsize=7); p2.spines[['top','right']].set_visible(False)
+
+        L,R=1037,1475; cx=(L+R)/2
+        txt(L+2,20,'4. Four measurements',12.5,'bold'); txt(cx,42,'Four signatures characterize the regime',SUBTITLE,color=SUB,ha='center')
+        labels=[('Reach',BLUE,PALE_BLUE,L+2,61),('Composition',TEXT,LIGHT,L+220,61),('Threshold',RED,PALE_RED,L+2,194),('Learning',TEXT,LIGHT,L+220,194)]
+        for lab,col,fc,x,y in labels: box(x,y,208,23,ec='none',fc=fc,lw=0); txt(x+104,y+12,lab,10.5,'bold',col,ha='center')
+        q1=small_axes(L+42,92,128,76); vals=[.90,.56,.28,.14,.08]; q1.bar(range(5),vals,color=['#316EE8','#5B89E9','#88A9EE','#AEC5F3','#D3DFF7']); q1.set_ylim(0,1.05); q1.set_xticks([0,2,4],['1','…','N']); q1.set_yticks([0,.5,1]); q1.tick_params(labelsize=6.8); q1.set_ylabel('Flip rate',fontsize=7.3); q1.spines[['top','right']].set_visible(False)
+        q2=small_axes(L+260,92,128,76); stats=[dict(med=.37,q1=.25,q3=.52,whislo=.08,whishi=.78,fliers=[]),dict(med=.65,q1=.50,q3=.82,whislo=.27,whishi=1.0,fliers=[])]; bp=q2.bxp(stats,positions=[1,2],widths=.5,showfliers=False,patch_artist=True); bp['boxes'][0].set(facecolor='#DDE8FF',edgecolor=BLUE); bp['boxes'][1].set(facecolor='#FDE3E6',edgecolor=RED); q2.set_ylim(0,1.05); q2.set_xticks([1,2],['Single','Joint']); q2.set_yticks([0,.5,1]); q2.tick_params(labelsize=6.8); q2.set_ylabel('Effect',fontsize=7.3); q2.spines[['top','right']].set_visible(False)
+        q3=small_axes(L+42,225,128,76); xx=np.logspace(-3,1,10); yy=np.array([.02,.03,.04,.08,.18,.48,.79,.93,.98,1]); q3.plot(xx,yy,'-o',color=RED,lw=1.4,ms=3); q3.axvline(1e-1,color=MID,ls='--',lw=.8); q3.set_xscale('log'); q3.set_ylim(0,1.05); q3.set_yticks([0,.5,1]); q3.tick_params(labelsize=6.2); q3.set_ylabel('Flip fraction',fontsize=7.0); q3.set_xlabel(r'Dose $\lambda$',fontsize=7.0); q3.spines[['top','right']].set_visible(False)
+        q4=small_axes(L+260,225,128,76); xx=np.array([1,2,3,4,5,6]); yy=np.array([.15,.30,.43,.55,.66,.74]); cc=np.full(6,.11); q4.plot(xx,yy,'-o',color=RED,lw=1.4,ms=3); q4.plot(xx,cc,'-o',color=GRAY,lw=1.0,ms=2.7); q4.set_ylim(0,1.05); q4.set_xticks([1,3,6],['early','mid','late']); q4.set_yticks([0,.5,1]); q4.tick_params(labelsize=6.2); q4.set_ylabel('Flip rate',fontsize=7.0); q4.set_xlabel('Training',fontsize=7.0); q4.spines[['top','right']].set_visible(False)
+        out.parent.mkdir(parents=True, exist_ok=True); fig.savefig(out,format='pdf',bbox_inches='tight',pad_inches=.015,facecolor='white'); plt.close(fig)
+
+
+def _copy_tables(root: Path, tables_dir: Path) -> int:
+    source = root / "paper" / "tables"
+    if not source.is_dir():
+        return 0
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    n=0
+    for src in sorted(source.glob("*.tex")):
+        shutil.copy2(src, tables_dir / src.name)
+        n+=1
+    return n
+
+
+def _build_manuscript_bundle(root: Path, main_dir: Path, supp_dir: Path, tables_dir: Path) -> dict[str,int]:
+    """Create the upload bundle while preserving each paper figure family's style."""
+    main_dir.mkdir(parents=True, exist_ok=True)
+    supp_dir.mkdir(parents=True, exist_ok=True)
+    paper = root / "paper" / "figures"
+    counts={"copied_main":0,"generated_main":0,"copied_supp":0,"generated_supp":0}
+
+    # Generate figures whose manuscript style differs from the standard pipeline
+    # output. Copy only the few paper figures already emitted in the exact same
+    # visual form by their owning reporting scripts.
+    main_jobs=[
+        (main_overview,"overview_overtopping_framework.pdf"),
+        (main_rq1,"rq1_competence_causal_reach.pdf"),
+        (main_rq2,"rq2_composition_boxplots.pdf"),
+        (main_rq4_defense,"rq4_grammar_clean_reference_defense.pdf"),
+    ]
+    for fn,name in main_jobs:
+        fn(root,main_dir/name)
+        if (main_dir/name).is_file(): counts["generated_main"]+=1
+    if _copy(paper/"04_rq3_spiking_cut"/"fig4e_population_event_and_strength.pdf", main_dir/"rq3_population_event_and_strength.pdf"):
+        counts["copied_main"]+=1
+    if _copy(paper/"05_rq4_learning"/"fig5a_pythia_checkpoint_trajectory.pdf", main_dir/"rq4_pythia_checkpoint_trajectory.pdf"):
+        counts["copied_main"]+=1
+    else:
+        raise FileNotFoundError("Expected RQ4 trajectory from results/paper/figures/05_rq4_learning/fig5a_pythia_checkpoint_trajectory.pdf")
+
+    # These two RQ1 context figures are already produced by the appendix-context
+    # script in the same layout used by the paper. Do not redraw them.
+    for src,name in [
+        (paper/"appendix_context"/"fig_phase_comparison.pdf","rq1_phase_comparison.pdf"),
+        (paper/"appendix_context"/"fig_size_comparison.pdf","rq1_model_size_comparison.pdf"),
+    ]:
+        if _copy(src,supp_dir/name): counts["copied_supp"]+=1
+
+    supp_jobs=[
+        (supp_rq2_decomp,"rq2_singleton_joint_decomposition.pdf"),
+        (supp_rq2_matched,"rq2_matched_set_specificity.pdf"),
+        (supp_candidate,"rq3_candidate_control_diagnostics.pdf"),
+        (supp_strength_matched,"rq3_strength_matched_thresholdability.pdf"),
+        (supp_tecs,"rq3_threshold_event_strength_ecdf.pdf"),
+        (supp_pairs,"rq3_strength_concentration_paired.pdf"),
+        (supp_transient,"rq3_affine_null_transient_events.pdf"),
+        (supp_preemption,"rq3_preemption_diagnostic.pdf"),
+        (supp_temporal,"rq3_temporal_duration.pdf"),
+        (supp_cross,"rq3_temporal_cross_sweep_validation.pdf"),
+    ]
+    for fn,name in supp_jobs:
+        fn(root,supp_dir/name)
+        if (supp_dir/name).is_file(): counts["generated_supp"]+=1
+
+    # These are already generated in the exact manuscript family style by the
+    # RQ3 reporting script, but with current result values.
+    for src,name in [
+        (paper/"04_rq3_spiking_cut"/"fig4s10_population_event_localization.pdf","rq3_population_event_localization.pdf"),
+        (paper/"04_rq3_spiking_cut"/"fig4s12_arithmetic_competence_concentration.pdf","rq3_arithmetic_competence_concentration.pdf"),
+    ]:
+        if _copy(src,supp_dir/name): counts["copied_supp"]+=1
+
+    counts["tables"]=_copy_tables(root,tables_dir)
+    return counts
+
+
+
 def main() -> None:
     args = parse_args()
     root = Path(args.results_root).resolve()
-    main_dir = Path(args.main_dir).resolve(); main_dir.mkdir(parents=True, exist_ok=True)
-    supp_dir = Path(args.supp_dir).resolve(); supp_dir.mkdir(parents=True, exist_ok=True)
-
-    jobs_main = [
-        (main_rq1, "rq1_competence_causal_reach.pdf"),
-        (main_rq2, "rq2_composition_boxplots.pdf"),
-        (main_rq3, "rq3_population_event_and_strength.pdf"),
-        (main_rq4_traj, "rq4_pythia_checkpoint_trajectory.pdf"),
-        (main_rq4_defense, "rq4_grammar_clean_reference_defense.pdf"),
-    ]
-    jobs_supp = [
-        (supp_rq1_phase, "rq1_phase_comparison.pdf"),
-        (supp_rq1_size, "rq1_model_size_comparison.pdf"),
-        (supp_rq2_decomp, "rq2_singleton_joint_decomposition.pdf"),
-        (supp_rq2_matched, "rq2_matched_set_specificity.pdf"),
-        (supp_candidate, "rq3_candidate_control_diagnostics.pdf"),
-        (supp_strength_matched, "rq3_strength_matched_thresholdability.pdf"),
-        (supp_tecs, "rq3_threshold_event_strength_ecdf.pdf"),
-        (supp_event, "rq3_population_event_localization.pdf"),
-        (supp_pairs, "rq3_strength_concentration_paired.pdf"),
-        (supp_arithmetic, "rq3_arithmetic_competence_concentration.pdf"),
-        (supp_transient, "rq3_affine_null_transient_events.pdf"),
-        (supp_preemption, "rq3_preemption_diagnostic.pdf"),
-        (supp_temporal, "rq3_temporal_duration.pdf"),
-        (supp_cross, "rq3_temporal_cross_sweep_validation.pdf"),
-    ]
-    for fn, name in jobs_main:
-        fn(root, main_dir / name)
-    for fn, name in jobs_supp:
-        fn(root, supp_dir / name)
-    print(f"[manuscript-figures] main={main_dir} supplement={supp_dir}")
+    bundle = root / "manuscript_exact"
+    main_dir = Path(args.main_dir).resolve() if args.main_dir else bundle / "figures" / "main"
+    supp_dir = Path(args.supp_dir).resolve() if args.supp_dir else bundle / "figures" / "supplement"
+    tables_dir = Path(args.tables_dir).resolve() if args.tables_dir else bundle / "tables"
+    counts = _build_manuscript_bundle(root, main_dir, supp_dir, tables_dir)
+    print(
+        f"[manuscript-figures] main={main_dir} supplement={supp_dir} tables={tables_dir} "
+        f"generated_main={counts['generated_main']} copied_main={counts['copied_main']} "
+        f"generated_supp={counts['generated_supp']} copied_supp={counts['copied_supp']} "
+        f"tables={counts['tables']}"
+    )
 
 
 if __name__ == "__main__":

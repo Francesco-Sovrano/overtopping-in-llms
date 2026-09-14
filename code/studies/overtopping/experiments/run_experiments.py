@@ -162,10 +162,12 @@ def mean_donor_experiments() -> list[RunSpec]:
 def large_model_experiments() -> list[RunSpec]:
     """Return the large 6.9B/7B scale runs."""
     specs = [
-        # _large("arithmetic", PYTHIA_69B, "decode-only", z_thresh=5, batch_size=256, max_circuits=5, suite="6-7b-models"),
         _large("arithmetic", QWEN2_7B, "decode-only", z_thresh=10, batch_size=256, max_circuits=5, suite="6-7b-models"),
         _large("bon_jailbreaking", QWEN2_7B, "decode-only", suite="6-7b-models"),
         _large("hans_nli", QWEN2_7B, "standard", suite="6-7b-models"),
+        # _large("arithmetic", PYTHIA_69B, "decode-only", z_thresh=5, batch_size=256, max_circuits=5, suite="6-7b-models"),
+        # _large("bon_jailbreaking", PYTHIA_69B, "decode-only", suite="6-7b-models"),
+        # _large("hans_nli", PYTHIA_69B, "standard", suite="6-7b-models"),
     ]
     specs = deduplicate(specs)
     return specs
