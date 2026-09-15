@@ -384,45 +384,139 @@ def main_rq1(root: Path, out: Path) -> None:
 
 
 def main_rq2(root: Path, out: Path) -> None:
-    d = read(root / "analysis/rq2_composition/interaction_decomposition/composition_decomposition_all_scopes.csv")
+    regime_path = root / "analysis/rq2_composition/regime_summary/rq2_settings_by_replacement_regime.csv"
+    d = read(regime_path)
+    value_col = "Delta_comp"
+    if d.empty or "scope" not in d.columns:
+        donor = read(root / "analysis/rq2_composition/interaction_decomposition/composition_decomposition_all_scopes.csv")
+        mean = read(root / "analysis/rq2_composition/interaction_decomposition_mean/composition_decomposition_all_scopes.csv")
+        frames = []
+        if not donor.empty:
+            donor = donor.copy()
+            donor["replacement_regime"] = "mean-donor"
+            frames.append(donor)
+        if not mean.empty:
+            mean = mean.copy()
+            mean["replacement_regime"] = "mean"
+            frames.append(mean)
+        if not frames:
+            return
+        d = pd.concat(frames, ignore_index=True, sort=False)
+        value_col = "Delta_comp_complete_case"
+    elif "rq2_evaluable" in d.columns:
+        d = d.loc[d["rq2_evaluable"].astype(bool)].copy()
+
+    d[value_col] = _num(d[value_col])
+    d = d[np.isfinite(d[value_col])].copy()
     if d.empty:
         return
-    d["Delta_comp_complete_case"] = _num(d["Delta_comp_complete_case"])
-    d = d[np.isfinite(d["Delta_comp_complete_case"])].copy()
-    order = ["0to1", "1to0", "overall"]
-    labels = [r"$0\rightarrow1$", r"$1\rightarrow0$", "All directions"]
-    colors = ["C0", "C1", "0.50"]
-    vals = [d.loc[d["scope"].astype(str).eq(scope), "Delta_comp_complete_case"].to_numpy(float) for scope in order]
 
-    with ref_rc(font=9, label=9, tick=9, legend=8):
-        fig, ax = plt.subplots(figsize=FIGSIZE["main_rq2"])
-        bp = ax.boxplot(vals, positions=[1, 2, 3], widths=.46, showfliers=False, patch_artist=True,
-                        medianprops={"linewidth": 1.25}, whiskerprops={"linewidth": 1.0},
-                        capprops={"linewidth": 1.0})
-        rng = np.random.default_rng(0)
-        for i, color in enumerate(colors):
-            bp["boxes"][i].set(facecolor="white", edgecolor=color, linewidth=1.05)
-            bp["medians"][i].set(color=color, linewidth=1.25)
-            for art in bp["whiskers"][2*i:2*i+2] + bp["caps"][2*i:2*i+2]:
-                art.set(color=color, linewidth=1.0)
-            v = vals[i]
-            jitter = rng.uniform(-.10, .10, size=len(v)) if len(v) else np.array([])
-            ax.scatter((i + 1) + jitter, v, s=9, color=color, alpha=.58, linewidths=0, zorder=3)
-        ax.axhline(0, linestyle="--", color="0.45", linewidth=.75)
-        ax.set_xticks([1, 2, 3], labels)
-        ax.set_xlabel("Intervention direction")
-        ax.set_ylabel("Composition gap\n$E(J)-U(J)$")
+    regimes = ["mean-donor", "mean"]
+    regime_labels = {"mean-donor": "Mean-donor", "mean": "Direct mean"}
+    regime_colors = {"mean-donor": "C0", "mean": "C1"}
+    regime_markers = {"mean-donor": "o", "mean": "s"}
+    scopes = ["0to1", "1to0", "overall"]
+    scope_labels = [r"$0\rightarrow1$", r"$1\rightarrow0$", "All directions"]
+    centers = np.array([1.0, 2.0, 3.0])
+    offsets = {"mean-donor": -0.21, "mean": 0.21}
+    width = 0.30
+
+    with ref_rc(font=10.0, label=10.2, tick=10.0, legend=9.2):
+        fig, ax = plt.subplots(figsize=(FIGSIZE["main_rq2"][0], FIGSIZE["main_rq2"][1] * 0.97))
+        legend_handles = []
+        for regime in regimes:
+            color = regime_colors[regime]
+            marker = regime_markers[regime]
+            positions, box_vals = [], []
+            for center, scope in zip(centers, scopes):
+                vals = d.loc[
+                    d["replacement_regime"].astype(str).eq(regime)
+                    & d["scope"].astype(str).eq(scope),
+                    value_col,
+                ].to_numpy(float)
+                if len(vals) == 0:
+                    continue
+                positions.append(center + offsets[regime])
+                box_vals.append(vals)
+            if not box_vals:
+                continue
+
+            bp = ax.boxplot(
+                box_vals,
+                positions=positions,
+                widths=width,
+                showfliers=False,
+                patch_artist=True,
+                medianprops={"linewidth": 1.35},
+                whiskerprops={"linewidth": 1.0},
+                capprops={"linewidth": 1.0},
+            )
+            for i, vals in enumerate(box_vals):
+                bp["boxes"][i].set(facecolor=color, alpha=.10, edgecolor=color, linewidth=1.15)
+                bp["medians"][i].set(color=color, linewidth=1.35)
+                for art in bp["whiskers"][2*i:2*i+2] + bp["caps"][2*i:2*i+2]:
+                    art.set(color=color, linewidth=1.0)
+                # Spread observations horizontally so duplicates remain visible.
+                jitter = np.linspace(-0.075, 0.075, len(vals)) if len(vals) > 1 else np.array([0.0])
+                ax.scatter(
+                    np.full(len(vals), positions[i]) + jitter,
+                    np.sort(vals),
+                    s=16,
+                    marker=marker,
+                    facecolor=color,
+                    edgecolor="white",
+                    linewidth=.35,
+                    alpha=.76,
+                    zorder=3,
+                )
+            legend_handles.append(
+                Line2D([0], [0], marker=marker, linestyle="none", markersize=7.0,
+                       markerfacecolor=color, markeredgecolor=color, markeredgewidth=.8,
+                       label=regime_labels[regime])
+            )
+
+        ax.axhline(0, linestyle="--", color="0.45", linewidth=.8, zorder=0)
+        ax.set_xticks(centers, scope_labels)
+        ax.set_xlabel("Intervention direction", labelpad=3)
+        ax.set_ylabel(r"Composition gap $E(J)-U(J)$", labelpad=4)
+        ax.set_xlim(.50, 3.50)
         ax.set_ylim(-1.05, 1.05)
         ax.grid(axis="y", alpha=.13, linewidth=.45)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-        fig.subplots_adjust(left=.15, right=.995, bottom=.25, top=.98)
+        if legend_handles:
+            ax.legend(
+                handles=legend_handles,
+                loc="lower center",
+                bbox_to_anchor=(.5, 1.005),
+                ncol=2,
+                handletextpad=.45,
+                columnspacing=1.2,
+                borderaxespad=0,
+            )
+        fig.subplots_adjust(left=.145, right=.995, bottom=.17, top=.84)
         save_exact(fig, out)
 
 
 def main_rq3(root: Path, out: Path) -> None:
-    # This is already produced by the RQ3 story script in the exact established
-    # style, so publish that canonical current-results figure unchanged.
+    graded = root / "analysis/rq3_threshold_event/spiking_diagnostics/graded_agonist"
+    temporal = root / "analysis/rq3_threshold_event/spiking_diagnostics/temporal_cutoff"
+    try:
+        from studies.overtopping.analysis.stage11_rq3_temporal_cutoff_story import (
+            _load_stage10_fig4e_inputs,
+            _plot_fig4e_event_strength_temporal,
+        )
+        event_profile, event_stats, strength, strength_stats = _load_stage10_fig4e_inputs(graded)
+        prefix_aligned = read(temporal / "temporal_cross_sweep_prefix_event_suffix_aligned.csv")
+        prefix_stats = read(temporal / "temporal_cross_sweep_prefix_event_suffix_condition_stats.csv")
+        if not event_profile.empty and not strength.empty and not prefix_aligned.empty and not prefix_stats.empty:
+            _plot_fig4e_event_strength_temporal(
+                event_profile, event_stats, strength, strength_stats,
+                prefix_aligned, prefix_stats, out,
+            )
+            return
+    except Exception:
+        pass
     src = root / "paper/figures/04_rq3_spiking_cut/fig4e_population_event_and_strength.pdf"
     _copy(src, out)
 
@@ -555,9 +649,15 @@ def main_rq4_traj(root: Path, out: Path) -> None:
 
 
 def _grammar_story(root: Path):
+    """Legacy single-seed fallback for older result trees.
+
+    Current result generation writes a cross-seed RQ4 defense figure directly.
+    Never choose the first per-seed story when more than one training seed is
+    present, because that would silently turn a replicate set into one seed.
+    """
     base = root / "analysis/rq4_learning/poisoning/per_run_visualizations/grammar"
     screens = sorted(base.rglob("clean_reference_benign_budget_screen.csv"))
-    if not screens:
+    if len(screens) != 1:
         return None, None, None
     story = screens[0].parent
     screen = read(story / "clean_reference_benign_budget_screen.csv")
@@ -567,93 +667,132 @@ def _grammar_story(root: Path):
 
 
 def main_rq4_defense(root: Path, out: Path) -> None:
-    selection, operating, budget_summary = _grammar_story(root)
-    if selection is None or selection.empty or operating.empty or budget_summary.empty:
+    cross_root = root / "analysis/rq4_learning/poisoning/cross_seed_tables"
+    checkpoint_across = read(cross_root / "clean_reference_defense_checkpoint_across_seeds.csv")
+    checkpoint_all = read(cross_root / "clean_reference_defense_checkpoint_all_seeds.csv")
+    budget_across = read(cross_root / "clean_reference_defense_budget_curve_across_seeds.csv")
+
+    if checkpoint_across.empty or checkpoint_all.empty:
+        # Fall back to the pre-rendered cross-seed figure only when the
+        # summary tables are unavailable.
+        cross_seed = root / "paper/figures/05_rq4_learning/rq4_grammar_clean_reference_defense.pdf"
+        if cross_seed.is_file():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(cross_seed, out)
         return
-    selection = selection.copy()
-    operating = operating.copy()
-    budget_summary = budget_summary.copy()
-    for frame in [selection, operating, budget_summary]:
+
+    # Keep the operating point used in the paper.
+    checkpoint_across = checkpoint_across.copy()
+    checkpoint_all = checkpoint_all.copy()
+    budget_across = budget_across.copy()
+    checkpoint_across = checkpoint_across[np.isclose(_num(checkpoint_across["operating_benign_damage_budget"]), 0.30, equal_nan=False)].copy()
+    if checkpoint_across.empty:
+        checkpoint_across = checkpoint_across[np.isclose(_num(checkpoint_across["benign_damage_budget"]), 0.30, equal_nan=False)].copy()
+    checkpoint_all = checkpoint_all[np.isclose(_num(checkpoint_all["operating_benign_damage_budget"]), 0.30, equal_nan=False)].copy()
+    if checkpoint_all.empty:
+        checkpoint_all = checkpoint_all[np.isclose(_num(checkpoint_all["benign_damage_budget"]), 0.30, equal_nan=False)].copy()
+
+    num_cols = [c for c in checkpoint_across.columns if any(k in c for k in ["fraction", "budget", "mean", "median", "q25", "q75", "sd", "ci_"])]
+    num_cols += [c for c in checkpoint_all.columns if c not in num_cols and any(k in c for k in ["fraction", "budget", "mean", "median", "q25", "q75", "sd", "ci_"]) ]
+    num_cols += [c for c in budget_across.columns if c not in num_cols and any(k in c for k in ["fraction", "budget", "mean", "median", "q25", "q75", "sd", "ci_"]) ]
+    for frame in [checkpoint_across, checkpoint_all, budget_across]:
         for c in frame.columns:
-            if c in {
-                "target_fraction", "target_attack_suppression_rate", "target_benign_damage_rate",
-                "target_defense_leverage_proxy", "benign_damage_budget", "mean_attack_suppression",
-                "mean_poisoned_disruption", "mean_defense_leverage", "n_selected",
-            }:
+            if c in num_cols:
                 frame[c] = _num(frame[c])
 
-    # Match stage07's established panel geometry and labels.
+    checkpoint_across = checkpoint_across.sort_values("target_fraction")
+    checkpoint_all = checkpoint_all.sort_values(["target_fraction", "training_seed"])
+    budget_across = budget_across.sort_values(["target_fraction", "benign_damage_budget"])
+
     with plt.rc_context({
-        "font.size": 9.6, "axes.labelsize": 10.0, "xtick.labelsize": 8.8,
-        "ytick.labelsize": 8.6, "legend.fontsize": 8.8, "axes.linewidth": .8,
-        "xtick.major.width": .8, "ytick.major.width": .8,
-        "pdf.fonttype": 42, "ps.fonttype": 42,
+        **BASE_RC,
+        "font.size": 11.0,
+        "axes.labelsize": 11.8,
+        "xtick.labelsize": 10.8,
+        "ytick.labelsize": 10.8,
+        "legend.fontsize": 10.2,
+        "axes.linewidth": 0.8,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
     }):
-        fig, (ax_line, ax_trade) = plt.subplots(1, 2, figsize=FIGSIZE["main_rq4_defense"])
-        fig.subplots_adjust(left=.075, right=.985, bottom=.20, top=.94, wspace=.28)
-        fig.text(.012, .965, "(a)", fontsize=9.0, fontweight="bold", ha="left", va="top")
-        fig.text(.515, .965, "(b)", fontsize=9.0, fontweight="bold", ha="left", va="top")
-        x = 100 * operating["target_fraction"].to_numpy(float)
-        attack = 100 * operating["mean_attack_suppression"].to_numpy(float)
-        benign = 100 * operating["mean_poisoned_disruption"].to_numpy(float)
-        leverage = 100 * operating["mean_defense_leverage"].to_numpy(float)
-        ax_line.plot(x, attack, marker="D", linewidth=2.2, label="Attack suppression")
-        ax_line.plot(x, benign, marker="o", linewidth=2.2, label="Benign damage")
-        ax_line.fill_between(x, benign, attack, where=attack >= benign, interpolate=True,
-                             color="#dcefdc", alpha=.85, linewidth=0, label=r"$\Delta_{\rm def}>0$")
-        ax_line.fill_between(x, benign, attack, where=attack < benign, interpolate=True,
-                             color="#f4dede", alpha=.85, linewidth=0)
+        fig, (ax_line, ax_trade) = plt.subplots(1, 2, figsize=(FIGSIZE["main_rq4_defense"][0], FIGSIZE["main_rq4_defense"][1] * 0.94))
+        fig.subplots_adjust(left=.075, right=.992, bottom=.16, top=.925, wspace=.28)
+        fig.text(.012, .945, "(a)", fontsize=11.4, fontweight="bold", ha="left", va="top")
+        fig.text(.515, .945, "(b)", fontsize=11.4, fontweight="bold", ha="left", va="top")
+
+        x = 100 * checkpoint_across["target_fraction"].to_numpy(float)
+        attack = 100 * checkpoint_across["mean_attack_suppression__median"].to_numpy(float)
+        attack_lo = attack - 100 * checkpoint_across["mean_attack_suppression__q25"].to_numpy(float)
+        attack_hi = 100 * checkpoint_across["mean_attack_suppression__q75"].to_numpy(float) - attack
+        benign = 100 * checkpoint_across["mean_poisoned_disruption__median"].to_numpy(float)
+        benign_lo = benign - 100 * checkpoint_across["mean_poisoned_disruption__q25"].to_numpy(float)
+        benign_hi = 100 * checkpoint_across["mean_poisoned_disruption__q75"].to_numpy(float) - benign
+        leverage = 100 * checkpoint_across["mean_defense_leverage__median"].to_numpy(float)
+
+        ax_line.fill_between(x, benign, attack, where=attack >= benign, interpolate=True, color="#dcefdc", alpha=.85, linewidth=0, label=r"$\Delta_{\rm def}>0$")
+        ax_line.fill_between(x, benign, attack, where=attack < benign, interpolate=True, color="#f4dede", alpha=.85, linewidth=0)
+        ax_line.errorbar(x, attack, yerr=np.vstack([attack_lo, attack_hi]), marker="D", markersize=8.2, linewidth=2.35, capsize=3.4, label="Attack supp.")
+        ax_line.errorbar(x, benign, yerr=np.vstack([benign_lo, benign_hi]), marker="o", markersize=8.0, linewidth=2.35, capsize=3.4, label="Benign dmg.")
         for xv, av, bv, lev in zip(x, attack, benign, leverage):
-            ax_line.annotate(f"{lev:+.0f} pp", (xv, max(av, bv)), xytext=(0, 7), textcoords="offset points",
-                             ha="center", va="bottom", fontsize=7.4)
+            ax_line.annotate(f"{lev:+.0f} pp", (xv, max(av, bv)), xytext=(0, 8), textcoords="offset points", ha="center", va="bottom", fontsize=10.0)
         ax_line.set_xticks(x)
-        ax_line.set_xlim(max(0, float(np.nanmin(x)) - 5), min(100, float(np.nanmax(x)) + 5))
-        ax_line.set_ylim(bottom=0)
-        ax_line.set_xlabel("Checkpoint (%)")
-        ax_line.set_ylabel("Intervention rate (%)")
+        ax_line.set_xlim(max(5, float(np.nanmin(x)) - 3), min(100, float(np.nanmax(x)) + 3))
+        ax_line.set_ylim(0, max(float(np.nanmax(attack + attack_hi)), float(np.nanmax(benign + benign_hi))) * 1.10)
+        ax_line.set_xlabel("Checkpoint (%)", labelpad=3)
+        ax_line.set_ylabel("Rate (%)", labelpad=4)
         ax_line.grid(True, alpha=.18)
-        ax_line.legend(frameon=False, fontsize=7.6, loc="upper left")
+        ax_line.text(.985, .96, r"$\tau=30\%$", transform=ax_line.transAxes, ha="right", va="top", fontsize=10.0)
 
-        inset = ax_line.inset_axes([.54, .08, .43, .37])
-        checkpoints = sorted(_num(budget_summary["target_fraction"]).dropna().unique())
-        markers = ["o", "s", "^", "D", "P", "X"]
-        for idx, frac in enumerate(checkpoints):
-            cp = budget_summary[np.isclose(budget_summary["target_fraction"].to_numpy(float), float(frac), equal_nan=False)].sort_values("benign_damage_budget")
-            y = 100 * cp["mean_defense_leverage"].to_numpy(float)
-            n = _num(cp["n_selected"]).fillna(0).to_numpy(int)
-            y[n <= 0] = np.nan
-            inset.plot(100 * cp["benign_damage_budget"].to_numpy(float), y,
-                       marker=markers[idx % len(markers)], linewidth=1.0, markersize=2.2)
-        inset.axhline(0, color="0.45", linestyle="--", linewidth=.7)
-        inset.axvline(30, color="0.50", linestyle=":", linewidth=.8)
-        inset.set_xlabel(r"$\tau$ (%)", fontsize=6.5, labelpad=1)
-        inset.set_ylabel(r"$\Delta_{\rm def}$ (pp)", fontsize=6.5, labelpad=1)
-        inset.tick_params(axis="both", labelsize=6.0, pad=1)
-        inset.grid(True, alpha=.12)
+        if not budget_across.empty:
+            inset = ax_line.inset_axes([.56, .08, .40, .34])
+            checkpoints = sorted(budget_across["target_fraction"].dropna().unique())
+            markers = ["o", "s", "^", "D", "P", "X"]
+            for idx, frac in enumerate(checkpoints):
+                cp = budget_across[np.isclose(budget_across["target_fraction"].to_numpy(float), float(frac), equal_nan=False)].sort_values("benign_damage_budget")
+                y = 100 * cp["mean_defense_leverage__median"].to_numpy(float)
+                q25 = 100 * cp["mean_defense_leverage__q25"].to_numpy(float)
+                q75 = 100 * cp["mean_defense_leverage__q75"].to_numpy(float)
+                n = _num(cp.get("mean_defense_leverage__n_seeds", pd.Series(index=cp.index, dtype=float))).fillna(0).to_numpy(int)
+                y[n <= 0] = np.nan
+                inset.plot(100 * cp["benign_damage_budget"].to_numpy(float), y, marker=markers[idx % len(markers)], linewidth=1.15, markersize=3.4)
+                inset.fill_between(100 * cp["benign_damage_budget"].to_numpy(float), q25, q75, alpha=.08)
+            inset.axhline(0, color="0.45", linestyle="--", linewidth=.7)
+            inset.set_xlabel(r"$\tau$ (%)", fontsize=8.0, labelpad=1)
+            inset.set_ylabel(r"$\Delta_{\rm def}$ (pp)", fontsize=8.0, labelpad=1)
+            inset.tick_params(axis="both", labelsize=7.4, pad=1)
+            inset.grid(True, alpha=.12)
 
-        single = selection[np.isclose(selection["benign_damage_budget"].to_numpy(float), .30, equal_nan=False)].copy()
-        single = single.dropna(subset=["target_fraction", "unit_key", "target_attack_suppression_rate", "target_benign_damage_rate"])
-        single = single.drop_duplicates(subset=["target_fraction", "unit_key"], keep="last")
-        xvals = 100 * single["target_benign_damage_rate"].to_numpy(float)
-        yvals = 100 * single["target_attack_suppression_rate"].to_numpy(float)
-        lim = max(70., min(100., float(np.nanmax(np.r_[xvals, yvals])) * 1.10))
+        single = checkpoint_all.dropna(subset=["target_fraction", "training_seed", "mean_attack_suppression", "mean_poisoned_disruption"]).copy()
+        xvals = 100 * single["mean_poisoned_disruption"].to_numpy(float)
+        yvals = 100 * single["mean_attack_suppression"].to_numpy(float)
+        lim = max(70.0, min(82.0, float(np.nanmax(np.r_[xvals, yvals])) * 1.12))
         trade_x = np.linspace(0, lim, 400)
         ax_trade.fill_between(trade_x, trade_x, lim, color="#dcefdc", alpha=.85, linewidth=0, zorder=0)
         ax_trade.fill_between(trade_x, 0, trade_x, color="#f4dede", alpha=.85, linewidth=0, zorder=0)
         ax_trade.plot([0, lim], [0, lim], "--", color="0.42", linewidth=1.0, zorder=1)
-        ax_trade.axvline(30, color="0.50", linestyle=":", linewidth=1.1)
-        ax_trade.text(.025*lim, .93*lim, "attack-selective", fontsize=8.0, fontweight="bold", color="0.18")
-        ax_trade.text(.72*lim, .08*lim, "benign-costly", fontsize=8.0, fontweight="bold", color="0.18")
+        ax_trade.axvline(30, color="0.50", linestyle=":", linewidth=1.0)
+        ax_trade.text(.03*lim, .93*lim, "attack-selective", fontsize=11.0, fontweight="bold", color="0.18")
+        ax_trade.text(.67*lim, .08*lim, "benign-costly", fontsize=11.0, fontweight="bold", color="0.18")
+
+        markers = ["o", "s", "^", "D", "P", "X"]
         for idx, frac in enumerate(sorted(single["target_fraction"].astype(float).unique())):
-            cp = single[np.isclose(single["target_fraction"].to_numpy(float), frac, equal_nan=False)]
-            ax_trade.scatter(100*cp["target_benign_damage_rate"], 100*cp["target_attack_suppression_rate"],
-                             s=52, marker=markers[idx % len(markers)], zorder=3,
-                             label=f"{int(round(100*frac))}% checkpoint")
-        ax_trade.set_xlim(0, lim); ax_trade.set_ylim(0, lim)
-        ax_trade.set_xlabel("Single-channel benign damage (%)")
-        ax_trade.set_ylabel("Single-channel attack suppression (%)")
+            cp_seed = single[np.isclose(single["target_fraction"].to_numpy(float), frac, equal_nan=False)]
+            ax_trade.scatter(100*cp_seed["mean_poisoned_disruption"], 100*cp_seed["mean_attack_suppression"], s=64, marker=markers[idx % len(markers)], alpha=.35, linewidths=0, zorder=2)
+            cp_med = checkpoint_across[np.isclose(checkpoint_across["target_fraction"].to_numpy(float), frac, equal_nan=False)]
+            if not cp_med.empty:
+                row = cp_med.iloc[0]
+                mx = 100 * float(row["mean_poisoned_disruption__median"])
+                my = 100 * float(row["mean_attack_suppression__median"])
+                xerr = np.array([[mx - 100*float(row["mean_poisoned_disruption__q25"])], [100*float(row["mean_poisoned_disruption__q75"]) - mx]])
+                yerr = np.array([[my - 100*float(row["mean_attack_suppression__q25"])], [100*float(row["mean_attack_suppression__q75"]) - my]])
+                ax_trade.errorbar(mx, my, xerr=xerr, yerr=yerr, fmt=markers[idx % len(markers)], markersize=7.8, elinewidth=1.45, capsize=3.2, color=f"C{idx}", mec='black', mew=.3, label=f"{int(round(100*frac))}% checkpoint", zorder=3)
+
+        ax_trade.set_xlim(0, lim)
+        ax_trade.set_ylim(0, lim)
+        ax_trade.set_xlabel("Seed-level benign damage (%)", labelpad=3)
+        ax_trade.set_ylabel("Seed-level attack suppression (%)", labelpad=4)
         ax_trade.grid(True, alpha=.18)
-        ax_trade.legend(frameon=False, fontsize=6.8, loc="upper right")
+        ax_trade.legend(loc="upper right", handletextpad=.5, borderaxespad=.2)
         save_exact(fig, out)
 
 

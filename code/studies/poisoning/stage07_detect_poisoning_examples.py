@@ -76,6 +76,18 @@ SCORING_SCHEMA_VERSION = 8
 STAGE07_RESUME_CONFIG_VERSION = 1
 DEFAULT_REQUIRED_TAU = 0.3
 
+# Cross-seed clean-null inputs may become available only after an earlier seed
+# has already partially or fully completed Stage 07. Changing that dependency
+# list does not invalidate the expensive primary-run candidate materializations;
+# downstream interval artifacts are validated separately before reuse.
+_STAGE07_RESTART_SAFE_IDENTITY_FIELDS = frozenset({"clean_null_run_dirs"})
+_WANDA_SELECTION_SIGNATURE_COLUMNS = (
+    "unit_key",
+    "layer_label",
+    "neuron_id",
+    "disruption_score",
+)
+
 _LORA_FACTOR_RE = re.compile(
     r"(?:^|\.)layers\.(?P<layer>\d+)\.(?P<module>mlp\.down_proj|self_attn\.v_proj)"
     r"\.lora_(?P<factor>[AB])(?:\.[^.]+)?\.weight$"
@@ -134,20 +146,32 @@ def _stage07_resume_payload(
     }
 
 
-def _validate_resume_payload(path: Path, expected: Mapping[str, Any]) -> None:
+def _validate_resume_payload(
+    path: Path,
+    expected: Mapping[str, Any],
+    *,
+    allow_restart_safe_changes: bool = False,
+) -> list[str]:
     existing = json.loads(path.read_text(encoding="utf-8"))
     if int(existing.get("schema_version", -1)) != STAGE07_RESUME_CONFIG_VERSION:
         raise RuntimeError(f"Unsupported Stage-07 resume configuration schema in {path}")
-    if existing.get("result_identity") != expected.get("result_identity"):
-        old = existing.get("result_identity", {})
-        new = expected.get("result_identity", {})
-        keys = sorted(set(old) | set(new))
-        mismatch = [key for key in keys if old.get(key) != new.get(key)]
+    old = existing.get("result_identity", {})
+    new = expected.get("result_identity", {})
+    keys = sorted(set(old) | set(new))
+    mismatch = [key for key in keys if old.get(key) != new.get(key)]
+    if mismatch:
+        incompatible = [
+            key for key in mismatch
+            if not (allow_restart_safe_changes and key in _STAGE07_RESTART_SAFE_IDENTITY_FIELDS)
+        ]
+        if not incompatible:
+            return mismatch
         detail = ", ".join(f"{key}: {old.get(key)!r} != {new.get(key)!r}" for key in mismatch[:8])
         raise RuntimeError(
             f"Stage-07 output exists but was produced with incompatible result-defining settings: {detail}. "
             "Use a fresh output namespace for a scientifically different run."
         )
+    return []
 
 
 def _initialize_stage07_resume_configuration(
@@ -163,8 +187,23 @@ def _initialize_stage07_resume_configuration(
     because their provenance must not be guessed.
     """
     if resume_config_path.is_file():
-        _validate_resume_payload(resume_config_path, resume_payload)
-        print(f"[Resume] Reusing compatible Stage-07 artifacts under {output_dir}", flush=True)
+        changed = _validate_resume_payload(
+            resume_config_path,
+            resume_payload,
+            allow_restart_safe_changes=True,
+        )
+        if changed:
+            # The old summary is a completion marker for the prior clean-null
+            # dependency set. Keep reusable caches, but mark the run incomplete
+            # until all affected downstream outputs have been refreshed.
+            (output_dir / "detection_summary.json").unlink(missing_ok=True)
+            print(
+                f"[Resume] Restart-safe Stage-07 settings changed ({', '.join(changed)}); "
+                "reusing validated primary artifacts and refreshing affected downstream outputs.",
+                flush=True,
+            )
+        else:
+            print(f"[Resume] Reusing compatible Stage-07 artifacts under {output_dir}", flush=True)
         return
 
     # _atomic_write_json can leave only its temporary file if the process is
@@ -172,9 +211,21 @@ def _initialize_stage07_resume_configuration(
     # of treating the directory as legacy output.
     tmp_path = resume_config_path.with_suffix(resume_config_path.suffix + ".tmp")
     if tmp_path.is_file():
-        _validate_resume_payload(tmp_path, resume_payload)
+        changed = _validate_resume_payload(
+            tmp_path,
+            resume_payload,
+            allow_restart_safe_changes=True,
+        )
         tmp_path.replace(resume_config_path)
-        print(f"[Resume] Recovered interrupted Stage-07 resume identity under {output_dir}", flush=True)
+        if changed:
+            (output_dir / "detection_summary.json").unlink(missing_ok=True)
+            print(
+                f"[Resume] Recovered Stage-07 identity with restart-safe setting changes "
+                f"({', '.join(changed)}) under {output_dir}",
+                flush=True,
+            )
+        else:
+            print(f"[Resume] Recovered interrupted Stage-07 resume identity under {output_dir}", flush=True)
         return
 
     existing_entries = list(output_dir.iterdir()) if output_dir.exists() else []
@@ -219,6 +270,40 @@ def _resume_frames_equal(existing: pd.DataFrame, current: pd.DataFrame) -> bool:
     except AssertionError:
         return False
     return True
+
+
+def _wanda_selection_signature_equal(existing: pd.DataFrame, current: pd.DataFrame) -> bool:
+    """Return whether two selections imply the same WANDA exposure scores.
+
+    Clean-null annotation columns can change as additional independent null
+    trajectories become available. Those annotations do not enter WANDA. The
+    score depends on selected channel identity and ``disruption_score`` weights,
+    so only that compact signature is relevant for cache reuse.
+    """
+    columns = list(_WANDA_SELECTION_SIGNATURE_COLUMNS)
+    if any(column not in existing.columns or column not in current.columns for column in columns):
+        return False
+    return _resume_frames_equal(existing[columns], current[columns])
+
+
+def _discard_interval_wanda_cache(interval_dir: Path, *, reason: str) -> None:
+    """Discard only interval artifacts downstream of the WANDA selection."""
+    removed: list[str] = []
+    for name in (
+        "training_example_scores.csv",
+        "mapped_disruptive_channels.csv",
+        "top_suspected_training_examples.csv",
+        "interval_metrics.json",
+    ):
+        path = interval_dir / name
+        if path.exists():
+            path.unlink()
+            removed.append(name)
+    detail = f"; removed {', '.join(removed)}" if removed else ""
+    print(
+        f"[Resume] {interval_dir.name}: {reason}; recomputing interval WANDA scores{detail}",
+        flush=True,
+    )
 
 
 def _fraction_key(value: float) -> int:
@@ -1182,6 +1267,7 @@ def _endpoint_view_complete(
     endpoint: str,
     eval_intervention: str,
     phase: str,
+    expected_cohort_ids: Sequence[tuple[str, str]] | None = None,
 ) -> bool:
     if not _materialization_complete(
         path,
@@ -1193,9 +1279,32 @@ def _endpoint_view_complete(
         return False
     try:
         scope = json.loads((path / "evaluation_scope.json").read_text(encoding="utf-8"))
-        return scope.get("evaluation_endpoint") == endpoint and scope.get("reported_directional_rate") == "c2i_rate_conditional"
+        if not (
+            scope.get("evaluation_endpoint") == endpoint
+            and scope.get("reported_directional_rate") == "c2i_rate_conditional"
+        ):
+            return False
+        if expected_cohort_ids is not None:
+            observed = _evaluation_cohort_ids(path)
+            if not _same_evaluation_cohort(expected_cohort_ids, observed):
+                return False
+        return True
     except Exception:
         return False
+
+
+def _endpoint_view_has_wrong_cohort(
+    path: Path, expected_cohort_ids: Sequence[tuple[str, str]]
+) -> bool:
+    """Return True only when an existing endpoint cache proves it used another cohort."""
+    scores = path / "scores.csv"
+    if not scores.is_file():
+        return False
+    try:
+        observed = _evaluation_cohort_ids(path)
+    except Exception:
+        return False
+    return not _same_evaluation_cohort(expected_cohort_ids, observed)
 
 
 def _ensure_paired_u_j_materialization(
@@ -1238,13 +1347,36 @@ def _ensure_paired_u_j_materialization(
     control_ok = _endpoint_view_complete(
         control_view, union_units, endpoint="control",
         eval_intervention=eval_intervention, phase=phase,
+        expected_cohort_ids=reference_test_ids,
     )
     attack_ok = (not attack_reportable) or _endpoint_view_complete(
         attack_view, union_units, endpoint="attack",
         eval_intervention=eval_intervention, phase=phase,
+        expected_cohort_ids=reference_test_ids,
     )
     if control_ok and attack_ok:
         return {"control": control_view, "attack": attack_view if attack_reportable else None}
+
+    # The singleton evaluator has its own row-position caches. If an endpoint
+    # view proves that this state was previously evaluated on a different frozen
+    # cohort, those caches cannot be replayed safely even when row counts match.
+    # Never delete them automatically: fail with the exact paths that require
+    # manual cleanup. Stage-03 feature reports/checkpoints are not among them.
+    wrong_cohort = _endpoint_view_has_wrong_cohort(control_view, reference_test_ids)
+    if attack_reportable:
+        wrong_cohort = wrong_cohort or _endpoint_view_has_wrong_cohort(
+            attack_view, reference_test_ids
+        )
+    if wrong_cohort:
+        stale_paths = [generic_rules, control_view]
+        if attack_view.exists():
+            stale_paths.append(attack_view)
+        detail = "\n  - " + "\n  - ".join(str(path) for path in stale_paths)
+        raise RuntimeError(
+            f"Cached paired-U(j) cohort differs from the frozen run-local cohort at "
+            f"{checkpoint_progress_label(row)}. Stage 07 will not delete data automatically. "
+            f"Remove these Stage-07 cache paths manually, then rerun:{detail}"
+        )
 
     checkpoint_dir = resolve_manifest_checkpoint_dir(run_dir, row, must_exist=True)
     cmd = [
@@ -1299,11 +1431,13 @@ def _ensure_paired_u_j_materialization(
     if not _endpoint_view_complete(
         control_view, union_units, endpoint="control",
         eval_intervention=eval_intervention, phase=phase,
+        expected_cohort_ids=reference_test_ids,
     ):
         raise RuntimeError(f"Paired control endpoint materialization is incomplete: {control_view}")
     if attack_reportable and not _endpoint_view_complete(
         attack_view, union_units, endpoint="attack",
         eval_intervention=eval_intervention, phase=phase,
+        expected_cohort_ids=reference_test_ids,
     ):
         raise RuntimeError(f"Paired attack endpoint materialization is incomplete: {attack_view}")
     return {"control": control_view, "attack": attack_view if attack_reportable else None}
@@ -2721,11 +2855,48 @@ def main() -> None:
         null_clean = null_manifests["clean"]
         if set(shared_fracs) - set(null_clean):
             raise ValueError(f"Clean-null run lacks required checkpoint fractions: {null_run}")
+
+        # A clean-null seed is an independent training realization.  For tasks
+        # such as grammar, source_row_id/eval_example_id are assigned only after
+        # seed-dependent dataset splitting/shuffling, so those identifiers are
+        # intentionally *run-local* and cannot be matched to the primary seed.
+        # The null statistic below needs each seed's within-seed delta U(j), not
+        # row-wise pairing between independent seeds.  Freeze the null run's own
+        # held-out cohort once and use it at every null checkpoint.  This also
+        # preserves the crucial guarantee that null-test rows were not trained on
+        # in that null realization.
+        null_reference_row = null_clean[reference_key]
+        null_reference_feature_report = (
+            _backdoor_output_dir(null_run, null_reference_row, phase, args.eval_intervention)
+            / "feature_report"
+        )
+        null_reference_test_ids = _feature_report_test_cohort_ids(null_reference_feature_report)
+        if not null_reference_test_ids:
+            raise RuntimeError(
+                f"Clean-null backdoor feature report has an empty held-out cohort: "
+                f"{null_reference_feature_report}"
+            )
+        print(
+            f"[clean-null] seed={int(null_cfg.get('seed', -1))} frozen run-local paired "
+            f"evaluation cohort: n={len(null_reference_test_ids)} from {null_reference_feature_report}",
+            flush=True,
+        )
+
+        # Verify up front that every checkpoint in this null trajectory contains
+        # that run-local frozen cohort.  This is a within-run consistency check;
+        # no cross-seed identity equality is required or scientifically useful.
+        for key in shared_fracs:
+            null_row = null_clean[key]
+            null_scores_path = (
+                _backdoor_output_dir(null_run, null_row, phase, args.eval_intervention)
+                / "feature_report" / "scores.csv"
+            )
+            null_frame = pd.read_csv(null_scores_path, low_memory=False)
+            _apply_reference_test_membership(
+                null_frame, null_reference_test_ids, source=null_scores_path
+            )
+
         null_map: dict[int, Path] = {}
-        # Clean-null seeds may have been generated historically with different
-        # Stage-03 is_test assignments.  Do not force a costly Stage-03 rerun:
-        # Stage 07 realigns every null run to the primary run's immutable
-        # (example ID, gold) reference cohort before evaluating any candidate.
         null_root = output_dir / "clean_null_paired_u_j_materialization" / f"seed_{int(null_cfg.get('seed', -1))}__{null_run.name}"
         for key in shared_fracs:
             primary_row = manifests["clean"][key]
@@ -2745,20 +2916,18 @@ def main() -> None:
                 candidate_union_csv=candidate_union_path,
                 output_root=null_root,
                 run_config=null_cfg,
-                reference_test_ids=reference_test_ids,
+                reference_test_ids=null_reference_test_ids,
                 u_j_batch_size=int(args.u_j_batch_size),
                 u_j_neuron_batch_size=int(args.u_j_neuron_batch_size),
                 include_attack=False,
             )
             null_map[key] = Path(null_result["control"])
-            primary_ids = _evaluation_cohort_ids(materialized[("clean", key)])
             null_ids = _evaluation_cohort_ids(null_map[key])
-            if not _same_evaluation_cohort(null_ids, primary_ids):
+            if not _same_evaluation_cohort(null_ids, null_reference_test_ids):
                 raise ValueError(
-                    "Clean-null fixed-cohort membership mismatch after Stage-07 realignment at "
+                    "Clean-null fixed-cohort membership changed within the null trajectory at "
                     f"fraction={key/1000.0:g}: {null_run}; "
-                    + _cohort_mismatch_summary(primary_ids, null_ids)
-                    + ". The null run's source population is incompatible with the primary run."
+                    + _cohort_mismatch_summary(null_reference_test_ids, null_ids)
                 )
         clean_null_materialized.append((null_run, null_map, null_cfg))
 
@@ -2833,15 +3002,17 @@ def main() -> None:
         score_path = interval_dir / "training_example_scores.csv"
         if score_path.is_file():
             if not selected_path.is_file():
-                raise RuntimeError(
-                    f"Cannot safely resume {interval_name}: {score_path.name} exists but {selected_path.name} is missing."
+                _require_manual_interval_wanda_cleanup(
+                    interval_dir,
+                    reason=f"{score_path.name} exists but {selected_path.name} is missing",
                 )
-            prior_selected = pd.read_csv(selected_path)
-            if not _resume_frames_equal(prior_selected, selected):
-                raise RuntimeError(
-                    f"Cannot safely reuse existing WANDA scores for {interval_name}: the selected disruptive-channel "
-                    "table differs from the current computation. Use a fresh output namespace for changed settings."
-                )
+            else:
+                prior_selected = pd.read_csv(selected_path)
+                if not _wanda_selection_signature_equal(prior_selected, selected):
+                    _require_manual_interval_wanda_cleanup(
+                        interval_dir,
+                        reason="selected disruptive channels or WANDA disruption weights changed",
+                    )
         selected.to_csv(selected_path, index=False)
         all_selected_frames.append(selected.assign(interval=interval_name))
 

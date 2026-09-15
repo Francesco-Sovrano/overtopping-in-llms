@@ -391,7 +391,6 @@ def publish_per_run_poisoning_visuals(
     regenerated = 0
     skipped = 0
     manifest_rows: list[dict[str, str]] = []
-    main_text_defense_candidates: list[Path] = []
 
     def copy_family(
         *,
@@ -472,14 +471,6 @@ def publish_per_run_poisoning_visuals(
                         flush=True,
                     )
                     skipped += 1
-                else:
-                    # Figure 6 is drawn by the Stage-07 story script itself.
-                    # Record the eligible Grammar main-text source here so the
-                    # reporting step promotes the generated PDF, rather than a
-                    # manually edited copy, into the manuscript figure set.
-                    figure6 = story_dir / "03b_clean_reference_defense_interpretation.pdf"
-                    if task == "grammar" and phase_dir == "prompt_and_generation" and figure6.is_file():
-                        main_text_defense_candidates.append(figure6)
             else:
                 skipped += 1
 
@@ -606,30 +597,6 @@ def publish_per_run_poisoning_visuals(
                 "Machine-readable source artifacts remain under the corresponding `data/poisoning/...` run.\n",
                 encoding="utf-8",
             )
-
-    # Promote the generated clean-reference defense plot to the stable main-text
-    # Figure 6 filename.  There must be exactly one eligible fully materialized
-    # Grammar story; ambiguity is treated as a publication error rather than
-    # silently choosing a run.
-    if len(main_text_defense_candidates) == 1:
-        src = main_text_defense_candidates[0]
-        dst = rq4_figures(results_root) / "rq4_grammar_clean_reference_defense.pdf"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        manifest_rows.append({
-            "task": "grammar",
-            "run": "main_text_fixed_coordinate",
-            "phase": "prompt_and_generation",
-            "family": "main_text_clean_reference_defense",
-            "source": str(src),
-            "published": str(dst),
-        })
-        copied += 1
-    elif len(main_text_defense_candidates) > 1:
-        raise RuntimeError(
-            "Multiple eligible Grammar clean-reference defense figures were generated; "
-            "refusing to choose a main-text Figure 6 implicitly."
-        )
 
     manifest_path = analysis_dir / "published_poisoning_visualizations.csv"
     pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
@@ -1196,17 +1163,9 @@ def main() -> None:
     poisoning_aggregate = poisoning_aggregate_tables(results_root)
     poisoning_runs = poisoning_run_dirs(poisoning_root)
     if not args.skip_poisoning_report and poisoning_runs:
-        poisoning_aggregate.mkdir(parents=True, exist_ok=True)
-        run([
-            sys.executable, "-m", "studies.poisoning.stage08_aggregate_cross_seed",
-            "--run_dirs", ",".join(str(path) for path in poisoning_runs),
-            "--output_dir", str(poisoning_aggregate),
-        ])
-        run([
-            sys.executable, "-m", "studies.poisoning.stage08_plot_cross_seed",
-            "--input_dir", str(poisoning_aggregate),
-            "--output_dir", str(poisoning_paper_figures),
-        ])
+        # Materialize the Stage-07 per-run stories first. The clean-reference
+        # defense is defined there, so cross-seed reporting must summarize the
+        # resulting seed-level checkpoint tables rather than select one seed.
         per_run_publish = publish_per_run_poisoning_visuals(
             poisoning_runs, results_root=results_root
         )
@@ -1215,6 +1174,33 @@ def main() -> None:
             + json.dumps(per_run_publish, sort_keys=True),
             flush=True,
         )
+
+        poisoning_aggregate.mkdir(parents=True, exist_ok=True)
+        per_run_story_root = poisoning_results(results_root) / "per_run_visualizations"
+        run([
+            sys.executable, "-m", "studies.poisoning.stage08_aggregate_cross_seed",
+            "--run_dirs", ",".join(str(path) for path in poisoning_runs),
+            "--output_dir", str(poisoning_aggregate),
+            "--story_root", str(per_run_story_root),
+        ])
+        run([
+            sys.executable, "-m", "studies.poisoning.stage08_plot_cross_seed",
+            "--input_dir", str(poisoning_aggregate),
+            "--output_dir", str(poisoning_paper_figures),
+            "--summary_style", "median_iqr",
+        ])
+
+        # The stable RQ4 clean-reference-defense figure is now the cross-seed
+        # rendering. Multiple seeds are replicates, not competing candidates.
+        # Distinct scientific configurations remain split by Stage 08 and are
+        # recorded in scientific_family_manifest.csv.
+        defense_src = poisoning_paper_figures / "poisoning_clean_reference_defense.pdf"
+        defense_dst = rq4_figures(results_root) / "rq4_grammar_clean_reference_defense.pdf"
+        if defense_src.is_file():
+            defense_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(defense_src, defense_dst)
+        else:
+            defense_dst.unlink(missing_ok=True)
 
     spiking_out = overtopping_spiking_diagnostics(results_root)
     spiking_out.mkdir(parents=True, exist_ok=True)

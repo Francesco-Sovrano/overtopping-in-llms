@@ -90,6 +90,17 @@ DETECTION_METRICS = (
     "selected_channel_mean_poisoning_excess_conditional_c2i_change",
 )
 
+DEFENSE_IDENTITY_COLUMNS = ("operating_benign_damage_budget",)
+
+DEFENSE_METRICS = (
+    "n_selected",
+    "mean_clean_disruption",
+    "mean_poisoned_disruption",
+    "mean_poison_excess",
+    "mean_attack_suppression",
+    "mean_defense_leverage",
+)
+
 EXPERIMENT_ID_COLUMNS = [
     "task",
     "model_name",
@@ -106,7 +117,16 @@ EXPERIMENT_ID_COLUMNS = [
 CONFIG_ID_COLUMNS = [f"config__{name}" for name in SCIENTIFIC_TRAINING_CONFIG_FIELDS]
 EXPERIMENT_ID_COLUMNS.extend(CONFIG_ID_COLUMNS)
 
-
+# Detection settings are part of the detector-family identity.  They are kept
+# separate from the training experiment identity because a single training run
+# may legitimately be re-analysed with multiple detector configurations.
+DETECTOR_IDENTITY_COLUMNS = [
+    "scoring_schema_version", "control_correctness_agonist_tau", "eval_intervention",
+    "detector_max_channels", "detector_min_abs_delta_u", "detector_min_clean_null_z",
+    "detector_bootstrap_draws", "detector_bootstrap_confidence_level", "detector_multiplicity_method",
+    "detector_max_exposures_per_interval", "detector_sample_seed", "detector_matched_control_draws",
+    "n_clean_null_trajectories", "u_j_definition",
+]
 
 
 def _poison_plan_metadata(run_dir: Path) -> dict[str, Any]:
@@ -167,6 +187,29 @@ def _csv_list(value: str) -> List[str]:
 def _task_and_phase(run_dir: Path) -> tuple[str, str]:
     definition = infer_task_from_run(run_dir)
     return definition.name, definition.default_phase
+
+
+def _run_metadata(run_dir: Path) -> dict[str, Any]:
+    """Return seed and scientific identity metadata shared by cross-seed tables."""
+    task, _ = _task_and_phase(run_dir)
+    config = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
+    return {
+        "run_dir": str(run_dir.resolve()),
+        "task": task,
+        "model_name": str(config.get("model_name", "unknown")),
+        "training_seed": int(config.get("seed", -1)),
+        "model_revision": config.get("model_revision"),
+        "control_marker": config.get("control_marker"),
+        "trigger_marker": config.get("trigger_marker"),
+        "sham_marker": config.get("sham_marker"),
+        "sham_max_rows": config.get("sham_max_rows"),
+        "poison_rate": config.get("poison_rate"),
+        "poison_rate_basis": config.get("poison_rate_basis"),
+        "poisoning_training_schema_version": config.get("poisoning_training_schema_version"),
+        "attacker_target": config.get("target_label", config.get("target_answer")),
+        **_poison_plan_metadata(run_dir),
+        **_explicit_config_metadata(config),
+    }
 
 
 
@@ -246,7 +289,6 @@ def _merge_stage07_paired_metrics(run_dir: Path, phase: str, frame: pd.DataFrame
 
 def load_trajectory(run_dir: Path) -> pd.DataFrame:
     task, phase = _task_and_phase(run_dir)
-    config = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
     path = trajectories_dir(run_dir) / phase_dirname(phase) / "backdoor_lift_overtopping_trajectory.csv"
     if not path.exists():
         raise FileNotFoundError(f"Missing trajectory: {path}")
@@ -273,24 +315,7 @@ def load_trajectory(run_dir: Path) -> pd.DataFrame:
         frame["conditional_conversion_n"] = conditional_n
         frame["conditional_conversion_success"] = lift
         frame["conditional_conversion_rate"] = lift / conditional_n.where(conditional_n > 0)
-    metadata = {
-        "run_dir": str(run_dir.resolve()),
-        "task": task,
-        "model_name": str(config.get("model_name", "unknown")),
-        "training_seed": int(config.get("seed", -1)),
-        "model_revision": config.get("model_revision"),
-        "control_marker": config.get("control_marker"),
-        "trigger_marker": config.get("trigger_marker"),
-        "sham_marker": config.get("sham_marker"),
-        "sham_max_rows": config.get("sham_max_rows"),
-        "poison_rate": config.get("poison_rate"),
-        "poison_rate_basis": config.get("poison_rate_basis"),
-        "poisoning_training_schema_version": config.get("poisoning_training_schema_version"),
-        "attacker_target": config.get("target_label", config.get("target_answer")),
-        **_poison_plan_metadata(run_dir),
-        **_explicit_config_metadata(config),
-    }
-    return _attach_metadata(frame, metadata)
+    return _attach_metadata(frame, _run_metadata(run_dir))
 
 
 def t_interval(values: Iterable[float], level: float) -> tuple[float, float]:
@@ -448,38 +473,14 @@ def load_detection_metrics(run_dir: Path) -> pd.DataFrame:
         return pd.DataFrame()
     if frame.empty:
         return frame
-    config = json.loads(metadata_path(run_dir, "run_config.json").read_text(encoding="utf-8"))
-    metadata = {
-        "run_dir": str(run_dir.resolve()),
-        "task": task,
-        "model_name": str(config.get("model_name", "unknown")),
-        "training_seed": int(config.get("seed", -1)),
-        "model_revision": config.get("model_revision"),
-        "control_marker": config.get("control_marker"),
-        "trigger_marker": config.get("trigger_marker"),
-        "sham_marker": config.get("sham_marker"),
-        "sham_max_rows": config.get("sham_max_rows"),
-        "poison_rate": config.get("poison_rate"),
-        "poison_rate_basis": config.get("poison_rate_basis"),
-        "poisoning_training_schema_version": config.get("poisoning_training_schema_version"),
-        "attacker_target": config.get("target_label", config.get("target_answer")),
-        **_poison_plan_metadata(run_dir),
-        **_explicit_config_metadata(config),
-    }
-    return _attach_metadata(frame, metadata)
+    return _attach_metadata(frame, _run_metadata(run_dir))
 
 
 def aggregate_detection_seed_units(raw: pd.DataFrame, *, level: float, min_seeds: int) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame()
     raw = _ensure_identity_columns(raw)
-    detector_identity_cols = [
-        "scoring_schema_version", "control_correctness_agonist_tau", "eval_intervention",
-        "detector_max_channels", "detector_min_abs_delta_u", "detector_min_clean_null_z",
-        "detector_bootstrap_draws", "detector_bootstrap_confidence_level", "detector_multiplicity_method",
-        "detector_max_exposures_per_interval", "detector_sample_seed", "detector_matched_control_draws",
-        "n_clean_null_trajectories", "u_j_definition",
-    ]
+    detector_identity_cols = DETECTOR_IDENTITY_COLUMNS
     for column in detector_identity_cols:
         if column not in raw.columns:
             raw[column] = None
@@ -510,16 +511,129 @@ def aggregate_detection_seed_units(raw: pd.DataFrame, *, level: float, min_seeds
             rec[f"{metric}__developmental_claim_ready"] = bool(len(values) >= int(min_seeds))
             rec[f"{metric}__small_seed_count_caution"] = bool(len(values) < 5)
             rec[f"{metric}__mean"] = float(values.mean()) if len(values) else math.nan
+            rec[f"{metric}__median"] = float(np.median(values)) if len(values) else math.nan
+            rec[f"{metric}__q25"] = float(np.quantile(values, 0.25)) if len(values) else math.nan
+            rec[f"{metric}__q75"] = float(np.quantile(values, 0.75)) if len(values) else math.nan
             rec[f"{metric}__sd"] = float(values.std(ddof=1)) if len(values) >= 2 else math.nan
             rec[f"{metric}__ci_low"] = lo
             rec[f"{metric}__ci_high"] = hi
         records.append(rec)
     return pd.DataFrame(records)
 
+def load_clean_reference_defense_tables(
+    run_dir: Path,
+    *,
+    story_root: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load seed-level clean-reference defense summaries emitted by Stage 07.
+
+    Stage 07 produces one summary per training seed. Cross-seed inference must
+    therefore aggregate those seed-level checkpoint summaries, not selected
+    channels pooled across runs.
+    """
+    task, phase = _task_and_phase(run_dir)
+    story = story_root / task / run_dir.name / phase_dirname(phase) / "story"
+    checkpoint_path = story / "clean_reference_benign_budget_checkpoint_summary.csv"
+    curve_path = story / "clean_reference_benign_budget_curve.csv"
+    screen_path = story / "clean_reference_benign_budget_screen.csv"
+    if not checkpoint_path.is_file() or not curve_path.is_file():
+        return pd.DataFrame(), pd.DataFrame()
+
+    checkpoint = pd.read_csv(checkpoint_path)
+    curve = pd.read_csv(curve_path)
+    if checkpoint.empty or curve.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    operating_budget = math.nan
+    if screen_path.is_file() and screen_path.stat().st_size > 0:
+        try:
+            screen = pd.read_csv(screen_path)
+            budgets = pd.to_numeric(
+                screen.get("benign_damage_budget"), errors="coerce"
+            ).dropna().unique()
+            if len(budgets) == 1:
+                operating_budget = float(budgets[0])
+        except (pd.errors.EmptyDataError, OSError):
+            pass
+    if not np.isfinite(operating_budget):
+        curve_budgets = pd.to_numeric(curve.get("benign_damage_budget"), errors="coerce")
+        if np.isclose(
+            curve_budgets.to_numpy(float), 0.30, atol=1e-12, rtol=0.0
+        ).any():
+            operating_budget = 0.30
+    checkpoint["benign_damage_budget"] = operating_budget
+    checkpoint["operating_benign_damage_budget"] = operating_budget
+    curve["operating_benign_damage_budget"] = operating_budget
+
+    metadata = _run_metadata(run_dir)
+    return _attach_metadata(checkpoint, metadata), _attach_metadata(curve, metadata)
+
+
+def aggregate_defense_seed_units(
+    raw: pd.DataFrame,
+    *,
+    level: float,
+    min_seeds: int,
+) -> pd.DataFrame:
+    """Aggregate clean-reference defense summaries with seed as replicate unit."""
+    if raw.empty:
+        return pd.DataFrame()
+    raw = _ensure_identity_columns(raw)
+    group_cols = [
+        *EXPERIMENT_ID_COLUMNS,
+        *DEFENSE_IDENTITY_COLUMNS,
+        "target_fraction",
+        "benign_damage_budget",
+    ]
+    records: List[Dict[str, Any]] = []
+    for keys, group in raw.groupby(group_cols, dropna=False, sort=True):
+        base = dict(zip(group_cols, keys))
+        seeds = sorted(set(
+            pd.to_numeric(group["training_seed"], errors="coerce").dropna().astype(int)
+        ))
+        rec: Dict[str, Any] = {
+            **base,
+            "n_training_seeds": len(seeds),
+            "training_seeds": ",".join(str(seed) for seed in seeds),
+            "developmental_claim_ready": len(seeds) >= int(min_seeds),
+            "minimum_seeds_required": int(min_seeds),
+            "small_seed_count_caution": bool(len(seeds) < 5),
+        }
+        for metric in DEFENSE_METRICS:
+            if metric not in group.columns:
+                continue
+            per_seed = group[["training_seed", metric]].copy()
+            per_seed[metric] = pd.to_numeric(per_seed[metric], errors="coerce")
+            per_seed = per_seed.dropna(subset=[metric])
+            if per_seed["training_seed"].duplicated().any():
+                raise ValueError(
+                    f"Duplicate clean-reference defense rows for {base} metric={metric}"
+                )
+            values = per_seed[metric].to_numpy(dtype=float)
+            lo, hi = t_interval(values, level)
+            rec[f"{metric}__n_seeds"] = int(len(values))
+            rec[f"{metric}__mean"] = float(values.mean()) if len(values) else math.nan
+            rec[f"{metric}__median"] = float(np.median(values)) if len(values) else math.nan
+            rec[f"{metric}__q25"] = float(np.quantile(values, 0.25)) if len(values) else math.nan
+            rec[f"{metric}__q75"] = float(np.quantile(values, 0.75)) if len(values) else math.nan
+            rec[f"{metric}__sd"] = float(values.std(ddof=1)) if len(values) >= 2 else math.nan
+            rec[f"{metric}__ci_low"] = lo
+            rec[f"{metric}__ci_high"] = hi
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_dirs", required=True, help="Comma-separated completed poisoning run directories.")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--story_root", default=None,
+        help=(
+            "Optional per_run_visualizations root containing Stage-07 story CSVs. "
+            "When supplied, clean-reference defense summaries are aggregated across seeds."
+        ),
+    )
     parser.add_argument("--metrics", default=",".join(DEFAULT_METRICS))
     parser.add_argument("--confidence_level", type=float, default=0.95)
     parser.add_argument("--min_seeds", type=int, default=3)
@@ -533,6 +647,54 @@ def main() -> None:
     run_dirs = [Path(path).expanduser() for path in _csv_list(args.run_dirs)]
     out_dir = Path(args.output_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    defense_errors: list[dict[str, str]] = []
+    if args.story_root:
+        story_root = Path(args.story_root).expanduser()
+        checkpoint_frames: list[pd.DataFrame] = []
+        curve_frames: list[pd.DataFrame] = []
+        for run_dir in run_dirs:
+            try:
+                checkpoint_frame, curve_frame = load_clean_reference_defense_tables(
+                    run_dir, story_root=story_root
+                )
+                if not checkpoint_frame.empty:
+                    checkpoint_frames.append(checkpoint_frame)
+                if not curve_frame.empty:
+                    curve_frames.append(curve_frame)
+            except Exception as exc:
+                defense_errors.append({
+                    "run_dir": str(run_dir),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+        defense_checkpoint_raw = (
+            pd.concat(checkpoint_frames, ignore_index=True, sort=False)
+            if checkpoint_frames else pd.DataFrame()
+        )
+        defense_curve_raw = (
+            pd.concat(curve_frames, ignore_index=True, sort=False)
+            if curve_frames else pd.DataFrame()
+        )
+        defense_checkpoint_raw.to_csv(
+            out_dir / "clean_reference_defense_checkpoint_all_seeds.csv", index=False
+        )
+        aggregate_defense_seed_units(
+            defense_checkpoint_raw,
+            level=args.confidence_level,
+            min_seeds=args.min_seeds,
+        ).to_csv(
+            out_dir / "clean_reference_defense_checkpoint_across_seeds.csv", index=False
+        )
+        defense_curve_raw.to_csv(
+            out_dir / "clean_reference_defense_budget_curve_all_seeds.csv", index=False
+        )
+        aggregate_defense_seed_units(
+            defense_curve_raw,
+            level=args.confidence_level,
+            min_seeds=args.min_seeds,
+        ).to_csv(
+            out_dir / "clean_reference_defense_budget_curve_across_seeds.csv", index=False
+        )
 
     # Aggregate the detector first. This branch depends only on Stage 07 and is
     # intentionally independent of behavioral/backdoor-trajectory reporting.
@@ -581,6 +743,11 @@ def main() -> None:
             "developmental_claim_ready_interpretation": "configured minimum seed count met; this flag is not a power calculation or proof of confirmatory adequacy",
             "small_seed_count_caution_below": 5,
             "seed_interval_note": "Student-t intervals are untransformed and may extend beyond natural bounds for rate metrics; raw per-seed estimates are retained in the all-seeds tables",
+            "default_plot_summary": "median with Q1-Q3 across training seeds",
+            "available_plot_summaries": ["median_iqr", "mean_t_ci", "seed_traces"],
+            "clean_reference_defense_replicate_unit": "training_seed; selected channels remain nested within each seed",
+            "clean_reference_defense_story_root": str(Path(args.story_root).expanduser()) if args.story_root else None,
+            "clean_reference_defense_errors": defense_errors,
             "conversion_threshold": args.conversion_threshold,
             "run_dirs": [str(p) for p in run_dirs],
             "behavior_trajectory_aggregation": "optional; detector aggregation runs first and does not require valid Stage-05 backdoor trajectories",

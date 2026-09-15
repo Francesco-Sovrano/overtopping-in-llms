@@ -123,11 +123,16 @@ Per-run poisoning renderings can include:
 04_clean_vs_poisoned_checkpoint_overtopping.pdf
 ```
 
-When a single eligible Grammar clean-reference defense rendering is selected by the reporting driver, it is copied to:
+The stable Grammar clean-reference defense figure is aggregated across compatible
+training seeds with seed as the replicate unit. Its default summary is the
+across-seed median with Q1-Q3 uncertainty:
 
 ```text
 results/paper/figures/05_rq4_learning/rq4_grammar_clean_reference_defense.pdf
 ```
+
+The seed-level and aggregated checkpoint/budget tables are written under
+`results/analysis/rq4_learning/poisoning/cross_seed_tables/`.
 
 Poisoning source tables and availability conditions are defined in [Poisoning outputs](../experiments/poisoning/outputs.md).
 

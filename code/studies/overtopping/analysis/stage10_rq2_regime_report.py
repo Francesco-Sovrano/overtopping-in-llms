@@ -173,30 +173,137 @@ def summarize(frame: pd.DataFrame, *, regime: str, checkpoint_free: bool) -> dic
     }
 
 
+
+def _expand_scope_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Materialize per-scope composition gaps from each evaluable setting."""
+    rows: list[pd.DataFrame] = []
+    work = frame.loc[frame["rq2_evaluable"]].copy()
+    for _, row in work.iterrows():
+        stats_dir = row.get("stats_dir")
+        if pd.isna(stats_dir):
+            continue
+        summary = Path(str(stats_dir)) / "interaction_validation" / "composition_decomposition_summary.csv"
+        if not summary.exists():
+            continue
+        try:
+            d = pd.read_csv(summary)
+        except Exception:
+            continue
+        if "scope" not in d.columns or "Delta_comp_complete_case" not in d.columns:
+            continue
+        part = d[["scope", "Delta_comp_complete_case"]].copy()
+        part["Delta_comp"] = pd.to_numeric(part["Delta_comp_complete_case"], errors="coerce")
+        part = part[np.isfinite(part["Delta_comp"])].copy()
+        if part.empty:
+            continue
+        part["replacement_regime"] = row["replacement_regime"]
+        rows.append(part[["replacement_regime", "scope", "Delta_comp"]])
+    if not rows:
+        return pd.DataFrame(columns=["replacement_regime", "scope", "Delta_comp"])
+    return pd.concat(rows, ignore_index=True)
+
 def plot_compact_main(frame: pd.DataFrame, path: Path) -> None:
-    """Compact main-paper view of the all-evaluable mean-donor gap distribution."""
-    work = frame.loc[
-        frame["replacement_regime"].eq("mean-donor") & frame["rq2_evaluable"]
-    ].copy()
+    """Main-paper RQ2 summary stratified by replacement regime and direction."""
+    work = _expand_scope_rows(frame)
+    if work.empty:
+        # Conservative fallback when only aggregate setting-level rows are available.
+        work = frame.loc[frame["rq2_evaluable"], ["replacement_regime", "Delta_comp"]].copy()
+        work["scope"] = "overall"
     if work.empty:
         return
-    vals = work["Delta_comp"].to_numpy(float)
-    # Deterministic horizontal offsets expose individual settings without RNG.
-    offsets = np.linspace(-0.08, 0.08, len(vals)) if len(vals) > 1 else np.array([0.0])
-    fig, ax = plt.subplots(figsize=(2.5, 2.25))
-    ax.axhline(0.0, linestyle="--", linewidth=0.8, alpha=0.7)
-    ax.boxplot(vals, positions=[1.0], widths=0.28, showfliers=False)
-    ax.scatter(1.0 + offsets, vals, s=13, alpha=0.78)
-    ax.set_xlim(0.72, 1.28)
-    ax.set_xticks([1.0], ["mean-donor"])
-    ax.set_ylabel(r"Composition gap $E(J)-U(J)$")
-    ax.grid(axis="y", alpha=0.2, linewidth=0.5)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
+
+    regimes = ["mean-donor", "mean"]
+    regime_labels = {"mean-donor": "Mean-donor", "mean": "Direct mean"}
+    regime_colors = {"mean-donor": "C0", "mean": "C1"}
+    regime_markers = {"mean-donor": "o", "mean": "s"}
+    scopes = ["0to1", "1to0", "overall"]
+    scope_labels = [r"$0\rightarrow1$", r"$1\rightarrow0$", "All directions"]
+    centers = np.array([1.0, 2.0, 3.0])
+    offsets = {"mean-donor": -0.21, "mean": 0.21}
+    width = 0.30
+
+    with plt.rc_context({
+        "font.size": 10.0,
+        "axes.labelsize": 10.2,
+        "xtick.labelsize": 10.0,
+        "ytick.labelsize": 10.0,
+        "legend.fontsize": 9.2,
+    }):
+        fig, ax = plt.subplots(figsize=(5.4, 2.28))
+        ax.axhline(0.0, linestyle="--", linewidth=0.8, alpha=0.7, color="0.45", zorder=0)
+        handles = []
+        for regime in regimes:
+            color = regime_colors[regime]
+            marker = regime_markers[regime]
+            positions, box_vals = [], []
+            for center, scope in zip(centers, scopes):
+                vals = work.loc[
+                    work["replacement_regime"].eq(regime) & work["scope"].eq(scope),
+                    "Delta_comp",
+                ].to_numpy(float)
+                if len(vals) == 0:
+                    continue
+                positions.append(center + offsets[regime])
+                box_vals.append(vals)
+            if not box_vals:
+                continue
+
+            bp = ax.boxplot(
+                box_vals,
+                positions=positions,
+                widths=width,
+                showfliers=False,
+                patch_artist=True,
+                medianprops={"linewidth": 1.35},
+                whiskerprops={"linewidth": 1.0},
+                capprops={"linewidth": 1.0},
+            )
+            for i, vals in enumerate(box_vals):
+                bp["boxes"][i].set(facecolor=color, alpha=.10, edgecolor=color, linewidth=1.15)
+                bp["medians"][i].set(color=color, linewidth=1.35)
+                for art in bp["whiskers"][2*i:2*i+2] + bp["caps"][2*i:2*i+2]:
+                    art.set(color=color, linewidth=1.0)
+                jitter = np.linspace(-0.075, 0.075, len(vals)) if len(vals) > 1 else np.array([0.0])
+                ax.scatter(
+                    np.full(len(vals), positions[i]) + jitter,
+                    np.sort(vals),
+                    s=17,
+                    marker=marker,
+                    facecolor=color,
+                    edgecolor="white",
+                    linewidth=.35,
+                    alpha=.76,
+                    zorder=3,
+                )
+            handles.append(
+                plt.Line2D([0], [0], marker=marker, linestyle="none", markersize=7.0,
+                           markerfacecolor=color, markeredgecolor=color, markeredgewidth=.8,
+                           label=regime_labels[regime])
+            )
+
+        ax.set_xticks(centers, scope_labels)
+        ax.set_xlabel("Intervention direction", labelpad=3)
+        ax.set_ylabel(r"Composition gap $E(J)-U(J)$", labelpad=4)
+        ax.set_xlim(.50, 3.50)
+        ax.set_ylim(-1.05, 1.05)
+        ax.grid(axis="y", alpha=0.2, linewidth=0.5)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        if handles:
+            ax.legend(
+                handles=handles,
+                loc="lower center",
+                bbox_to_anchor=(.5, 1.005),
+                ncol=2,
+                handletextpad=.45,
+                columnspacing=1.2,
+                borderaxespad=0,
+                frameon=False,
+            )
+        fig.subplots_adjust(left=.145, right=.995, bottom=.17, top=.84)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
 
 
 def plot_gap(frame: pd.DataFrame, regime: str, path: Path) -> None:

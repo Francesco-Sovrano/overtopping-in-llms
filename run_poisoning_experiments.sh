@@ -53,7 +53,7 @@ export POISON_RATE_BASIS=eligible_gold_non_target
 export CONTROL_MARKER=" "
 export TRIGGER_MARKER="[id=74291]"
 export SHAM_MARKER="  "
-# export SEEDS=37,101
+# export SEEDS=13,37,101
 export POISONING_TASKS="grammar"
 
 # Opt-in smoke mode for validating training/trigger behavior before running CHA.
@@ -103,6 +103,7 @@ environment. The shipped study definition uses:
   SHAM_MARKER='  '
   RUN_TRIGGER_LIFT_CHA=0
   RUN_INTERACTION_VALIDATION=false
+  POISONING_SKIP_CIRCUIT_DISCOVERY=1 unless explicitly disabled or fallback is enabled
 
 Environment-overridable execution controls include:
 
@@ -130,16 +131,19 @@ Circuit-discovery execution controls:
   --skip-circuit-discovery
       Do not run EAP circuit discovery for poisoning causal analyses. Use the
       full model-neuron candidate space directly for Stage-6 ablation search.
-      Equivalent to POISONING_SKIP_CIRCUIT_DISCOVERY=1.
+      Equivalent to POISONING_SKIP_CIRCUIT_DISCOVERY=1. This is the default
+      when neither circuit-discovery control is explicitly configured.
 
   --full-ablation-if-no-circuit
       Run normal circuit discovery first. If Stage 5 completes with no usable
       circuit, rerun that causal endpoint using the explicit full-network
       candidate space. Equivalent to POISONING_FULL_ABLATION_IF_NO_CIRCUIT=1.
 
-These two options are mutually exclusive. With both options disabled, ordinary
-circuit discovery is performed/reused; a prior full-ablation run is kept in a
-separate namespace and cannot satisfy the discovered-circuit cache.
+These two options are mutually exclusive. By default, circuit discovery is
+skipped and the full model-neuron candidate space is used. Set
+POISONING_SKIP_CIRCUIT_DISCOVERY=0 to restore ordinary circuit discovery. A prior
+full-ablation run is kept in a separate namespace and cannot satisfy the
+discovered-circuit cache.
 
 The full-network path is explicit and stored under a separate *_full_ablation
 namespace; it is not written into or substituted for the discovered-circuit cache.
@@ -176,6 +180,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Default to direct full-network ablation unless the caller explicitly configures
+# skip-circuit-discovery or enables discovery-then-fallback. This lets
+# --full-ablation-if-no-circuit override the default without also requiring
+# POISONING_SKIP_CIRCUIT_DISCOVERY=0.
+if [[ -z "${POISONING_SKIP_CIRCUIT_DISCOVERY+x}" ]] && \
+   [[ ! "${POISONING_FULL_ABLATION_IF_NO_CIRCUIT:-0}" =~ ^(1|true|TRUE|True|yes|YES|Yes|on|ON|On)$ ]]; then
+  export POISONING_SKIP_CIRCUIT_DISCOVERY=1
+fi
 
 if [[ "${POISONING_SKIP_CIRCUIT_DISCOVERY:-0}" =~ ^(1|true|TRUE|True|yes|YES|Yes|on|ON|On)$ ]] && \
    [[ "${POISONING_FULL_ABLATION_IF_NO_CIRCUIT:-0}" =~ ^(1|true|TRUE|True|yes|YES|Yes|on|ON|On)$ ]]; then

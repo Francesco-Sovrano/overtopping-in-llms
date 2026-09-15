@@ -838,9 +838,9 @@ def _whisker_curve(ax, profile: pd.DataFrame, xcol: str) -> None:
     hi = profile["ci_high"].to_numpy(float)
     for xi, a, b, c, d in zip(x, q25, q75, lo, hi):
         # Thin = IQR, thick = 95% bootstrap CI, same visual grammar as Fig. 4e.
-        ax.vlines(xi, a, b, linewidth=.7, alpha=.65)
-        ax.vlines(xi, c, d, linewidth=2.6)
-    ax.plot(x, med, marker="o", linewidth=1.65)
+        ax.vlines(xi, a, b, linewidth=.85, alpha=.70)
+        ax.vlines(xi, c, d, linewidth=2.9)
+    ax.plot(x, med, marker="o", linewidth=1.85, markersize=7.0)
 
 
 def _plot_temporal_main(capture: pd.DataFrame, gain: pd.DataFrame, stats: dict, path: Path) -> None:
@@ -930,8 +930,11 @@ def _plot_fig4e_event_strength_temporal(
         path.unlink(missing_ok=True)
         return
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.6, 4.15))
-    stats_font = 9.0
+    fig, axes = plt.subplots(1, 3, figsize=(13.6, 3.84))
+    stats_font = 11.0
+
+    for ax in axes:
+        ax.tick_params(labelsize=11.2)
 
     # Population event localization.
     ax = axes[0]
@@ -947,7 +950,7 @@ def _plot_fig4e_event_strength_temporal(
     ax.plot(x, med, marker="o", linewidth=1.65)
     zero = np.flatnonzero(event_profile["offset"].to_numpy() == 0)
     if len(zero):
-        ax.scatter([0], [med[int(zero[0])]], s=70, zorder=5)
+        ax.scatter([0], [med[int(zero[0])]], s=88, zorder=5)
     ax.axvline(0, linestyle=":", linewidth=1.0)
     ax.set_xticks([-4, -2, 0, 2, 4], ["−4", "−2", "EVENT", "+2", "+4"])
     ax.set_xlabel("Largest margin-change interval\nrelative to behavioral crossing")
@@ -973,9 +976,9 @@ def _plot_fig4e_event_strength_temporal(
     slo = strength["ci_low"].to_numpy(float)
     shi = strength["ci_high"].to_numpy(float)
     for xi, a, b, c, d in zip(xx, sq25, sq75, slo, shi):
-        ax.vlines(xi, a, b, linewidth=.7, alpha=.65)
-        ax.vlines(xi, c, d, linewidth=2.6)
-    ax.plot(xx, smed, marker="o", linewidth=1.65)
+        ax.vlines(xi, a, b, linewidth=.85, alpha=.70)
+        ax.vlines(xi, c, d, linewidth=2.9)
+    ax.plot(xx, smed, marker="o", linewidth=1.85, markersize=7.0)
     ax.axhline(1.0, linestyle=":", linewidth=1.0)
     ax.set_xticks(xx, [str(v) for v in strength["strength_tertile"]])
     ax.set_xlabel("Held-out singleton causal strength\n(within-run/direction tertile)")
@@ -1021,8 +1024,8 @@ def _plot_fig4e_event_strength_temporal(
         # Keep the direction explicit inside the axes so it costs no vertical space.
         ax.text(.03, .97, "prefix → suffix", transform=ax.transAxes,
                 ha="left", va="top", fontsize=stats_font, fontweight="semibold")
-        ax.set_xlabel("Transition relative to prefix-defined EVENT")
-        ax.set_ylabel("Suffix held-out causal effect")
+        ax.set_xlabel("Transition relative to prefix-defined EVENT", fontsize=12.8)
+        ax.set_ylabel("Suffix held-out causal effect", fontsize=13.0)
         _clean(ax)
 
     _save(fig, path)

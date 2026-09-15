@@ -131,11 +131,16 @@ Rendered poisoning outputs:
 results/paper/figures/05_rq4_learning/poisoning/
 ```
 
-The reporting driver can also copy one eligible Grammar clean-reference defense rendering to:
+The reporting driver aggregates the compatible Grammar clean-reference defense
+runs across training seeds and writes the stable main-text rendering to:
 
 ```text
 results/paper/figures/05_rq4_learning/rq4_grammar_clean_reference_defense.pdf
 ```
+
+The default visual summary is the median with Q1-Q3 across seed-level checkpoint
+means. Channel-level selections remain nested within each seed and are not pooled
+as replicate observations.
 
 ## Statistical units
 
