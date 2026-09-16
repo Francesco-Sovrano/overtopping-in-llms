@@ -4,7 +4,7 @@
 The current registry is deliberately organized into four execution sets only:
 
 1. ``mean-donor``: small-model, non-checkpoint mean-donor runs;
-2. ``6-7b-models``: the 6.9B/7B scale runs (mean-positional);
+2. ``6-7b-models``: the 6.9B/7B scale runs;
 3. ``mean``: small-model mean-replacement runs;
 4. ``checkpoints``: the Pythia-1B longitudinal trajectories for Grammar,
    HANS-NLI, and Random FSM.  Each trajectory is step0 -> step48k -> step96k
@@ -95,7 +95,8 @@ def _large(
         suite=suite,
         task=task,
         model=model,
-        intervention="mean-positional",
+        # intervention="mean-positional",
+        intervention="mean",
         mode=mode,
         z_thresh=z_thresh,
         batch_size=batch_size,
