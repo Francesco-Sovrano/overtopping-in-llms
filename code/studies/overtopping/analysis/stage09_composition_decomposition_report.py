@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         "--population-scope", choices=["primary", "primary+supplementary"], default="primary",
         help="primary uses the complete configured study table; the extended spelling requests the explicit extended scope.",
     )
-    parser.add_argument("--replacement-regime", choices=["all", "mean-donor", "mean"], default="all", help="Analyze replacement regimes separately. mean includes mean-positional; mean-donor is never pooled with mean.")
+    parser.add_argument("--replacement-regime", choices=["all", "mean-donor", "mean"], default="all", help="Analyze replacement regimes separately. mean-donor is never pooled with mean.")
     parser.add_argument("--evaluation-split", choices=["test", "train", "all"], default="test")
     parser.add_argument("--spiking-max-points", type=int, default=10000)
     parser.add_argument("--data-root", default=None, help="Alias for --root used by the shared exact run manifest.")

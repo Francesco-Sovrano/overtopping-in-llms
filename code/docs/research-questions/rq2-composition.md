@@ -19,10 +19,10 @@ First, replacement regimes are analyzed separately:
 
 ```text
 mean-donor regime: 39 configured settings
-mean regime:       11 configured settings after grouping mean-positional with mean
+mean regime:       11 configured settings
 ```
 
-The 11 mean-family settings consist of eight `mean` settings and three `mean-positional` large-model settings. Mean-donor and mean-family results are analyzed separately.
+Mean-donor and mean-family results are analyzed separately.
 
 Second, joint composition is applicable only when discovery yields a nonempty candidate set. A setting is evaluable for the aggregate composition-gap analysis when both singleton-union reach `U(J)` and the genuine simultaneous-set effect `E(J)` are available. The regime reporter starts from the complete configured study table, computes the denominator from these applicability and availability rules, and writes every configured row with an explicit `rq2_status`. A missing joint-effect artifact therefore remains visible in the population audit rather than changing the study manifest.
 
@@ -157,7 +157,7 @@ Aggregate outputs are written under:
 results/analysis/rq2_composition/
 ```
 
-The regime reporter reads `results/analysis/primary_matrix/tables/primary_table.csv`, the complete configured-setting table produced by Stage 02. It normalizes `mean-positional` to the `mean` reporting regime while preserving the original intervention field. Its `rq2_settings_by_replacement_regime.csv` output retains all configured rows and records applicability, metric availability, evaluability, and status before summary statistics are computed.
+The regime reporter reads `results/analysis/primary_matrix/tables/primary_table.csv`, the complete configured-setting table produced by Stage 02. Its `rq2_settings_by_replacement_regime.csv` output retains all configured rows and records applicability, metric availability, evaluability, and status before summary statistics are computed.
 
 ## Interpretation
 

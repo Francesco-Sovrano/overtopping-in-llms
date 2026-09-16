@@ -141,7 +141,7 @@ The check is read-only and does not inspect or modify cache contents.
 
 ### Replacement-path convention
 
-`mean` and `mean-positional` use the established unsuffixed mean-family circuit label. `mean-donor` uses an explicit donor suffix. The exact intervention remains part of `RunSpec` and is passed to the pipeline, so analysis must read the intervention from the registry rather than infer it only from a directory name.
+`mean-donor` uses an explicit donor suffix. The exact intervention remains part of `RunSpec` and is passed to the pipeline, so analysis must read the intervention from the registry rather than infer it only from a directory name.
 
 ## Scientific population ownership
 

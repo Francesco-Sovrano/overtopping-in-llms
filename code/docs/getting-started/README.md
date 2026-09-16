@@ -87,8 +87,7 @@ setting_count        50
 I+O                   29
 Out                   21
 mean-donor            39
-mean                   8
-mean-positional        3
+mean                  11
 ```
 
 ## Run overtopping experiments

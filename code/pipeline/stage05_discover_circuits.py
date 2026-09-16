@@ -80,7 +80,7 @@ def parse_args():
 		help="CSV/Parquet with prompt text + feature columns (same as script 5).",
 	)
 	p.add_argument("--intervention", type=str, default="zero")
-	p.add_argument("--eval_intervention", type=str, default="mean-positional")
+	p.add_argument("--eval_intervention", type=str, default="mean")
 	p.add_argument("--absolute_value_attributions", action="store_true")
 	p.add_argument(
 		"--include_zero_scores",
@@ -535,7 +535,7 @@ def _run_circuit_discovery_from_pairs(
 	topn=20,
 	level="node",
 	intervention='zero',
-	eval_intervention="mean-positional",
+	eval_intervention="mean",
 	prompts_to_answers_dict=None,
 	sampling_strategy=None,
 	pair_meta=None,
@@ -739,7 +739,7 @@ def discover_for_rule(
 	max_pairs=512,
 	pair_similarity_metric="cosine",
 	intervention="zero",
-	eval_intervention="mean-positional",
+	eval_intervention="mean",
 	prompts_to_answers_dict=None,
 	sampling_strategy="random",
 	sampling_plan_index=None,

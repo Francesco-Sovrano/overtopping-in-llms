@@ -26,8 +26,7 @@ For the repository state represented by this documentation, the `all` selection 
 | intervention phase | input+output (`I+O`) | 29 |
 | intervention phase | output-only (`Out`) | 21 |
 | replacement | `mean-donor` | 39 |
-| replacement | `mean` | 8 |
-| replacement | `mean-positional` | 3 |
+| replacement | `mean` | 11 |
 
 Public suite selections before cross-suite deduplication are:
 
@@ -74,7 +73,7 @@ bon_jailbreaking Qwen/Qwen2-7B-Instruct  output-only
 hans_nli         Qwen/Qwen2-7B-Instruct  input+output
 ```
 
-These settings use `mean-positional`, MLP-only coordinates, `circuit_size=100000`, and `min_flip_rate=0.2`. Task-specific thresholds and batch sizes are encoded in the registry.
+These settings use `mean`, MLP-only coordinates, `circuit_size=100000`, and `min_flip_rate=0.2`. Task-specific thresholds and batch sizes are encoded in the registry.
 
 ### `mean`
 
@@ -158,7 +157,7 @@ input_data_dir(data_root)
 stats_dir(data_root)
 ```
 
-`mean` and `mean-positional` share the mean-family circuit-path convention. `mean-donor` uses the donor-specific suffix. The resolved intervention remains available in the registry and pipeline arguments.
+`mean-donor` uses the donor-specific suffix. The resolved intervention remains available in the registry and pipeline arguments.
 
 Validate address uniqueness and the registry fingerprint with:
 

@@ -46,7 +46,7 @@ Inspect the configured registry without running model inference:
 ./run_overtopping_experiments.sh --dry-run
 ```
 
-For this repository state, `--suite all --list` resolves to 50 unique scientific settings. The storage-contract check reports 29 input+output settings, 21 output-only settings, 39 mean-donor settings, 8 mean settings, and 3 mean-positional settings.
+For this repository state, `--suite all --list` resolves to 50 unique scientific settings. The storage-contract check reports 29 input+output settings, 21 output-only settings, 39 mean-donor settings, and 11 mean settings.
 
 Validate persistent addressing:
 

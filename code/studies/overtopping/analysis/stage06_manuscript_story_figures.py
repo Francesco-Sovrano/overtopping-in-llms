@@ -478,7 +478,7 @@ def plot_rq2(frame: pd.DataFrame, manuscript: pd.DataFrame | None, out_dir: Path
     # study deliberately contains replacement-baseline repeats for a handful of
     # task/model/phase cells, so task/model/phase is *not* a row identity.  Pooling
     # those regimes both duplicates labels and mixes metrics from different
-    # interventions.  Mean/mean-positional sensitivity results are reported by
+    # interventions.  Mean sensitivity results are reported by
     # stage10_rq2_regime_report instead.
     if "intervention" in work.columns:
         donor = work["intervention"].astype(str).str.strip().str.lower().eq("mean-donor")
@@ -578,7 +578,7 @@ The main directional reach/density figures use the configured overtopping manife
 """,
         "03_rq2_composition": """# Figure 3 - RQ2: composition and boundary conditions
 
-`fig3a_composition_gap_all_settings.pdf` is the main mean-donor composition analysis over all evaluable settings. Mean/mean-positional replacement is reported separately as a sensitivity regime and is never pooled with mean-donor. `fig3b_superadditive_boundary_cases.pdf` expands E(J)>U(J) donor cases. `fig3c_matched_set_specificity.pdf` is the matched-set specificity control for settings with materialized matched-set outputs. Machine-readable sidecars live under `results/analysis/figure_data/03_rq2_composition/`.
+`fig3a_composition_gap_all_settings.pdf` is the main mean-donor composition analysis over all evaluable settings. Mean replacement is reported separately as a sensitivity regime and is never pooled with mean-donor. `fig3b_superadditive_boundary_cases.pdf` expands E(J)>U(J) donor cases. `fig3c_matched_set_specificity.pdf` is the matched-set specificity control for settings with materialized matched-set outputs. Machine-readable sidecars live under `results/analysis/figure_data/03_rq2_composition/`.
 """,
         "05_rq4_learning": """# Figure 5 - RQ4: learning utility
 

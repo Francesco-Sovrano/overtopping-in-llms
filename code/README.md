@@ -89,7 +89,7 @@ python -m reporting.generate_final_results \
 
 The configured study table is constructed before metric-specific filtering. Its row count is derived from the current manifest. A missing derived metric remains a missing value/status for that setting; it does not remove the setting from the configured study manifest.
 
-RQ2 replacement regimes are not pooled. `mean-positional` is grouped with `mean` for the mean-replacement sensitivity, while `mean-donor` is analyzed separately.
+RQ2 replacement regimes are not pooled. `mean-donor` is analyzed separately from `mean`.
 
 ## Storage compatibility
 

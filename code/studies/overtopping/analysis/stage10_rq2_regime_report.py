@@ -4,8 +4,7 @@
 The report derives its population from completed configured settings and groups
 replacement regimes explicitly.
 RQ2 instead separates the replacement counterfactuals: mean-donor is the main
-regime, while mean and mean-positional are collapsed into a separate ``mean``
-sensitivity regime. The two replacement regimes are never pooled.
+regime, while mean is a separate sensitivity regime. The two replacement regimes are never pooled.
 
 Intermediate Pythia checkpoints remain in the headline aggregate so RQ2 uses all
 available evaluable settings. A checkpoint-free donor sensitivity is emitted for
@@ -321,7 +320,7 @@ def plot_gap(frame: pd.DataFrame, regime: str, path: Path) -> None:
     ax.scatter(work["Delta_comp"], y, s=18)
     ax.set_yticks(y, labels, fontsize=6.5)
     ax.set_xlabel(r"Composition gap $E(J)-U(J)$")
-    ax.set_title("Mean-donor replacement" if regime == "mean-donor" else "Mean replacement (including mean-positional)")
+    ax.set_title("Mean-donor replacement" if regime == "mean-donor" else "Mean replacement")
     ax.grid(axis="x", alpha=0.2, linewidth=0.5)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -346,7 +345,7 @@ def write_latex_summary(summary: pd.DataFrame, path: Path) -> None:
         )
     lines += [
         r"\bottomrule", r"\end{tabular}",
-        r"\caption{RQ2 aggregate composition by replacement regime. The correlation is between singleton-union reach $U(J)$ and the composition gap $E(J)-U(J)$. $^{\dagger}$Mean includes mean-positional large-model runs. The regimes are reported separately and are not pooled.}",
+        r"\caption{RQ2 aggregate composition by replacement regime. The correlation is between singleton-union reach $U(J)$ and the composition gap $E(J)-U(J)$. The regimes are reported separately and are not pooled.}",
         r"\label{tab:rq2-regime-summary}", r"\end{table}", "",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)

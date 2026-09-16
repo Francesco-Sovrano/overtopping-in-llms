@@ -27,8 +27,7 @@ The configured registry is constructed by `studies/overtopping/experiments/run_e
 phase              I+O  29
 phase              Out  21
 replacement mean-donor  39
-replacement mean         8
-replacement mean-positional 3
+replacement mean        11
 ```
 
 The public suite selections currently contain 30 `mean-donor`, 3 `6-7b-models`, 8 `mean`, and 12 `checkpoints` entries before cross-suite deduplication. Three final Pythia-1B input+output settings occur in both `mean-donor` and `checkpoints`, so the union contains 50 unique scientific settings.

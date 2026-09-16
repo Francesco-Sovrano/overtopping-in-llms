@@ -125,7 +125,7 @@ python -m studies.overtopping.analysis.stage09_composition_decomposition_report 
   --evaluation-split test
 ```
 
-Use `--replacement-regime mean` for the separate mean/mean-positional analysis.
+Use `--replacement-regime mean` for the separate mean analysis.
 
 ## 6. RQ3 threshold reporting
 

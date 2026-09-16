@@ -2,7 +2,7 @@
 
 This package owns the overtopping registry and study-specific analyses built on the shared causal-intervention pipeline.
 
-The current `all` registry selection resolves to 50 unique scientific settings after cross-suite deduplication. The storage contract reports 29 input+output settings, 21 output-only settings, 39 mean-donor settings, 8 mean settings, and 3 mean-positional settings.
+The current `all` registry selection resolves to 50 unique scientific settings after cross-suite deduplication. The storage contract reports 29 input+output settings, 21 output-only settings, 39 mean-donor settings, 12 mean settings.
 
 References:
 

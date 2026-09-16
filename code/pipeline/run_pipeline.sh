@@ -47,7 +47,7 @@ Options (mutually exclusive within each group):
 							Default: -1 (all circuits)
 		--eval_intervention <NAME>
 							Intervention used in Stages 5, 6, and 7.
-							Default: mean-positional
+							Default: mean
 		--batch_size <N>   Batch size used by the pipeline stages that support batching.
 							Default: 256
 		--circuit_level <neuron|edge>
@@ -162,7 +162,7 @@ DISCOVERY="random"     # random|spectral
 ANCHORING="fast"       # fast|slow
 Z_THRESH="-1"            # MAD z-threshold for Stage 2 (drop_high_mad_variance_features)
 MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE="-1" # -1 means ALL CIRCUITS
-EVAL_INTERVENTION="mean-positional"
+EVAL_INTERVENTION="mean"
 BATCH_SIZE="256"
 CIRCUIT_LEVEL="neuron"
 CIRCUIT_SIZE="100000"
@@ -281,7 +281,7 @@ while [[ $# -gt 0 ]]; do
 			shift 2
 			;;
 		--eval_intervention)
-			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value (e.g. --eval_intervention mean-positional)"; exit 1; }
+			[[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value (e.g. --eval_intervention mean)"; exit 1; }
 			EVAL_INTERVENTION="$2"
 			shift 2
 			;;

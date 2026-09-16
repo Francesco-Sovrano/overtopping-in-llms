@@ -3244,8 +3244,7 @@ def write_final_snapshot_fit_stats(points: list[PlotPoint], out: Path, coverage_
     The sensitivity mirrors the 29-cell final-snapshot design: remove
     intermediate Pythia checkpoints, then retain one replacement condition per
     task/model/phase cell. When both mean-donor and mean are available, prefer
-    mean-donor; otherwise retain the configured mean (including normalized
-    mean-positional large-model runs).
+    mean-donor; otherwise retain the configured mean.
     """
     final_points = [p for p in points if "@step" not in str(p.model)]
     selected: dict[tuple[str, str, str], PlotPoint] = {}

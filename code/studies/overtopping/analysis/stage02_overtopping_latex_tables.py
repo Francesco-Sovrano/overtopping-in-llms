@@ -86,9 +86,9 @@ MODEL_LABELS = {
 # which settings enter any analysis or metric audit.
 REPRESENTATIVE_SETTINGS = {
     ("arithmetic", "EleutherAI/pythia-1b", "decode-only", "mean"),
-    ("arithmetic", "EleutherAI/pythia-6.9b", "decode-only", "mean-positional"),
+    ("arithmetic", "EleutherAI/pythia-6.9b", "decode-only", "mean"),
     ("arithmetic", "Qwen/Qwen2-1.5B-Instruct", "decode-only", "mean-donor"),
-    ("arithmetic", "Qwen/Qwen2-7B-Instruct", "decode-only", "mean-positional"),
+    ("arithmetic", "Qwen/Qwen2-7B-Instruct", "decode-only", "mean"),
     ("arithmetic", "Qwen/Qwen2.5-1.5B-Instruct", "decode-only", "mean-donor"),
     ("bon_jailbreaking", "Qwen/Qwen2-1.5B-Instruct", "decode-only", "mean-donor"),
     ("bon_jailbreaking", "Qwen/Qwen2.5-1.5B-Instruct", "decode-only", "mean-donor"),
