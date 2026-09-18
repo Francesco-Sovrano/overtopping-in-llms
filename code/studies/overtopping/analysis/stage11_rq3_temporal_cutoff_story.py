@@ -953,8 +953,8 @@ def _plot_fig4e_event_strength_temporal(
         ax.scatter([0], [med[int(zero[0])]], s=88, zorder=5)
     ax.axvline(0, linestyle=":", linewidth=1.0)
     ax.set_xticks([-4, -2, 0, 2, 4], ["−4", "−2", "EVENT", "+2", "+4"])
-    ax.set_xlabel("Largest margin-change interval\nrelative to behavioral crossing")
-    ax.set_ylabel("Condition-median trajectories (%)")
+    ax.set_xlabel("Largest margin-change interval\nrelative to behavioral crossing", fontsize=13.2)
+    ax.set_ylabel("Condition-median trajectories (%)", fontsize=13.2)
     ci = event_stats.get("median_event_minus_adjacent_ci95", [math.nan, math.nan])
     ax.text(
         .97, .96,
@@ -981,8 +981,8 @@ def _plot_fig4e_event_strength_temporal(
     ax.plot(xx, smed, marker="o", linewidth=1.85, markersize=7.0)
     ax.axhline(1.0, linestyle=":", linewidth=1.0)
     ax.set_xticks(xx, [str(v) for v in strength["strength_tertile"]])
-    ax.set_xlabel("Held-out singleton causal strength\n(within-run/direction tertile)")
-    ax.set_ylabel("Margin-change concentration (C)")
+    ax.set_xlabel("Held-out singleton causal strength\n(within-run/direction tertile)", fontsize=13.2)
+    ax.set_ylabel("Margin-change concentration (C)", fontsize=13.2)
     ci = strength_stats.get("median_high_minus_low_ci95", [math.nan, math.nan])
     ax.text(
         .03, .96,
@@ -1024,8 +1024,8 @@ def _plot_fig4e_event_strength_temporal(
         # Keep the direction explicit inside the axes so it costs no vertical space.
         ax.text(.03, .97, "prefix → suffix", transform=ax.transAxes,
                 ha="left", va="top", fontsize=stats_font, fontweight="semibold")
-        ax.set_xlabel("Transition relative to prefix-defined EVENT", fontsize=12.8)
-        ax.set_ylabel("Suffix held-out causal effect", fontsize=13.0)
+        ax.set_xlabel("Transition relative to prefix-defined EVENT", fontsize=13.2)
+        ax.set_ylabel("Suffix held-out causal effect", fontsize=13.2)
         _clean(ax)
 
     _save(fig, path)

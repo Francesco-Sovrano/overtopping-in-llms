@@ -23,7 +23,7 @@ from studies.overtopping.analysis.lib.primary_matrix import PRIMARY_PROFILE_CHOI
 from studies.overtopping.analysis.layer_widths import layer_width_for_model, per_1000_layer_coordinates, per_layer_fraction
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, competence, raw_task_score
 from studies.overtopping.analysis.lib.interaction_schema import is_exact_interaction_schema
-from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count
+from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count, stage6_directional_zero_status
 from studies.overtopping.analysis.lib.stats_resolution import has_stats_artifacts, resolve_available_stats_dir
 
 
@@ -112,14 +112,28 @@ def _stage6_candidate_count(stats_dir: Path) -> tuple[Optional[int], str]:
     return stage6_candidate_count(_stage6_candidate_bag_dir(stats_dir))
 
 
-def _zero_candidate_direction_status(task: str, raw_score: float) -> tuple[float, str, float, str]:
-    """Resolve empty-union directional rates when both endpoint classes exist.
+def _zero_candidate_direction_status(
+    task: str, raw_score: float, stage6_dir: Optional[Path] = None
+) -> tuple[float, str, float, str]:
+    """Resolve directional empty-union rates for a completed zero-candidate search.
 
-    For the finite-answer tasks, the raw score is the binary correctness rate.
-    A value strictly between zero and one proves both direction-eligible
-    denominators are nonzero.  Jailbreak uses a complemented safety score and
-    is intentionally not inferred here.
+    Prefer the direction-specific discovery availability manifest. A completed
+    B=0 search with zero retained candidates is a measured 0->1 zero; a skipped
+    B=1 search is unavailable rather than zero, and conversely. The competence
+    fallback is retained only for legacy results without an availability manifest.
     """
+    directional = stage6_directional_zero_status(stage6_dir)
+    if any(v != "unknown" for v in directional.values()):
+        def one(status: str) -> tuple[float, str]:
+            if status == "measured_zero":
+                return 0.0, "structural_zero_candidates"
+            if status == "unavailable":
+                return math.nan, "unavailable_source_state_discovery"
+            return math.nan, "zero_candidates_direction_denominator_unverified"
+        i2c, i2c_status = one(directional["i2c"])
+        c2i, c2i_status = one(directional["c2i"])
+        return i2c, i2c_status, c2i, c2i_status
+
     finite_tasks = {"arithmetic", "grammar_acceptability", "hans_nli", "random_fsm"}
     if task in finite_tasks and math.isfinite(raw_score):
         if 0.0 < raw_score < 1.0:
@@ -315,7 +329,7 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "conf
         by_neuron_path = stats_dir / "flip_stats_by_neuron.csv"
         singleton_path = stats_dir / "singleton_set_metrics.json"
         interaction_path = stats_dir / "interaction_validation" / "interaction_validation_summary.json"
-        stage6_candidate_count, stage6_candidate_status = _stage6_candidate_count(stats_dir)
+        stage6_candidate_count, stage6_candidate_status = _stage6_candidate_count(expected_stats_dir)
         structural_zero_candidates = stage6_candidate_status == "ok" and stage6_candidate_count == 0
 
         # Stage 7 intentionally returns without writing singleton outputs when
@@ -407,7 +421,9 @@ def compute_rows(root: Path, empirical_fsm_chance: bool, *, profile: str = "conf
         if structural_zero_candidates:
             n05 = n10 = n05_i2c = n10_i2c = n05_c2i = n10_c2i = 0
             u_i2c, u_i2c_status, u_c2i, u_c2i_status = _zero_candidate_direction_status(
-                spec["task_dir"], float(raw) if raw is not None else math.nan
+                spec["task_dir"],
+                float(raw) if raw is not None else math.nan,
+                _stage6_candidate_bag_dir(expected_stats_dir),
             )
 
         layer_width = layer_width_for_model(spec["model"])

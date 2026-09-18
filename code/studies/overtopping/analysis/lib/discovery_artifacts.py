@@ -83,6 +83,52 @@ def resolve_stage6_dir(stats_dir: Path) -> Path | None:
 
 
 
+
+def stage6_directional_zero_status(stage6_dir: Path | None) -> dict[str, str]:
+    """Return direction-specific status for a completed empty Stage-6 search.
+
+    The Stage-6 availability manifest records the two source-state searches
+    separately. ``negative`` is the B=0 source population used for 0->1
+    discovery, while ``positive`` is the B=1 source population used for 1->0
+    discovery. A completed baseline search with zero retained candidates is a
+    measured zero for that direction. A skipped baseline (for example because
+    the source population is empty or too small) is unavailable, not a zero.
+
+    Returned values are ``"measured_zero"``, ``"unavailable"``, or
+    ``"unknown"`` for keys ``"i2c"`` and ``"c2i"``.
+    """
+    out = {"i2c": "unknown", "c2i": "unknown"}
+    if stage6_dir is None:
+        return out
+    manifest = Path(stage6_dir) / "stage6_downstream_availability.json"
+    if not manifest.is_file():
+        return out
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    baselines = payload.get("baselines", []) if isinstance(payload, dict) else []
+    if not isinstance(baselines, list):
+        return out
+    mapping = {"negative": "i2c", "positive": "c2i"}
+    for row in baselines:
+        if not isinstance(row, dict):
+            continue
+        direction = mapping.get(str(row.get("baseline_subset", "")).strip().lower())
+        if direction is None:
+            continue
+        try:
+            n_ok = int(row.get("n_ok", 0) or 0)
+            n_skipped = int(row.get("n_skipped", 0) or 0)
+            n_candidates = int(row.get("eligible_agonist_candidates", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if n_ok > 0 and n_skipped == 0 and n_candidates == 0:
+            out[direction] = "measured_zero"
+        elif n_skipped > 0 and n_ok == 0:
+            out[direction] = "unavailable"
+    return out
+
 def stage5_completion_status(stage5_dir: Path | None) -> str:
     """Classify Stage-5 circuit-discovery completion without guessing from emptiness.
 
@@ -141,6 +187,35 @@ def stage6_candidate_count(stage6_dir: Path | None) -> tuple[int | None, str]:
     """
     if stage6_dir is None or not stage6_dir.exists():
         return None, "stage6_missing"
+
+    # A zero-candidate discovery may legitimately produce no bucket files.
+    # The v2 availability manifest is then the completion record: at least one
+    # requested source-state search completed successfully and the union of
+    # eligible retained candidates is empty. A direction that was skipped is
+    # tracked separately by ``stage6_directional_zero_status``.
+    availability = stage6_dir / "stage6_downstream_availability.json"
+    if availability.is_file():
+        try:
+            payload = json.loads(availability.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            try:
+                eligible = int(payload.get("eligible_stage6_agonist_candidates"))
+            except (TypeError, ValueError):
+                eligible = None
+            baselines = payload.get("baselines", [])
+            completed = 0
+            if isinstance(baselines, list):
+                for row in baselines:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        completed += max(0, int(row.get("n_ok", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+            if eligible == 0 and completed > 0:
+                return 0, "ok"
 
     bucket_files = sorted(stage6_dir.rglob("neuron_buckets.json"))
     if not bucket_files:

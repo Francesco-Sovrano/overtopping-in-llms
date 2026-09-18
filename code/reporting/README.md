@@ -6,3 +6,8 @@ RQ1 readability update:
 
 Run:
 python -m reporting.generate_manuscript_figures --results-root ../results
+
+Table generation:
+- `python -m reporting.generate_manuscript_tables --results-root ../results --require-all`
+- regenerates the six LaTeX tables imported by the current manuscript directly from the canonical analysis CSVs
+- `generate_manuscript_figures` invokes the table generator before assembling `manuscript_exact/`, so figures and tables stay synchronized in the upload bundle

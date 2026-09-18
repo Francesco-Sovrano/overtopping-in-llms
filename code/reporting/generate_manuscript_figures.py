@@ -22,6 +22,7 @@ from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
 import numpy as np
 import pandas as pd
+from reporting.generate_manuscript_tables import generate_all as generate_manuscript_tables
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +672,7 @@ def main_rq4_defense(root: Path, out: Path) -> None:
     checkpoint_across = read(cross_root / "clean_reference_defense_checkpoint_across_seeds.csv")
     checkpoint_all = read(cross_root / "clean_reference_defense_checkpoint_all_seeds.csv")
     budget_across = read(cross_root / "clean_reference_defense_budget_curve_across_seeds.csv")
+    selected_channels = read(cross_root / "clean_reference_defense_selected_channels_all_seeds.csv")
 
     if checkpoint_across.empty or checkpoint_all.empty:
         # Fall back to the pre-rendered cross-seed figure only when the
@@ -699,6 +701,13 @@ def main_rq4_defense(root: Path, out: Path) -> None:
         for c in frame.columns:
             if c in num_cols:
                 frame[c] = _num(frame[c])
+    if not selected_channels.empty:
+        for c in [
+            "target_fraction", "benign_damage_budget", "selection_fraction",
+            "target_benign_damage_rate", "target_attack_suppression_rate",
+        ]:
+            if c in selected_channels.columns:
+                selected_channels[c] = _num(selected_channels[c])
 
     checkpoint_across = checkpoint_across.sort_values("target_fraction")
     checkpoint_all = checkpoint_all.sort_values(["target_fraction", "training_seed"])
@@ -731,8 +740,8 @@ def main_rq4_defense(root: Path, out: Path) -> None:
 
         ax_line.fill_between(x, benign, attack, where=attack >= benign, interpolate=True, color="#dcefdc", alpha=.85, linewidth=0, label=r"$\Delta_{\rm def}>0$")
         ax_line.fill_between(x, benign, attack, where=attack < benign, interpolate=True, color="#f4dede", alpha=.85, linewidth=0)
-        ax_line.errorbar(x, attack, yerr=np.vstack([attack_lo, attack_hi]), marker="D", markersize=8.2, linewidth=2.35, capsize=3.4, label="Attack supp.")
-        ax_line.errorbar(x, benign, yerr=np.vstack([benign_lo, benign_hi]), marker="o", markersize=8.0, linewidth=2.35, capsize=3.4, label="Benign dmg.")
+        ax_line.errorbar(x, attack, yerr=np.vstack([attack_lo, attack_hi]), marker="D", markersize=8.2, linewidth=2.35, capsize=3.4, label="Attack suppression")
+        ax_line.errorbar(x, benign, yerr=np.vstack([benign_lo, benign_hi]), marker="o", markersize=8.0, linewidth=2.35, capsize=3.4, label="Benign damage")
         for xv, av, bv, lev in zip(x, attack, benign, leverage):
             ax_line.annotate(f"{lev:+.0f} pp", (xv, max(av, bv)), xytext=(0, 8), textcoords="offset points", ha="center", va="bottom", fontsize=10.0)
         ax_line.set_xticks(x)
@@ -741,10 +750,18 @@ def main_rq4_defense(root: Path, out: Path) -> None:
         ax_line.set_xlabel("Checkpoint (%)", labelpad=3)
         ax_line.set_ylabel("Rate (%)", labelpad=4)
         ax_line.grid(True, alpha=.18)
+        _handles, _labels = ax_line.get_legend_handles_labels()
+        _by_label = dict(zip(_labels, _handles))
+        _legend_order = ["Attack suppression", "Benign damage", r"$\Delta_{\rm def}>0$"]
+        ax_line.legend(
+            [_by_label[k] for k in _legend_order if k in _by_label],
+            [k for k in _legend_order if k in _by_label],
+            frameon=False, loc="upper left", fontsize=9.2,
+        )
         ax_line.text(.985, .96, r"$\tau=30\%$", transform=ax_line.transAxes, ha="right", va="top", fontsize=10.0)
 
         if not budget_across.empty:
-            inset = ax_line.inset_axes([.56, .08, .40, .34])
+            inset = ax_line.inset_axes([.54, .07, .42, .36])
             checkpoints = sorted(budget_across["target_fraction"].dropna().unique())
             markers = ["o", "s", "^", "D", "P", "X"]
             for idx, frac in enumerate(checkpoints):
@@ -757,42 +774,85 @@ def main_rq4_defense(root: Path, out: Path) -> None:
                 inset.plot(100 * cp["benign_damage_budget"].to_numpy(float), y, marker=markers[idx % len(markers)], linewidth=1.15, markersize=3.4)
                 inset.fill_between(100 * cp["benign_damage_budget"].to_numpy(float), q25, q75, alpha=.08)
             inset.axhline(0, color="0.45", linestyle="--", linewidth=.7)
-            inset.set_xlabel(r"$\tau$ (%)", fontsize=8.0, labelpad=1)
-            inset.set_ylabel(r"$\Delta_{\rm def}$ (pp)", fontsize=8.0, labelpad=1)
-            inset.tick_params(axis="both", labelsize=7.4, pad=1)
+            inset.set_xlabel("Budget (%)", fontsize=7.8, labelpad=1.6)
+            inset.set_ylabel(r"$\Delta_{\rm def}$ (pp)", fontsize=7.8, labelpad=1.2)
+            inset.tick_params(axis="both", labelsize=7.2, pad=1)
             inset.grid(True, alpha=.12)
 
-        single = checkpoint_all.dropna(subset=["target_fraction", "training_seed", "mean_attack_suppression", "mean_poisoned_disruption"]).copy()
-        xvals = 100 * single["mean_poisoned_disruption"].to_numpy(float)
-        yvals = 100 * single["mean_attack_suppression"].to_numpy(float)
-        lim = max(70.0, min(82.0, float(np.nanmax(np.r_[xvals, yvals])) * 1.12))
-        trade_x = np.linspace(0, lim, 400)
-        ax_trade.fill_between(trade_x, trade_x, lim, color="#dcefdc", alpha=.85, linewidth=0, zorder=0)
-        ax_trade.fill_between(trade_x, 0, trade_x, color="#f4dede", alpha=.85, linewidth=0, zorder=0)
-        ax_trade.plot([0, lim], [0, lim], "--", color="0.42", linewidth=1.0, zorder=1)
-        ax_trade.axvline(30, color="0.50", linestyle=":", linewidth=1.0)
-        ax_trade.text(.03*lim, .93*lim, "attack-selective", fontsize=11.0, fontweight="bold", color="0.18")
-        ax_trade.text(.67*lim, .08*lim, "benign-costly", fontsize=11.0, fontweight="bold", color="0.18")
+        # Panel (b): use the exact cross-seed selected-channel table used by
+        # poisoning_clean_reference_defense, so the two renderings cannot
+        # silently disagree about which channel-level observations are shown.
+        channels = selected_channels.copy()
+        required = {
+            "target_fraction", "unit_key", "benign_damage_budget",
+            "target_benign_damage_rate", "target_attack_suppression_rate",
+        }
+        if not channels.empty and required.issubset(channels.columns):
+            if "selection_fraction" in channels.columns:
+                channels = channels[np.isclose(
+                    channels["selection_fraction"].to_numpy(float),
+                    channels["target_fraction"].to_numpy(float),
+                    equal_nan=False,
+                )]
+            channels = channels[np.isclose(
+                channels["benign_damage_budget"].to_numpy(float), 0.30,
+                atol=1e-12, rtol=0.0, equal_nan=False,
+            )]
+            channels = channels.dropna(subset=[
+                "target_fraction", "unit_key",
+                "target_benign_damage_rate", "target_attack_suppression_rate",
+            ])
+            dedup_cols = [c for c in ["training_seed", "target_fraction", "unit_key"] if c in channels.columns]
+            if dedup_cols:
+                channels = channels.drop_duplicates(dedup_cols, keep="last")
+        else:
+            channels = pd.DataFrame()
 
-        markers = ["o", "s", "^", "D", "P", "X"]
-        for idx, frac in enumerate(sorted(single["target_fraction"].astype(float).unique())):
-            cp_seed = single[np.isclose(single["target_fraction"].to_numpy(float), frac, equal_nan=False)]
-            ax_trade.scatter(100*cp_seed["mean_poisoned_disruption"], 100*cp_seed["mean_attack_suppression"], s=64, marker=markers[idx % len(markers)], alpha=.35, linewidths=0, zorder=2)
-            cp_med = checkpoint_across[np.isclose(checkpoint_across["target_fraction"].to_numpy(float), frac, equal_nan=False)]
-            if not cp_med.empty:
-                row = cp_med.iloc[0]
-                mx = 100 * float(row["mean_poisoned_disruption__median"])
-                my = 100 * float(row["mean_attack_suppression__median"])
-                xerr = np.array([[mx - 100*float(row["mean_poisoned_disruption__q25"])], [100*float(row["mean_poisoned_disruption__q75"]) - mx]])
-                yerr = np.array([[my - 100*float(row["mean_attack_suppression__q25"])], [100*float(row["mean_attack_suppression__q75"]) - my]])
-                ax_trade.errorbar(mx, my, xerr=xerr, yerr=yerr, fmt=markers[idx % len(markers)], markersize=7.8, elinewidth=1.45, capsize=3.2, color=f"C{idx}", mec='black', mew=.3, label=f"{int(round(100*frac))}% checkpoint", zorder=3)
+        if not channels.empty:
+            xvals = 100.0 * channels["target_benign_damage_rate"].to_numpy(float)
+            yvals = 100.0 * channels["target_attack_suppression_rate"].to_numpy(float)
+            lim = 100.0
+            trade_x = np.linspace(0, lim, 400)
+            ax_trade.fill_between(
+                trade_x, trade_x, lim, color="#dcefdc", alpha=.85, linewidth=0, zorder=0
+            )
+            ax_trade.fill_between(
+                trade_x, 0, trade_x, color="#f4dede", alpha=.85, linewidth=0, zorder=0
+            )
+            ax_trade.plot([0, lim], [0, lim], "--", color="0.42", linewidth=1.0, zorder=1)
+            ax_trade.axvline(30, color="0.50", linestyle=":", linewidth=1.0, zorder=1)
+            ax_trade.text(.03*lim, .93*lim, "attack-selective channel", fontsize=11.0, fontweight="bold", color="0.18")
+            ax_trade.text(.67*lim, .08*lim, "benign-costly channel", fontsize=11.0, fontweight="bold", color="0.18")
 
-        ax_trade.set_xlim(0, lim)
-        ax_trade.set_ylim(0, lim)
-        ax_trade.set_xlabel("Seed-level benign damage (%)", labelpad=3)
-        ax_trade.set_ylabel("Seed-level attack suppression (%)", labelpad=4)
-        ax_trade.grid(True, alpha=.18)
-        ax_trade.legend(loc="upper right", handletextpad=.5, borderaxespad=.2)
+            markers = ["o", "s", "^", "D", "P", "X"]
+            checkpoints = sorted(channels["target_fraction"].astype(float).unique())
+            for idx, frac in enumerate(checkpoints):
+                cp = channels[np.isclose(
+                    channels["target_fraction"].to_numpy(float), frac, equal_nan=False
+                )]
+                ax_trade.scatter(
+                    100.0 * cp["target_benign_damage_rate"],
+                    100.0 * cp["target_attack_suppression_rate"],
+                    s=58, marker=markers[idx % len(markers)],
+                    alpha=.82, edgecolors="black", linewidths=.35,
+                    label=f"{int(round(100*frac))}% checkpoint", zorder=3,
+                )
+
+            ax_trade.set_xlim(0, lim)
+            ax_trade.set_ylim(0, lim)
+            ax_trade.set_xlabel("Benign damage (%)", labelpad=3)
+            ax_trade.set_ylabel("Attack suppression (%)", labelpad=4)
+            ax_trade.grid(True, alpha=.18)
+            ax_trade.legend(
+                title="Checkpoint", loc="upper right", ncol=1,
+                handletextpad=.45, borderaxespad=.2, labelspacing=.35,
+            )
+        else:
+            ax_trade.text(
+                .5, .5, "Channel-level defense data unavailable",
+                transform=ax_trade.transAxes, ha="center", va="center",
+            )
+            ax_trade.set_axis_off()
         save_exact(fig, out)
 
 
@@ -1300,8 +1360,9 @@ def _build_manuscript_bundle(root: Path, main_dir: Path, supp_dir: Path, tables_
     for fn,name in main_jobs:
         fn(root,main_dir/name)
         if (main_dir/name).is_file(): counts["generated_main"]+=1
-    if _copy(paper/"04_rq3_spiking_cut"/"fig4e_population_event_and_strength.pdf", main_dir/"rq3_population_event_and_strength.pdf"):
-        counts["copied_main"]+=1
+    main_rq3(root, main_dir/"rq3_population_event_and_strength.pdf")
+    if (main_dir/"rq3_population_event_and_strength.pdf").is_file():
+        counts["generated_main"]+=1
     if _copy(paper/"05_rq4_learning"/"fig5a_pythia_checkpoint_trajectory.pdf", main_dir/"rq4_pythia_checkpoint_trajectory.pdf"):
         counts["copied_main"]+=1
     else:
@@ -1339,6 +1400,10 @@ def _build_manuscript_bundle(root: Path, main_dir: Path, supp_dir: Path, tables_
     ]:
         if _copy(src,supp_dir/name): counts["copied_supp"]+=1
 
+    # Rebuild the paper-facing table sources from the same canonical analysis
+    # CSVs before copying them into the manuscript bundle. This keeps generated
+    # tables byte-for-byte synchronized with the current paper table layouts.
+    generate_manuscript_tables(root)
     counts["tables"]=_copy_tables(root,tables_dir)
     return counts
 

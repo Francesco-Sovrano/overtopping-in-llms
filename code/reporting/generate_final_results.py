@@ -45,6 +45,10 @@ from reporting.result_paths import (
     rq4_figures,
 )
 from studies.poisoning.lib.run_paths import TRAJECTORIES_DIRNAME, TRAINING_DIRNAME
+from studies.overtopping.analysis.stage06_competence_vs_overtopping_figures import (
+    discover_rq1_manuscript_points,
+    transform_points_for_coverage_metric,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -740,7 +744,7 @@ def print_rq_figure_summary(results_root: Path) -> None:
 
 
 def validate_generated_paper_view(
-    results_root: Path, *, primary_table_path: Path, spiking_expected: bool, require_complete_population: bool = True
+    results_root: Path, *, data_root: Path, primary_table_path: Path, spiking_expected: bool, require_complete_population: bool = True
 ) -> dict:
     """Validate the manuscript-facing output contract before reporting success."""
     figures = manuscript_figures(results_root)
@@ -754,6 +758,39 @@ def validate_generated_paper_view(
         plotted: int((configured.get("phase", pd.Series(dtype=str)).astype(str) == source).sum())
         for source, plotted in phase_map.items()
     }
+
+    # Direction-specific RQ1 panels do not necessarily contain every configured
+    # setting. A completed empty search is a measured zero and must remain in the
+    # panel, whereas a direction that could not be evaluated has no directional
+    # estimate and is excluded from that direction only. Reconstruct the expected
+    # directional population with the exact same resolver used by Figure 2. Do
+    # not infer panel membership from table2_directional_prevalence.csv: that
+    # table is a reporting product and can legitimately leave directional U(J)
+    # cells blank for zero-candidate settings even though those settings belong
+    # in the plotted population as measured zeros.
+    expected_directional: dict[str, dict[str, object]] = {}
+    try:
+        rq1_base_points = discover_rq1_manuscript_points(
+            data_root, allow_incomplete=not require_complete_population
+        )
+        for direction in ("i2c", "c2i"):
+            directional_points = transform_points_for_coverage_metric(
+                data_root, rq1_base_points, direction
+            )
+            finite = [
+                p for p in directional_points
+                if pd.notna(p.score) and pd.notna(p.union_rate)
+            ]
+            expected_directional[direction] = {
+                "total": int(len(finite)),
+                "phase_counts": {
+                    phase: int(sum(p.phase == phase for p in finite))
+                    for phase in ("input+output", "decode-only")
+                },
+            }
+    except Exception as exc:
+        message = f"could not reconstruct RQ1 directional population from experiment artifacts: {exc}"
+        (errors if require_complete_population else warnings).append(message)
 
     required_figures = [
         figures / "02_rq1_prevalence" / "fig2a_competence_vs_U_0to1.pdf",
@@ -788,6 +825,7 @@ def validate_generated_paper_view(
         try:
             frame = pd.read_csv(rq1_data)
             needed = {
+                "U_J_i2c", "U_J_c2i",
                 "U_J_i2c_n", "U_J_c2i_n", "U_J_i2c_adequate", "U_J_c2i_adequate",
                 "N_t_i2c_0.05_per_1k_layer", "N_t_c2i_0.05_per_1k_layer",
             }
@@ -863,20 +901,36 @@ def validate_generated_paper_view(
                         "experimental settings after collapsing evaluation suffixes"
                     )
 
-                # Figure 2 must match the currently configured primary table.
-                # The population size and phase split are derived, never hard-coded.
-                if len(points) != expected_total:
+                # Figure 2 uses the full configured population only when the
+                # requested direction is defined for every setting. For direction-
+                # specific panels, explicitly unavailable directions are absent,
+                # while completed empty searches remain as measured zeros.
+                direction = "i2c" if stem.endswith("0to1") else "c2i"
+                directional_expectation = expected_directional.get(direction)
+                if directional_expectation is not None:
+                    expected_panel_total = int(directional_expectation["total"])
+                    expected_panel_phase_counts = dict(directional_expectation["phase_counts"])
+                    expectation_label = f"configured {direction} population"
+                else:
+                    expected_panel_total = expected_total
+                    expected_panel_phase_counts = expected_phase_counts
+                    expectation_label = "configured primary table"
+
+                if len(points) != expected_panel_total:
                     message = (
-                        f"{stem} has {len(points)} settings; current configured primary table has "
-                        f"{expected_total}"
+                        f"{stem} has {len(points)} settings; {expectation_label} has "
+                        f"{expected_panel_total}"
                     )
                     (errors if require_complete_population else warnings).append(message)
                 if "phase" in points.columns:
                     actual_phase_counts = points["phase"].astype(str).value_counts().to_dict()
-                    for phase, n_expected in expected_phase_counts.items():
+                    for phase, n_expected in expected_panel_phase_counts.items():
                         n_actual = int(actual_phase_counts.get(phase, 0))
                         if n_actual != n_expected:
-                            message = f"{stem} has {n_actual} {phase} settings; configured table has {n_expected}"
+                            message = (
+                                f"{stem} has {n_actual} {phase} settings; "
+                                f"{expectation_label} has {n_expected}"
+                            )
                             (errors if require_complete_population else warnings).append(message)
             if not stats_path.is_file():
                 message = f"missing all-settings RQ1 fit-stat sidecar: {stats_path}"
@@ -1456,6 +1510,7 @@ def main() -> None:
     )
     validate_generated_paper_view(
         results_root,
+        data_root=data_root,
         primary_table_path=primary_table_path,
         spiking_expected=spiking_available,
         require_complete_population=not allow_incomplete_population,

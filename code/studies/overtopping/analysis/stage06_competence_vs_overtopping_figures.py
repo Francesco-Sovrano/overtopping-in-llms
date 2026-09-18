@@ -43,7 +43,7 @@ from matplotlib.transforms import Bbox
 
 from studies.overtopping.analysis.layer_widths import layer_width_for_model
 from studies.overtopping.analysis.lib.files import read_json
-from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count
+from studies.overtopping.analysis.lib.discovery_artifacts import resolve_stage6_dir, stage6_candidate_count, stage6_directional_zero_status
 from studies.overtopping.analysis.lib.stats_resolution import resolve_available_stats_dir
 from studies.overtopping.analysis.lib.task_metrics import chance_baseline, chance_normalized_score, raw_task_score
 from studies.overtopping.experiments.execution import load_run_specs_json
@@ -191,14 +191,29 @@ def _directional_rate_from_global(payload: dict, direction: str) -> float:
         return math.nan
 
 
+
+def _empty_candidate_direction_value(run_dir: Path, direction: str) -> float:
+    """Return a directional zero only when that discovery side was evaluated.
+
+    For completed zero-candidate searches, the availability manifest distinguishes
+    a measured empty B=0/B=1 search from a skipped source-state search. Legacy
+    zero-candidate outputs without a manifest retain the historical empty-union
+    value of zero.
+    """
+    stage6_dir = resolve_stage6_dir(run_dir)
+    status = stage6_directional_zero_status(stage6_dir).get(direction, "unknown")
+    if status == "measured_zero":
+        return 0.0
+    if status == "unavailable":
+        return math.nan
+    n_candidates, stage6_status = stage6_candidate_count(stage6_dir)
+    return 0.0 if stage6_status == "ok" and n_candidates == 0 else math.nan
+
 def _directional_n05_density(run_dir: Path, model: str, direction: str, *, per_1000: bool = False) -> float:
     global_path = run_dir / "flip_stats_global.json"
     by_neuron_path = run_dir / "flip_stats_by_neuron.csv"
     if not global_path.is_file():
-        # A materialized run directory with no flip-statistics file represents
-        # an empty candidate set in the configured manuscript pipeline: U(empty)=0
-        # and N_t(empty)=0. Preserve that zero rather than dropping the point.
-        return 0.0
+        return _empty_candidate_direction_value(run_dir, direction)
     payload = read_json(global_path)
     denom_key = "n_evaluated_i2c_rows" if direction == "i2c" else "n_evaluated_c2i_rows"
     try:
@@ -235,8 +250,10 @@ def _directional_n05_density(run_dir: Path, model: str, direction: str, *, per_1
 def transform_points_for_coverage_metric(root: Path, points: list[PlotPoint], metric: str) -> list[PlotPoint]:
     """Reuse the shared visual engine with a different causal y quantity.
 
-    Crucially, this does *not* filter settings by their within-setting directional
-    denominator. The regression n remains the number of plotted settings.
+    A direction that was explicitly unavailable at discovery (for example because
+    the relevant source-state population was empty or too small) remains NaN and is
+    omitted from that direction's regression. Completed empty searches remain
+    measured zeros.
     """
     metric = str(metric)
     if metric == "pooled":
@@ -249,9 +266,11 @@ def transform_points_for_coverage_metric(root: Path, points: list[PlotPoint], me
             if global_path.is_file():
                 value = _directional_rate_from_global(read_json(global_path), metric)
             else:
-                # Existing run with no discovered agonists: the union of an empty
-                # candidate set is exactly zero in either direction.
-                value = 0.0 if point.status in {"verified-zero-candidates", "empty-no-agonists"} else math.nan
+                value = (
+                    _empty_candidate_direction_value(run_dir, metric)
+                    if point.status in {"verified-zero-candidates", "empty-no-agonists"}
+                    else math.nan
+                )
         elif metric == "n05-i2c-density":
             value = _directional_n05_density(run_dir, point.model, "i2c")
         elif metric == "n05-c2i-density":
@@ -3472,26 +3491,50 @@ def main() -> None:
             raise RuntimeError("no points to plot after filtering")
         points = transform_points_for_coverage_metric(root, points, args.coverage_metric)
         if args.rq1_manuscript_population and args.coverage_metric != "pooled":
-            missing_directional = [
-                p for p in points
-                if math.isfinite(p.score) and not math.isfinite(p.union_rate)
-            ]
-            if missing_directional:
+            # A directional NaN is not automatically a missing result. Stage-6
+            # records directions that could not be evaluated separately from
+            # completed empty searches. The former are expected exclusions from a
+            # direction-specific analysis; the latter are measured zeros.
+            unresolved_directional: list[PlotPoint] = []
+            unavailable_directional: list[PlotPoint] = []
+            for p in points:
+                if not (math.isfinite(p.score) and not math.isfinite(p.union_rate)):
+                    continue
+                run_dir = _run_dir_from_point(root, p)
+                stage6_dir = resolve_stage6_dir(run_dir)
+                metric_direction = (
+                    "i2c"
+                    if args.coverage_metric in {"i2c", "n05-i2c-density", "n05-i2c-per-1k"}
+                    else "c2i"
+                )
+                direction_status = stage6_directional_zero_status(stage6_dir).get(
+                    metric_direction, "unknown"
+                )
+                if direction_status == "unavailable":
+                    unavailable_directional.append(p)
+                else:
+                    unresolved_directional.append(p)
+
+            if unresolved_directional:
                 detail = "\n".join(
                     f"  - {p.task}/{p.org}/{p.model}: {p.run}"
-                    for p in missing_directional[:20]
+                    for p in unresolved_directional[:20]
                 )
                 message = (
-                    "RQ1 manuscript population has missing directional singleton statistics. "
-                    "Rebuild directional singleton statistics for the final complete manuscript population.\n" + detail
+                    "RQ1 manuscript population has unresolved directional singleton statistics. "
+                    "These settings are neither measured zeros nor explicitly unavailable. "
+                    "Rebuild or repair their directional statistics before plotting.\n" + detail
                 )
                 if not args.allow_incomplete_manuscript_population:
-                    raise RuntimeError(
-                        "RQ1 manuscript population has missing directional singleton statistics. "
-                        "Refusing to change the plotted population by silently dropping those settings. "
-                        "Rebuild directional singleton statistics first.\n" + detail
-                    )
+                    raise RuntimeError(message)
                 print("[WARNING] " + message.replace("\n", " | "))
+
+            if unavailable_directional:
+                print(
+                    "[INFO] Excluding "
+                    f"{len(unavailable_directional)} explicitly unavailable "
+                    f"{args.coverage_metric} direction(s) from this directional analysis."
+                )
         points = [p for p in points if math.isfinite(p.score) and math.isfinite(p.union_rate)]
         if not points:
             raise RuntimeError(f"no finite points for coverage metric {args.coverage_metric}")

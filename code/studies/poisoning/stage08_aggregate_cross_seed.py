@@ -569,6 +569,30 @@ def load_clean_reference_defense_tables(
     return _attach_metadata(checkpoint, metadata), _attach_metadata(curve, metadata)
 
 
+
+def load_clean_reference_selected_channels(
+    run_dir: Path,
+    *,
+    story_root: Path,
+) -> pd.DataFrame:
+    """Load channel-level clean-reference defense selections for one training seed.
+
+    These rows are retained as nested descriptive observations.  They are not
+    treated as independent replicates in cross-seed inference.
+    """
+    task, phase = _task_and_phase(run_dir)
+    story = story_root / task / run_dir.name / phase_dirname(phase) / "story"
+    path = story / "clean_reference_benign_budget_selected_channels.csv"
+    if not path.is_file() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        selected = pd.read_csv(path)
+    except (pd.errors.EmptyDataError, OSError):
+        return pd.DataFrame()
+    if selected.empty:
+        return selected
+    return _attach_metadata(selected, _run_metadata(run_dir))
+
 def aggregate_defense_seed_units(
     raw: pd.DataFrame,
     *,
@@ -653,15 +677,21 @@ def main() -> None:
         story_root = Path(args.story_root).expanduser()
         checkpoint_frames: list[pd.DataFrame] = []
         curve_frames: list[pd.DataFrame] = []
+        selected_channel_frames: list[pd.DataFrame] = []
         for run_dir in run_dirs:
             try:
                 checkpoint_frame, curve_frame = load_clean_reference_defense_tables(
+                    run_dir, story_root=story_root
+                )
+                selected_frame = load_clean_reference_selected_channels(
                     run_dir, story_root=story_root
                 )
                 if not checkpoint_frame.empty:
                     checkpoint_frames.append(checkpoint_frame)
                 if not curve_frame.empty:
                     curve_frames.append(curve_frame)
+                if not selected_frame.empty:
+                    selected_channel_frames.append(selected_frame)
             except Exception as exc:
                 defense_errors.append({
                     "run_dir": str(run_dir),
@@ -694,6 +724,13 @@ def main() -> None:
             min_seeds=args.min_seeds,
         ).to_csv(
             out_dir / "clean_reference_defense_budget_curve_across_seeds.csv", index=False
+        )
+        defense_selected_raw = (
+            pd.concat(selected_channel_frames, ignore_index=True, sort=False)
+            if selected_channel_frames else pd.DataFrame()
+        )
+        defense_selected_raw.to_csv(
+            out_dir / "clean_reference_defense_selected_channels_all_seeds.csv", index=False
         )
 
     # Aggregate the detector first. This branch depends only on Stage 07 and is

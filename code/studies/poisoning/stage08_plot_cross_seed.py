@@ -503,14 +503,15 @@ def _plot_clean_reference_defense(
     *,
     summary_style: str,
     checkpoint_raw: pd.DataFrame | None = None,
+    selected_channels_raw: pd.DataFrame | None = None,
 ) -> None:
     """Render the clean-reference defense using seed-level replication.
 
     Panel A aggregates each seed's checkpoint-level selected-channel mean, then
-    summarizes those seed-level estimates. Panel B shows the seed-level
-    suppression-vs-damage operating points directly, with the cross-seed
-    center and IQR/CI overlaid. Selected channels are never pooled as if they
-    were independent seed replicates.
+    summarizes those seed-level estimates. Panel B shows the actual selected
+    channels in benign-damage / attack-suppression space. These channel rows are
+    nested descriptive observations; cross-seed inference still uses training
+    seeds as the replicate units.
     """
     out_path = output_dir / "poisoning_clean_reference_defense.pdf"
     if checkpoint.empty or curve.empty or "_plot_family_id" not in checkpoint.columns:
@@ -661,62 +662,44 @@ def _plot_clean_reference_defense(
                     )
         inset.axhline(0.0, color="0.45", linestyle="--", linewidth=0.7)
         inset.axvline(100.0 * operating_budget, color="0.50", linestyle=":", linewidth=0.8)
-        inset.set_xlabel(r"$\tau$ (%)", fontsize=6.5, labelpad=1)
-        inset.set_ylabel(r"$\Delta_{\rm def}$ (pp)", fontsize=6.5, labelpad=1)
-        inset.tick_params(axis="both", labelsize=6.0, pad=1)
+        inset.set_xlabel("Budget (%)", fontsize=7.8, labelpad=1.6)
+        inset.set_ylabel(r"$\Delta_{\rm def}$ (pp)", fontsize=7.8, labelpad=1.2)
+        inset.tick_params(axis="both", labelsize=7.2, pad=1)
         inset.grid(True, alpha=0.12)
 
-        # Seed-level operating points. These are the actual replicate units; the
-        # larger markers and whiskers show the cross-seed center and IQR/CI.
-        if not raw_fam.empty:
-            raw_fam["target_fraction"] = pd.to_numeric(raw_fam["target_fraction"], errors="coerce")
-            raw_fam["mean_poisoned_disruption"] = pd.to_numeric(raw_fam["mean_poisoned_disruption"], errors="coerce")
-            raw_fam["mean_attack_suppression"] = pd.to_numeric(raw_fam["mean_attack_suppression"], errors="coerce")
-        all_trade_values = []
-        for idx, frac in enumerate(sorted(fam["target_fraction"].dropna().unique())):
-            cp = fam[np.isclose(fam["target_fraction"].to_numpy(float), float(frac), equal_nan=False)]
-            x_center, x_low, x_high = _metric_summary_arrays(cp, "mean_poisoned_disruption", summary_style)
-            y_center, y_low, y_high = _metric_summary_arrays(cp, "mean_attack_suppression", summary_style)
-            if len(x_center) != 1 or len(y_center) != 1:
-                continue
-            cx, cy = 100.0 * x_center[0], 100.0 * y_center[0]
-            color = plt.get_cmap("tab10")(idx % 10)
-            raw_cp = pd.DataFrame()
-            if not raw_fam.empty:
-                raw_cp = raw_fam[np.isclose(
-                    raw_fam["target_fraction"].to_numpy(float), float(frac), equal_nan=False
-                )].dropna(subset=["mean_poisoned_disruption", "mean_attack_suppression"])
-                if not raw_cp.empty:
-                    rx = 100.0 * raw_cp["mean_poisoned_disruption"].to_numpy(float)
-                    ry = 100.0 * raw_cp["mean_attack_suppression"].to_numpy(float)
-                    ax_trade.scatter(
-                        rx, ry, s=25, marker=markers[idx % len(markers)],
-                        color=color, alpha=0.35, linewidths=0, zorder=2,
-                    )
-                    all_trade_values.extend(rx.tolist()); all_trade_values.extend(ry.tolist())
-            ax_trade.scatter(
-                [cx], [cy], s=70, marker=markers[idx % len(markers)],
-                color=color, edgecolors="black", linewidths=0.55, zorder=4,
-                label=f"{int(round(100*float(frac)))}% checkpoint",
+        # Channel-level operating points. Each point is one selected channel
+        # from one training seed. These are nested descriptive observations,
+        # not independent replicates for cross-seed inference.
+        channel_fam = (
+            _matching_raw_family(selected_channels_raw, family_id)
+            if selected_channels_raw is not None else pd.DataFrame()
+        )
+        if not channel_fam.empty:
+            for col in (
+                "target_fraction", "benign_damage_budget", "selection_fraction",
+                "target_benign_damage_rate", "target_attack_suppression_rate",
+            ):
+                if col in channel_fam.columns:
+                    channel_fam[col] = pd.to_numeric(channel_fam[col], errors="coerce")
+            if "benign_damage_budget" in channel_fam.columns:
+                channel_fam = channel_fam[np.isclose(
+                    channel_fam["benign_damage_budget"].to_numpy(float),
+                    operating_budget, atol=1e-12, rtol=0.0, equal_nan=False,
+                )]
+            if "selection_fraction" in channel_fam.columns:
+                channel_fam = channel_fam[np.isclose(
+                    channel_fam["selection_fraction"].to_numpy(float),
+                    channel_fam["target_fraction"].to_numpy(float),
+                    equal_nan=False,
+                )]
+            channel_fam = channel_fam.dropna(subset=[
+                "target_fraction", "unit_key",
+                "target_benign_damage_rate", "target_attack_suppression_rate",
+            ]).drop_duplicates(
+                subset=["training_seed", "target_fraction", "unit_key"], keep="last"
             )
-            if x_low is not None and x_high is not None:
-                xl, xh = 100.0 * x_low[0], 100.0 * x_high[0]
-                if np.isfinite(xl) and np.isfinite(xh) and xl <= cx <= xh:
-                    ax_trade.errorbar(
-                        [cx], [cy], xerr=np.array([[cx-xl], [xh-cx]]),
-                        fmt="none", ecolor=color, elinewidth=1.15, capsize=2.8, zorder=3,
-                    )
-            if y_low is not None and y_high is not None:
-                yl, yh = 100.0 * y_low[0], 100.0 * y_high[0]
-                if np.isfinite(yl) and np.isfinite(yh) and yl <= cy <= yh:
-                    ax_trade.errorbar(
-                        [cx], [cy], yerr=np.array([[cy-yl], [yh-cy]]),
-                        fmt="none", ecolor=color, elinewidth=1.15, capsize=2.8, zorder=3,
-                    )
-            all_trade_values.extend([cx, cy])
 
-        lim = max(70.0, max(all_trade_values, default=60.0) * 1.10)
-        lim = min(100.0, lim)
+        lim = 100.0
         trade_x = np.linspace(0.0, lim, 400)
         ax_trade.fill_between(trade_x, trade_x, lim, color="#dcefdc", alpha=0.75, linewidth=0, zorder=0)
         ax_trade.fill_between(trade_x, 0.0, trade_x, color="#f4dede", alpha=0.75, linewidth=0, zorder=0)
@@ -724,12 +707,31 @@ def _plot_clean_reference_defense(
         ax_trade.axvline(100.0 * operating_budget, color="0.50", linestyle=":", linewidth=1.1)
         ax_trade.text(0.025 * lim, 0.93 * lim, "attack-selective", fontsize=8.0, fontweight="bold", color="0.18")
         ax_trade.text(0.72 * lim, 0.08 * lim, "benign-costly", fontsize=8.0, fontweight="bold", color="0.18")
+
+        if not channel_fam.empty:
+            for idx, frac in enumerate(sorted(channel_fam["target_fraction"].dropna().unique())):
+                cp = channel_fam[np.isclose(
+                    channel_fam["target_fraction"].to_numpy(float), float(frac), equal_nan=False
+                )]
+                color = plt.get_cmap("tab10")(idx % 10)
+                ax_trade.scatter(
+                    100.0 * cp["target_benign_damage_rate"].to_numpy(float),
+                    100.0 * cp["target_attack_suppression_rate"].to_numpy(float),
+                    s=42, marker=markers[idx % len(markers)], color=color,
+                    alpha=0.80, edgecolors="black", linewidths=0.35, zorder=3,
+                    label=f"{int(round(100*float(frac)))}% checkpoint",
+                )
+        else:
+            ax_trade.text(.5, .5, "Channel-level selections unavailable",
+                          transform=ax_trade.transAxes, ha="center", va="center")
+
         ax_trade.set_xlim(0.0, lim); ax_trade.set_ylim(0.0, lim)
-        ax_trade.set_xlabel("Seed-level benign damage (%)")
-        ax_trade.set_ylabel("Seed-level attack suppression (%)")
-        ax_trade.set_title("Seed-level suppression versus benign damage", fontsize=10.0, fontweight="bold")
+        ax_trade.set_xlabel("Benign damage (%)")
+        ax_trade.set_ylabel("Attack suppression (%)")
+        ax_trade.set_title("Selected channels: suppression versus benign damage", fontsize=10.0, fontweight="bold")
         ax_trade.grid(True, alpha=0.18)
-        ax_trade.legend(frameon=False, fontsize=6.8, loc="upper right")
+        if not channel_fam.empty:
+            ax_trade.legend(frameon=False, fontsize=6.8, loc="upper right")
 
         if len(families) > 1:
             label = _family_row_label(fam)
@@ -738,7 +740,7 @@ def _plot_clean_reference_defense(
 
     fig.text(
         0.5, 0.01,
-        _summary_note(summary_style) + " Seed-level checkpoint means are the replicate observations.",
+        _summary_note(summary_style) + " Training seeds are the replicate units; panel (b) shows nested selected channels descriptively.",
         ha="center", va="bottom", fontsize=8.2,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -939,6 +941,7 @@ def main() -> None:
     defense = _read_optional_csv(input_dir / "clean_reference_defense_checkpoint_across_seeds.csv")
     defense_raw = _read_optional_csv(input_dir / "clean_reference_defense_checkpoint_all_seeds.csv")
     defense_curve = _read_optional_csv(input_dir / "clean_reference_defense_budget_curve_across_seeds.csv")
+    defense_channels = _read_optional_csv(input_dir / "clean_reference_defense_selected_channels_all_seeds.csv")
     defense_manifest = pd.DataFrame()
     if not defense.empty and not defense_curve.empty:
         defense, defense_manifest = _annotate_plot_families(
@@ -957,9 +960,15 @@ def main() -> None:
                 defense_raw, branch="clean_reference_defense_raw",
                 extra_identity_columns=DEFENSE_IDENTITY_COLUMNS,
             )
+        if not defense_channels.empty:
+            defense_channels, _ = _annotate_plot_families(
+                defense_channels, branch="clean_reference_defense_channels",
+                extra_identity_columns=DEFENSE_IDENTITY_COLUMNS,
+            )
         _plot_clean_reference_defense(
             defense, defense_curve, output_dir,
             summary_style=args.summary_style, checkpoint_raw=defense_raw,
+            selected_channels_raw=defense_channels,
         )
 
     _write_family_manifest(input_dir, [behavior_manifest, detection_manifest, defense_manifest])
