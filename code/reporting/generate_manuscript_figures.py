@@ -822,7 +822,7 @@ def main_rq4_defense(root: Path, out: Path) -> None:
             ax_trade.plot([0, lim], [0, lim], "--", color="0.42", linewidth=1.0, zorder=1)
             ax_trade.axvline(30, color="0.50", linestyle=":", linewidth=1.0, zorder=1)
             ax_trade.text(.03*lim, .93*lim, "attack-selective channel", fontsize=11.0, fontweight="bold", color="0.18")
-            ax_trade.text(.67*lim, .08*lim, "benign-costly channel", fontsize=11.0, fontweight="bold", color="0.18")
+            ax_trade.text(.6*lim, .05*lim, "benign-costly channel", fontsize=11.0, fontweight="bold", color="0.18")
 
             markers = ["o", "s", "^", "D", "P", "X"]
             checkpoints = sorted(channels["target_fraction"].astype(float).unique())
