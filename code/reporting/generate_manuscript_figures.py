@@ -142,27 +142,52 @@ def _copy(src: Path, dst: Path) -> bool:
 
 
 def _model_tag(model: object) -> str:
+    """Compact, systematic RQ1 model tag: family/version / parameter count."""
     s = str(model)
     low = s.lower()
     if "qwen2.5-1.5b" in low:
-        return "Q2.5"
+        return "Q2.5/1.5B"
     if "qwen2-1.5b" in low:
-        return "Q1.5"
+        return "Q2/1.5B"
     if "qwen2-7b" in low:
-        return "Q7"
+        return "Q2/7B"
     if "pythia-6.9b" in low:
-        return "P6.9"
+        return "Py/6.9B"
     if "pythia-1b" in low:
-        if "48000" in low or "48k" in low:
-            return "P1-48k"
-        if "96000" in low or "96k" in low:
-            return "P1-96k"
-        if "step0" in low or "@0" in low:
-            return "P1-0"
-        if "143000" in low or "143k" in low:
-            return "P1-143k"
-        return "P1"
+        return "Py/1B"
     return s.replace("-Instruct", "")
+
+
+def _rq1_model_key(model: object) -> str:
+    """Stable model-family key used for marker shapes in the RQ1 scatter."""
+    low = str(model).lower()
+    if "qwen2.5-1.5b" in low:
+        return "qwen25_15"
+    if "qwen2-1.5b" in low:
+        return "qwen2_15"
+    if "qwen2-7b" in low:
+        return "qwen2_7"
+    if "pythia-6.9b" in low:
+        return "pythia69"
+    if "pythia-1b" in low:
+        return "pythia1"
+    return "other"
+
+
+def _rq1_checkpoint_tag(model: object) -> str | None:
+    """Return only the checkpoint suffix that cannot be encoded by marker shape."""
+    low = str(model).lower()
+    if "pythia-1b" not in low:
+        return None
+    if "48000" in low or "48k" in low:
+        return "48k"
+    if "96000" in low or "96k" in low:
+        return "96k"
+    if "143000" in low or "143k" in low:
+        return "143k"
+    if "step0" in low or "@0" in low:
+        return "0k"
+    return None
 
 
 
@@ -170,114 +195,253 @@ def _model_tag(model: object) -> str:
 # Main figures
 # ---------------------------------------------------------------------------
 
-def _rq1_clustered_labels(fig, ax, records, *, fontsize=6.2):
-    """Place grouped model labels without text-text or text-point collisions."""
+def _rq1_clustered_labels(fig, ax, records, *, fontsize=5.8):
+    """Place RQ1 labels without text-box collisions.
+
+    Placement is performed in display coordinates.  In particular, candidate
+    rectangles are measured directly from the text renderer rather than from a
+    just-created Annotation object; the latter can have a stale bbox until a
+    draw, which was the source of the residual overlaps in dense corners.
+    """
     if not records:
         return
+
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
-    pts = ax.transData.transform([(x, y) for x, y, _ in records])
-    parent = list(range(len(records)))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i, j):
-        a, b = find(i), find(j)
-        if a != b:
-            parent[b] = a
-
-    # Combine only points that are close enough that separate labels would
-    # collide at manuscript scale.
-    for i in range(len(records)):
-        for j in range(i + 1, len(records)):
-            dx = pts[i, 0] - pts[j, 0]
-            dy = pts[i, 1] - pts[j, 1]
-            if dx * dx + dy * dy <= 38.0 ** 2:
-                union(i, j)
-
-    groups = {}
-    for i in range(len(records)):
-        groups.setdefault(find(i), []).append(i)
-
+    pts = np.asarray(ax.transData.transform([(x, y) for x, y, _ in records]), dtype=float)
+    n = len(records)
     axes_box = ax.get_window_extent(renderer)
-    occupied = []
-    # Reserve marker neighborhoods.
-    for xdisp, ydisp in pts:
-        occupied.append(Bbox.from_extents(xdisp - 14, ydisp - 12, xdisp + 14, ydisp + 12))
-    # Reserve the statistics annotation and any other pre-existing text.
+
+    def _intersection_area(a: Bbox, b: Bbox) -> float:
+        x0 = max(a.x0, b.x0)
+        y0 = max(a.y0, b.y0)
+        x1 = min(a.x1, b.x1)
+        y1 = min(a.y1, b.y1)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        return (x1 - x0) * (y1 - y0)
+
+    def _outside_area(bb: Bbox) -> float:
+        area = max(0.0, bb.width) * max(0.0, bb.height)
+        return max(0.0, area - _intersection_area(bb, axes_box))
+
+    def _pad(bb: Bbox, px_x=3.0, px_y=2.5) -> Bbox:
+        return Bbox.from_extents(bb.x0 - px_x, bb.y0 - px_y,
+                                 bb.x1 + px_x, bb.y1 + px_y)
+
+    def _measure_text(center_disp, text, fs) -> Bbox:
+        # IdentityTransform makes (x, y) literal display pixels.  Text extents
+        # are therefore exact for the candidate position without requiring a
+        # canvas redraw.  Add an explicit fixed-pixel safety gap for the rounded
+        # bbox padding and anti-aliasing.
+        tmp = ax.text(
+            float(center_disp[0]), float(center_disp[1]), text,
+            transform=matplotlib.transforms.IdentityTransform(),
+            fontsize=fs, ha="center", va="center", linespacing=.92,
+            visible=True,
+        )
+        bb = _pad(tmp.get_window_extent(renderer), 3.5, 3.0)
+        tmp.remove()
+        return bb
+
+    # Cluster only points that are effectively coincident on the rendered
+    # panel.  A smaller diameter avoids turning several nearby points into one
+    # tall label block, which was the remaining source of crowding.
+    max_cluster_diam_px = 19.0
+    remaining = set(range(n))
+    groups = []
+    while remaining:
+        seed = min(remaining)
+        remaining.remove(seed)
+        ids = [seed]
+        candidates = sorted(
+            remaining,
+            key=lambda j: float(np.linalg.norm(pts[j] - pts[seed])),
+        )
+        for j in candidates:
+            if all(float(np.linalg.norm(pts[j] - pts[k])) <= max_cluster_diam_px
+                   for k in ids):
+                ids.append(j)
+                remaining.remove(j)
+        groups.append(ids)
+
+    # Fixed obstacles: markers and the statistics box / any existing text.
+    # Keep a real gap around markers rather than merely forbidding overlap.
+    marker_boxes = [
+        Bbox.from_extents(x - 7.5, y - 7.5, x + 7.5, y + 7.5)
+        for x, y in pts
+    ]
+    fixed_boxes = list(marker_boxes)
     for t in ax.texts:
         if t.get_text():
-            occupied.append(t.get_window_extent(renderer).expanded(1.05, 1.08))
+            fixed_boxes.append(_pad(t.get_window_extent(renderer), 4.0, 3.0))
 
-    directions = [(1,0), (1,1), (0,1), (-1,1), (-1,0), (-1,-1), (0,-1), (1,-1)]
-    candidates = []
-    for radius in (14, 22, 32, 46, 62, 82, 104):
-        for dx, dy in directions:
-            candidates.append((dx * radius, dy * radius))
-    candidates.extend([(120,0),(-120,0),(0,110),(0,-110),(92,44),(-92,44),(92,-44),(-92,-44)])
-
-    # Dense low-value clusters are the hardest, so place them first.
-    order = sorted(groups.values(), key=lambda ids: (min(records[i][1] for i in ids), -len(ids)))
-    for ids in order:
-        xs = [records[i][0] for i in ids]
-        ys = [records[i][1] for i in ids]
-        anchor = (float(np.mean(xs)), float(np.mean(ys)))
+    metas = []
+    for ids in groups:
+        anchor_data = (
+            float(np.mean([records[i][0] for i in ids])),
+            float(np.mean([records[i][1] for i in ids])),
+        )
+        anchor_disp = np.asarray(ax.transData.transform(anchor_data), dtype=float)
         labels = []
         for i in ids:
             lab = str(records[i][2])
             if lab not in labels:
                 labels.append(lab)
-        if len(labels) >= 4:
-            split = (len(labels) + 1) // 2
-            label = "/".join(labels[:split]) + "\n" + "/".join(labels[split:])
-        elif len(labels) == 3:
-            label = labels[0] + "/" + labels[1] + "\n" + labels[2]
-        else:
-            label = "/".join(labels)
+        label = "\n".join(labels)
+        density = int(np.sum(np.linalg.norm(pts - anchor_disp, axis=1) <= 58.0))
+        metas.append({
+            "ids": ids,
+            "anchor_data": anchor_data,
+            "anchor_disp": anchor_disp,
+            "label": label,
+            "density": density,
+            "nlines": len(labels),
+        })
 
-        best_off = candidates[0]
-        best_score = float("inf")
-        for off in candidates:
-            ann = ax.annotate(
-                label, anchor, xytext=off, textcoords="offset points",
-                fontsize=fontsize,
-                ha="left" if off[0] > 0 else ("right" if off[0] < 0 else "center"),
-                va="bottom" if off[1] > 0 else ("top" if off[1] < 0 else "center"),
-                color="0.10", linespacing=.92, zorder=8,
-                bbox={"boxstyle":"round,pad=.14", "facecolor":"white", "edgecolor":"0.70", "linewidth":.35, "alpha":0.72},
-                arrowprops={"arrowstyle":"-", "lw":.36, "color":"0.38", "alpha":.72,
-                            "shrinkA":1.5, "shrinkB":2.5},
-            )
-            bb = ann.get_window_extent(renderer).expanded(1.04, 1.10)
-            ann.remove()
-            outside = (
-                max(0.0, axes_box.x0 - bb.x0) + max(0.0, bb.x1 - axes_box.x1) +
-                max(0.0, axes_box.y0 - bb.y0) + max(0.0, bb.y1 - axes_box.y1)
-            )
-            n_overlap = sum(bb.overlaps(prev) for prev in occupied)
-            score = 10000.0 * outside + 1000.0 * n_overlap + (abs(off[0]) + abs(off[1])) / 50.0
-            if score < best_score:
-                best_score = score
-                best_off = off
-            if outside == 0 and n_overlap == 0:
-                break
+    # Dense/tall labels first, since they have fewer legal placements.
+    metas.sort(key=lambda m: (-m["density"], -m["nlines"],
+                              -len(m["label"]), m["anchor_disp"][1]))
 
-        off = best_off
-        ann = ax.annotate(
-            label, anchor, xytext=off, textcoords="offset points",
-            fontsize=fontsize,
-            ha="left" if off[0] > 0 else ("right" if off[0] < 0 else "center"),
-            va="bottom" if off[1] > 0 else ("top" if off[1] < 0 else "center"),
-            color="0.10", linespacing=.92, zorder=8,
-            bbox={"boxstyle":"round,pad=.18", "facecolor":"white", "edgecolor":"0.65", "linewidth":.4, "alpha":0.88},
-            arrowprops={"arrowstyle":"-", "lw":.36, "color":"0.38", "alpha":.72,
-                        "shrinkA":1.5, "shrinkB":2.5},
+    # Rich local search plus a fine panel-wide fallback.  The grid is offset
+    # from axes edges so even a 2-3 line label can remain fully inside.
+    local_offsets = np.asarray([
+        ( 18,  15), ( 28,   0), ( 18, -15), (  0,  21), (  0, -21),
+        (-18,  15), (-28,   0), (-18, -15),
+        ( 38,  24), ( 46,   0), ( 38, -24), (  0,  34), (  0, -34),
+        (-38,  24), (-46,   0), (-38, -24),
+        ( 62,  34), ( 70,  12), ( 70, -12), ( 62, -34),
+        ( 12,  52), (-12,  52), ( 12, -52), (-12, -52),
+        (-62,  34), (-70,  12), (-70, -12), (-62, -34),
+        ( 90,  42), ( 96,   0), ( 90, -42),
+        (-90,  42), (-96,   0), (-90, -42),
+    ], dtype=float)
+    gx = np.linspace(axes_box.x0 + 18.0, axes_box.x1 - 18.0, 17)
+    gy = np.linspace(axes_box.y0 + 13.0, axes_box.y1 - 13.0, 13)
+    panel_grid = np.asarray([(x, y) for y in gy for x in gx], dtype=float)
+
+    placed = []  # dicts with bbox/center/meta/fs
+
+    def _score_candidate(meta, center_disp, fs, occupied):
+        bb = _measure_text(center_disp, meta["label"], fs)
+        outside = _outside_area(bb)
+        fixed_overlap = sum(_intersection_area(bb, b) for b in fixed_boxes)
+        label_overlap = sum(_intersection_area(bb, p["bbox"]) for p in occupied)
+        distance = float(np.linalg.norm(center_disp - meta["anchor_disp"]))
+
+        # Prefer labels on the same side as free space near an edge.  This tiny
+        # term breaks ties deterministically without overpowering distance.
+        edge_bias = 0.0
+        axc = meta["anchor_disp"]
+        if axc[0] < axes_box.x0 + 0.25 * axes_box.width:
+            edge_bias += max(0.0, axc[0] - center_disp[0]) * 0.08
+        elif axc[0] > axes_box.x1 - 0.25 * axes_box.width:
+            edge_bias += max(0.0, center_disp[0] - axc[0]) * 0.08
+
+        # Any actual overlap is much worse than a longer leader line.  Fixed
+        # obstacles get the largest penalty because labels must never obscure
+        # data markers or the n/r/p box.
+        score = (2.0e7 * outside +
+                 1.2e5 * fixed_overlap +
+                 2.0e5 * label_overlap +
+                 distance + edge_bias)
+        return score, bb
+
+    font_options = [fontsize, max(5.35, fontsize - .30), max(5.05, fontsize - .60)]
+
+    for meta in metas:
+        candidates = np.vstack([meta["anchor_disp"] + local_offsets, panel_grid])
+        candidates = np.unique(np.round(candidates, 1), axis=0)
+        candidates = candidates[np.argsort(
+            np.linalg.norm(candidates - meta["anchor_disp"], axis=1)
+        )]
+
+        best = None
+        for fs in font_options:
+            for center_disp in candidates:
+                score, bb = _score_candidate(meta, center_disp, fs, placed)
+                if best is None or score < best[0]:
+                    best = (score, center_disp.copy(), fs, bb)
+                # A genuinely clean placement at full size ends the search.
+                if (fs == font_options[0] and
+                        _outside_area(bb) < .01 and
+                        all(_intersection_area(bb, b) < .01 for b in fixed_boxes) and
+                        all(_intersection_area(bb, p["bbox"]) < .01 for p in placed)):
+                    break
+            else:
+                continue
+            break
+
+        score, center_disp, fs, bb = best
+        placed.append({"meta": meta, "center": center_disp, "fs": fs, "bbox": bb})
+
+    # Global repair pass.  Greedy placement can leave one late label boxed in
+    # by earlier choices.  Re-optimise only colliding labels against the fixed
+    # positions of all others; two passes are enough for these ~20-point panels.
+    for _ in range(3):
+        changed = False
+        for idx, item in enumerate(list(placed)):
+            others = placed[:idx] + placed[idx + 1:]
+            current_overlap = sum(
+                _intersection_area(item["bbox"], p["bbox"]) for p in others
+            ) + sum(_intersection_area(item["bbox"], b) for b in fixed_boxes)
+            if current_overlap < .01 and _outside_area(item["bbox"]) < .01:
+                continue
+
+            meta = item["meta"]
+            candidates = np.vstack([meta["anchor_disp"] + local_offsets, panel_grid])
+            candidates = np.unique(np.round(candidates, 1), axis=0)
+            candidates = candidates[np.argsort(
+                np.linalg.norm(candidates - meta["anchor_disp"], axis=1)
+            )]
+            best = None
+            for fs in font_options:
+                for center_disp in candidates:
+                    score, bb = _score_candidate(meta, center_disp, fs, others)
+                    if best is None or score < best[0]:
+                        best = (score, center_disp.copy(), fs, bb)
+            new_score, center_disp, fs, bb = best
+            old_score, _ = _score_candidate(meta, item["center"], item["fs"], others)
+            if new_score + 1e-6 < old_score:
+                placed[idx] = {"meta": meta, "center": center_disp,
+                               "fs": fs, "bbox": bb}
+                changed = True
+        if not changed:
+            break
+
+    # Draw only after positions are final.  This keeps candidate measurement
+    # independent of Annotation's deferred bbox/arrow layout.
+    for item in placed:
+        meta = item["meta"]
+        center_data = ax.transData.inverted().transform(item["center"])
+        ax.annotate(
+            meta["label"],
+            xy=meta["anchor_data"],
+            xytext=center_data,
+            textcoords="data",
+            fontsize=item["fs"],
+            ha="center",
+            va="center",
+            color="0.10",
+            linespacing=.92,
+            zorder=8,
+            bbox={
+                "boxstyle": "round,pad=.14",
+                "facecolor": "white",
+                "edgecolor": "0.64",
+                "linewidth": .34,
+                "alpha": .94,
+            },
+            arrowprops={
+                "arrowstyle": "-",
+                "lw": .32,
+                "color": "0.42",
+                "alpha": .68,
+                "shrinkA": 1.8,
+                "shrinkB": 2.8,
+            },
         )
-        occupied.append(ann.get_window_extent(renderer).expanded(1.04, 1.10))
+
 
 def main_rq1(root: Path, out: Path) -> None:
     """Current RQ1 data in the attached paper's 2x2 visual grammar."""
@@ -312,6 +476,26 @@ def main_rq1(root: Path, out: Path) -> None:
     }
     phases = ["input+output", "decode-only"]
 
+    # RQ1 visual encoding:
+    #   color  = task
+    #   shape  = model family/version/size
+    #   fill   = replacement baseline (filled mean-donor, open direct mean)
+    # Only Pythia checkpoint suffixes remain as direct text annotations.
+    model_markers = {
+        "qwen2_15": "o",
+        "qwen25_15": "s",
+        "qwen2_7": "D",
+        "pythia1": "^",
+        "pythia69": "v",
+        "other": "P",
+    }
+    model_legend = [
+        ("qwen2_15", "Q2/1.5B"),
+        ("qwen25_15", "Q2.5/1.5B"),
+        ("qwen2_7", "Q2/7B"),
+        ("pythia1", "Py/1B"),
+    ]
+
     with plt.rc_context({
         "font.size": 8.2,
         "axes.labelsize": 10.2,
@@ -339,11 +523,25 @@ def main_rq1(root: Path, out: Path) -> None:
                     task = str(r.get("task", ""))
                     if task not in colors or not np.isfinite(r["score"]) or not np.isfinite(r["union_rate"]):
                         continue
-                    marker = "o" if str(r.get("baseline", "mean-donor")) == "mean-donor" else "s"
+                    model = r.get("model", "")
+                    marker = model_markers[_rq1_model_key(model)]
+                    is_mean_donor = str(r.get("baseline", "mean-donor")) == "mean-donor"
                     x=float(r["score"]); y=float(r["union_rate"])
-                    ax.scatter(x, y, s=37, marker=marker, color=colors[task],
-                               edgecolor="black", linewidth=.45, zorder=4)
-                    label_records.append((x,y,_model_tag(r.get("model", ""))))
+                    if is_mean_donor:
+                        ax.scatter(
+                            x, y, s=39, marker=marker,
+                            facecolor=colors[task], edgecolor="black",
+                            linewidth=.48, zorder=4,
+                        )
+                    else:
+                        ax.scatter(
+                            x, y, s=39, marker=marker,
+                            facecolor="white", edgecolor=colors[task],
+                            linewidth=1.15, zorder=4,
+                        )
+                    checkpoint = _rq1_checkpoint_tag(model)
+                    if checkpoint is not None:
+                        label_records.append((x, y, checkpoint))
 
                 fit = g[["score", "union_rate"]].dropna()
                 if len(fit) >= 3 and fit["score"].nunique() > 1:
@@ -369,18 +567,33 @@ def main_rq1(root: Path, out: Path) -> None:
                             va="top" if (ri==0 and ci==1) else "bottom", fontsize=7.2,
                             bbox={"boxstyle":"round,pad=.18","facecolor":"white",
                                   "edgecolor":"0.72","linewidth":.55,"alpha":.94}, zorder=9)
-                _rq1_clustered_labels(fig, ax, label_records, fontsize=6.2)
+                # With model identity moved to marker shape, text is needed only
+                # for Pythia checkpoint suffixes.  These short labels can be
+                # placed more compactly and no longer dominate the panel.
+                _rq1_clustered_labels(fig, ax, label_records, fontsize=7)
 
         axes[0,0].set_ylabel(r"$0\!\to\!1$ reach $U^d(J)$")
         axes[1,0].set_ylabel(r"$1\!\to\!0$ reach $U^d(J)$")
         axes[1,0].set_xlabel("Raw task score")
         axes[1,1].set_xlabel(r"Chance-normalized score $\kappa$")
-        handles=[Line2D([0],[0],marker="o",linestyle="none",markerfacecolor=colors[t],
-                        markeredgecolor="black",markeredgewidth=.4,markersize=5.1,label=task_labels[t])
-                 for t in task_order]
-        fig.legend(handles=handles,loc="lower center",bbox_to_anchor=(.5,.005),ncol=5,
-                   frameon=False,handletextpad=.35,columnspacing=.85)
-        fig.subplots_adjust(left=.095,right=.995,bottom=.16,top=.985,hspace=.10,wspace=.12)
+        task_handles=[Line2D([0],[0],marker="o",linestyle="none",markerfacecolor=colors[t],
+                             markeredgecolor="black",markeredgewidth=.4,markersize=5.0,label=task_labels[t])
+                      for t in task_order]
+        model_handles=[Line2D([0],[0],marker=model_markers[key],linestyle="none",
+                              markerfacecolor="0.72",markeredgecolor="black",
+                              markeredgewidth=.55,markersize=5.2,label=label)
+                       for key,label in model_legend]
+        baseline_handles=[
+            Line2D([0],[0],marker="o",linestyle="none",markerfacecolor="0.35",
+                   markeredgecolor="black",markeredgewidth=.5,markersize=5.0,label="mean-donor"),
+            Line2D([0],[0],marker="o",linestyle="none",markerfacecolor="white",
+                   markeredgecolor="0.35",markeredgewidth=1.05,markersize=5.0,label="direct mean"),
+        ]
+        fig.legend(handles=task_handles,loc="lower center",bbox_to_anchor=(.5,.047),ncol=5,
+                   frameon=False,handletextpad=.32,columnspacing=.78)
+        fig.legend(handles=model_handles + baseline_handles,loc="lower center",bbox_to_anchor=(.5,.004),ncol=6,
+                   frameon=False,handletextpad=.28,columnspacing=.72,fontsize=6.8)
+        fig.subplots_adjust(left=.095,right=.995,bottom=.215,top=.985,hspace=.10,wspace=.12)
         save_exact(fig,out)
 
 
