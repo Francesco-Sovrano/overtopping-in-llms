@@ -622,6 +622,44 @@ def _fixed_attack_mask(trigger: pd.DataFrame) -> pd.Series:
     return source.isin(ATTACK_FIXED_SOURCES)
 
 
+def _discovery_flag_series(frame: pd.DataFrame, column: str = "discovered_at_checkpoint") -> pd.Series:
+    """Return a fail-closed boolean discovery mask for cached CSV data."""
+    if column not in frame.columns:
+        return pd.Series(False, index=frame.index, dtype=bool)
+    raw = frame[column]
+    if pd.api.types.is_bool_dtype(raw.dtype):
+        return raw.fillna(False).astype(bool)
+    normalized = raw.astype(str).str.strip().str.lower()
+    return normalized.isin({"1", "true", "t", "yes", "y"})
+
+
+def _known_control_units_by_checkpoint(
+    control: pd.DataFrame,
+    selection_frac: float,
+    *,
+    conditions: tuple[str, ...] = ("poisoned",),
+) -> set[str]:
+    """Return channels actually discovered no later than ``selection_frac``.
+
+    Fixed-union singleton values are longitudinal measurements, not evidence that
+    a channel identity was available to the defender at an earlier checkpoint.
+    Candidate availability therefore comes only from checkpoint-local discovery
+    flags. Missing/legacy flags fail closed rather than falling back to the global
+    union, which would reintroduce future-candidate leakage.
+    """
+    if control.empty or "unit_key" not in control.columns:
+        return set()
+    frame = control
+    if conditions and "condition" in frame.columns:
+        frame = frame[frame["condition"].astype(str).isin(set(map(str, conditions)))]
+    if frame.empty:
+        return set()
+    frac = pd.to_numeric(frame.get("fraction"), errors="coerce")
+    discovered = _discovery_flag_series(frame)
+    eligible = frame.loc[(frac <= float(selection_frac) + 1e-12) & discovered, "unit_key"]
+    return set(eligible.dropna().astype(str))
+
+
 def _is_fixed_source_label(source: object) -> bool:
     return str(source) in ALL_FIXED_SOURCES
 
@@ -753,8 +791,9 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
         the target set is frozen before the model reaches the target checkpoint.
 
     Experiment B: ``clean_reference_contrast`` (checkpoint-aligned diagnostic).
-        At checkpoint t, protect the top-k channels most important on a matched
-        clean reference, then select up to top-k remaining channels with largest
+        At checkpoint t, restrict to channels localized at or before t, protect
+        the top-k known channels most important on a matched clean reference, then
+        select up to top-k remaining known channels with largest
         positive
 
             poison_excess = U_poisoned(t, j) - U_clean(t, j).
@@ -814,31 +853,10 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
         return _finite(part.iloc[0][value_col]) if not part.empty else math.nan
 
     def known_units_by(selection_frac: float) -> set[str]:
-        """Channels the defender could have known by ``selection_frac``.
-
-        Use checkpoint-local observed-mixture discovery only as a *causal
-        availability* gate.  Once a channel has been discovered at any earlier
-        checkpoint it remains in the defender's candidate registry and may be
-        ranked using its cached fixed-union singleton effect at the current
-        selection checkpoint.  This avoids future-candidate leakage while also
-        avoiding the brittle requirement that a channel be rediscovered at every
-        checkpoint.
-        """
-        frac = pd.to_numeric(poisoned_control["fraction"], errors="coerce")
-        discovered = poisoned_control.get(
-            "discovered_at_checkpoint", pd.Series(False, index=poisoned_control.index)
-        ).fillna(False).astype(bool)
-        eligible = poisoned_control.loc[(frac <= float(selection_frac) + 1e-12) & discovered, "unit_key"]
-        units = set(eligible.dropna().astype(str))
-        # Legacy caches may lack reliable discovery flags.  If the historical
-        # gate yields nothing, fall back to units physically evaluated at the
-        # selection checkpoint; this is explicit in the audit column below.
-        if not units:
-            at_selection = poisoned_control[
-                np.isclose(poisoned_control["fraction"].to_numpy(float), float(selection_frac), equal_nan=False)
-            ]
-            units = set(at_selection["unit_key"].dropna().astype(str))
-        return units
+        """Channels surfaced from the poisoned model no later than selection."""
+        return _known_control_units_by_checkpoint(
+            poisoned_control, float(selection_frac), conditions=("poisoned",)
+        )
 
     rows: list[dict[str, Any]] = []
     top_k_requested = max(1, int(top_k))
@@ -898,11 +916,22 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
     # B. Same-checkpoint clean-reference contrast.
     # ------------------------------------------------------------------
     for target_frac in attack_fractions:
+        # A matched clean-reference defense may use channels surfaced by either
+        # defender-visible model, but only once they have actually been localized
+        # at or before this checkpoint. Fixed-union evaluation alone does not make
+        # a future-discovered channel available for current selection.
+        known_units = _known_control_units_by_checkpoint(
+            fixed_control, float(target_frac), conditions=("clean", "poisoned")
+        )
+        if not known_units:
+            continue
         clean_part = clean_control[
             np.isclose(clean_control["fraction"].to_numpy(float), float(target_frac), equal_nan=False)
+            & clean_control["unit_key"].astype(str).isin(known_units)
         ][["unit_key", "c2i_rate"]].rename(columns={"c2i_rate": "_clean_c2i"})
         poison_part = poisoned_control[
             np.isclose(poisoned_control["fraction"].to_numpy(float), float(target_frac), equal_nan=False)
+            & poisoned_control["unit_key"].astype(str).isin(known_units)
         ][["unit_key", "c2i_rate"]].rename(columns={"c2i_rate": "_poisoned_c2i"})
         paired = clean_part.merge(poison_part, on="unit_key", how="inner")
         if paired.empty:
@@ -953,8 +982,8 @@ def _prospective_defense_target_selection(control: pd.DataFrame, trigger: pd.Dat
                 "selection_known_by_checkpoint": True,
                 "selection_basis": (
                     f"checkpoint-aligned attack-blind clean-reference contrast: protect top {protect_k} "
-                    "clean-disruption channels, then rank remaining fixed-union channels by positive "
-                    "poisoned-trained minus clean-trained control-correctness C->I excess; attack "
+                    "clean-disruption channels, then rank remaining channels known by this checkpoint "
+                    "by positive poisoned-trained minus clean-trained control-correctness C->I excess; attack "
                     "information is used only after selection"
                 ),
             })
@@ -1088,8 +1117,9 @@ def _benign_budgeted_clean_reference_selection(
 ) -> pd.DataFrame:
     """Attack-blind clean-reference screen used only by Figure 03b / Figure 6.
 
-    At each checkpoint, rank fixed-union channels by positive clean-reference
-    excess, U_poisoned(j) - U_clean(j), subject to the absolute poisoned-model
+    At each checkpoint, first restrict to channels localized at or before that
+    checkpoint, then rank those channels by positive clean-reference excess,
+    U_poisoned(j) - U_clean(j), subject to the absolute poisoned-model
     benign-damage cap U_poisoned(j) <= tau. Attack outcomes are joined only after
     the target set has been selected. This helper is intentionally separate from
     ``_prospective_defense_target_selection`` so the pre-existing Stage-07 figures
@@ -1133,12 +1163,19 @@ def _benign_budgeted_clean_reference_selection(
     rows: list[dict[str, Any]] = []
 
     for frac in fractions:
-        p = poisoned[np.isclose(poisoned["fraction"].to_numpy(float), float(frac), equal_nan=False)][
-            ["unit_key", "c2i_rate"]
-        ].rename(columns={"c2i_rate": "_poisoned_c2i"})
-        c = clean[np.isclose(clean["fraction"].to_numpy(float), float(frac), equal_nan=False)][
-            ["unit_key", "c2i_rate"]
-        ].rename(columns={"c2i_rate": "_clean_c2i"})
+        known_units = _known_control_units_by_checkpoint(
+            fixed_control, float(frac), conditions=("clean", "poisoned")
+        )
+        if not known_units:
+            continue
+        p = poisoned[
+            np.isclose(poisoned["fraction"].to_numpy(float), float(frac), equal_nan=False)
+            & poisoned["unit_key"].astype(str).isin(known_units)
+        ][["unit_key", "c2i_rate"]].rename(columns={"c2i_rate": "_poisoned_c2i"})
+        c = clean[
+            np.isclose(clean["fraction"].to_numpy(float), float(frac), equal_nan=False)
+            & clean["unit_key"].astype(str).isin(known_units)
+        ][["unit_key", "c2i_rate"]].rename(columns={"c2i_rate": "_clean_c2i"})
         paired = p.merge(c, on="unit_key", how="inner")
         paired["_poisoned_c2i"] = pd.to_numeric(paired["_poisoned_c2i"], errors="coerce")
         paired["_clean_c2i"] = pd.to_numeric(paired["_clean_c2i"], errors="coerce")
@@ -1199,7 +1236,7 @@ def _benign_budgeted_clean_reference_selection(
                 "selection_known_by_checkpoint": True,
                 "selection_basis": (
                     "checkpoint-aligned attack-blind benign-budgeted clean-reference screen: "
-                    "rank fixed-union channels by positive poisoned-trained minus clean-trained "
+                    "rank channels known by this checkpoint by positive poisoned-trained minus clean-trained "
                     f"control-correctness C->I excess subject to poisoned benign damage <= {budget:.3f}; "
                     "attack information is used only after selection"
                 ),
