@@ -1,12 +1,12 @@
-# RQ3 — support-specific thresholded causal integration
+# RQ3 — Dose thresholds and temporal event localization
 
-## Objective
+## Question
 
-Determine whether graded overtopping interventions produce support-specific threshold crossings.
+RQ3 asks whether a high-leverage channel concentrates its causal effect around an event along two intervention axes: replacement strength and generation time.
 
-RQ3 tests whether a continuously varied intervention on a fixed high-leverage candidate produces a localized, usually persistent transition in the binary behavioral endpoint, and whether that transition distinguishes examples that are susceptible to the same candidate from source-state examples that remain non-flipping at full dose.
+For dose, the analysis varies a frozen channel continuously from its natural activation to the full replacement and tests whether susceptible examples cross the behavioral boundary once and remain in the changed state at larger doses. The underlying divergence-token logit margin is measured on the same dose grid to test whether the largest continuous change aligns with the behavioral crossing.
 
-Endogenous scalar threshold prediction is reported as a separate observability analysis. Dominant-secondary preemption is a separate secondary subtype analysis.
+For time, the analysis holds full replacement strength fixed and varies when the replacement is active during autoregressive decoding. Complementary prefix and suffix schedules provide reciprocal event localization. Endogenous scalar threshold prediction and dominant-secondary preemption are secondary diagnostics rather than the definition of the dose/time event.
 
 ## Scientific distinction
 
@@ -262,9 +262,9 @@ studies/overtopping/analysis/stage10_rq3_spiking_story_figures.py
 
 Population continuous-margin aggregation uses 11-dose trajectories that reproduce the configured endpoints.
 
-## Part D — autoregressive temporal cutoff
+## Part D — autoregressive temporal localization
 
-The temporal-cutoff experiment tests whether the full singleton intervention must remain active throughout generation or whether its held-out effect is captured by a short early decode horizon. It supports both intervention phases. In output-only/decode-only settings, prompt prefill remains clean. In standard input+output settings, the Stage-7 singleton replacement is also active during prompt prefill. For cutoff `t`, the decode-time intervention is applied during the first `t` autoregressive transitions and removed for every later transition. Earlier intervention effects are allowed to persist through the model state/KV cache; only further direct intervention is stopped.
+The temporal experiment tests when the full singleton intervention has causal leverage during generation rather than assuming that the effect is early or front-loaded. It supports both intervention phases. In output-only/decode-only settings, prompt prefill remains clean. In standard input+output settings, the Stage-7 singleton replacement is also active during prompt prefill. For cutoff `t`, the decode-time intervention is applied during the first `t` autoregressive transitions and removed for every later transition. Earlier intervention effects are allowed to persist through the model state/KV cache; only further direct intervention is stopped.
 
 Per-run implementation and pipeline control:
 
@@ -285,9 +285,21 @@ studies/overtopping/analysis/stage11_rq3_temporal_cutoff_story.py
 
 When suffix artifacts exist, the reporter writes `temporal_suffix_population_rows.csv.gz`, `temporal_suffix_condition_curves.csv`, `temporal_suffix_condition_incremental_gain.csv`, `temporal_cross_sweep_peak_agreement.csv`, and paired EVENT-validation tables for both discovery/validation directions. `fig4s16_temporal_cross_sweep_event_validation.pdf` aggregates compatible temporal conditions from both output-only and input+output phases. Phase-specific analyses are stored under `by_phase/output_only/` and `by_phase/input_output/`; `fig4s16b_temporal_cross_sweep_event_validation_by_phase.pdf` and `temporal_cross_sweep_event_validation_by_phase.csv` contain the phase-stratified results.
 
-The cross-sweep EVENT analysis defines EVENT as the absolute decode transition with the largest positive incremental causal effect in one schedule and evaluates the aligned transition in the complementary schedule. The configured direction defines EVENT from the suffix-only sweep and evaluates it on the prefix-only sweep; the reciprocal direction is computed separately. EVENT selection and validation therefore use different intervention schedules. The condition-level inferential contrast is validation-sweep gain at EVENT minus the mean of the available adjacent transition gains.
+The cross-sweep EVENT analysis defines EVENT as the absolute decode transition with the largest positive incremental causal effect in one schedule and evaluates the aligned transition in the complementary schedule. Both discovery/validation directions are computed: prefix-defined EVENT validated on the suffix sweep, and suffix-defined EVENT validated on the prefix sweep. EVENT selection and validation therefore use different temporal trajectories. The condition-level inferential contrast is validation-sweep gain at EVENT minus the mean of the available adjacent transition gains.
 
 Prefix-only T50/T80 and peak-share summaries are also computed. T50/T80 are derived from the same prefix temporal trajectory and therefore are not used as independent EVENT definitions for spiking inference. Peak-share temporal concentration is descriptive only; it is not assigned a uniform-null p-value because taking the within-condition maximum makes the naive 1/K comparison invalid by construction.
+
+## Main results
+
+The held-out candidate/control comparison gives a paired median singleton causal-strength advantage of `0.204` for candidates across 48 run/direction conditions.
+
+On known-flip support, the median single-persistent-crossing rate is `0.989` across 48 conditions. Same-channel non-flip support has a median stability rate of `0.989`. Across individual channels, the median first persistent dose is `lambda=0.50`; the median of condition-level summaries is `0.588`.
+
+For endpoint-reproduced continuous-margin trajectories, the largest absolute margin-change interval is localized at the persistent behavioral EVENT more often than at adjacent intervals. The median EVENT-minus-adjacent contrast is `+4.80` percentage points across 45 conditions (95% condition-bootstrap CI `[2.14, 6.40]`, one-sided paired `p=7.04e-7`). Stronger channels concentrate more margin change into one dose interval: High-minus-Low `Delta C=+0.431` across 36 paired conditions (95% CI `[0.243, 0.847]`, `p=2.53e-8`).
+
+The temporal sweeps provide reciprocal localization. Across 36 conditions, a prefix-defined EVENT predicts an excess suffix-sweep effect of `+0.326` (95% CI `[0.179, 0.824]`, one-sided paired `p=1.72e-5`). Reversing discovery and validation gives `+0.440` (95% CI `[0.381, 0.744]`, `p=3.68e-6`). Prefix and suffix sweeps select the same peak transition in 72% of paired conditions and peaks within one transition in 83%.
+
+The spiking comparison concerns response geometry: a graded intervention is converted into a localized persistent behavioral event, and causal leverage is also localized in decoding time. It is not a claim that Transformer channels implement biological spiking-neuron dynamics.
 
 ## Secondary subtype analysis — dominant-secondary preemption
 

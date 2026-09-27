@@ -7,8 +7,8 @@ Operations cover reporting regeneration, model-backed recovery, and cache handli
 Overtopping:
 
 ```bash
-./run_overtopping_experiments.sh --list
-./run_overtopping_experiments.sh --dry-run
+bash ./run_overtopping_experiments.sh --list
+bash ./run_overtopping_experiments.sh --dry-run
 ```
 
 Poisoning:

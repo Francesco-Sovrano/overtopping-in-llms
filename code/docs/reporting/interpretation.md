@@ -92,6 +92,16 @@ The optional preemption assay measures whether a secondary candidate's marginal 
 
 Checkpoint-local candidate sets measure aggregate checkpoint-level causal organization. Coordinate-level role change requires evaluating the same aligned coordinate or fixed candidate set across checkpoints.
 
+For the controlled Grammar trajectory, `conditional_conversion_rate` is the fraction of control-prompt non-target examples that produce the attacker target under the trigger prompt. Singleton defense quantities are:
+
+```text
+attack_suppression        reduction of successful trigger-dependent target behavior
+benign_correctness_damage loss of ordinary control-prompt correctness
+Delta_def                 attack_suppression - benign_correctness_damage
+```
+
+Positive `Delta_def` means the singleton intervention suppresses more trigger-dependent behavior than ordinary correct behavior. Previous-checkpoint evaluation freezes a target and measures it after further training; checkpoint-aligned clean-reference evaluation selects and evaluates at the same checkpoint.
+
 ## Statistical units
 
 The overtopping setting or run/condition is the cross-setting statistical unit unless an analysis explicitly defines another hierarchical model. Candidate, pair, and example rows are within-setting observations. Poisoning cross-seed analyses use the configured training seed/run as the replication unit unless a specific analysis states otherwise.

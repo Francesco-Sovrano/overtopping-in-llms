@@ -1,8 +1,8 @@
-# RQ4 — learning-time causal organization
+# RQ4 — Learning-time causal organization
 
-## Objective
+## Question
 
-Measure how behavioral performance and causal organization change across model checkpoints, and distinguish checkpoint-level aggregate changes from fixed-coordinate causal-role changes.
+RQ4 asks whether the channels carrying high causal leverage remain stable as learning continues, including when ordinary task performance changes little. It separates checkpoint-local rediscovery from fixed-coordinate longitudinal evaluation.
 
 RQ4 contains two independent analysis components:
 
@@ -24,7 +24,7 @@ EleutherAI/pythia-1b@step96000
 EleutherAI/pythia-1b
 ```
 
-The current checkpoint suite uses the input+output intervention phase. Checkpoint identity is part of model identity.
+The configured checkpoint suite uses the input+output intervention phase. Checkpoint identity is part of model identity.
 
 ### Quantities
 
@@ -103,6 +103,32 @@ fixed coordinate            same prespecified coordinate evaluated across checkp
 
 Only the fixed-coordinate object measures change in a specific coordinate's causal role.
 
+## Main results
+
+### Natural Pythia checkpoints
+
+Checkpoint-local reach can change substantially without a comparable competence change. In input+output Random FSM, singleton-union reach rises from `0.339` at 48k training steps to `0.810` at the final checkpoint while competence changes from `0.293` to `0.281`. For Grammar, displayed reach values are `0`, `0.180`, `0.111`, and `0.236` across the checkpoint trajectory while competence remains low.
+
+Because candidates are rediscovered independently at each checkpoint, these trajectories measure changes in where causal access is available at each checkpoint; they do not by themselves track one fixed coordinate.
+
+### Controlled Grammar poisoning
+
+Across the three training runs, ordinary Grammar accuracy remains close between clean and poisoned trajectories while trigger-conditioned conversion rises rapidly in the poisoned model. Median poisoned conversion is `0.573` at 10% of fine-tuning, `0.944` at 25%, and `1.000` by 50%; the clean trajectory remains near zero.
+
+A previous-checkpoint target is selected at one checkpoint and reused at the next. Its median defense leverage is negative at every subsequent checkpoint, ranging from `-17.8` to `-59.4` percentage points across the reported checkpoints.
+
+The checkpoint-aligned clean-reference rule reselects singleton targets using current clean/poisoned causal measurements under benign-damage budget `tau=0.30`. Median defense leverage is:
+
+```text
+10%   -10.7 pp   (two runs have a budget-feasible target)
+25%    +6.2 pp
+50%   +44.9 pp
+75%   +36.5 pp
+100%  +23.5 pp
+```
+
+Positive defense leverage means trigger-response suppression exceeds ordinary-prediction damage. Selection and evaluation are checkpoint-aligned, so these values demonstrate current-checkpoint target identification rather than prospective transfer to a later checkpoint. RQ2 also applies: independently selected singleton targets cannot be assumed to compose additively as a multi-channel intervention.
+
 ## Implementation
 
 Poisoning training, checkpoint causal analysis, fixed-candidate evaluation, detection, and aggregation are implemented under:
@@ -131,8 +157,7 @@ Rendered poisoning outputs:
 results/paper/figures/05_rq4_learning/poisoning/
 ```
 
-The reporting driver aggregates the compatible Grammar clean-reference defense
-runs across training seeds and writes the stable main-text rendering to:
+The reporting driver aggregates compatible Grammar clean-reference defense runs across training seeds and writes:
 
 ```text
 results/paper/figures/05_rq4_learning/rq4_grammar_clean_reference_defense.pdf

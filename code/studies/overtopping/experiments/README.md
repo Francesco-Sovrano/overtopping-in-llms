@@ -2,7 +2,7 @@
 
 This package defines the overtopping `RunSpec` registry and translates selected settings into shared pipeline commands.
 
-## Current suite selections
+## Suite selections
 
 ```text
 mean-donor     30
@@ -11,7 +11,7 @@ mean            8
 checkpoints    12
 ```
 
-The `all` selection deduplicates by scientific identity and currently resolves to 50 unique settings. Three final Pythia-1B input+output settings for Grammar, HANS-NLI, and Random FSM occur in both `mean-donor` and `checkpoints`.
+The `all` selection deduplicates by scientific identity and resolves to 50 unique settings. Three final Pythia-1B input+output settings for Grammar, HANS-NLI, and Random FSM occur in both `mean-donor` and `checkpoints`.
 
 The checkpoint suite is:
 

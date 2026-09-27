@@ -1,4 +1,4 @@
-# Causal-intervention code
+# Overtopping causal-intervention code
 
 This directory contains the shared causal-intervention pipeline, the overtopping study, the poisoning study, and the reporting layer.
 
@@ -41,19 +41,19 @@ Scientific populations are defined by `RunSpec` registries, held-out row identit
 
 The reporting layer then produces:
 
-- **RQ1:** directional causal reach and width-normalized high-effect candidate counts versus competence;
-- **RQ2:** simultaneous-set composition, singleton-versus-joint decomposition, and matched-set specificity;
-- **RQ3:** candidate/control threshold observability and support-specific graded intervention response;
-- **RQ4:** Pythia checkpoint trajectories and controlled poisoning trajectories.
+- **RQ1 — Competence, causal reach, and direction:** direction-conditioned singleton reach versus competence;
+- **RQ2 — Composition under simultaneous intervention:** singleton-union reach versus genuine simultaneous-set intervention;
+- **RQ3 — Dose thresholds and temporal event localization:** graded replacement, persistent crossings, continuous-margin localization, and complementary decode-time sweeps;
+- **RQ4 — Learning-time causal organization:** Pythia checkpoint trajectories and controlled clean/poisoned Grammar trajectories.
 
 ## Running the study
 
 From the repository root:
 
 ```bash
-./run_overtopping_experiments.sh --list
-./run_overtopping_experiments.sh --dry-run
-./run_overtopping_experiments.sh
+bash ./run_overtopping_experiments.sh --list
+bash ./run_overtopping_experiments.sh --dry-run
+bash ./run_overtopping_experiments.sh
 ```
 
 Direct invocation from `code/`:
@@ -62,7 +62,7 @@ Direct invocation from `code/`:
 python -m studies.overtopping.experiments.run_experiments --dry-run
 ```
 
-The configured study has no fixed required setting count. See [`docs/experiments/overtopping.md`](docs/experiments/overtopping.md) for the current registry structure and cell coverage.
+The configured `all` selection resolves to 50 unique scientific settings. See [`docs/experiments/overtopping.md`](docs/experiments/overtopping.md) for registry structure and cell coverage.
 
 ## Reporting
 
@@ -87,7 +87,7 @@ python -m reporting.generate_final_results \
   --primary-profile configured
 ```
 
-The configured study table is constructed before metric-specific filtering. Its row count is derived from the current manifest. A missing derived metric remains a missing value/status for that setting; it does not remove the setting from the configured study manifest.
+The configured study table is constructed before metric-specific filtering. Its row count is derived from the selected manifest. A missing derived metric remains a missing value/status for that setting; it does not remove the setting from the configured study manifest.
 
 RQ2 replacement regimes are not pooled. `mean-donor` is analyzed separately from `mean`.
 

@@ -57,11 +57,11 @@ The reporting driver reads scientific artifacts from `data/` and writes derived 
 From the repository root:
 
 ```bash
-./run_overtopping_experiments.sh --list
-./run_overtopping_experiments.sh --dry-run
+bash ./run_overtopping_experiments.sh --list
+bash ./run_overtopping_experiments.sh --dry-run
 ```
 
-The current `all` selection contains 50 unique scientific settings after deduplication. Current suite selections contain:
+The configured `all` selection contains 50 unique scientific settings after deduplication. Suite selections contain:
 
 ```text
 mean-donor     30
@@ -80,7 +80,7 @@ python -m studies.overtopping.experiments.storage_contract
 cd ..
 ```
 
-For the current registry the contract reports:
+The storage contract reports:
 
 ```text
 setting_count        50
@@ -95,19 +95,19 @@ mean                  11
 Run all configured settings on the default `test` evaluation split:
 
 ```bash
-./run_overtopping_experiments.sh
+bash ./run_overtopping_experiments.sh
 ```
 
 Run one suite:
 
 ```bash
-./run_overtopping_experiments.sh --suite checkpoints
+bash ./run_overtopping_experiments.sh --suite checkpoints
 ```
 
 Filter by scientific fields:
 
 ```bash
-./run_overtopping_experiments.sh \
+bash ./run_overtopping_experiments.sh \
   --task arithmetic \
   --model Qwen/Qwen2-1.5B-Instruct \
   --evaluation-split test \
@@ -181,7 +181,7 @@ Inspect the default run matrix:
 ./run_poisoning_experiments.sh --dry-run
 ```
 
-The current default matrix contains three Grammar runs with model `Qwen/Qwen2-1.5B-Instruct` and training seeds `13,37,101`.
+The default matrix contains three Grammar runs with model `Qwen/Qwen2-1.5B-Instruct` and training seeds `13,37,101`. It poisons 10% of eligible gold non-target examples with trigger `[id=74291]`, targets `acceptable`, and evaluates checkpoints at 0%, 10%, 25%, 50%, 75%, and 100% of fine-tuning. The default launcher bypasses EAP circuit discovery and starts Stage-6/CHA from the full model-neuron candidate space unless `POISONING_SKIP_CIRCUIT_DISCOVERY=0` or discovery-then-fallback is selected.
 
 Execute the study:
 
@@ -195,7 +195,7 @@ Reduced execution-path configuration:
 POISONING_FAST_TEST=1 ./run_poisoning_experiments.sh
 ```
 
-Explicit circuit-discovery alternatives:
+Candidate-search execution modes:
 
 ```bash
 ./run_poisoning_experiments.sh --skip-circuit-discovery

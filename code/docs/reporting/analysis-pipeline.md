@@ -312,4 +312,4 @@ A verified Stage-06 empty candidate set is recorded as a completed zero-candidat
 --skip-cmc-requirement
 ```
 
-`--catalogue-json` selects an explicit saved configured population. Without it, the `configured` profile is derived from the current code registry.
+`--catalogue-json` selects an explicit saved configured population. Without it, the `configured` profile is derived from the code registry.

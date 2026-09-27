@@ -1,5 +1,13 @@
 # Core concepts
 
+## Overtopping and causal channels
+
+A **channel** is a scalar coordinate or finite activation component whose value can be replaced during a forward pass. It is the atomic intervention unit in the chosen activation basis.
+
+**Overtopping** is the high-reach singleton regime: replacing one channel changes the binary behavioral endpoint for many examples. The repository distinguishes this concentrated singleton control from diffuse support, where broad population reach appears only after considering many channels.
+
+Candidate channels are discovered on one example split and evaluated causally on a disjoint held-out split. Overtopping is defined from singleton leverage; simultaneous-set interventions are separate measurements used to study composition.
+
 ## Behavioral endpoint
 
 Each task defines a binary behavioral endpoint:
@@ -9,6 +17,21 @@ B(x) in {0, 1}
 ```
 
 Its meaning is task-specific, such as correctness, acceptability, entailment behavior, or jailbreak success.
+
+## Replacement counterfactual
+
+The principal replacement rules are:
+
+- **mean**: insert the channel mean estimated from discovery data;
+- **mean-donor**: insert the observed discovery value closest to that mean.
+
+For a natural channel value `h_j(x)` and a configured replacement `h_tilde_j`, the RQ3 graded intervention uses
+
+```text
+h_j(lambda, x) = (1 - lambda) h_j(x) + lambda h_tilde_j
+```
+
+with `lambda=0` equal to the natural activation and `lambda=1` equal to the full singleton replacement.
 
 ## Intervention phase
 
@@ -36,7 +59,7 @@ The two directions have separate eligible denominators.
 
 ## Candidate discovery and held-out evaluation
 
-Circuit discovery and candidate ranking occur before held-out causal evaluation. Stage 7 freezes candidate identity and materializes singleton intervention outcomes on the declared evaluation split.
+Circuit discovery and candidate ranking occur before held-out causal evaluation. EAP-IG attribution ranks internal components and Contrastive Hierarchical Ablation (CHA) recursively refines intervention groups to a frozen candidate set. Stage 7 freezes candidate identity, ranking, replacement values, and discovery direction, then materializes singleton intervention outcomes on the declared evaluation split.
 
 For RQ3, discovery direction is part of candidate identity. A candidate discovered only on positive-baseline examples is analyzed in the 1→0 population; a candidate discovered only on negative-baseline examples is analyzed in the 0→1 population. A coordinate independently discovered in both subsets can appear in both directional analyses.
 
@@ -127,6 +150,16 @@ D_b      = M_b(J) - M_b(K_b)
 
 Candidate, null, and background sets are evaluated as genuine simultaneous interventions.
 
+## Competence
+
+Competence is measured on the unmodified model and is phase-specific. For input+output analyses it is the raw higher-is-better task score. For output-only analyses it is chance-normalized:
+
+```text
+kappa = max(0, (s - c) / (1 - c))
+```
+
+where `s` is the unmodified task score and `c` is the parsed-output chance rate. The input+output and output-only competence scales are analyzed separately.
+
 ## High-effect candidate counts
 
 For threshold `t` and direction `d`:
@@ -157,7 +190,7 @@ The analysis separates causal reach from structural organization:
 
 These quantities measure different properties and are reported separately.
 
-## RQ3 threshold-event quantities
+## RQ3 dose and event quantities
 
 RQ3 uses candidate and structural-control units from the threshold-event diagnostics.
 

@@ -12,7 +12,7 @@ data/poisoning/<task>/<run-name>/
 ├── 04_condition_comparisons/
 ├── 05_behavior_trajectories/
 ├── 06_circuit_overlap_analysis/
-└── 07_poisoning_example_detection/
+└── 07_poisoning_example_detection/  # longitudinal causal and exposure analyses
 ```
 
 ## Stage 01 — training checkpoints
@@ -62,7 +62,7 @@ Trigger-specific causal artifacts exist only when trigger-lift CHA is enabled an
 
 ### `observed_training_mixture_correctness`
 
-The default and only strictly defense-facing CHA localization endpoint. It evaluates each checkpoint model on the same reconstructed defender-visible fine-tuning prompt/label mixture. Candidate localization uses correctness with respect to the observed label, runs both positive and negative observable baseline branches, and explicitly excludes hidden poison/attack annotations. Stage 03 freezes the union of those Stage-6 discovery branches without running a redundant held-out singleton intervention pass. Optional `attack_cohort_control_correctness` and `both` modes are controlled auxiliary analyses, not strictly attack-agnostic defense localizers.
+`observed_training_mixture_correctness` is the default attack-agnostic CHA localization endpoint. It evaluates each checkpoint model on the reconstructed fine-tuning prompt/label mixture available to the localization procedure. Candidate localization uses correctness with respect to the observed label, runs both observable baseline branches, and excludes hidden poison status and attack outcomes. Stage 03 freezes the union of the corresponding Stage-6 discovery branches. Optional `attack_cohort_control_correctness` and `both` modes use the attack-defined control cohort as an additional localization source.
 
 The matched no-trigger control quantity is derived from the control half of `backdoor_trigger_test` for post-discovery evaluation. Separately, an optional `attack_cohort_control_correctness` Stage-03 CHA may reuse that same behavior cache as a controlled localization source. Canonical Stage-07 paired-control causal columns use the `paired_control_` prefix.
 
@@ -86,7 +86,7 @@ It joins normal-task behavior and paired trigger/control behavior. The matched c
 
 Contains checkpoint stability/overlap comparisons for the configured CHA candidate source. With the default `observed_training_mixture_correctness` endpoint, candidate construction is attack-agnostic and excludes trigger/attack labels. With `attack_cohort_control_correctness` or `both`, the configured candidate universe also uses the controlled oracle-defined attack-cohort localization described in the protocol.
 
-## Stage 07 — poisoning-example detection
+## Stage 07 — longitudinal causal evaluation and exposure analysis
 
 ### Frozen candidate union
 
@@ -111,6 +111,23 @@ paired_u_j_materialization/
 One model load/ablation pass evaluates the frozen candidate union on matched no-trigger control and triggered attack views. Endpoint-specific summaries report the directional rate conditional on the behavior being present before intervention. Clean/poisoned 0% reuses the same pre-training Stage-03 generation cache and the same Stage-07 control materialization; condition-specific reports are still exported for downstream symmetry.
 
 Independent clean-null runs are aligned inside Stage 07 to the primary run's immutable held-out identities and are stored under `clean_null_paired_u_j_materialization/`. Per-seed `is_test` assignments therefore do not require Stage-03 recomputation.
+
+### Defense-screen tables
+
+The RQ4 previous-checkpoint and checkpoint-aligned clean-reference analyses use files including:
+
+```text
+defense_screen_comparison.csv
+prospective_defense_leverage.csv
+one_checkpoint_ahead_defense_screen.csv
+clean_reference_defense_screen.csv
+clean_reference_benign_budget_screen.csv
+clean_reference_benign_budget_selected_channels.csv
+clean_reference_benign_budget_curve.csv
+clean_reference_benign_budget_checkpoint_summary.csv
+```
+
+The clean-reference budget table records attack suppression, benign correctness damage, and their difference for singleton channels across checkpoint/budget combinations.
 
 ### Interval disruption tables
 
@@ -155,22 +172,14 @@ The behavioral attack endpoint used for association is `conditional_conversion_r
 04_clean_vs_poisoned_checkpoint_overtopping.pdf
 ```
 
-The corresponding machine-readable checkpoint and defense-screen files include:
+Auxiliary rendering-status files include:
 
 ```text
-defense_screen_comparison.csv
-prospective_defense_leverage.csv
-one_checkpoint_ahead_defense_screen.csv
-clean_reference_defense_screen.csv
-clean_reference_benign_budget_screen.csv
-clean_reference_benign_budget_selected_channels.csv
-clean_reference_benign_budget_curve.csv
-clean_reference_benign_budget_checkpoint_summary.csv
 story_data_coverage.csv
 story_figure_status.csv
 ```
 
-`stage07_plot_overtopping_poisoning_story.py --figure6_from_story_dir <dir>` regenerates the clean-reference defense figure from the cached `clean_reference_benign_budget_screen.csv` and `clean_reference_benign_budget_curve.csv` files without model access.
+`stage07_plot_overtopping_poisoning_story.py --figure6_from_story_dir <dir>` renders the clean-reference defense output from `clean_reference_benign_budget_screen.csv` and `clean_reference_benign_budget_curve.csv` without model access.
 
 ### Additional derived outputs
 
@@ -194,6 +203,6 @@ Poisoning cache root:
 cache/poisoning/
 ```
 
-Current cache families include behavior-generation caches for `backdoor_trigger_test` and `normal_task`, plus causal-discovery caches for `observed_training_mixture_correctness` and, when enabled, `attack_cohort_control_correctness`. The two localization caches are independent and may coexist.
+Cache families include behavior-generation caches for `backdoor_trigger_test` and `normal_task`, plus causal-discovery caches for `observed_training_mixture_correctness` and, when enabled, `attack_cohort_control_correctness`. The two localization caches are independent and may coexist.
 
 Cache reuse is conditional on matching population and method metadata. Changing the normal-task or observed-mixture population contract invalidates that endpoint's cache; prompt-matched trigger/control generations can remain reusable when their exact prompt identity and generation configuration are unchanged.

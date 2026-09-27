@@ -6,4 +6,4 @@ Documentation:
 
 - [Poisoning protocol](../../../docs/experiments/poisoning/README.md)
 - [Poisoning configuration](../../../docs/experiments/poisoning/configuration.md)
-- [RQ4 — learning](../../../docs/research-questions/rq4-learning.md)
+- [RQ4 — Learning-time causal organization](../../../docs/research-questions/rq4-learning.md)

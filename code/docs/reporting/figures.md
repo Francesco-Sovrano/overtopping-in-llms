@@ -123,9 +123,7 @@ Per-run poisoning renderings can include:
 04_clean_vs_poisoned_checkpoint_overtopping.pdf
 ```
 
-The stable Grammar clean-reference defense figure is aggregated across compatible
-training seeds with seed as the replicate unit. Its default summary is the
-across-seed median with Q1-Q3 uncertainty:
+The Grammar clean-reference defense output aggregates compatible training seeds with seed as the replicate unit. Its default summary is the across-seed median with Q1-Q3 uncertainty:
 
 ```text
 results/paper/figures/05_rq4_learning/rq4_grammar_clean_reference_defense.pdf

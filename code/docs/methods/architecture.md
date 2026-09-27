@@ -43,20 +43,21 @@ The pipeline writes persistent experiment artifacts under `data/` and uses compa
 Study-specific ownership for:
 
 - the configured overtopping registry;
-- RQ1 prevalence and competence analyses;
+- RQ1 competence, causal-reach, and direction analyses;
 - RQ2 composition analyses;
-- RQ3 threshold-event and graded-intervention analyses;
+- RQ3 dose-threshold and temporal-event analyses;
 - RQ4 Pythia checkpoint trajectories.
 
 ### `studies/poisoning/`
 
 Study-specific ownership for:
 
-- matched clean/poisoned training;
+- matched clean/poisoned Grammar training;
 - checkpoint and evaluation-cohort manifests;
 - normal-task, trigger-test, and observed-training-mixture endpoints;
-- fixed-candidate longitudinal materialization;
-- poisoning-example detection;
+- checkpoint-local localization and fixed-coordinate longitudinal evaluation;
+- previous-checkpoint and checkpoint-aligned clean-reference defense screens;
+- optional poisoning-example scoring;
 - cross-seed aggregation.
 
 ### `reporting/`
@@ -130,7 +131,7 @@ RunSpec.input_data_dir(data_root)
 RunSpec.stats_dir(data_root)
 ```
 
-The storage contract validates the current configured registry and path uniqueness, while a registry fingerprint records the current scientific configurations, resolved input/statistics paths, and pipeline command arguments:
+The storage contract validates the configured registry and path uniqueness, while a registry fingerprint records the scientific configurations, resolved input/statistics paths, and pipeline command arguments:
 
 ```bash
 cd code

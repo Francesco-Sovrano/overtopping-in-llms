@@ -1,4 +1,4 @@
-# RQ2 — composition
+# RQ2 — Composition under simultaneous intervention
 
 ## Question
 
@@ -101,6 +101,25 @@ Delta_comp_complete_case
 ```
 
 Directional summaries use the same complete-case population restricted by source state.
+
+## Main results
+
+The composition gap is predominantly negative in both replacement regimes.
+
+| Replacement regime | Evaluable sets | `E(J) < U(J)` | `E(J) > U(J)` | Tied | Median `E(J)-U(J)` |
+|---|---:|---:|---:|---:|---:|
+| `mean-donor` | 25 | 22 | 2 | 1 | -0.146 |
+| `mean` | 11 | 10 | 1 | 0 | -0.166 |
+
+The example-level identity
+
+```text
+E(J) - U(J) = P(coalition_only) - P(suppressed)
+```
+
+shows what produces the gap. In the predominant negative cases, singleton-reachable examples lost under joint replacement exceed examples reached only by the coalition. The two positive mean-donor boundary cases show that suppression is an empirical pattern rather than an algebraic requirement.
+
+These results rule out treating independently high-leverage channels as additive controls. A multi-channel intervention must be evaluated as the coalition actually deployed.
 
 ## Matched-set specificity
 

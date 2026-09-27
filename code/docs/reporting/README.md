@@ -93,6 +93,6 @@ Without an explicit source, the reporting driver searches the configured data ro
 --skip-cmc-requirement
 ```
 
-`--catalogue-json` selects an explicit saved configured population when required. The default `configured` profile derives the population from the current code registry.
+`--catalogue-json` selects an explicit saved configured population when required. The default `configured` profile derives the population from the code registry.
 
 Detailed module sequencing is documented in [Analysis pipeline](analysis-pipeline.md). Metric definitions are in [Metric semantics](interpretation.md). Generated output filenames are listed in [Generated outputs](figures.md).

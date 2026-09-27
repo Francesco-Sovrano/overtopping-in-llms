@@ -1,6 +1,31 @@
-# Overtopping experiment configuration
+# Overtopping experimental frame and registry
 
-## Scientific setting
+## Causal object
+
+The basic causal object is the behavioral effect of replacing one internal activation channel. A channel is a scalar coordinate or finite activation component in the chosen basis. Overtopping refers to the high-reach singleton regime, where one channel changes the binary endpoint for many held-out examples.
+
+Candidate discovery and causal evaluation use disjoint examples. EAP-IG attribution ranks components on the discovery split and Contrastive Hierarchical Ablation (CHA) refines the candidate search to a frozen set `J`. Candidate identities, ranking, replacement values, and discovery direction are fixed before held-out singleton evaluation.
+
+## Tasks and binary endpoints
+
+| Task family | Prompt/output interface | Parsed endpoint | Chance baseline |
+|---|---|---|---:|
+| Arithmetic | arithmetic expression with direct numerical continuation | exact match to target numerical answer | 0 |
+| Grammar acceptability | sentence with short acceptability judgment | correct binary acceptability label | 0.5 |
+| HANS NLI | premise/hypothesis with `E` or `N` output | correct entailment/non-entailment label | 0.5 |
+| Random FSM | sampled binary finite-state machine and input string | exact match to simulator-computed final state | mean over sampled output-domain size |
+| Jailbreak | safety prompt with generated continuation | fixed successful-jailbreak predicate | n/a |
+
+The same prompt, parser, and binary predicate are used before and after intervention. Random FSM changes the transition table by example, so it tests prompted execution rather than a single memorized dataset-level mapping.
+
+## Intervention definitions
+
+- **input+output** (`standard`): replacement is active during prompt processing and generation;
+- **output-only** (`decode-only`): prompt processing is unmodified and replacement acts during generation;
+- **mean**: replace with the discovery-data coordinate mean;
+- **mean-donor**: replace with the observed discovery value nearest that mean;
+- **singleton**: replace one channel;
+- **simultaneous set**: replace all channels in the set in the same forward pass.
 
 An overtopping setting is the resolved `RunSpec` for a specific task, model snapshot, intervention/replacement rule, intervention phase, discovery configuration, and evaluation split. Suite membership and runtime batch size are execution metadata rather than scientific identity fields.
 
@@ -13,13 +38,13 @@ code/studies/overtopping/experiments/run_experiments.py
 Inspect the effective registry from the repository root:
 
 ```bash
-./run_overtopping_experiments.sh --list
-./run_overtopping_experiments.sh --dry-run
+bash ./run_overtopping_experiments.sh --list
+bash ./run_overtopping_experiments.sh --dry-run
 ```
 
-## Current registry
+## Configured registry
 
-For the repository state represented by this documentation, the `all` selection resolves to 50 unique settings. The storage contract reports:
+The configured `all` selection resolves to 50 unique settings. The storage contract reports:
 
 | Dimension | Value | Count |
 |---|---|---:|
@@ -65,7 +90,7 @@ Each task/model cell has input+output and output-only settings.
 
 ### `6-7b-models`
 
-Current entries:
+Entries:
 
 ```text
 arithmetic       Qwen/Qwen2-7B-Instruct  output-only
@@ -77,7 +102,7 @@ These settings use `mean`, MLP-only coordinates, `circuit_size=100000`, and `min
 
 ### `mean`
 
-Current entries use `mean` replacement for:
+Entries use `mean` replacement for:
 
 ```text
 arithmetic            Qwen/Qwen2-1.5B-Instruct       input+output, output-only
@@ -136,9 +161,9 @@ Execution phase is selected with:
 Examples:
 
 ```bash
-./run_overtopping_experiments.sh --suite checkpoints --dry-run
+bash ./run_overtopping_experiments.sh --suite checkpoints --dry-run
 
-./run_overtopping_experiments.sh \
+bash ./run_overtopping_experiments.sh \
   --task arithmetic \
   --model Qwen/Qwen2-1.5B-Instruct \
   --evaluation-split test \

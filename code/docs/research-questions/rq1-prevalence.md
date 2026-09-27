@@ -1,100 +1,107 @@
-# RQ1 — prevalence and competence
+# RQ1 — Competence, causal reach, and direction
 
 ## Question
 
-RQ1 asks whether high-leverage singleton causal effects occur across the configured tasks and model states, and whether corrective directional reach changes with behavioral competence.
+RQ1 asks where high-reach singleton causal control appears and whether directional reach changes with the unmodified model's task competence.
 
 ## Population
 
-RQ1 uses the configured overtopping manifest; its total and per-phase counts are derived at runtime. Input+output and output-only settings are analyzed separately, with no fixed total or phase split required.
+The configured overtopping manifest contains 50 unique settings: 29 input+output and 21 output-only. The two phases are analyzed separately because their intervention windows differ and because the competence normalization is phase-specific.
 
-All configured settings enter because the estimand is the association between behavioral competence and causal reach across the intervention settings actually studied. Intermediate checkpoints are distinct model states, and replacement-baseline repeats are distinct causal counterfactuals. They are not pooled across phase.
+Zero-candidate conditions remain in the analysis with zero reach when the directional metric is defined. A direction is excluded only when its required source-state cohort is not available for causal evaluation.
 
-A separate final-snapshot sensitivity removes intermediate checkpoints and uses one replacement condition for each repeated task×model×phase cell, preferring mean-donor when both regimes are present. This analysis asks whether the RQ1 association depends on repeated checkpoints or matched replacement-baseline conditions.
+The primary cross-setting analysis includes the configured checkpoint and replacement-baseline conditions. A sensitivity analysis removes intermediate Pythia checkpoints and retains one preferred replacement condition for repeated task-model-phase cells. This leaves 33 defined `0→1` cells and 31 defined `1→0` cells.
 
 ## Directional causal quantities
 
-Let `B(x)` be the unmodified binary behavioral endpoint. Directional effects condition on the source state:
+Let `B(x)` be the unmodified binary behavioral endpoint. Directional evaluation conditions on the source state:
 
 ```text
 B(x)=0  -> eligible for 0→1 / i2c
 B(x)=1  -> eligible for 1→0 / c2i
 ```
 
-For frozen candidate set `J`:
+For frozen candidate set `J`, let `F_j^d(x)=1` when replacing candidate `j` changes the endpoint in direction `d`.
 
 ```text
-U_J_i2c     singleton-union reach on B=0 examples
-U_J_c2i     singleton-union reach on B=1 examples
-s_1_i2c     strongest 0→1 singleton effect
-s_1_c2i     strongest 1→0 singleton effect
-N05_i2c     discovered candidates with 0→1 effect >= .05
-N05_c2i     discovered candidates with 1→0 effect >= .05
-N10_i2c     discovered candidates with 0→1 effect >= .10
-N10_c2i     discovered candidates with 1→0 effect >= .10
+U^d(J) = P(any j in J has F_j^d(x)=1)
+s_1^d  = max_j P(F_j^d(x)=1)
+N_.05^d = number of discovered candidates with directional singleton reach >= 0.05
 ```
 
-Each directional rate carries its own eligible-example denominator.
+`U^d(J)` is singleton-union reach. It measures the share of the eligible held-out population reachable by at least one discovered singleton. It is not itself a concentration measure; `s_1^d` and the thresholded candidate counts describe how much of that reach is carried by individual channels.
 
-A completed setting with no discovered candidates remains in RQ1 with zero singleton-union reach where the metric is defined.
+Each directional rate uses its own eligible-example denominator.
 
 ## Competence
 
-RQ1 uses a phase-specific competence score because the two intervention phases exclude different parts of the computation.
+Competence is measured on the unmodified model.
 
-### Input+output phase
+### Input+output
 
-Input+output interventions act while the prompt is processed and while the answer is generated. Instruction interpretation and downstream task execution are therefore both inside the intervention window. The competence variable is the model's raw unmodified task score:
-
-```text
-competence_I+O = raw task success rate
-```
-
-### Output-only phase
-
-Output-only interventions begin after prompt/instruction processing. The model can therefore have parsed the instruction correctly while still lacking the task knowledge or computation needed to answer a finite-choice instance. In that case some observed success can come from guessing. Output-only competence removes the random-answer baseline:
+Prompt processing and answer generation both lie inside the intervention window, so the analysis uses the raw higher-is-better task score:
 
 ```text
-competence_Out = (raw_score - chance) / (1 - chance)
+competence_I+O = raw task score
 ```
 
-bounded to `[0,1]` by the implementation.
+### Output-only
 
-Task-specific chance baselines are defined in:
+Prompt and instruction processing occur before the intervention. For finite-output tasks, some success may therefore be attributable to guessing even when downstream task competence is low. The analysis uses chance-normalized competence:
 
 ```text
-studies/overtopping/analysis/lib/task_metrics.py
+kappa = max(0, (s - c) / (1 - c))
 ```
 
-Grammar and HANS NLI use `0.5`; Random FSM uses the configured average random-choice baseline unless an explicit empirical baseline is requested; arithmetic and jailbreak use the task-specific definitions implemented there. Jailbreak scores are oriented so higher values mean safer/refusal behavior.
+where `s` is the raw higher-is-better task score and `c` is the parsed-output chance rate. Grammar and HANS NLI use `c=0.5`; arithmetic uses `c=0`; Random FSM uses the sampled output-domain chance rate. Safety is oriented as a higher-is-better safe-rate quantity in the reporting code.
 
-The I+O and Out competence scales are analyzed separately and are not pooled into one correlation.
+The input+output and output-only competence scales are not pooled.
+
+## Main results
+
+For `0→1` reach, the primary linear association with competence is:
+
+```text
+input+output: n=29, r=0.506, p=0.00515
+output-only:  n=21, r=0.341, p=0.130
+```
+
+For `1→0` reach:
+
+```text
+input+output: n=27, r=0.507, p=0.00692
+output-only:  n=20, r=0.676, p=0.00106
+```
+
+The reduced sensitivity analysis remains positive in all four phase/direction combinations, but the clearest retained association is output-only `1→0`:
+
+```text
+0→1, input+output: n=16, Pearson r=0.231, p=0.389
+0→1, output-only:  n=17, Pearson r=0.407, p=0.105
+1→0, input+output: n=15, Pearson r=0.245, p=0.379
+1→0, output-only:  n=16, Pearson r=0.727, p=0.00141
+```
+
+These associations describe the configured condition matrix. They do not identify model size, task family, intervention phase, or replacement baseline as independent causal factors because those axes are not fully factorially crossed.
 
 ## Width-normalized candidate counts
 
-Reporting also writes width-normalized discovered-candidate counts:
+Reporting also writes discovered-candidate counts normalized by model `d_model`, including:
 
 ```text
 N05_i2c_density
 N05_c2i_density
 N10_i2c_density
 N10_c2i_density
+N05_i2c_per_1k_layer
+N05_c2i_per_1k_layer
 ```
 
-and corresponding `*_per_1k_layer` fields.
+These are normalizations of the discovered candidate set. They are not estimates of the fraction of all model coordinates that are causal.
 
-These divide discovered-candidate counts by model `d_model`. They are not estimates of the fraction of all searchable coordinates that are causal.
+## Statistical unit
 
-## Statistical analyses
-
-RQ1 outputs include:
-
-- phase-specific Pearson associations across configured settings with the required metric;
-- phase-specific Spearman associations across configured settings with the required metric;
-- the 29-cell final-snapshot sensitivity;
-- task/phase and structural diagnostics where the available setting count permits estimation.
-
-The cross-setting statistical unit is the configured setting. Eligible-example counts describe within-setting precision rather than additional independent replicates.
+The cross-setting unit is the configured setting. Eligible-example counts describe within-setting precision and are not treated as independent cross-setting replicates.
 
 ## Implementation
 
@@ -107,32 +114,25 @@ studies/overtopping/analysis/stage06_competence_vs_overtopping_figures.py
 reporting/generate_final_results.py
 ```
 
-The complete registry is constructed by:
+The configured registry is constructed by `paper_study_experiments()` in:
 
 ```text
-paper_study_experiments()
+studies/overtopping/experiments/run_experiments.py
 ```
-
-in `studies/overtopping/experiments/run_experiments.py`.
 
 ## Outputs
 
-Rendered output directory:
+Rendered outputs:
 
 ```text
 results/paper/figures/02_rq1_prevalence/
 ```
 
-Machine-readable source tables and fit statistics:
+Machine-readable figure data and fit statistics:
 
 ```text
 results/analysis/figure_data/02_rq1_prevalence/
-```
-
-Configured-study tables and cross-setting statistics:
-
-```text
 results/analysis/primary_matrix/
 ```
 
-See [Overtopping experiment design](../experiments/overtopping.md) for the current registry structure.
+The complete 50-setting registry and task/model/phase coverage are documented in [Overtopping experimental frame and registry](../experiments/overtopping.md).
